@@ -1,0 +1,1 @@
+/Users/aleks/Downloads/GeelyToolsV2/app/src/main/cpp/CMakeLists.txt

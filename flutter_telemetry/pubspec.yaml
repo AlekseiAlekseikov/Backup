@@ -1,0 +1,66 @@
+# GeelyTools telemetry module.
+# Ported from capy (https://github.com/Timoteohss/capy), Apache License 2.0.
+# Deviations from the capy pubspec:
+#   - name: capy_energy -> geelytools_telemetry (GeelyTools namespace);
+#   - add-to-app `module` section (GeelyTools hosts the FlutterEngine);
+#   - apps/companion workspace member and capy_companion dev dependency
+#     removed (Capy Companion / phone pairing is excluded from GeelyTools).
+name: geelytools_telemetry
+description: "GeelyTools telemetry UI (ported from capy)."
+publish_to: 'none'
+version: 0.26.0+712
+
+workspace:
+  - packages/telemetry_core
+  - packages/capy_ui
+
+environment:
+  sdk: ^3.12.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+  intl: ^0.20.2
+  telemetry_core:
+  capy_ui:
+  cupertino_icons: ^1.0.8
+  shared_preferences: ^2.5.5
+  package_info_plus: ^8.3.1
+  fl_chart: ^1.2.0
+  flutter_map: ^8.3.1
+  latlong2: ^0.10.1
+  flutter_confetti: ^0.8.0
+  ffi: ^2.1.3
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  fake_async: ^1.3.1
+  flutter_lints: ^6.0.0
+  pigeon: ^25.0.0
+  sqflite_common_ffi: ^2.3.6
+
+flutter:
+  uses-material-design: true
+  generate: true
+
+  fonts:
+    - family: Inter
+      fonts:
+        - asset: packages/capy_ui/assets/fonts/Inter-Regular.ttf
+          weight: 400
+        - asset: packages/capy_ui/assets/fonts/Inter-Medium.ttf
+          weight: 500
+        - asset: packages/capy_ui/assets/fonts/Inter-SemiBold.ttf
+          weight: 600
+        - asset: packages/capy_ui/assets/fonts/Inter-Bold.ttf
+          weight: 700
+        - asset: packages/capy_ui/assets/fonts/Inter-ExtraBold.ttf
+          weight: 800
+
+  module:
+    androidX: true
+    androidPackage: com.alekseikov.geelytools.geelytools_telemetry
+    iosBundleIdentifier: com.alekseikov.geelytools.geelytoolsTelemetry

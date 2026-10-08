@@ -1,0 +1,7 @@
+[
+{
+  "directory": "/Users/aleks/Downloads/GeelyToolsV2/app/.cxx/Debug/5e5e1b30/arm64-v8a",
+  "command": "/Users/aleks/Library/Android/sdk/ndk/27.3.13750724/toolchains/llvm/prebuilt/darwin-x86_64/bin/clang --target=aarch64-none-linux-android28 --sysroot=/Users/aleks/Library/Android/sdk/ndk/27.3.13750724/toolchains/llvm/prebuilt/darwin-x86_64/sysroot -Droadcast_jni_EXPORTS -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security  -fno-limit-debug-info  -fPIC -O2 -Wall -Wextra -Werror -o CMakeFiles/roadcast_jni.dir/roadcast_jni.c.o -c /Users/aleks/Downloads/GeelyToolsV2/app/src/main/cpp/roadcast_jni.c",
+  "file": "/Users/aleks/Downloads/GeelyToolsV2/app/src/main/cpp/roadcast_jni.c"
+}
+]

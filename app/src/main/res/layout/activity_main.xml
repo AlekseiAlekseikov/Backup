@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Новый интерфейс: WebView с assets/ui/index.html
+    (макет «Geely EX2 ГУ — концепт в стиле Zeekr»).
+    Логика подключается через ui/UiBridge.kt (GeelyNative в JS).
+
+    Projection-оверлеи (Stage CPv2): TextureView поверх WebView. CarPlay /
+    Android Auto рендерятся OEM-стеком в нашу SurfaceTexture (capy-архитектура);
+    WebView сам не может показать Surface. Оверлей раскладывается ровно по
+    прямоугольнику, который измерил JS вкладки (projectionFrame), и скрыт,
+    пока projection-вкладка не активна. Касания оверлей перехватывает сам и
+    пересылает телефону через ProjectionTouchController — WebView их не видит.
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <WebView
+        android:id="@+id/webView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+    <TextureView
+        android:id="@+id/carplaySurface"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:visibility="gone"
+        android:clickable="true" />
+
+    <TextureView
+        android:id="@+id/aautoSurface"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:visibility="gone"
+        android:clickable="true" />
+</FrameLayout>

@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Светлая тема в языке Sapo: белые карты, тёмный текст, зелёный selected. -->
+<resources>
+    <color name="background">#F3F5F8</color>
+    <color name="bar">#F3F5F8</color>
+    <color name="rail">#F3F5F8</color>
+    <color name="card">#FFFFFF</color>
+    <color name="card_stroke">#E2E8F0</color>
+    <color name="text_primary">#0F172A</color>
+    <color name="text_secondary">#64748B</color>
+    <color name="text_accent">#64748B</color>
+    <color name="accent">#2563EB</color>
+    <color name="accent_pressed">#1D4ED8</color>
+    <color name="chip">#EEF2F7</color>
+    <color name="chip_stroke">#D8DEE8</color>
+    <color name="divider">#E6EAF0</color>
+    <color name="mic_tint">#2563EB</color>
+    <color name="hint">#94A3B8</color>
+    <color name="nav_on">#2563EB</color>
+    <color name="seg_on">#1F9A64</color>
+    <color name="seg_on_text">#FFFFFF</color>
+    <color name="green_btn">#1F9A64</color>
+    <color name="green_btn_pressed">#187A50</color>
+    <color name="ghost_btn">#E8EDF3</color>
+    <color name="status_ok">#22C55E</color>
+
+    <color name="purple_200">#FFBB86FC</color>
+    <color name="purple_500">#FF6200EE</color>
+    <color name="purple_700">#FF3700B3</color>
+    <color name="teal_200">#FF03DAC5</color>
+    <color name="teal_700">#FF018786</color>
+    <color name="black">#FF000000</color>
+    <color name="white">#FFFFFFFF</color>
+</resources>

@@ -1,0 +1,5 @@
+/app/release/
+/app/build/
+/app/release/
+/app/debug/
+*.apk
