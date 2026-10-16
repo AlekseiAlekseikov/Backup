@@ -1,0 +1,26 @@
+# ninja log v5
+0	15	0	clean	7aeb5db16e02199d
+306	436	1791906647114109632	/Users/aleks/Downloads/GeelyToolsV2/app/build/intermediates/cxx/Debug/5e5e1b30/obj/arm64-v8a/libroadcast_jni.so	cbc42c6dc758a234
+0	306	1791906646983140934	CMakeFiles/roadcast_jni.dir/roadcast_jni.c.o	eaf25b687ad546b4
+0	9	0	clean	7aeb5db16e02199d
+0	21	0	clean	7aeb5db16e02199d
+0	13	0	clean	7aeb5db16e02199d
+0	18	0	clean	7aeb5db16e02199d
+0	14	0	clean	7aeb5db16e02199d
+0	8	0	clean	7aeb5db16e02199d
+0	19	0	clean	7aeb5db16e02199d
+0	14	0	clean	7aeb5db16e02199d
+0	7	0	clean	7aeb5db16e02199d
+0	8	0	clean	7aeb5db16e02199d
+0	10	0	clean	7aeb5db16e02199d
+0	10	0	clean	7aeb5db16e02199d
+0	9	0	clean	7aeb5db16e02199d
+0	9	0	clean	7aeb5db16e02199d
+0	14	0	clean	7aeb5db16e02199d
+0	8	0	clean	7aeb5db16e02199d
+0	9	0	clean	7aeb5db16e02199d
+0	7	0	clean	7aeb5db16e02199d
+0	11	0	clean	7aeb5db16e02199d
+0	11	0	clean	7aeb5db16e02199d
+0	7	0	clean	7aeb5db16e02199d
+0	10	0	clean	7aeb5db16e02199d

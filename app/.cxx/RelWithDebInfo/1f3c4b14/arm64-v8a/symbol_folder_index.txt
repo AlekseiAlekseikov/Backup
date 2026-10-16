@@ -1,0 +1,1 @@
+/Users/aleks/Downloads/GeelyToolsV2/app/build/intermediates/cxx/RelWithDebInfo/1f3c4b14/obj/arm64-v8a

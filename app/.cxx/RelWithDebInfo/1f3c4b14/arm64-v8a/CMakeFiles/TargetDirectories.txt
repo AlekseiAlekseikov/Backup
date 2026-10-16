@@ -1,0 +1,3 @@
+/Users/aleks/Downloads/GeelyToolsV2/app/.cxx/RelWithDebInfo/1f3c4b14/arm64-v8a/CMakeFiles/roadcast_jni.dir
+/Users/aleks/Downloads/GeelyToolsV2/app/.cxx/RelWithDebInfo/1f3c4b14/arm64-v8a/CMakeFiles/edit_cache.dir
+/Users/aleks/Downloads/GeelyToolsV2/app/.cxx/RelWithDebInfo/1f3c4b14/arm64-v8a/CMakeFiles/rebuild_cache.dir
