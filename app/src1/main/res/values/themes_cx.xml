@@ -1,0 +1,262 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Базовая тема (токены :root) и девять палитр цвета кузова
+  body[data-th="0..8"]. Идентификаторы и названия — из реестра
+  THEMES / THEME_IDS шелла, порядок сохранён.
+
+  Каждая палитра самодостаточна: светлая или тёмная она по своей
+  природе, поэтому values-night не используется — иначе ночной
+  режим системы перекрывал бы выбор цвета кузова.
+-->
+<resources>
+    <style name="Theme.GeelyTools" parent="Theme.AppCompat.NoActionBar">
+        <item name="cxPage1">#F3EEE3</item>
+        <item name="cxPage2">#E6DECD</item>
+        <item name="cxCard">#FFFDF8</item>
+        <item name="cxCard2">#F5F0E5</item>
+        <item name="cxInk">#1A1A1A</item>
+        <item name="cxMuted">#8A8175</item>
+        <item name="cxMuted2">#A79E8C</item>
+        <item name="cxLine">#E9E2D2</item>
+        <item name="cxTrack">#EEE7D6</item>
+        <item name="cxBtn">#1A1A1A</item>
+        <item name="cxOnBtn">#FFFFFF</item>
+        <item name="cxSel">#FFFFFF</item>
+        <item name="cxOnSel">#1A1A1A</item>
+        <item name="cxBarBg">#F0FFFDF8</item>
+        <item name="cxGreen">#34C759</item>
+        <item name="cxDanger">#FF3B30</item>
+        <item name="cxAccent">#1677F2</item>
+        <item name="android:windowBackground">?attr/cxPage1</item>
+        <item name="android:statusBarColor">?attr/cxPage1</item>
+        <item name="android:navigationBarColor">?attr/cxPage1</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+    </style>
+
+    <style name="Theme.GeelyTools.P0" parent="Theme.GeelyTools">
+        <item name="cxPage1">#EFEFED</item>
+        <item name="cxPage2">#DFDFDD</item>
+        <item name="cxCard">#FFFFFF</item>
+        <item name="cxCard2">#EBEBEB</item>
+        <item name="cxInk">#0D0D0D</item>
+        <item name="cxMuted">#6B6B6B</item>
+        <item name="cxMuted2">#9A9A9A</item>
+        <item name="cxLine">#DEDEDC</item>
+        <item name="cxTrack">#E3E3E1</item>
+        <item name="cxBtn">#262626</item>
+        <item name="cxOnBtn">#FFFFFF</item>
+        <item name="cxSel">#FFFFFF</item>
+        <item name="cxOnSel">#0D0D0D</item>
+        <item name="cxBarBg">#F0FFFFFF</item>
+        <item name="cxGreen">#6DC24B</item>
+        <item name="cxDanger">#FF3B30</item>
+        <item name="cxAccent">#EFA83A</item>
+        <item name="android:windowBackground">?attr/cxPage1</item>
+        <item name="android:statusBarColor">?attr/cxPage1</item>
+        <item name="android:navigationBarColor">?attr/cxPage1</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+    </style>
+
+    <style name="Theme.GeelyTools.P1" parent="Theme.GeelyTools">
+        <item name="cxPage1">#17323E</item>
+        <item name="cxPage2">#0E222B</item>
+        <item name="cxCard">#294854</item>
+        <item name="cxCard2">#3A5964</item>
+        <item name="cxInk">#F7F7F0</item>
+        <item name="cxMuted">#D2DDDA</item>
+        <item name="cxMuted2">#9EB2B1</item>
+        <item name="cxLine">#466570</item>
+        <item name="cxTrack">#3A5964</item>
+        <item name="cxBtn">#D7E8E5</item>
+        <item name="cxOnBtn">#17313B</item>
+        <item name="cxSel">#D7E8E5</item>
+        <item name="cxOnSel">#17313B</item>
+        <item name="cxBarBg">#F0294854</item>
+        <item name="cxGreen">#6DC24B</item>
+        <item name="cxDanger">#FF6961</item>
+        <item name="cxAccent">#EFA83A</item>
+        <item name="android:windowBackground">?attr/cxPage1</item>
+        <item name="android:statusBarColor">?attr/cxPage1</item>
+        <item name="android:navigationBarColor">?attr/cxPage1</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+    </style>
+
+    <style name="Theme.GeelyTools.P2" parent="Theme.GeelyTools">
+        <item name="cxPage1">#0A0A0A</item>
+        <item name="cxPage2">#000000</item>
+        <item name="cxCard">#151515</item>
+        <item name="cxCard2">#232323</item>
+        <item name="cxInk">#F2F2F2</item>
+        <item name="cxMuted">#AFAFAF</item>
+        <item name="cxMuted2">#7A7A7A</item>
+        <item name="cxLine">#2C2C2C</item>
+        <item name="cxTrack">#2A2A2A</item>
+        <item name="cxBtn">#E8E8E8</item>
+        <item name="cxOnBtn">#0A0A0A</item>
+        <item name="cxSel">#E8E8E8</item>
+        <item name="cxOnSel">#0A0A0A</item>
+        <item name="cxBarBg">#F0151515</item>
+        <item name="cxGreen">#6DC24B</item>
+        <item name="cxDanger">#FF6961</item>
+        <item name="cxAccent">#EFA83A</item>
+        <item name="android:windowBackground">?attr/cxPage1</item>
+        <item name="android:statusBarColor">?attr/cxPage1</item>
+        <item name="android:navigationBarColor">?attr/cxPage1</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+    </style>
+
+    <style name="Theme.GeelyTools.P3" parent="Theme.GeelyTools">
+        <item name="cxPage1">#F0E9DC</item>
+        <item name="cxPage2">#E0D3BA</item>
+        <item name="cxCard">#FBF6EC</item>
+        <item name="cxCard2">#E9E0CF</item>
+        <item name="cxInk">#231C0F</item>
+        <item name="cxMuted">#6E6353</item>
+        <item name="cxMuted2">#9C9081</item>
+        <item name="cxLine">#D8CCB4</item>
+        <item name="cxTrack">#E4DACA</item>
+        <item name="cxBtn">#3A2F1E</item>
+        <item name="cxOnBtn">#FBF6EC</item>
+        <item name="cxSel">#FFFFFF</item>
+        <item name="cxOnSel">#231C0F</item>
+        <item name="cxBarBg">#F0FBF6EC</item>
+        <item name="cxGreen">#6DC24B</item>
+        <item name="cxDanger">#FF3B30</item>
+        <item name="cxAccent">#EFA83A</item>
+        <item name="android:windowBackground">?attr/cxPage1</item>
+        <item name="android:statusBarColor">?attr/cxPage1</item>
+        <item name="android:navigationBarColor">?attr/cxPage1</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+    </style>
+
+    <style name="Theme.GeelyTools.P4" parent="Theme.GeelyTools">
+        <item name="cxPage1">#20242C</item>
+        <item name="cxPage2">#14171D</item>
+        <item name="cxCard">#2C323C</item>
+        <item name="cxCard2">#3A414D</item>
+        <item name="cxInk">#E7ECF3</item>
+        <item name="cxMuted">#B6BFCD</item>
+        <item name="cxMuted2">#8792A3</item>
+        <item name="cxLine">#434B58</item>
+        <item name="cxTrack">#3A414D</item>
+        <item name="cxBtn">#D5DEEB</item>
+        <item name="cxOnBtn">#20242C</item>
+        <item name="cxSel">#D5DEEB</item>
+        <item name="cxOnSel">#20242C</item>
+        <item name="cxBarBg">#F02C323C</item>
+        <item name="cxGreen">#6DC24B</item>
+        <item name="cxDanger">#FF6961</item>
+        <item name="cxAccent">#EFA83A</item>
+        <item name="android:windowBackground">?attr/cxPage1</item>
+        <item name="android:statusBarColor">?attr/cxPage1</item>
+        <item name="android:navigationBarColor">?attr/cxPage1</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+    </style>
+
+    <style name="Theme.GeelyTools.P5" parent="Theme.GeelyTools">
+        <item name="cxPage1">#FFFFFF</item>
+        <item name="cxPage2">#E4E4E4</item>
+        <item name="cxCard">#FFFFFF</item>
+        <item name="cxCard2">#E2E2E2</item>
+        <item name="cxInk">#000000</item>
+        <item name="cxMuted">#3D3D3D</item>
+        <item name="cxMuted2">#5E5E5E</item>
+        <item name="cxLine">#3A3A3A</item>
+        <item name="cxTrack">#D8D8D8</item>
+        <item name="cxBtn">#000000</item>
+        <item name="cxOnBtn">#FFFFFF</item>
+        <item name="cxSel">#FFFFFF</item>
+        <item name="cxOnSel">#000000</item>
+        <item name="cxBarBg">#F5FFFFFF</item>
+        <item name="cxGreen">#6DC24B</item>
+        <item name="cxDanger">#FF3B30</item>
+        <item name="cxAccent">#EFA83A</item>
+        <item name="android:windowBackground">?attr/cxPage1</item>
+        <item name="android:statusBarColor">?attr/cxPage1</item>
+        <item name="android:navigationBarColor">?attr/cxPage1</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+    </style>
+
+    <style name="Theme.GeelyTools.P6" parent="Theme.GeelyTools">
+        <item name="cxPage1">#0B0714</item>
+        <item name="cxPage2">#05030B</item>
+        <item name="cxCard">#150E24</item>
+        <item name="cxCard2">#221838</item>
+        <item name="cxInk">#F2ECFF</item>
+        <item name="cxMuted">#B9A8E0</item>
+        <item name="cxMuted2">#7E6BA8</item>
+        <item name="cxLine">#2B2043</item>
+        <item name="cxTrack">#251A3C</item>
+        <item name="cxBtn">#E9DDFF</item>
+        <item name="cxOnBtn">#150E24</item>
+        <item name="cxSel">#E9DDFF</item>
+        <item name="cxOnSel">#150E24</item>
+        <item name="cxBarBg">#F0150E24</item>
+        <item name="cxGreen">#21E7E0</item>
+        <item name="cxDanger">#FF6961</item>
+        <item name="cxAccent">#FF3D9A</item>
+        <item name="android:windowBackground">?attr/cxPage1</item>
+        <item name="android:statusBarColor">?attr/cxPage1</item>
+        <item name="android:navigationBarColor">?attr/cxPage1</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+    </style>
+
+    <style name="Theme.GeelyTools.P7" parent="Theme.GeelyTools">
+        <item name="cxPage1">#1B0F1C</item>
+        <item name="cxPage2">#120812</item>
+        <item name="cxCard">#2A1728</item>
+        <item name="cxCard2">#3A2036</item>
+        <item name="cxInk">#FFEDE4</item>
+        <item name="cxMuted">#E0B9AE</item>
+        <item name="cxMuted2">#A9807C</item>
+        <item name="cxLine">#3E2238</item>
+        <item name="cxTrack">#3E2238</item>
+        <item name="cxBtn">#FFE0CF</item>
+        <item name="cxOnBtn">#2A1728</item>
+        <item name="cxSel">#FFE0CF</item>
+        <item name="cxOnSel">#2A1728</item>
+        <item name="cxBarBg">#F02A1728</item>
+        <item name="cxGreen">#34D8A6</item>
+        <item name="cxDanger">#FF6961</item>
+        <item name="cxAccent">#FF7A5C</item>
+        <item name="android:windowBackground">?attr/cxPage1</item>
+        <item name="android:statusBarColor">?attr/cxPage1</item>
+        <item name="android:navigationBarColor">?attr/cxPage1</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+    </style>
+
+    <style name="Theme.GeelyTools.P8" parent="Theme.GeelyTools">
+        <item name="cxPage1">#FDF2FA</item>
+        <item name="cxPage2">#F0D6E8</item>
+        <item name="cxCard">#FFFFFF</item>
+        <item name="cxCard2">#F7E4F3</item>
+        <item name="cxInk">#2B1030</item>
+        <item name="cxMuted">#7A5478</item>
+        <item name="cxMuted2">#A889A6</item>
+        <item name="cxLine">#EBD0E6</item>
+        <item name="cxTrack">#F3DCEE</item>
+        <item name="cxBtn">#3D1642</item>
+        <item name="cxOnBtn">#FFF5FC</item>
+        <item name="cxSel">#FFFFFF</item>
+        <item name="cxOnSel">#2B1030</item>
+        <item name="cxBarBg">#F0FFFFFF</item>
+        <item name="cxGreen">#16BFA6</item>
+        <item name="cxDanger">#FF3B30</item>
+        <item name="cxAccent">#E8398B</item>
+        <item name="android:windowBackground">?attr/cxPage1</item>
+        <item name="android:statusBarColor">?attr/cxPage1</item>
+        <item name="android:navigationBarColor">?attr/cxPage1</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+    </style>
+
+</resources>

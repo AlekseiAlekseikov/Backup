@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Нативная полоса климата (ui/ClimBarPanel.kt): замена HTML #climBar.
+    Контейнер не перехватывает касания; пилюля снизу по центру над доком.
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/climBarHost"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent" />

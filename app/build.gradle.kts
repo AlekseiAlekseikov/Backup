@@ -46,8 +46,8 @@ android {
         applicationId = "com.example.voiceapp3"
         minSdk = 28
         targetSdk = 32
-        versionCode = 18
-        versionName = "1.0.18"
+        versionCode = 23
+        versionName = "1.0.23"
 
         buildConfigField("String", "APP_UPDATE_MANIFEST_URL", "\"$appUpdateManifestUrl\"")
         buildConfigField("String", "CHARGE_CONTROL_MANIFEST_URL", "\"$chargeControlManifestUrl\"")

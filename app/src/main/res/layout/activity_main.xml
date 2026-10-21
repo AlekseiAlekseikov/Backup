@@ -1,24 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!--
-    Новый интерфейс: WebView с assets/ui/index.html
-    (макет «Geely EX2 ГУ — концепт в стиле Zeekr»).
-    Логика подключается через ui/UiBridge.kt (GeelyNative в JS).
-
-    Projection-оверлеи (Stage CPv2): TextureView поверх WebView. CarPlay /
-    Android Auto рендерятся OEM-стеком в нашу SurfaceTexture (capy-архитектура);
-    WebView сам не может показать Surface. Оверлей раскладывается ровно по
-    прямоугольнику, который измерил JS вкладки (projectionFrame), и скрыт,
-    пока projection-вкладка не активна. Касания оверлей перехватывает сам и
-    пересылает телефону через ProjectionTouchController — WebView их не видит.
--->
+<!-- Корень шелла: весь интерфейс — нативные View (ui/*). Фон корня задаёт тема (UiBridge.applyShellBackground). -->
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/shellRoot"
     android:layout_width="match_parent"
     android:layout_height="match_parent">
-
-    <WebView
-        android:id="@+id/webView"
-        android:layout_width="match_parent"
-        android:layout_height="match_parent" />
 
     <TextureView
         android:id="@+id/carplaySurface"
@@ -33,4 +18,71 @@
         android:layout_height="wrap_content"
         android:visibility="gone"
         android:clickable="true" />
+
+    <!-- Этап 9: сообщение над видео CarPlay / AA (ui/ProjectionMessagePanel.kt). -->
+    <include layout="@layout/view_projection_message" />
+
+    <!-- Нативная карточка автомобиля (ui/CarCardPanel.kt): поверх пустого слота #carSlot в HTML. -->
+    <include layout="@layout/view_car_card" />
+
+    <!-- Нативная верхняя строка (ui/TopBarPanel.kt): замена HTML .topbar. -->
+    <include layout="@layout/view_top_bar" />
+
+    <!--
+        Нативная вкладка «Быстрый доступ» (ui/QuickPanel.kt): накрывает
+        #content по геометрии quick.frame из JS; скрыта вне своей вкладки.
+    -->
+    <include layout="@layout/view_quick_panel" />
+
+    <!-- Нативная вкладка «Голос» (ui/VoicePanel.kt): накрывает #content на своей вкладке. -->
+    <include layout="@layout/view_voice_panel" />
+
+    <!-- Нативная вкладка «Приложения» (ui/ApplicationsPanel.kt): накрывает #content на своей вкладке. -->
+    <include layout="@layout/view_apps_panel" />
+
+    <!-- Нативная вкладка «Видеорегистратор» (ui/DashcamPanel.kt): каркас с заглушкой, этап 6. -->
+    <include layout="@layout/view_dashcam_panel" />
+
+    <!-- Нативная вкладка «Сервис» (ui/ServicePanel.kt): каркас с заглушкой, этап 7. -->
+    <include layout="@layout/view_service_panel" />
+
+    <!-- Нативная вкладка «Обновления» (ui/UpdatesPanel.kt): AppUpdater через UiBridge, этап 8. -->
+    <include layout="@layout/view_updates_panel" />
+
+    <!-- Нативная вкладка «Инструменты», этап 5a (ui/ToolsPanel.kt): пока не активна, см. NATIVE_TABS. -->
+    <include layout="@layout/view_tools_panel" />
+
+    <!-- Нативная полоса климата (ui/ClimBarPanel.kt): замена HTML #climBar. -->
+    <include layout="@layout/view_clim_bar" />
+
+    <!-- Нативные тосты (ui/ToastPanel.kt): замена HTML #toast. -->
+    <include layout="@layout/view_toast" />
+
+    <!--
+        Нативный плавающий док вкладок (замена HTML #tabbar). Кнопки создаёт
+        ui/NativeDock.kt по списку, который публикует JS (tabs.state).
+        Последний в дереве: поверх WebView, карты, Flutter и проекций.
+    -->
+    <HorizontalScrollView
+        android:id="@+id/nativeDock"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|center_horizontal"
+        android:layout_marginBottom="14dp"
+        android:paddingStart="7dp"
+        android:paddingTop="7dp"
+        android:paddingEnd="7dp"
+        android:paddingBottom="7dp"
+        android:clipToPadding="false"
+        android:elevation="10dp"
+        android:overScrollMode="never"
+        android:scrollbars="none">
+
+        <LinearLayout
+            android:id="@+id/nativeDockRow"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal" />
+    </HorizontalScrollView>
 </FrameLayout>

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Нативные тосты (ui/ToastPanel.kt): пилюля сверху по центру, на всех вкладках.
+    Контейнер не перехватывает касания — нажатия проходят к экрану под ним.
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/toastHost"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent" />

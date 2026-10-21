@@ -2,14 +2,13 @@ package com.example.voiceapp3.ui
 
 import android.app.Activity
 import android.content.Context
+import android.view.ViewGroup
 import android.content.Intent
 import android.graphics.Color
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.view.View
-import android.webkit.JavascriptInterface
-import android.webkit.WebView
 import com.example.voiceapp3.AppUpdater
 import com.example.voiceapp3.BuildConfig
 import com.example.voiceapp3.tools.ScreenBrightness
@@ -54,7 +53,7 @@ import com.google.gson.JsonParser
  *   voice.request         -> VoiceAssistantService (старт прослушивания)
  *   voice.micRestart      -> MicPump (перезапуск микрофона)
  *   settings.change       -> ToolsBackend (persist + живой эффект + readback)
- *   tab.change            -> вкладки, вкл. CarPlay/AA (SET.proj)
+ *   tab.change            -> выбранная вкладка (ShellTabs)
  *   update.*              -> AppUpdater
  *
  * Обратный канал (Kotlin → JS): [pushToUi] вызывает
@@ -62,6 +61,8 @@ import com.google.gson.JsonParser
  * интерфейс диспатчит CustomEvent 'native:<name>' (см. конец index.html).
  */
 private const val PREF_CAR_PAINT = "pref_car_paint"
+/** Тумблер «Автообновление» (вкладка «Обновления»): true — проверять и ставить сами. */
+const val PREF_UPDATE_AUTO = "update.auto"
 
 /* Stage CXT: имена ключей настроек приложения («Полный экран», «Запуск при
    пробуждении», «Полоса климата», CarPlay/AA, тема ГУ и палитра) живут в
@@ -72,7 +73,7 @@ private const val PREF_CAR_PAINT = "pref_car_paint"
 
 class UiBridge(
     private val activity: Activity,
-    private val webView: WebView,
+    private val shellRoot: ViewGroup,
     // GeelyTools deviation: вместо полного WebView-порта телеметрии — тонкий
     // live-фид движка (навигация/кузов/карточка батареи), см. VehicleLiveAdapter.
     private val vehicleLive: VehicleLiveAdapter? = null
@@ -90,13 +91,58 @@ class UiBridge(
     // встраивание и тот же вырез под док, что у TelemetryHostController.
     var navHost: com.example.voiceapp3.nav.NavigationHostController? = null
 
+    /** Нативный док вкладок шелла (замена HTML #tabbar, см. NativeDock). */
+    var nativeDock: NativeDock? = null
+    /** Этап 9b: вкладки шелла и правило CarPlay / AA (нативно). */
+    var shellTabs: ShellTabs? = null
+
+    /** Нативная вкладка «Быстрый доступ» (замена HTML-панели quick, см. QuickPanel). */
+    var quickPanel: QuickPanel? = null
+    var carCard: CarCardPanel? = null
+    /** Нативная геометрия главного экрана (замена JS-замеров). */
+    var shellGeometry: ShellGeometry? = null
+    /** Нативная верхняя строка и тосты (замена HTML .topbar и #toast). */
+    var topBar: TopBarPanel? = null
+    var toastPanel: ToastPanel? = null
+    /** Нативная полоса климата (замена HTML #climBar). */
+    var climBar: ClimBarPanel? = null
+
+    /** Нативная вкладка «Голос» (замена HTML-панели voice, см. VoicePanel). */
+    var voicePanel: VoicePanel? = null
+
+    /** Нативная вкладка «Приложения» (замена HTML-панели apps, см. ApplicationsPanel). */
+    var appsPanel: ApplicationsPanel? = null
+    /** Нативная вкладка «Видеорегистратор» (каркас, DashcamPanel). */
+    var dashcamPanel: DashcamPanel? = null
+    /** Нативная вкладка «Сервис» (каркас, ServicePanel). */
+    var servicePanel: ServicePanel? = null
+    /** Нативная вкладка «Обновления» (UpdatesPanel): получает снимки update.state. */
+    var updatesPanel: UpdatesPanel? = null
+    /** Этап 9: сообщение над видео CarPlay / AA (статусы, рамка, активация). */
+    var projectionMessage: ProjectionMessagePanel? = null
+
+    /** Нативная вкладка «Инструменты», этап 5a (см. ToolsPanel). */
+    var toolsPanel: ToolsPanel? = null
+
     /**
      * Stage B7: управление кузовом (капот/багажник) — тот же путь VHAL,
      * что у голосового TrunkControlHandler. Замок — только индикатор
      * (управления нет ни в проекте, ни в источниках телеметрии).
      */
     private val bodyControl by lazy {
-        BodyControlAdapter(activity) { name, json -> pushToUi(name, json) }
+        BodyControlAdapter(activity) { name, json ->
+            // Результат открытия показываем нативным тостом: JS этого события не слушает.
+            if (name == "telemetry.actionDone") {
+                runCatching {
+                    val msg = JsonParser.parseString(json).asJsonObject.get("message")?.asString
+                    if (!msg.isNullOrBlank()) activity.runOnUiThread {
+                        android.widget.Toast.makeText(activity, msg, android.widget.Toast.LENGTH_SHORT).show()
+                    }
+                }.onFailure { Log.w(TAG, "actionDone parse failed", it) }
+            } else {
+                pushToUi(name, json)
+            }
+        }
     }
 
     /**
@@ -106,6 +152,19 @@ class UiBridge(
      */
     @Volatile
     private var lastRemote: AppUpdater.Remote? = null
+
+    /** Автообновление: повторная проверка раз в 6 ч, пока приложение открыто. */
+    private val updateHandler = Handler(Looper.getMainLooper())
+    private val autoCheckTask: Runnable = Runnable {
+        if (autoUpdateEnabled()) {
+            startUpdateCheck()
+            updateHandler.postDelayed(autoCheckTask, AUTO_CHECK_INTERVAL_MS)
+        }
+    }
+    /** Скачивание или установка идут: новые запуски не стартуем. */
+    @Volatile private var updateBusy = false
+    /** Версия, для которой автоустановка уже запущена; сбрасывается при ошибке — повтор на следующей проверке. */
+    private var lastAutoInstallCode = -1
 
     /**
      * Stage CPv2: рендер-мост CarPlay/Android Auto. Ставится MainActivity
@@ -122,6 +181,14 @@ class UiBridge(
         val i = Intent(VoiceAssistantService.ACTION_HUB)
             .putExtra(VoiceAssistantService.EXTRA_HUB, kind)
         mode?.let { i.putExtra(VoiceAssistantService.EXTRA_MODE, it) }
+        activity.sendBroadcast(i)
+    }
+
+    /** Тап по фразе каталога «Голос»: сервис обрабатывает её как распознанную речь. */
+    private fun hubPhrase(text: String?) {
+        val i = Intent(VoiceAssistantService.ACTION_HUB)
+            .putExtra(VoiceAssistantService.EXTRA_HUB, VoiceAssistantService.HUB_PHRASE)
+            .putExtra(VoiceAssistantService.EXTRA_TEXT, text.orEmpty())
         activity.sendBroadcast(i)
     }
 
@@ -189,8 +256,17 @@ class UiBridge(
         runCatching { StatusIcons.syncAll(activity) }
     }
 
+    /**
+     * Снимок телеметрии и присутствие проекций (раньше — telemetry.request из JS
+     * при загрузке страницы и при выборе вкладки «Телеметрия»).
+     */
+    fun telemetryRequest() {
+        vehicleLive?.request()
+        com.timhss.capyenergy.projection.ProjectionPresenceBridge.get(activity)?.publishLatest()
+        projectionRender?.publishStatuses()
+    }
+
     /** Единый канал событий из интерфейса. */
-    @JavascriptInterface
     fun onEvent(name: String, data: String) {
         Log.d(TAG, "event: $name $data")
         when (name) {
@@ -224,7 +300,7 @@ class UiBridge(
                     // синхронно подсветить вкладку в доке шелла (JS select
                     // пришлёт tab.change → повторный show() — no-op).
                     activity.runOnUiThread { telemetryHost?.show(dest) }
-                    pushToUi("ui.selectTab", "{\"id\":\"telemetry\"}")
+                    selectTab("telemetry")
                 }.onFailure { Log.w(TAG, "telemetry.open failed", it) }
             }
             // Действующая палитра шелла (каталог THEMES index.html ↔
@@ -234,34 +310,6 @@ class UiBridge(
             // (TelemetryPrefsMirror). Выбор плиток (ui_shell_theme_id) здесь не
             // трогается: при «Следовать теме ГУ» ui.theme приносит тёмный
             // вариант, и запись его в ключ выбора ломала бы обратный ход.
-            "ui.theme" -> {
-                runCatching {
-                    val id = JsonParser.parseString(data).asJsonObject
-                        .get("id")?.asString
-                    if (!id.isNullOrBlank()) {
-                        TelemetryPrefsMirror.rememberEffectiveTheme(activity, id)
-                        // Stage NAV-MAP: хром и подложка карты меняют палитру
-                        // вслед за шеллом сразу, без перезагрузки.
-                        activity.runOnUiThread { navHost?.onThemeChanged(id) }
-                    }
-                }.onFailure { Log.w(TAG, "ui.theme parse failed", it) }
-            }
-            // Геометрия плавающего дока: JS меряет .tabbar (rect × dpr) и
-            // присылает нижний отступ для встроенного FlutterView — тот же
-            // паттерн, что projectionFrame у CarPlay/AA-оверлеев.
-            "telemetry.frame" -> {
-                runCatching {
-                    val inset = JsonParser.parseString(data).asJsonObject
-                        .get("bottomInset")?.asDouble
-                    if (inset != null && inset.isFinite()) {
-                        activity.runOnUiThread {
-                            telemetryHost?.setDockInsetPx(inset.toInt())
-                            // Stage NAV-MAP: общий вырез и для карты навигации.
-                            navHost?.setDockInsetPx(inset.toInt())
-                        }
-                    }
-                }.onFailure { Log.w(TAG, "telemetry.frame parse failed", it) }
-            }
             // Stage B7: капот/багажник из карточки машины. Открывает через
             // BodyControlAdapter (порт TrunkControlHandler); закрытие
             // электроприводом на EX2 невозможно — честно отказываем.
@@ -372,73 +420,37 @@ class UiBridge(
             // CarplayBridge/AndroidAutoBridge: activate/deactivate/refresh).
             // Вкладка активна → activate (binding касаний + Surface + рендер),
             // ушла → deactivate (подъём пальцев, R8-освобождение, unbind).
-            "projection.activate" -> projectionRender?.activate(
-                ProjectionRenderBridge.stackFromWire(
-                    JsonParser.parseString(data).asJsonObject.get("stack")?.asString ?: return
-                ) ?: return
-            )
-            "projection.deactivate" -> projectionRender?.deactivate(
-                ProjectionRenderBridge.stackFromWire(
-                    JsonParser.parseString(data).asJsonObject.get("stack")?.asString ?: return
-                ) ?: return
-            )
+            "projection.activate" -> {
+                projectionRender?.activate(
+                    ProjectionRenderBridge.stackFromWire(
+                        JsonParser.parseString(data).asJsonObject.get("stack")?.asString ?: return
+                    ) ?: return
+                )
+                wireStack(data)?.let { s -> activity.runOnUiThread { projectionMessage?.setActive(s) } }
+            }
+            "projection.deactivate" -> {
+                projectionRender?.deactivate(
+                    ProjectionRenderBridge.stackFromWire(
+                        JsonParser.parseString(data).asJsonObject.get("stack")?.asString ?: return
+                    ) ?: return
+                )
+                wireStack(data)?.let { s -> activity.runOnUiThread { projectionMessage?.setInactive(s) } }
+            }
             "projection.refresh" -> projectionRender?.refresh(
                 ProjectionRenderBridge.stackFromWire(
                     JsonParser.parseString(data).asJsonObject.get("stack")?.asString ?: return
                 ) ?: return
             )
             "voice.request" -> hub(VoiceAssistantService.HUB_LISTEN)
+            "voice.phrase" -> runCatching {
+                val text = JsonParser.parseString(data).asJsonObject.get("text")?.asString
+                hubPhrase(text)
+            }.onFailure { Log.w(TAG, "voice.phrase parse failed", it) }
             "voice.micRestart" -> hub(VoiceAssistantService.HUB_RESTART_MIC)
             // ── Stage UPD: вкладка «Обновления» — GitHub Releases ──
-            "update.check" -> {
-                pushUpdateState("checking")
-                AppUpdater.check(activity, object : AppUpdater.Listener {
-                    override fun onCheck(result: AppUpdater.CheckResult) {
-                        when (result) {
-                            is AppUpdater.CheckResult.Available -> {
-                                lastRemote = result.remote
-                                pushUpdateState(
-                                    "available",
-                                    versionName = result.remote.versionName,
-                                    changelog = result.remote.changelog
-                                )
-                            }
-                            is AppUpdater.CheckResult.UpToDate ->
-                                pushUpdateState("uptodate", versionName = AppUpdater.currentVersionName(activity))
-                            is AppUpdater.CheckResult.Error ->
-                                pushUpdateState("error", message = result.message)
-                        }
-                    }
-                    override fun onProgress(percent: Int, message: String) = Unit
-                    override fun onInstallStarted() = Unit
-                    override fun onFailure(message: String) = Unit
-                })
-            }
-            "update.install" -> {
-                val remote = lastRemote
-                if (remote == null) {
-                    pushUpdateState("error", message = "Сначала проверьте обновление")
-                    return
-                }
-                pushUpdateState("downloading", percent = 0, message = "Скачиваю ${remote.versionName}…")
-                AppUpdater.downloadAndInstall(activity, remote, object : AppUpdater.Listener {
-                    override fun onCheck(result: AppUpdater.CheckResult) = Unit
-                    override fun onProgress(percent: Int, message: String) {
-                        // percent = -1 — сообщение без прогресса (докачка/повтор)
-                        pushUpdateState(
-                            if (percent >= 100) "installing" else "downloading",
-                            percent = percent,
-                            message = message
-                        )
-                    }
-                    override fun onInstallStarted() {
-                        pushUpdateState("installing", message = "Устанавливаю… приложение перезапустится")
-                    }
-                    override fun onFailure(message: String) {
-                        pushUpdateState("error", message = message)
-                    }
-                })
-            }
+            "update.check" -> startUpdateCheck()
+            "update.install" -> startUpdateInstall()
+            "update.auto" -> setAutoUpdate(data)
             "car.color" -> {
                 runCatching {
                     val color = JsonParser.parseString(data).asJsonObject.get("color")?.asString
@@ -450,36 +462,15 @@ class UiBridge(
             }
             // Stage B6: вкладки поток больше не гасят — только onPause
             // приложения; lastUiTab хранится для возобновления контекста.
-            "tab.change" -> {
+            // Нативные вкладки (быстрый доступ, голос): JS публикует геометрию
+            // #content (физ. px) и активность каждой вкладки; нативная панель
+            // накрывает #content, когда её вкладка активна.
+            // Геометрия пустого слота #carSlot (якорь нативной карточки, до переноса главного экрана).
+            "toast" -> {
                 runCatching {
-                    val obj: JsonObject = JsonParser.parseString(data).asJsonObject
-                    val id = obj.get("id")?.asString
-                    // Палитра шелла едет прямо в событии — страховка от гонок
-                    // порядка (ui.theme при загрузке мог не успеть/потеряться):
-                    // запоминаем ДО show(), чтобы зеркало взяло свежее значение.
-                    // Это действующая палитра, а не выбор плиток — см. ui.theme.
-                    obj.get("theme")?.asString?.let { theme ->
-                        TelemetryPrefsMirror.rememberEffectiveTheme(activity, theme)
-                    }
-                    if (id != null) {
-                        lastUiTab = id
-                        vehicleLive?.startLive()
-                        // Встроенная телеметрия живёт ровно на своей вкладке:
-                        // показ/скрытие — на UI-потоке (onEvent зовётся из
-                        // JavaBridge-треда WebView).
-                        activity.runOnUiThread {
-                            if (id == "telemetry") telemetryHost?.show()
-                            else telemetryHost?.hide()
-                            // Stage NAV-MAP: карта живёт ровно на своей вкладке.
-                            if (id == "navi") navHost?.show()
-                            else navHost?.hide()
-                            // …тема из события сразу доступна: хром и карта
-                            // меняют палитру, фон WebView — смотри ниже.
-                            obj.get("theme")?.asString?.let { navHost?.onThemeChanged(it) }
-                            applyNavWebViewBg(id == "navi", obj.get("theme")?.asString)
-                        }
-                    }
-                }.onFailure { Log.w(TAG, "tab.change parse failed", it) }
+                    val msg = JsonParser.parseString(data).asJsonObject.get("message")?.asString
+                    if (!msg.isNullOrBlank()) activity.runOnUiThread { toastPanel?.show(msg) }
+                }.onFailure { Log.w(TAG, "toast parse failed", it) }
             }
             // GeelyTools deviation: команды WebView-экранов телеметрии
             // (sync.now, charge.*, charges.merge, energy.window, history.series,
@@ -501,7 +492,6 @@ class UiBridge(
                             lastToolsResult = result
                             if (key == "theme") {
                                 TelemetryPrefsMirror.rememberShellTheme(activity, value.toString())
-                                activity.runOnUiThread { navHost?.onThemeChanged(value.toString()) }
                             }
                             pushToolsState()
                         }
@@ -619,7 +609,7 @@ class UiBridge(
                         addProperty("output", output)
                     }
                     activity.runOnUiThread {
-                        webView.evaluateJavascript("window.__onDevCmdResult && window.__onDevCmdResult($resObj)", null)
+                        toolsPanel?.onDevCmdResult(exitCode, output)
                     }
                 }
             }
@@ -628,7 +618,7 @@ class UiBridge(
                     val (exitCode, output) = AdbClient.execute("logcat -d -t 120 -s CentralWatchdog:V LockSound:V WindowDoors:V NetworkTtl:V UiBridge:V ToolsBackend:V", 8000)
                     val escaped = com.google.gson.Gson().toJson(output)
                     activity.runOnUiThread {
-                        webView.evaluateJavascript("window.__onDevLogcatResult && window.__onDevLogcatResult($escaped)", null)
+                        toolsPanel?.onLogcat(output)
                     }
                 }
             }
@@ -666,7 +656,7 @@ class UiBridge(
                 runCatching {
                     val list = AppPerformance.getInstalledAppsInfo(activity)
                     activity.runOnUiThread {
-                        webView.evaluateJavascript("window.__onKeepAliveApps && window.__onKeepAliveApps($list)", null)
+                        toolsPanel?.onKeepAliveApps(list.toString())
                     }
                 }
             }
@@ -689,19 +679,16 @@ class UiBridge(
     }
 
     /** Версия APK для верхней строки («· EX2 v…»). */
-    @JavascriptInterface
     fun appVersion(): String = BuildConfig.VERSION_NAME
 
     /** Stage T5: номер сборки для «О приложении»
      *  (settingsAppVersion(version, build) из SettingsV2). */
-    @JavascriptInterface
     fun appBuild(): Int = BuildConfig.VERSION_CODE
 
     /**
      * Stage SCR: состояние настроек приложения для JS-инициализации страницы
      * (SET.imm/SET.wake при загрузке — до того, как рендер покажет тумблеры).
      */
-    @JavascriptInterface
     fun appState(): String {
         val obj = tools.state()
         // Тумблер CarPlay/AA: до первой записи через шелл приоритет у
@@ -742,6 +729,7 @@ class UiBridge(
 
     override fun setProjectionBetaSetting(enabled: Boolean) {
         vehicleLive?.setProjectionBeta(enabled)
+        activity.runOnUiThread { shellTabs?.refresh() }
     }
 
     override fun projectionBetaState(): Boolean? = runCatching {
@@ -757,31 +745,225 @@ class UiBridge(
     private fun pushToolsState() {
         val state = tools.state()
         lastToolsResult?.let { state.add("last", it.toJson()) }
+        // W3: действующая палитра считается нативно (раньше — JS applyTheme).
+        refreshShellTheme()
         pushToUi("tools.state", state.toString())
+        // Нативная панель «Инструменты» (5a) получает тот же снимок в UI-потоке.
+        val snapshot = state.toString()
+        activity.runOnUiThread { toolsPanel?.onToolsState(snapshot) }
+    }
+
+    /**
+     * W3: действующая палитра шелла считается нативно (раньше — JS applyTheme).
+     * Тёмная, если включены «Следовать теме ГУ» и тема ГУ тёмная; иначе — выбранная плитка.
+     * Выбор по умолчанию совпадает с инструментами («sepia»).
+     */
+    fun refreshShellTheme() {
+        val prefs = activity.getSharedPreferences(ToolsBackend.Prefs.FILE, Context.MODE_PRIVATE)
+        val follow = prefs.getBoolean(ToolsBackend.Prefs.THEME_FOLLOW_HU, true)
+        val gu = prefs.getString(ToolsBackend.Prefs.HEAD_UNIT_THEME, "light") ?: "light"
+        val chosen = prefs.getString(TelemetryPrefsMirror.KEY_SHELL_THEME, null)
+            ?.takeIf { it in TelemetryPrefsMirror.THEME_IDS } ?: "sepia"
+        applyShellTheme(if (follow && gu == "dark") "dark" else chosen)
+    }
+
+    private fun applyShellTheme(id: String) {
+        TelemetryPrefsMirror.rememberEffectiveTheme(activity, id)
+        activity.runOnUiThread {
+            navHost?.onThemeChanged(id)
+            applyShellBackground(lastUiTab == "navi", id)
+            nativeDock?.setTheme(id)
+            quickPanel?.setTheme(id)
+            carCard?.setTheme(id)
+            topBar?.setTheme(id)
+            toastPanel?.setTheme(id)
+            voicePanel?.setTheme(id)
+            appsPanel?.setTheme(id)
+            dashcamPanel?.setTheme(id)
+            servicePanel?.setTheme(id)
+            updatesPanel?.setTheme(id)
+            toolsPanel?.setTheme(id)
+        }
     }
 
     /** Дубликат тостов интерфейса — сам тост уже показан в HTML. */
+    /**
+     * Выбор вкладки (W2): вызывается из нативного дока, из карточки/баннера и из
+     * ShellTabs. Раньше шёл круг через JS (ui.selectTab → select → tab.change).
+     * Тема — действующая палитра из TelemetryPrefsMirror (её пишет ui.theme).
+     */
+    fun selectTab(id: String) {
+        lastUiTab = id
+        vehicleLive?.startLive()
+        if (id == "telemetry") telemetryRequest()
+        val themeId = com.example.voiceapp3.TelemetryPrefsMirror.currentThemeId(activity)
+        activity.runOnUiThread {
+            topBar?.setVisible(id != "carplay" && id != "aa")
+            shellGeometry?.setTab(id, fresh = true)
+            climBar?.setTabAllows(id != "navi")
+            if (id == "telemetry") telemetryHost?.show() else telemetryHost?.hide()
+            if (id == "navi") navHost?.show() else navHost?.hide()
+            navHost?.onThemeChanged(themeId)
+            applyShellBackground(id == "navi", themeId)
+            syncProjectionTab(id)
+            shellTabs?.onSelected(id)
+            nativeDock?.setSelected(id, themeId)
+            nativeDock?.raise()
+        }
+    }
+
+    /** Прямоугольник карточки автомобиля (физ. px); нулевой — скрыть. */
+    fun applyCarFrame(x: Float, y: Float, w: Float, h: Float) {
+        activity.runOnUiThread { carCard?.onFrame(x, y, w, h) }
+    }
+
+    /** Прямоугольник #content для нативной вкладки (физ. px). */
+    fun applyContentFrame(tab: String, active: Boolean, x: Float, y: Float, w: Float, h: Float, fresh: Boolean) {
+        activity.runOnUiThread {
+            when (tab) {
+                "quick" -> quickPanel?.onFrame(active, x, y, w, h, fresh)
+                "voice" -> voicePanel?.onFrame(active, x, y, w, h, fresh)
+                "apps" -> appsPanel?.onFrame(active, x, y, w, h, fresh)
+                "dashcam" -> dashcamPanel?.onFrame(active, x, y, w, h, fresh)
+                "service" -> servicePanel?.onFrame(active, x, y, w, h, fresh)
+                "updates" -> updatesPanel?.onFrame(active, x, y, w, h, fresh)
+                "tools" -> toolsPanel?.onFrame(active, x, y, w, h, fresh)
+            }
+        }
+    }
+
     /**
      * Stage CPv2: прямоугольник видео-области projection-вкладки, в
      * физических пикселях окна (JS: getBoundingClientRect × devicePixelRatio;
      * WebView занимает всё окно, системы координат совпадают). Мост кладёт
      * TextureView-оверлей ровно по этому прямоугольнику.
      */
-    @JavascriptInterface
     fun projectionFrame(stack: String, x: Float, y: Float, w: Float, h: Float) {
         projectionRender?.frame(stack, x, y, w, h)
+        activity.runOnUiThread { projectionMessage?.setRect(stack, x, y, w, h) }
     }
 
-    @JavascriptInterface
+    /** Имя стека из команды projection.* ({"stack":"carplay"|"androidAuto"}). */
+    /** Стек проекции, активный на текущей вкладке (null — нет). Переход — по ребру вкладки. */
+    private var activeProjection: String? = null
+
+    /**
+     * Правило CarPlay / Android Auto на стороне Kotlin (раньше — syncProjectionActivation в JS).
+     * Вызывается на каждый tab.change; реагирует только на смену стека.
+     */
+    private fun syncProjectionTab(tabId: String) {
+        val want = when (tabId) {
+            "carplay" -> "carplay"
+            "aa" -> "androidAuto"
+            else -> null
+        }
+        if (want == activeProjection) return
+        activeProjection?.let { old ->
+            ProjectionRenderBridge.stackFromWire(old)?.let { projectionRender?.deactivate(it) }
+            activity.runOnUiThread { projectionMessage?.setInactive(old) }
+        }
+        want?.let { new ->
+            ProjectionRenderBridge.stackFromWire(new)?.let { projectionRender?.activate(it) }
+            activity.runOnUiThread { projectionMessage?.setActive(new) }
+        }
+        activeProjection = want
+    }
+
+    private fun wireStack(data: String): String? =
+        runCatching { JsonParser.parseString(data).asJsonObject.get("stack")?.asString }.getOrNull()
+
     fun toast(message: String) {
         Log.d(TAG, "toast: $message")
     }
 
     /** Настройка «Полный экран»: скрыть/показать системные панели ГУ. */
-    @JavascriptInterface
     fun setImmersive(enabled: Boolean) {
         immersive = enabled
         activity.runOnUiThread { applyImmersive() }
+    }
+
+    // ── Автообновление ─────────────────────────────────────────────────────
+
+    private fun autoUpdateEnabled(): Boolean = prefs().getBoolean(PREF_UPDATE_AUTO, false)
+
+    /** Тумблер: вкл. — сразу проверка и далее раз в 6 ч; выкл. — таймер снимаем. */
+    private fun setAutoUpdate(json: String) {
+        val enabled = runCatching {
+            JsonParser.parseString(json).asJsonObject.get("enabled")?.asBoolean
+        }.getOrNull() ?: return
+        prefs().edit().putBoolean(PREF_UPDATE_AUTO, enabled).apply()
+        lastAutoInstallCode = -1
+        if (enabled) scheduleAutoCheck(0L) else updateHandler.removeCallbacks(autoCheckTask)
+        activity.runOnUiThread { updatesPanel?.setAutoUpdateChecked(enabled) }
+    }
+
+    private fun scheduleAutoCheck(delayMs: Long) {
+        updateHandler.removeCallbacks(autoCheckTask)
+        if (autoUpdateEnabled()) updateHandler.postDelayed(autoCheckTask, delayMs)
+    }
+
+    /** Проверка обновления. Нашлась версия и тумблер вкл. — ставим её без нажатия. */
+    private fun startUpdateCheck() {
+        if (updateBusy) return
+        pushUpdateState("checking")
+        AppUpdater.check(activity, object : AppUpdater.Listener {
+            override fun onCheck(result: AppUpdater.CheckResult) {
+                when (result) {
+                    is AppUpdater.CheckResult.Available -> {
+                        lastRemote = result.remote
+                        pushUpdateState(
+                            "available",
+                            versionName = result.remote.versionName,
+                            changelog = result.remote.changelog
+                        )
+                        val code = result.remote.versionCode
+                        if (autoUpdateEnabled() && code != lastAutoInstallCode) {
+                            lastAutoInstallCode = code
+                            startUpdateInstall()
+                        }
+                    }
+                    is AppUpdater.CheckResult.UpToDate ->
+                        pushUpdateState("uptodate", versionName = AppUpdater.currentVersionName(activity))
+                    is AppUpdater.CheckResult.Error ->
+                        pushUpdateState("error", message = result.message)
+                }
+            }
+            override fun onProgress(percent: Int, message: String) = Unit
+            override fun onInstallStarted() = Unit
+            override fun onFailure(message: String) = Unit
+        })
+    }
+
+    /** Скачать и установить последнюю найденную версию (кнопка или автоустановка). */
+    private fun startUpdateInstall() {
+        val remote = lastRemote
+        if (remote == null) {
+            pushUpdateState("error", message = "Сначала проверьте обновление")
+            return
+        }
+        if (updateBusy) return
+        updateBusy = true
+        pushUpdateState("downloading", percent = 0, message = "Скачиваю ${remote.versionName}…")
+        AppUpdater.downloadAndInstall(activity, remote, object : AppUpdater.Listener {
+            override fun onCheck(result: AppUpdater.CheckResult) = Unit
+            override fun onProgress(percent: Int, message: String) {
+                // percent = -1 — сообщение без прогресса (докачка/повтор)
+                pushUpdateState(
+                    if (percent >= 100) "installing" else "downloading",
+                    percent = percent,
+                    message = message
+                )
+            }
+            override fun onInstallStarted() {
+                updateBusy = false
+                pushUpdateState("installing", message = "Устанавливаю… приложение перезапустится")
+            }
+            override fun onFailure(message: String) {
+                updateBusy = false
+                if (lastAutoInstallCode == remote.versionCode) lastAutoInstallCode = -1
+                pushUpdateState("error", message = message)
+            }
+        })
     }
 
     /**
@@ -803,6 +985,8 @@ class UiBridge(
         percent?.let { obj.addProperty("percent", it) }
         message?.let { obj.addProperty("message", it) }
         pushToUi("update.state", obj.toString())
+        // Нативная вкладка «Обновления» получает тот же снимок в UI-потоке.
+        activity.runOnUiThread { updatesPanel?.onUpdateState(obj.toString()) }
     }
 
     /**
@@ -810,27 +994,31 @@ class UiBridge(
      * [json] — строка JSON-объекта, например {"battPct":78}.
      */
     fun pushToUi(name: String, json: String) {
-        val script = "window.__nativeEvent && window.__nativeEvent('$name', $json)"
-        webView.post { webView.evaluateJavascript(script, null) }
+        // Этап 9: статусы и presence питают нативное сообщение над видео.
+        if (name == "carplay.status" || name == "android_auto.status" || name == "projection.presence") {
+            activity.runOnUiThread { projectionMessage?.onEvent(name, json) }
+        }
+        // Карточка автомобиля читает телеметрию напрямую (тот же пуш, что уходит в JS).
+        if (name == "telemetry.data" || name == "telemetry.live") {
+            activity.runOnUiThread { carCard?.onTelemetry(name, json) }
+        }
+        if (name == "telemetry.live") {
+            activity.runOnUiThread { topBar?.onTelemetry(name, json) }
+        }
+        // Живой поток (1 Гц+) в JS больше никто не читает: карточка — нативная.
+        // W3: JS-слушателей пушей больше нет — всё, что нужно, уже получено нативно выше.
     }
 
     /**
-     * Stage NAV-MAP: фон виджета WebView при смене вкладок. Карта макета
-     * лежит ПОД WebView, поэтому на вкладке «Навигация» виджет делается
-     * прозрачным (сама страница в navfull-режиме тоже прозрачна — класс
-     * переключает JS select()), видно только плавающий док и сверху
-     * нативный хром. На прочих вкладках фон — page-цвет темы (тех, чтобы
-     * при отрисовке-мигании страницы не было белой вспышки).
+     * Фон корня шелла: на вкладке «Навигация» прозрачный (карта лежит под ним),
+     * на прочих — page-цвет действующей темы.
      */
-    private fun applyNavWebViewBg(nav: Boolean, themeId: String?) {
-        webView.post {
-            if (nav) {
-                webView.setBackgroundColor(Color.TRANSPARENT)
-            } else {
-                webView.setBackgroundColor(
-                    com.example.voiceapp3.nav.NavTheme.pageBackdrop(themeId)
-                )
-            }
+    private fun applyShellBackground(nav: Boolean, themeId: String?) {
+        activity.runOnUiThread {
+            shellRoot.setBackgroundColor(
+                if (nav) Color.TRANSPARENT
+                else com.example.voiceapp3.nav.NavTheme.pageBackdrop(themeId)
+            )
         }
     }
 
@@ -862,23 +1050,25 @@ class UiBridge(
         phrase: String? = null,
         reply: String? = null
     ) {
-        val obj = JsonObject()
-        obj.addProperty("phase", phase)
-        text?.let { obj.addProperty("text", it) }
-        phrase?.let { obj.addProperty("phrase", it) }
-        reply?.let { obj.addProperty("reply", it) }
-        pushToUi("voice.ui", obj.toString())
+        // Нативная вкладка «Голос» получает то же событие напрямую (UI-поток).
+        activity.runOnUiThread { voicePanel?.onVoiceUi(phase, text, phrase, reply) }
     }
 
     /** MainActivity.onDestroy: сервис больше не должен считать мост живым. */
     fun dispose() {
+        updateHandler.removeCallbacks(autoCheckTask)
         if (companionInstance == this) companionInstance = null
     }
 
-    init { companionInstance = this }
+    init {
+        companionInstance = this
+        // Тумблер включён до запуска: первая проверка через 30 с (сеть успевает подняться).
+        if (autoUpdateEnabled()) scheduleAutoCheck(30_000L)
+    }
 
     companion object {
         private const val TAG = "UiBridge"
+        private const val AUTO_CHECK_INTERVAL_MS = 6L * 60 * 60 * 1000
 
         /** Единственный живой мост UI (сервис голоса ищет его для voice.ui). */
         @Volatile

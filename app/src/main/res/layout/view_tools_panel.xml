@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Нативная вкладка «Инструменты» (замена HTML-панели tools в index.html).
+
+    Заголовок и подпись — здесь. Дерево настроек (навигация слева) и страницы
+    (справа) строит ui/ToolsPanel.kt по данным ui/ToolsCatalog.kt. Панель
+    накрывает прямоугольник #content (content.frame) и скрыта на остальных вкладках.
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/toolsPanel"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:visibility="gone">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        android:paddingStart="20dp"
+        android:paddingTop="18dp"
+        android:paddingEnd="20dp"
+        android:paddingBottom="18dp">
+
+        <TextView
+            android:id="@+id/toolsTitle"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Инструменты"
+            android:textSize="26sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/toolsSubtitle"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:text="Настройте головное устройство под себя."
+            android:textSize="14sp" />
+
+        <!-- Карта: слева дерево настроек, справа страница. -->
+        <LinearLayout
+            android:id="@+id/toolsCard"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_marginTop="14dp"
+            android:layout_weight="1"
+            android:orientation="horizontal">
+
+            <ScrollView
+                android:id="@+id/toolsNavScroll"
+                android:layout_width="0dp"
+                android:layout_height="match_parent"
+                android:layout_weight="0.32"
+                android:scrollbars="none">
+
+                <LinearLayout
+                    android:id="@+id/toolsNav"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:paddingEnd="8dp" />
+            </ScrollView>
+
+            <View
+                android:layout_width="1dp"
+                android:layout_height="match_parent" />
+
+            <ScrollView
+                android:id="@+id/toolsPageScroll"
+                android:layout_width="0dp"
+                android:layout_height="match_parent"
+                android:layout_weight="0.68"
+                android:scrollbars="none">
+
+                <LinearLayout
+                    android:id="@+id/toolsPage"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:paddingStart="16dp"
+                    android:paddingEnd="8dp" />
+            </ScrollView>
+        </LinearLayout>
+    </LinearLayout>
+</FrameLayout>

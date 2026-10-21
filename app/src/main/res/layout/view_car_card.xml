@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Нативная карточка автомобиля на главном экране (ui/CarCardPanel.kt).
+    Содержимое строит CarCardPanel в коде; здесь — только контейнер.
+    Прямоугольник задаёт JS (car.frame) по пустому слоту #carSlot.
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/carCard"
+    android:layout_width="wrap_content"
+    android:layout_height="wrap_content"
+    android:visibility="gone" />

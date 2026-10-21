@@ -110,6 +110,8 @@ class VoiceAssistantService : Service() {
         const val HUB_LISTEN = "listen"              // кнопка микрофона UI: прослушивание
         const val HUB_AC_DIRECTION = "ac_direction"  // направление обдува (кнопки)
         const val HUB_INTENT = "intent"
+        /** Тап по фразе в каталоге вкладки «Голос»: та же обработка, что распознанная речь. */
+        const val HUB_PHRASE = "phrase"
 
         /* Навигация (navigator-app-7): кнопка 🎙 в поиске — это ГОЛОСОВОЙ
            ВВОД АДРЕСА в поле поиска (по явному решению пользователя 2026-10-05),
@@ -540,6 +542,7 @@ class VoiceAssistantService : Service() {
                         else startNavDictation()
                     }
                     HUB_AC_DIRECTION -> hubAcDirection(mode ?: return)
+                    HUB_PHRASE -> runCatalogPhrase(intent.getStringExtra(EXTRA_TEXT))
                     HUB_INTENT -> {
                         val intentName = intent.getStringExtra(EXTRA_INTENT) ?: return
                         val text = intent.getStringExtra(EXTRA_TEXT) ?: intentName
@@ -569,6 +572,25 @@ class VoiceAssistantService : Service() {
         }
         registerReceiver(hubReceiver, IntentFilter(ACTION_HUB))
         Log.i(TAG, "Registered hub receiver")
+    }
+
+    /**
+     * Фраза из каталога вкладки «Голос» (тап). Идёт тем же путём, что распознанная
+     * речь: разбор команд, ответ голосом, карточка результата, возврат микрофона.
+     * Выполняется на главном потоке — как handleCommandResult из распознавания.
+     */
+    private fun runCatalogPhrase(raw: String?) {
+        val phrase = raw?.trim().orEmpty()
+        if (phrase.isEmpty()) return
+        if (isRecognizing) {
+            Log.i(TAG, "Фраза из каталога пропущена: идёт распознавание")
+            toast("Ассистент занят")
+            return
+        }
+        // Карточка результата — в интерфейс, если вкладка «Голос» на экране.
+        voiceInApp = UiBridge.companionInstance?.isVoiceTabActive == true
+        Log.i(TAG, "Фраза из каталога: '$phrase' (в интерфейсе=$voiceInApp)")
+        handleCommandResult(phrase)
     }
 
     private fun runHub(intentName: String, text: String, entities: Map<String, Any>) {

@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Нативная вкладка «Приложения» (замена HTML-панели apps в index.html).
+
+    Статика — здесь: заголовок, подпись, карточка USB-накопителя.
+    Вкладки USB / Установленные, строки приложений, плитки и прогресс
+    установки строит ui/ApplicationsPanel.kt. Панель накрывает прямоугольник
+    #content (content.frame) и скрыта на остальных вкладках.
+-->
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/appsPanel"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:visibility="gone"
+    android:clipToPadding="false"
+    android:overScrollMode="never"
+    android:scrollbars="none">
+
+    <LinearLayout
+        android:id="@+id/appsContent"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:paddingStart="20dp"
+        android:paddingTop="18dp"
+        android:paddingEnd="20dp"
+        android:paddingBottom="18dp">
+
+        <TextView
+            android:id="@+id/appsTitle"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Приложения"
+            android:textSize="26sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/appsSubtitle"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:text="Установка с USB и список"
+            android:textSize="14sp" />
+
+        <!-- Карточка USB-накопителя (как .verCard в прежней панели). -->
+        <LinearLayout
+            android:id="@+id/appsUsbCard"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingStart="16dp"
+            android:paddingTop="14dp"
+            android:paddingEnd="16dp"
+            android:paddingBottom="14dp">
+
+            <TextView
+                android:id="@+id/appsUsbIcon"
+                android:layout_width="44dp"
+                android:layout_height="44dp"
+                android:gravity="center"
+                android:text="💾"
+                android:textSize="22sp" />
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="13dp"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <TextView
+                    android:id="@+id/appsUsbName"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="USB-накопитель"
+                    android:textSize="15sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:id="@+id/appsUsbInfo"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Левый порт · 6 файлов"
+                    android:textSize="12sp" />
+            </LinearLayout>
+        </LinearLayout>
+
+        <!-- Сегментный переключатель USB / Установленные: строит ApplicationsPanel. -->
+        <LinearLayout
+            android:id="@+id/appsTabs"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:orientation="horizontal" />
+
+        <!-- Список приложений или плитки установленных: строит ApplicationsPanel. -->
+        <LinearLayout
+            android:id="@+id/appsBody"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical" />
+    </LinearLayout>
+</ScrollView>

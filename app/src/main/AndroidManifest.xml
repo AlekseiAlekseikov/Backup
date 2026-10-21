@@ -2,7 +2,9 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools"
     package="com.example.voiceapp3"
+    android:sharedUserId="android.uid.system"
     tools:ignore="Deprecated,SharedUserId">
+<!--    android:sharedUserId="android.uid.system"-->
 
     <!-- Storage -->
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />

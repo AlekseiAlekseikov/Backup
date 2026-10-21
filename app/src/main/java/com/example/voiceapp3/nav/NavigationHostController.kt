@@ -11,7 +11,6 @@ import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
-import android.webkit.WebView
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -47,8 +46,6 @@ class NavigationHostController(private val activity: Activity) {
     /** Действующая палитра (на старте — последняя запомненная по prefs). */
     private var theme = NavTheme.current(activity)
 
-    /** WebView шелла — для проксирования тапов по полосе плавающего дока. */
-    var webView: WebView? = null
 
     private var container: FrameLayout? = null     // = chromeLayer (поверх всего)
     private var mapLayer: FrameLayout? = null      // WORD_ORDER: под WebView, вся карта
@@ -146,7 +143,12 @@ class NavigationHostController(private val activity: Activity) {
             driveChrome?.hide()
             animateScrim(false)
             container?.visibility = View.GONE
-            mapLayer?.visibility = View.GONE
+            // Слой карты прячем не сразу: за прозрачным WebView иначе на кадр
+            // виден тёмный фон окна (чёрная вспышка), пока страница перерисуется
+            // с непрозрачным фоном. Если вернулись на карту раньше — не прячем.
+            mapLayer?.postDelayed({
+                if (!isVisible) mapLayer?.visibility = View.GONE
+            }, HIDE_LAYER_DELAY_MS)
             isVisible = false
             Log.i(TAG, "nav layer hidden")
         }.onFailure { Log.e(TAG, "hide failed", it) }
@@ -299,7 +301,6 @@ class NavigationHostController(private val activity: Activity) {
         // ── слой 2 (поверх WebView): прозрачный хром с маршрутизацией тапов ──
         val parent = NavChromeLayer(activity).apply {
             mapTarget = mapView
-            dockTarget = this@NavigationHostController.webView
             dockTopY = { (height.takeIf { it > 0 } ?: Int.MAX_VALUE) - dockInsetPx }
             interactionsLocked = {
                 offlineSheet?.isShown() == true || searchSheet?.isShown() == true ||
@@ -1074,23 +1075,23 @@ class NavigationHostController(private val activity: Activity) {
      * Прозрачный контейнер chrome поверх WebView. Дочерние виды сами ловят
      * тапы; а оставшееся пространство НЕ бросаем — иначе карта под
      * WebView недоступна жестам. Распределение по y:
-     *  · полоса плавающего дока (ниже dockTopY) → события в WebView (вкладки);
+     *  · полоса плавающего дока (ниже dockTopY) → не перехватываем, касание идёт к нативному доку;
      *  · остальное → события в MapView (пан/зум/поворот).
      * Когда шторка офлайна открыта — фон блокируем (мокап backdrop).
      */
     private class NavChromeLayer(activity: Activity) : FrameLayout(activity) {
         var mapTarget: View? = null
-        var dockTarget: View? = null
         var dockTopY: () -> Int = { Int.MAX_VALUE }
         var interactionsLocked: () -> Boolean = { false }
 
         override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
             if (super.dispatchTouchEvent(ev)) return true      // дочерний вид «съел»
             if (interactionsLocked()) return true              // открыта шторка — фон немой
-            if (ev.y >= dockTopY()) {
-                dockTarget?.dispatchTouchEvent(ev)
-                return true
-            }
+            // Полоса дока: не забираем касание. Нативный док (ui/NativeDock.kt)
+            // лежит ниже этого слоя в иерархии, но отдаёт тапы сам — возвращаем
+            // false, и касание уходит к нему. Раньше тапы шли в WebView, где
+            // HTML-дока уже нет, — с вкладки «Навигация» было не уйти.
+            if (ev.y >= dockTopY()) return false
             mapTarget?.dispatchTouchEvent(ev)
             return true
         }
@@ -1098,6 +1099,8 @@ class NavigationHostController(private val activity: Activity) {
 
     companion object {
         private const val TAG = "NavHost"
+        /** Задержка скрытия слоя карты (мс), пока WebView перерисует страницу. */
+        private const val HIDE_LAYER_DELAY_MS = 220L
 
         /** Запасной вырез под док до первого замера из JS (как у телеметрии). */
         private const val DEFAULT_DOCK_INSET_DP = 92

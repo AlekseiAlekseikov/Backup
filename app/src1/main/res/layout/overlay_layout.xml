@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Запасной системный оверлей. На ГУ экран «Слушаю» — OverlayActivity.
+    Этот layout нужен VoiceAssistantService.initOverlay(), если есть
+    SYSTEM_ALERT_WINDOW. Без файла сборка падает на R.layout.overlay_layout
+    и R.id.listening_status_text.
+-->
+<FrameLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@android:color/transparent"
+    android:clickable="false"
+    android:focusable="false">
+
+    <LinearLayout
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|center_horizontal"
+        android:layout_marginTop="24dp"
+        android:gravity="center_horizontal"
+        android:orientation="vertical"
+        android:padding="16dp">
+
+        <com.airbnb.lottie.LottieAnimationView
+            android:id="@+id/mic_animation"
+            android:layout_width="96dp"
+            android:layout_height="96dp" />
+
+        <TextView
+            android:id="@+id/listening_status_text"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:gravity="center"
+            android:textColor="#FFFFFF"
+            android:textSize="18sp" />
+    </LinearLayout>
+</FrameLayout>

@@ -1,7 +1,6 @@
 package com.example.voiceapp3
 
 import android.Manifest
-import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -9,15 +8,12 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
-import android.webkit.ConsoleMessage
-import android.webkit.WebChromeClient
-import android.webkit.WebResourceRequest
-import android.webkit.WebResourceResponse
-import android.webkit.WebSettings
-import android.webkit.WebView
-import android.webkit.WebViewClient
+import android.view.ViewGroup
 import androidx.appcompat.app.AppCompatActivity
 import com.example.voiceapp3.ui.VehicleLiveAdapter
+import android.database.Cursor
+import android.provider.OpenableColumns
+import com.google.gson.JsonObject
 import com.example.voiceapp3.ui.UiBridge
 
 /**
@@ -35,7 +31,7 @@ import com.example.voiceapp3.ui.UiBridge
  */
 class MainActivity : AppCompatActivity() {
 
-    private lateinit var webView: WebView
+    private lateinit var shellRoot: ViewGroup
     private lateinit var bridge: UiBridge
     // GeelyTools deviation: тонкий live-фид движка телеметрии для шелла
     // (навигация/кузов/карточка батареи); экраны телеметрии — TelemetryActivity.
@@ -52,6 +48,9 @@ class MainActivity : AppCompatActivity() {
     /** Stage NAV-MAP: нативная карта вкладки «Навигация» (MapLibre поверх WebView). */
     private var navHost: com.example.voiceapp3.nav.NavigationHostController? = null
 
+    /** Нативный док вкладок шелла (NativeDock). */
+    private var nativeDock: com.example.voiceapp3.ui.NativeDock? = null
+
     private val handler = Handler(Looper.getMainLooper())
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -64,25 +63,95 @@ class MainActivity : AppCompatActivity() {
 
         setContentView(R.layout.activity_main)
 
-        webView = findViewById(R.id.webView)
+        shellRoot = findViewById(R.id.shellRoot)
+        // Фон корня до первой темы (прежний фон WebView, чтобы не мигал белый экран).
+        shellRoot.setBackgroundColor(0xFFF0E9DC.toInt())
         // Живой фид движка телеметрии для шелла (telemetry.live + тонкий
         // telemetry.data): навигация, быстрый доступ, карточка батареи.
         vehicleLive = VehicleLiveAdapter(applicationContext) { name, json ->
             if (::bridge.isInitialized) bridge.pushToUi(name, json)
         }
-        bridge = UiBridge(this, webView, vehicleLive)
+        bridge = UiBridge(this, shellRoot, vehicleLive)
         // GeelyTools deviation: Flutter-телеметрия встроена во вкладку шелла
         // (FlutterView поверх WebView с отступом под плавающий док) — вкладка
         // открывает её сразу, док остаётся видимым.
         telemetryHost = com.example.voiceapp3.ui.TelemetryHostController(this)
         bridge.telemetryHost = telemetryHost
         // Stage NAV-MAP: нативный слой карты открывается вкладкой «Навигация».
-        // Двухслойная геометрия макета: карта под прозрачным WebView (100vw ×
-        // 100vh, панель шелла парит на prechu), chrome — слоем сверху; для
-        // проксирования тапов по доку хосту нужен сам webView.
+        // Двухслойная геометрия: карта под корнем шелла (прозрачным на вкладке
+        // «Навигация»), chrome — слоем сверху. Тапы по доку — нативные, без прокси.
         navHost = com.example.voiceapp3.nav.NavigationHostController(this)
-            .also { it.webView = webView }
         bridge.navHost = navHost
+        // Нативный док вкладок: клик → UiBridge.selectTab (W2, без JS).
+        // Вырез под док для Flutter-телеметрии и карты:
+        // высота дока + 14dp (низ) + 8dp — тот же состав, что у прежнего замера
+        // telFrame в JS. Верх дока уходит в JS (dock.geometry) для проекций.
+        nativeDock = com.example.voiceapp3.ui.NativeDock(this) { id ->
+            bridge.selectTab(id)
+        }.also { dock ->
+            dock.onGeometryChanged = { heightPx, topPx ->
+                val inset = heightPx + dpPx(14) + dpPx(8)
+                telemetryHost?.setDockInsetPx(inset)
+                navHost?.setDockInsetPx(inset)
+                // Верх дока — для высоты видео CarPlay / AA (нативная геометрия).
+                bridge.shellGeometry?.setDockTop(topPx.toInt())
+            }
+        }
+        bridge.nativeDock = nativeDock
+        // Этап 9b: вкладки шелла и правило CarPlay / AA — нативно (ui/ShellTabs.kt).
+        bridge.shellTabs = com.example.voiceapp3.ui.ShellTabs(
+            enabled = {
+                com.timhss.capyenergy.telemetry.TelemetrySettings(applicationContext).projectionBetaEnabled()
+            },
+            publish = { tabs, selected ->
+                nativeDock?.setTabs(tabs, selected, null)
+                nativeDock?.raise()
+            },
+            select = { id -> bridge.selectTab(id) },
+        )
+        bridge.shellTabs?.refresh()
+        // Нативная вкладка «Быстрый доступ» (ui/QuickPanel.kt): клики уходят в тот
+        // же мост onEvent, что и вызовы из прежней HTML-панели.
+        bridge.quickPanel = com.example.voiceapp3.ui.QuickPanel(this) { name, json ->
+            bridge.onEvent(name, json)
+        }
+        // Нативная верхняя строка и тосты (ui/TopBarPanel.kt, ui/ToastPanel.kt).
+        bridge.topBar = com.example.voiceapp3.ui.TopBarPanel(this)
+        bridge.toastPanel = com.example.voiceapp3.ui.ToastPanel(this)
+        bridge.climBar = com.example.voiceapp3.ui.ClimBarPanel(this)
+        // Нативная геометрия главного экрана (замена JS-замеров, ui/ShellGeometry.kt).
+        bridge.shellGeometry = com.example.voiceapp3.ui.ShellGeometry(this, shellRoot, bridge)
+        shellRoot.addOnLayoutChangeListener { _, l, t, r, b, ol, ot, or, ob ->
+            if (r - l != or - ol || b - t != ob - ot) bridge.shellGeometry?.refresh(false)
+        }
+        // Нативная карточка автомобиля (ui/CarCardPanel.kt) на главном экране.
+        bridge.carCard = com.example.voiceapp3.ui.CarCardPanel(this) { name, json ->
+            bridge.onEvent(name, json)
+        }
+        // Живой поток и снимок — нативно, без telemetry.request из JS.
+        vehicleLive?.startLive()
+        bridge.telemetryRequest()
+        // Нативная вкладка «Голос» (ui/VoicePanel.kt): кнопки шлют voice.request /
+        // voice.micRestart через тот же мост; состояние голоса — из voiceUi сервиса.
+        bridge.voicePanel = com.example.voiceapp3.ui.VoicePanel(this) { name, json ->
+            bridge.onEvent(name, json)
+        }
+        // Нативная вкладка «Приложения» (ui/ApplicationsPanel.kt): событий в мост нет,
+        // как и у прежней HTML-панели; состояние установки — локальное.
+        bridge.appsPanel = com.example.voiceapp3.ui.ApplicationsPanel(this)
+        // Нативная вкладка «Видеорегистратор» (этап 6): каркас с заглушкой.
+        bridge.dashcamPanel = com.example.voiceapp3.ui.DashcamPanel(this)
+        // Нативная вкладка «Сервис» (этап 7): каркас с заглушкой.
+        bridge.servicePanel = com.example.voiceapp3.ui.ServicePanel(this)
+        // Нативная вкладка «Обновления» (этап 8): проверка и установка — через мост (AppUpdater).
+        bridge.updatesPanel = com.example.voiceapp3.ui.UpdatesPanel(this) { name, json ->
+            bridge.onEvent(name, json)
+        }
+        // Нативная вкладка «Инструменты», этап 5a (ui/ToolsPanel.kt): настройки уходят
+        // в тот же мост, снимок tools.state приходит из UiBridge.pushToolsState.
+        bridge.toolsPanel = com.example.voiceapp3.ui.ToolsPanel(this) { name, json ->
+            bridge.onEvent(name, json)
+        }
         // Stage CPv2: рендер-мост строится сразу после UiBridge (аналог
         // configureFlutterEngine в capy), статусы уходят в WebView пушами
         // carplay.status / android_auto.status.
@@ -90,7 +159,8 @@ class MainActivity : AppCompatActivity() {
             bridge.pushToUi(name, json)
         }
         bridge.projectionRender = projectionRender
-        setupWebView()
+        // Этап 9: нативное сообщение области видео (статусы и presence приходят через pushToUi).
+        bridge.projectionMessage = com.example.voiceapp3.ui.ProjectionMessagePanel(this)
 
         // CarPlay / Android Auto (порт capy): экранная половина присутствия.
         // Строится здесь, как ProjectionPresenceBridge в configureFlutterEngine
@@ -98,7 +168,15 @@ class MainActivity : AppCompatActivity() {
         // уходят в WebView пушем projection.presence.
         com.timhss.capyenergy.projection.ProjectionPresenceBridge.getOrCreate(
             applicationContext
-        ) { json -> if (::bridge.isInitialized) bridge.pushToUi("projection.presence", json) }
+        ) { json ->
+            if (::bridge.isInitialized) {
+                bridge.pushToUi("projection.presence", json)
+                runOnUiThread {
+                    bridge.toolsPanel?.onProjectionPresence(json)
+                    bridge.shellTabs?.onPresence(json)
+                }
+            }
+        }
         com.timhss.capyenergy.projection.ProjectionPresenceBridge.get(applicationContext)
             ?.setEnabled(
                 com.timhss.capyenergy.telemetry.TelemetrySettings(applicationContext)
@@ -118,17 +196,14 @@ class MainActivity : AppCompatActivity() {
                 .getBoolean("app_immersive_mode_enabled", true)
         )
 
-        if (savedInstanceState != null) {
-            webView.restoreState(savedInstanceState)
-        } else {
-            webView.loadUrl(APP_ORIGIN + "/ui/index.html")
-        }
-
+        bridge.refreshShellTheme()
         ensurePermissions()
         startVoiceService()
         startTelemetryCollector()
         handleDestination(intent)
     }
+
+    private fun dpPx(v: Int): Int = (v * resources.displayMetrics.density + 0.5f).toInt()
 
     /**
      * Capy Energy при подключении зарядки открывает приложение с extra
@@ -144,7 +219,11 @@ class MainActivity : AppCompatActivity() {
         val dest = intent?.getStringExtra("destination") ?: return
         Log.i(TAG, "destination extra: $dest")
         if (::bridge.isInitialized) {
-            bridge.pushToUi("ui.destination", "{\"destination\":\"$dest\"}")
+            bridge.shellTabs?.onDestination(dest)
+            // W3: авто-открытие зарядки — прямо в нативный telemetry.open (раньше через JS).
+            if (dest.contains("charg")) {
+                bridge.onEvent("telemetry.open", "{\"destination\":\"charging\"}")
+            }
         }
     }
 
@@ -166,70 +245,6 @@ class MainActivity : AppCompatActivity() {
                 }
             }.onFailure { Log.w(TAG, "Не удалось запустить сборщик телеметрии", it) }
         }, 400)
-    }
-
-    @SuppressLint("SetJavaScriptEnabled")
-    private fun setupWebView() {
-        webView.settings.apply {
-            javaScriptEnabled = true
-            domStorageEnabled = true
-            // file:///android_asset доступен и без этого флага, но старые
-            // сборки WebView на Android 9 лучше не удивлять.
-            allowFileAccess = true
-            mediaPlaybackRequiresUserGesture = false
-            // Не масштабировать интерфейс системным шрифтом ГУ.
-            textZoom = 100
-            cacheMode = WebSettings.LOAD_DEFAULT
-            useWideViewPort = true
-            loadWithOverviewMode = true
-        }
-        // Фон стартовой темы макета (Сепия), чтобы не мигал белый экран.
-        webView.setBackgroundColor(0xFFF0E9DC.toInt())
-        webView.isVerticalScrollBarEnabled = false
-        webView.isHorizontalScrollBarEnabled = false
-        webView.overScrollMode = WebView.OVER_SCROLL_NEVER
-
-        webView.addJavascriptInterface(bridge, "GeelyNative")
-        webView.webViewClient = object : WebViewClient() {
-            /**
-             * Assets по https-домену. Всё, что начинается с
-             * APP_ORIGIN, читается из apk; остальное (геоданные,
-             * обновления) идёт в сеть как обычно.
-             */
-            override fun shouldInterceptRequest(
-                view: WebView?,
-                request: WebResourceRequest?,
-            ): WebResourceResponse? {
-                val url = request?.url ?: return null
-                if (url.host != APP_HOST) return super.shouldInterceptRequest(view, request)
-                var path = url.path?.removePrefix("/") ?: return notFound()
-                if (path.isBlank()) path = "ui/index.html"
-                return try {
-                    val opened = assets.open(path)
-                    WebResourceResponse(mimeOf(path), null, opened)
-                } catch (e: Exception) {
-                    notFound()
-                }
-            }
-
-            override fun shouldOverrideUrlLoading(
-                view: WebView?,
-                request: WebResourceRequest?,
-            ): Boolean {
-                // Наш домен грузится сам (через перехват выше); внешние ссылки
-                // не открываем: приложение — это его UI.
-                return request?.url?.host != APP_HOST
-            }
-        }
-        webView.webChromeClient = object : WebChromeClient() {
-            override fun onConsoleMessage(message: ConsoleMessage): Boolean {
-                Log.d(
-                    "WebViewUI",
-                    "${message.message()} (${message.sourceId()}:${message.lineNumber()})"
-                )
-                return true
-            }
-        }
     }
 
     /** Как в старой версии: сервис стартует вскоре после отрисовки UI. */
@@ -283,38 +298,21 @@ class MainActivity : AppCompatActivity() {
         }, 500)
     }
 
-    /**
-     * Кнопка «Назад»: сначала даём интерфейсу шанс закрыть модалку
-     * или полноэкранный навигатор (window.__nativeBack), иначе выходим.
-     */
+    /** Кнопка «Назад»: прежний путь (JS-хук уже удалён) всегда завершал активность. */
     override fun onBackPressed() {
-        if (!::webView.isInitialized) {
-            super.onBackPressed()
-            return
-        }
-        webView.evaluateJavascript("(window.__nativeBack ? window.__nativeBack() : false)") { value ->
-            if (value != "true") finish()
-        }
-    }
-
-    override fun onSaveInstanceState(outState: Bundle) {
-        super.onSaveInstanceState(outState)
-        if (::webView.isInitialized) webView.saveState(outState)
+        finish()
     }
 
     override fun onResume() {
         super.onResume()
         isResumed = true
-        if (::webView.isInitialized) {
-            webView.onResume()
-            // Stage SCR: как didChangeAppLifecycleState(resumed) в capy — режим
-            // просится у окна на каждом resume: Android восстанавливает панели,
-            // когда активность пересоздаётся или системный диалог уходил вперёд.
-            bridge.applyImmersive()
-            // Stage B5: живой поток телеметрии возвращается вместе с приложением,
-            // если вкладка телеметрии была открыта.
-            bridge.onAppResumed()
-        }
+        // Stage SCR: как didChangeAppLifecycleState(resumed) в capy — режим
+        // просится у окна на каждом resume: Android восстанавливает панели,
+        // когда активность пересоздаётся или системный диалог уходил вперёд.
+        bridge.applyImmersive()
+        // Stage B5: живой поток телеметрии возвращается вместе с приложением,
+        // если вкладка телеметрии была открыта.
+        bridge.onAppResumed()
         // CarPlay/AA, как onActivityResumed в мосте capy: рёбра подключения,
         // ушедшие пока приложение было в фоне, до нас не дошли — перечитываем
         // геттеры обоих стеков.
@@ -340,11 +338,8 @@ class MainActivity : AppCompatActivity() {
         telemetryHost?.onActivityPaused()
         navHost?.onActivityPaused()
         isResumed = false
-        if (::webView.isInitialized) {
-            webView.onPause()
-            // Stage B5: за скрытым приложением шину не сэмплить.
-            bridge.onAppPaused()
-        }
+        // Stage B5: за скрытым приложением шину не сэмплить.
+        bridge.onAppPaused()
         super.onPause()
     }
 
@@ -363,7 +358,6 @@ class MainActivity : AppCompatActivity() {
         navHost = null
         if (::bridge.isInitialized) bridge.dispose()
         if (::vehicleLive.isInitialized) vehicleLive.dispose()
-        if (::webView.isInitialized) webView.destroy()
         super.onDestroy()
     }
 
@@ -379,25 +373,31 @@ class MainActivity : AppCompatActivity() {
         var isResumed = false
             private set
 
-        /** Служебный https-домен для UI (см. loadUrl в onCreate). */
-        private const val APP_HOST = "appassets.androidplatform.net"
-        private const val APP_ORIGIN = "https://$APP_HOST"
+    }
 
-        /** MIME по расширению для отдачи assets. */
-        private fun mimeOf(path: String): String = when {
-            path.endsWith(".html") -> "text/html"
-            path.endsWith(".js") -> "application/javascript"
-            path.endsWith(".css") -> "text/css"
-            path.endsWith(".svg") -> "image/svg+xml"
-            path.endsWith(".png") -> "image/png"
-            path.endsWith(".jpg") || path.endsWith(".jpeg") -> "image/jpeg"
-            path.endsWith(".json") -> "application/json"
-            path.endsWith(".woff2") -> "font/woff2"
-            path.endsWith(".ttf") -> "font/ttf"
-            else -> "application/octet-stream"
+    /**
+     * Результат системного выбора звука (запускается из Kotlin по audio.selectFile / audio.selectUnlockFile с пустым телом).
+     * Передаём только имя файла — так же, как HTML-версия (LockSound берёт File(path).name).
+     */
+    @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != 7001 && requestCode != 7002) return
+        val uri = if (resultCode == RESULT_OK) data?.data else null
+        val name = uri?.let { displayNameOf(it) }
+        if (name.isNullOrEmpty()) {
+            bridge.toolsPanel?.onSoundPickCancelled()
+            return
         }
+        val event = if (requestCode == 7001) "audio.selectFile" else "audio.selectUnlockFile"
+        bridge.onEvent(event, JsonObject().apply { addProperty("path", name) }.toString())
+    }
 
-        private fun notFound(): WebResourceResponse =
-            WebResourceResponse("text/plain", "utf-8", 404, "Not Found", null, null)
+    private fun displayNameOf(uri: android.net.Uri): String? {
+        val cursor: Cursor? = runCatching {
+            contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+        }.getOrNull()
+        cursor?.use { c -> if (c.moveToFirst()) return c.getString(0) }
+        return uri.lastPathSegment?.substringAfterLast('/')
     }
 }

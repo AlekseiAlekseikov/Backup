@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- res/drawable/bg_pill_off.xml — статус "спит" / "загрузка" -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <solid android:color="#2A3345" />
+    <corners android:radius="100dp" />
+    <stroke
+        android:width="1dp"
+        android:color="#4B5A72" />
+    <padding
+        android:left="20dp"
+        android:top="8dp"
+        android:right="20dp"
+        android:bottom="8dp" />
+</shape>

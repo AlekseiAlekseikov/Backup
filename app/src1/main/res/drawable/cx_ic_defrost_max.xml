@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Иконка панели «Быстрый доступ». Сгенерирована из инлайнового SVG
+     шелла (PANELS.quick). Обводка 1.8, концы и соединения скруглены —
+     как в CSS .air svg / .heat svg / .seat svg. Цвет здесь заглушка:
+     на экране иконка тонируется ?attr/cxInk через setColorFilter. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:name="cx_ic_defrost_max"
+    android:width="26dp"
+    android:height="26dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <group>
+        <path
+            android:pathData="M3.5 15.5L5.5 9h13l2 6.5"
+            android:strokeColor="#FF000000"
+            android:strokeWidth="1.8"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round"
+            android:fillColor="#00000000" />
+        <path
+            android:pathData="M8 12.5V7M6.9 8.2L8 7l1.1 1.2M12 12.5V7M10.9 8.2L12 7l1.1 1.2M16 12.5V7M14.9 8.2L16 7l1.1 1.2"
+            android:strokeColor="#FF000000"
+            android:strokeWidth="1.8"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round"
+            android:fillColor="#00000000" />
+        <path
+            android:pathData="M3.5 19.5h17"
+            android:strokeColor="#FF000000"
+            android:strokeWidth="1.8"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round"
+            android:fillColor="#00000000" />
+    </group>
+</vector>

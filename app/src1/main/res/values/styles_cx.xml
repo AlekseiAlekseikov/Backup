@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Производные стили. Цвета только через ?attr, поэтому файл один на
+  все десять палитр.
+-->
+<resources>
+    <style name="Cx" />
+
+    <style name="Cx.Card">
+        <item name="android:background">?attr/cxCard</item>
+    </style>
+
+    <style name="Cx.Card.Inset">
+        <item name="android:background">?attr/cxCard2</item>
+    </style>
+
+    <style name="Cx.Text" />
+
+    <style name="Cx.Text.Title">
+        <item name="android:textColor">?attr/cxInk</item>
+        <item name="android:textSize">17sp</item>
+        <item name="android:textStyle">bold</item>
+    </style>
+
+    <style name="Cx.Text.Primary">
+        <item name="android:textColor">?attr/cxInk</item>
+        <item name="android:textSize">15sp</item>
+    </style>
+
+    <style name="Cx.Text.Secondary">
+        <item name="android:textColor">?attr/cxMuted</item>
+        <item name="android:textSize">13sp</item>
+    </style>
+
+    <style name="Cx.Text.Muted">
+        <item name="android:textColor">?attr/cxMuted2</item>
+        <item name="android:textSize">12sp</item>
+    </style>
+
+    <style name="Cx.Divider">
+        <item name="android:background">?attr/cxLine</item>
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">1dp</item>
+    </style>
+
+    <style name="Cx.Button">
+        <item name="android:background">?attr/cxBtn</item>
+        <item name="android:textColor">?attr/cxOnBtn</item>
+        <item name="android:textSize">14sp</item>
+        <item name="android:minHeight">44dp</item>
+        <item name="android:paddingLeft">18dp</item>
+        <item name="android:paddingRight">18dp</item>
+    </style>
+
+</resources>
+
