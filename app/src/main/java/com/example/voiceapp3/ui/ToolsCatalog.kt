@@ -129,7 +129,7 @@ internal object ToolsCatalog {
         Theme("daylight", "Дневной свет", listOf("#FFFFFF", "#FFFFFF", "#000000", "#3D3D3D", "#EFA83A", "#6DC24B")),
         Theme("tokyoNeon", "Токийский неон", listOf("#0B0714", "#150E24", "#F2ECFF", "#B9A8E0", "#FF3D9A", "#21E7E0")),
         Theme("sunsetDrive", "Закат", listOf("#1B0F1C", "#2A1728", "#FFEDE4", "#E0B9AE", "#FF7A5C", "#34D8A6")),
-        Theme("bubblegum", "Жвачка", listOf("#FDF2FA", "#FFFFFF", "#2B1030", "#7A5478", "#E8398B", "#16BFA6")),
+        Theme("pearl", "Жемчуг", listOf("#FAFAFA", "#FFFFFF", "#1A1A1A", "#777777", "#E8B4C8", "#9FD9C8")),
     )
 
     /** Справки CX_HELP: страница → заголовок и строки («контроль», «описание»). */

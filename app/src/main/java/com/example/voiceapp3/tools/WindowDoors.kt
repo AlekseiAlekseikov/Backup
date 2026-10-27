@@ -13,16 +13,28 @@ import android.util.Log
 /**
  * Stage CXT · срез №5: Автоматизация окон и дверей (§9 ТЗ).
  *
- * Точный перенос логики CentralEXAuto (w0.s2, w0.u, w0.g1, CentralWatchdogService):
- * 1. window_driver_on_door: Снятие избыточного давления воздуха при закрытии
- *    двери (filete de ar) — приоткрытие стекла на 10% (POS 10) при открытии двери,
- *    возврат в закрытое положение (POS 0) при закрытии.
- * 2. window_opposite_on_door: Приоткрытие противоположного окна при открытии
- *    пассажирских дверей.
- * 
- * Точные VHAL свойства Geely EX2 (IHU629G):
- * - DOOR_POS: 373295872 (0x16400b00)
- * - WINDOW_POS: 322964416 (0x13400bc0)
+ * Точный перенос логики CentralEXAuto (com.ex.auto.CentralWatchdogService.k0()
+ * и w0.s2 case 4 = windowDriver observer):
+ *
+ * 1. window_driver_on_door (case 15 в w0.kc): при открытии СВОЕЙ двери
+ *    приоткрыть СВОЁ стекло на POS 10 (≈10%) — "filete de ar" для сброса
+ *    избыточного давления воздуха при захлопывании. При закрытии двери —
+ *    вернуть в POS 0 (закрыто).
+ * 2. window_opposite_on_door (case 16 в w0.kc): то же самое, но вентилируется
+ *    ПРОТИВОПОЛОЖНОЕ окно того же ряда (передний пассажир ↔ водитель,
+ *    задний левый ↔ задний правый).
+ *
+ * Пороги OEM k0() (точное соответствие):
+ *   - Открытие: читать текущую позицию целевого окна; если pos > 7 — НЕ МЕШАТЬ
+ *     (стекло уже приоткрыто вручную); иначе set POS 10.
+ *   - Закрытие: если |pos - 10| > 3 — НЕ МЕШАТЬ (пользователь сдвинул стекло
+ *     сам после открытия двери); иначе set POS 0.
+ *
+ * Точные VHAL свойства Geely EX2 (IHU629G) из smali CentralEXAuto:
+ * - DOOR_POS:  373295872 (0x16400b00)  — w0.q1.java:218
+ * - WINDOW_POS: 322964416 (0x13400bc0) — g1.c/g1.l в k0()
+ *
+ * rawVal DOOR_POS: 1 = открыта, 2 = закрыта (из w0.s2 case 4).
  */
 object WindowDoors {
     private const val TAG = "WindowDoors"
@@ -35,11 +47,20 @@ object WindowDoors {
     const val PROP_DOOR_POS = 373295872     // 0x16400b00
     const val PROP_WINDOW_POS = 322964416   // 0x13400bc0
 
-    // Зоны дверей -> Зоны стекол (из w0.u CentralEXAuto)
-    // f4340s = [16, 64, 256, 1024]
-    // f4341t = {1: 16, 4: 64, 16: 256, 64: 1024}
-    // f4342u = {16: 64, 64: 16, 256: 1024, 1024: 256}
+    // Пороги из CentralWatchdogService.k0():
+    private const val WINDOW_OPEN_THRESHOLD = 7   // pos > 7 → уже приоткрыто
+    private const val WINDOW_OPEN_POS = 10        // позиция "filete de ar"
+    private const val WINDOW_CLOSE_TOLERANCE = 3  // |pos-10| > 3 → не трогать
+    private const val WINDOW_CLOSED_POS = 0
+
+    // Зоны дверей -> Зоны стекол (из w0.u.f4341t CentralEXAuto):
+    //   дверь водителя      (1=0x1)   -> стекло водителя      (16=0x10)
+    //   дверь пер.пассажира (4=0x4)   -> стекло пер.пассажира (64=0x40)
+    //   дверь зад.левого    (16=0x10) -> стекло зад.левого    (256=0x100)
+    //   дверь зад.правого   (64=0x40) -> стекло зад.правого   (1024=0x400)
     val DOOR_TO_WINDOW = mapOf(1 to 16, 4 to 64, 16 to 256, 64 to 1024)
+
+    // Противоположные окна того же ряда (w0.u.f4342u):
     val OPPOSITE_WINDOW = mapOf(16 to 64, 64 to 16, 256 to 1024, 1024 to 256)
 
     private var car: Car? = null
@@ -49,9 +70,17 @@ object WindowDoors {
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val doorStates = HashMap<Int, Boolean>()
-    private var activeVentWindow: Int? = null
 
-    
+    /**
+     * Множество окон, которые мы сами приоткрыли в этом цикле открытия двери.
+     * Аналог поля f864o в CentralWatchdogService, но на МНОЖЕСТВО: при
+     * одновременном открытии двух дверей каждая добавляет своё окно в набор,
+     * и при закрытии соответствующей двери удаляет его. Если при закрытии
+     * последней из всех открытых дверей окно всё ещё в POS ~10 — закрывает его
+     * (метод T() в CentralWatchdogService).
+     */
+    private val activeVentWindows = hashSetOf<Int>()
+
     private var screenWakeReceiver: android.content.BroadcastReceiver? = null
     private var lastSleepTimeMs: Long = SystemClock.elapsedRealtime()
 
@@ -68,10 +97,10 @@ object WindowDoors {
                 val idleSeconds = (now - lastSleepTimeMs) / 1000
                 lastSleepTimeMs = now
                 AppLog.i(ctx, TAG, "ГУ проснулось (${intent?.action}), простой = ${idleSeconds} с")
-                
+
                 if (LockSound.isUnlockSoundEnabled(ctx)) {
                     val soundPath = LockSound.getUnlockSelectedPath(ctx)
-                    val soundFile = if (soundPath.isNotEmpty()) java.io.File(soundPath) else java.io.File("/vendor/etc/carlock/dajidali.wav")
+                    val soundFile = if (soundPath.isNotEmpty()) java.io.File(soundPath) else java.io.File(OEM_CARLOCK_DEFAULT_WAV)
                     if (soundFile.exists()) {
                         LockSound.playUnlockSound(ctx, soundFile)
                     }
@@ -85,19 +114,19 @@ object WindowDoors {
         }
     }
 
-private val carCallback = object : CarPropertyManager.CarPropertyEventCallback {
+    private val carCallback = object : CarPropertyManager.CarPropertyEventCallback {
         override fun onChangeEvent(value: CarPropertyValue<*>) {
             if (value.propertyId == PROP_DOOR_POS) {
                 val areaId = value.areaId
                 val rawVal = (value.value as? Number)?.toInt() ?: return
-                // rawVal == 1: открыта, rawVal == 2: закрыта (из w0.s2)
+                // rawVal == 1: открыта, rawVal == 2: закрыта
                 val isOpen = (rawVal == 1)
                 onDoorChanged(areaId, isOpen)
             }
         }
 
         override fun onErrorEvent(propId: Int, zone: Int) {
-            // suppressed
+            Log.w(TAG, "onErrorEvent prop=0x${Integer.toHexString(propId)} area=0x${Integer.toHexString(zone)}")
         }
     }
 
@@ -113,9 +142,6 @@ private val carCallback = object : CarPropertyManager.CarPropertyEventCallback {
         return getPrefs(context).getBoolean(PREF_WINDOW_OPPOSITE_ON_DOOR, false)
     }
 
-    /**
-     * Инициализация подписки на CarPropertyManager для дверей.
-     */
     fun initCarService(context: Context) {
         val appCtx = context.applicationContext
         appContext = appCtx
@@ -128,7 +154,8 @@ private val carCallback = object : CarPropertyManager.CarPropertyEventCallback {
                         val cpm = carObj.getCarManager("property") as? CarPropertyManager
                         if (cpm != null) {
                             carPropertyManager = cpm
-                            registerDoorListener(); registerWakeReceiver(context)
+                            registerDoorListener()
+                            registerWakeReceiver(context)
                         }
                     } catch (e: Throwable) {
                         Log.w(TAG, "Ошибка получения CarPropertyManager", e)
@@ -149,55 +176,128 @@ private val carCallback = object : CarPropertyManager.CarPropertyEventCallback {
         try {
             cpm.registerCallback(carCallback, PROP_DOOR_POS, 0.0f)
             isRegistered = true
-            Log.i(TAG, "Успешно подписались на события DOOR_POS (0x16400b00)")
+            Log.i(TAG, "Подписка на DOOR_POS (0x16400b00) активна")
         } catch (e: Throwable) {
             Log.w(TAG, "registerCallback DOOR_POS failed", e)
         }
     }
 
+    /**
+     * Обработчик события двери — точный перенос k0() CentralWatchdogService.
+     *
+     * @param doorAreaId  зона двери (1/4/16/64 = 0x1/0x4/0x10/0x40)
+     * @param isOpen      true = дверь открылась, false = закрылась
+     */
     private fun onDoorChanged(doorAreaId: Int, isOpen: Boolean) {
         val lastState = doorStates[doorAreaId]
         doorStates[doorAreaId] = isOpen
         if (lastState == isOpen) return
 
         val cpm = carPropertyManager ?: return
-        val targetWindow = DOOR_TO_WINDOW[doorAreaId] ?: return
+        val ctx = appContext ?: return
+        val ownWindow = DOOR_TO_WINDOW[doorAreaId] ?: return
 
-        Log.i(TAG, "Дверь 0x${Integer.toHexString(doorAreaId)} ${if (isOpen) "открыта" else "закрыта"}")
+        // Выбираем целевое окно по настройке. В отличие от ранней версии,
+        // режимы работают НЕЗАВИСИМО: если включены ОБА — вентилируются оба
+        // окна (своё + противоположное). Это соответствует k0()-семантике,
+        // где z3=true помечает вторую подряд итерацию для oposta.
+        val prefOwn = getPrefs(ctx).getBoolean(PREF_WINDOW_DRIVER_ON_DOOR, false)
+        val prefOpp = getPrefs(ctx).getBoolean(PREF_WINDOW_OPPOSITE_ON_DOOR, false)
 
-        // Воспроизведение звука открытия двери через наружный динамик AVAS (Вариант А)
-        if (isOpen) {
-            val ctx = appContext
-            if (ctx != null && LockSound.isUnlockSoundEnabled(ctx)) {
-                val soundPath = LockSound.getUnlockSelectedPath(ctx)
-                val soundFile = if (soundPath.isNotEmpty()) java.io.File(soundPath) else java.io.File("/vendor/etc/carlock/dajidali.wav")
-                if (soundFile.exists()) {
-                    LockSound.playExternalSound(ctx, soundFile, LockSound.getVolume(ctx))
-                }
+        // Звук приветствия при открытии двери (если включен в LockSound).
+        if (isOpen && LockSound.isUnlockSoundEnabled(ctx)) {
+            val soundPath = LockSound.getUnlockSelectedPath(ctx)
+            val soundFile = if (soundPath.isNotEmpty()) java.io.File(soundPath) else java.io.File(OEM_CARLOCK_DEFAULT_WAV)
+            if (soundFile.exists()) {
+                LockSound.playUnlockSound(ctx, soundFile)
             }
         }
 
-        if (isOpen) {
-            // Если включено открывать стекло:
-            // опускаем стекло на 10% (POS 10)
-            try {
-                cpm.setIntProperty(PROP_WINDOW_POS, targetWindow, 10)
-                activeVentWindow = targetWindow
-                Log.i(TAG, "Окно 0x${Integer.toHexString(targetWindow)} -> приоткрыто на 10%")
-            } catch (e: Throwable) {
-                Log.w(TAG, "Не удалось приоткрыть окно 0x${Integer.toHexString(targetWindow)}", e)
-            }
-        } else {
-            // Дверь закрылась: возвращаем в POS 0 (полностью закрыто)
-            try {
-                cpm.setIntProperty(PROP_WINDOW_POS, targetWindow, 0)
-                if (activeVentWindow == targetWindow) activeVentWindow = null
-                Log.i(TAG, "Окно 0x${Integer.toHexString(targetWindow)} -> закрыто (0%)")
-            } catch (e: Throwable) {
-                Log.w(TAG, "Не удалось закрыть окно 0x${Integer.toHexString(targetWindow)}", e)
-            }
+        // Список окон для вентиляции: own и/или opposite в зависимости от префов.
+        val targets = mutableListOf<Pair<Int, /*oposta*/ Boolean>>()
+        if (prefOwn) targets.add(ownWindow to false)
+        val opp = OPPOSITE_WINDOW[ownWindow]
+        if (prefOpp && opp != null) targets.add(opp to true)
+
+        if (targets.isEmpty()) return
+
+        for ((target, oposta) in targets) {
+            applyFilete(cpm, target, doorAreaId, isOpen, oposta)
         }
     }
+
+    /**
+     * Применить filete de ar для одного окна — дословный перенос кода k0().
+     *
+     * Багфикс двух дверей (b3/auditr3): activeVentWindows — МНОЖЕСТВО, а не одно поле.
+     * При открытии нескольких дверей КАЖДОЕ соотв. окно добавляется в набор;
+     * при закрытии — удаляется и закрывается. Это соответствует независимому
+     * вызову k0 для каждой двери в s2.onChangeEvent в OEM.
+     *
+     * @return true если команду в VHAL удалось отправить
+     */
+    private fun applyFilete(
+        cpm: CarPropertyManager,
+        windowAreaId: Int,
+        doorAreaId: Int,
+        doorOpened: Boolean,
+        oposta: Boolean
+    ): Boolean {
+        val tag = if (oposta) "oposta " else ""
+        val curPos = readWindowPos(cpm, windowAreaId)
+        if (curPos == null) {
+            Log.w(TAG, "windowDriver чтение ${tag}0x${Integer.toHexString(windowAreaId)}: таймаут/ошибка VHAL")
+            return false
+        }
+
+        if (doorOpened) {
+            // k0(z2=true): приоткрываем только если окно фактически закрыто (pos ≤ 7).
+            if (curPos > WINDOW_OPEN_THRESHOLD) {
+                Log.i(TAG, "janela ${tag}0x${Integer.toHexString(windowAreaId)} не закрыта (pos=$curPos) — дверь 0x${Integer.toHexString(doorAreaId)} открылась, не мешаю")
+                return false
+            }
+            val ok = writeWindowPos(cpm, windowAreaId, WINDOW_OPEN_POS)
+            if (ok) {
+                activeVentWindows.add(windowAreaId)
+                Log.i(TAG, "janela ${tag}0x${Integer.toHexString(windowAreaId)} → POS $WINDOW_OPEN_POS (дверь 0x${Integer.toHexString(doorAreaId)} открыта); activeSet=$activeVentWindows")
+            } else {
+                Log.w(TAG, "windowDriver set ${tag}0x${Integer.toHexString(windowAreaId)} не удался")
+            }
+            return ok
+        } else {
+            // k0(z2=false): закрываем только если окно всё ещё около POS 10.
+            if (kotlin.math.abs(curPos - WINDOW_OPEN_POS) > WINDOW_CLOSE_TOLERANCE) {
+                Log.i(TAG, "janela ${tag}0x${Integer.toHexString(windowAreaId)} не около POS $WINDOW_OPEN_POS (pos=$curPos) — дверь 0x${Integer.toHexString(doorAreaId)} закрылась, не мешаю")
+                activeVentWindows.remove(windowAreaId)
+                return false
+            }
+            if (windowAreaId !in activeVentWindows) {
+                Log.i(TAG, "janela ${tag}0x${Integer.toHexString(windowAreaId)} не была открыта нами в этом цикле — не закрываю")
+                return false
+            }
+            val ok = writeWindowPos(cpm, windowAreaId, WINDOW_CLOSED_POS)
+            if (ok) {
+                activeVentWindows.remove(windowAreaId)
+                Log.i(TAG, "janela ${tag}0x${Integer.toHexString(windowAreaId)} → POS $WINDOW_CLOSED_POS (дверь 0x${Integer.toHexString(doorAreaId)} закрыта); activeSet=$activeVentWindows")
+            } else {
+                Log.w(TAG, "windowDriver set ${tag}0x${Integer.toHexString(windowAreaId)} не удался")
+            }
+            return ok
+        }
+    }
+
+    /** Чтение позиции окна (POS 0..100+) из VHAL; null при ошибке/таймауте. */
+    private fun readWindowPos(cpm: CarPropertyManager, areaId: Int): Int? = runCatching {
+        cpm.getIntProperty(PROP_WINDOW_POS, areaId)
+    }.getOrNull()
+
+    /** Установка позиции окна; возвращает true если setIntProperty не выбросил. */
+    private fun writeWindowPos(cpm: CarPropertyManager, areaId: Int, pos: Int): Boolean = runCatching {
+        cpm.setIntProperty(PROP_WINDOW_POS, areaId, pos)
+        true
+    }.getOrDefault(false)
+
+    private const val OEM_CARLOCK_DEFAULT_WAV = "/vendor/etc/carlock/dajidali.wav"
 
     fun setWindowDriverOnDoor(context: Context, enabled: Boolean): ToolsResult {
         val t0 = SystemClock.uptimeMillis()
@@ -220,7 +320,7 @@ private val carCallback = object : CarPropertyManager.CarPropertyEventCallback {
         )
         return ToolsResult(
             action = "settings.windowDriverOnDoor",
-            title = "Стекло водителя при открытии двери",
+            title = "Стекло своей двери при открытии (filete de ar)",
             steps = listOf(step)
         )
     }
@@ -246,7 +346,7 @@ private val carCallback = object : CarPropertyManager.CarPropertyEventCallback {
         )
         return ToolsResult(
             action = "settings.windowOppositeOnDoor",
-            title = "Противоположное стекло",
+            title = "Противоположное стекло при открытии двери",
             steps = listOf(step)
         )
     }

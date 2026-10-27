@@ -7,9 +7,9 @@ import android.graphics.drawable.ColorDrawable
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.os.Handler
+import android.os.Looper
 import android.text.Editable
 import android.text.TextWatcher
-import android.os.Looper
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup

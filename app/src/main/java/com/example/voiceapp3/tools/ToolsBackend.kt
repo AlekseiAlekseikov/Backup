@@ -279,14 +279,17 @@ enum class Choice(
                 return AppPerformance.setAutoOptimize(appContext, value)
             }
             Toggle.UNLOCK_SOUND -> {
-                WindowDoors.initCarService(appContext)
+                // Звук открытия двери проигрывается в WindowDoors.onDoorChanged —
+                // подписка на двери поднимается только когда ВКЛючен один из тумблеров
+                // «Стекло водителя»/«Противоположное стекло» (см. Boot-receiver и
+                // WindowDoors.setWindowDriverOnDoor), а не безусловно по unlock-триггеру.
                 return LockSound.setUnlockSoundEnabled(appContext, value)
             }
 
             Toggle.NOTIF_BATTERY, Toggle.NOTIF_EXT_TEMP, Toggle.NOTIF_WIFI -> {
                 steps += toolsStep(
                     step = "apply",
-                    command = "startForegroundService(VoiceAssistantService) / StatusIcons.syncAll"
+                    command = "startForegroundService + startPeriodicSync + syncAll"
                 ) {
                     val svcClass = Class.forName("com.example.voiceapp3.VoiceAssistantService")
                     val svcIntent = android.content.Intent(appContext, svcClass)
@@ -298,19 +301,26 @@ enum class Choice(
                         } catch (e: Exception) {
                             Log.w(TAG, "startForegroundService reflection failed", e)
                         }
+                        // Аудит §5.2: раньше цикл стартовал ТОЛЬКО из boot-receiver,
+                        // поэтому после включения тумблера в уже загруженном ГУ иконка
+                        // не обновлялась до перезагрузки. Запускаем здесь же.
+                        StatusIcons.startPeriodicSync(appContext)
                         // Сразу постим текущее значение (если Car доступен)
                         StatusIcons.syncAll(appContext)
                     } else {
-                        // Если все три выключены — можно отменить иконки и не держать сервис
+                        // Если все три выключены — отменяем иконки и останавливаем цикл.
                         val anyOn = Toggle.values()
                             .filter { it == Toggle.NOTIF_BATTERY || it == Toggle.NOTIF_EXT_TEMP || it == Toggle.NOTIF_WIFI }
                             .any { prefs().getBoolean(it.pref, false) }
                         if (!anyOn) {
                             StatusIcons.cancelAll(appContext)
                             StatusIcons.stopPeriodicSync()
+                        } else {
+                            // Остальные включённые — немедленно перерисовываем.
+                            StatusIcons.syncAll(appContext)
                         }
                     }
-                    true to if (value) "сервис запущен, иконки опубликованы" else "иконки скрыты"
+                    true to if (value) "сервис запущен, иконки опубликованы, цикл 15с активен" else "иконки скрыты"
                 }
                 // Подтверждение состояния тумблера
                 steps += toolsStep(
@@ -382,6 +392,32 @@ enum class Choice(
                 TelemetryPrefsMirror.rememberShellTheme(appContext, value)
                 val actual = prefs().getString(choice.pref, "") ?: ""
                 (actual == value) to actual
+            }
+        }
+        if (choice == Choice.HEAD_UNIT_THEME) {
+            // Ручной переключатель темы ГУ работает только когда
+            // «Следовать теме ГУ» выключено; через UiModeManager.setNightMode
+            // (доступно системным/привилегированным приложениям).
+            steps += toolsStep(
+                step = "apply",
+                command = "UiModeManager.setNightMode(MODE_NIGHT_" + (if (value == "dark") "YES" else "NO") + ")",
+                expected = value
+            ) {
+                try {
+                    val umm = appContext.getSystemService(android.content.Context.UI_MODE_SERVICE)
+                        as? android.app.UiModeManager
+                    if (umm != null) {
+                        umm.nightMode = if (value == "dark")
+                            android.app.UiModeManager.MODE_NIGHT_YES
+                        else
+                            android.app.UiModeManager.MODE_NIGHT_NO
+                        true to "nightMode=${if (value == "dark") "YES" else "NO"}"
+                    } else {
+                        false to "UiModeManager недоступен"
+                    }
+                } catch (t: Throwable) {
+                    false to (t.message ?: "применение отклонено")
+                }
             }
         }
         return ToolsResult(action = "settings." + choice.key, title = choice.title, steps = steps)

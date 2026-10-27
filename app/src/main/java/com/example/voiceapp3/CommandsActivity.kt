@@ -1,5 +1,6 @@
 package com.example.voiceapp3
 
+import android.content.Context
 import android.graphics.Color
 import android.graphics.Typeface
 import android.os.Bundle
@@ -10,6 +11,10 @@ import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 
 class CommandsActivity : AppCompatActivity() {
+
+    override fun attachBaseContext(newBase: Context) {
+        super.attachBaseContext(AppTheme.attachBaseContext(newBase))
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         AppTheme.applySaved(this)

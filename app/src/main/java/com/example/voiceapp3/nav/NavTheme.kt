@@ -145,19 +145,19 @@ data class NavTheme(
             rgb(0x3E2238), rgb(0xFFE0CF), rgb(0x2A1728),
             rgb(0xFF7A5C), rgb(0x34D8A6)
         )
-        val BUBBLEGUM = NavTheme(
-            "bubblegum", false,
-            rgb(0xFDF2FA), rgb(0xF0D6E8), rgb(0xFFFFFF), rgb(0xF7E4F3),
-            rgb(0x2B1030), rgb(0x7A5478), rgb(0xA889A6), rgb(0xEBD0E6),
-            rgb(0xF3DCEE), rgb(0x3D1642), rgb(0xFFF5FC),
-            rgb(0xE8398B), rgb(0x16BFA6)
+        val PEARL = NavTheme(
+            "pearl", true,
+            rgb(0xFAFAFA), rgb(0xF2F0EE), rgb(0xFFFFFF), rgb(0xF5F3F1),
+            rgb(0x1A1A1A), rgb(0x777777), rgb(0xB9B9B9), rgb(0xEAEAEA),
+            rgb(0xEAE6E6), rgb(0x1A1A1A), rgb(0xFFFFFF),
+            rgb(0xE8B4C8), rgb(0x9FD9C8)
         )
 
         private val ALL = mapOf(
             LIGHT.id to LIGHT, DARK.id to DARK, MIDNIGHT.id to MIDNIGHT,
             SEPIA.id to SEPIA, NORDIC.id to NORDIC, DAYLIGHT.id to DAYLIGHT,
             TOKYO_NEON.id to TOKYO_NEON, SUNSET_DRIVE.id to SUNSET_DRIVE,
-            BUBBLEGUM.id to BUBBLEGUM
+            PEARL.id to PEARL
         )
 
         /** Палитра по id из ui.theme/tab.change; незнакомый id → sepia-дефолт. */

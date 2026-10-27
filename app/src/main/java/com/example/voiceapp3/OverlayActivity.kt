@@ -35,6 +35,10 @@ import androidx.localbroadcastmanager.content.LocalBroadcastManager
  */
 class OverlayActivity : Activity() {
 
+    override fun attachBaseContext(newBase: Context) {
+        super.attachBaseContext(AppTheme.attachBaseContext(newBase))
+    }
+
     private lateinit var statusText: TextView
     private lateinit var localBroadcastManager: LocalBroadcastManager
     private lateinit var root: View

@@ -75,8 +75,7 @@ object AppPerformance {
     fun isVideo60FpsActive(): Boolean {
         return try {
             val res = runSuCommand(
-                "echo \"SRC=\$(stat -c %i $STAGING_VCODEC_PATH 2>/dev/null)\"; " +
-                "echo \"TGT=\$(stat -c %i $TARGET_VCODEC_PATH 2>/dev/null)\""
+                "echo SRC=" + "$" + "(stat -c %i $STAGING_VCODEC_PATH 2>/dev/null); echo TGT=" + "$" + "(stat -c %i $TARGET_VCODEC_PATH 2>/dev/null)"
             )
             val srcInode = parseTag(res.output, "SRC")
             val tgtInode = parseTag(res.output, "TGT")
@@ -131,7 +130,7 @@ object AppPerformance {
         // Применяем защиту в adb / system (deviceidle whitelist + oom_score_adj)
         for (pkg in packages) {
             AdbClient.execute("dumpsys deviceidle whitelist +$pkg 2>/dev/null")
-            AdbClient.execute("for pid in $(pidof $pkg); do echo -900 > /proc/\$pid/oom_score_adj 2>/dev/null; done")
+            AdbClient.execute("for pid in " + "$" + "(pidof $pkg); do echo -900 > /proc/" + "$" + "pid/oom_score_adj 2>/dev/null; done")
         }
 
         val step = ToolsStep(
@@ -182,21 +181,36 @@ object AppPerformance {
             )
 
             val valStr = if (enabled) "true" else "false"
-            val script = "setprop dalvik.vm.usejit $valStr; setprop dalvik.vm.usejitprofiles $valStr"
+            val D = "$"
+            // Точный порт la.java case 0: wifi disable -> wait wlan0 -> umount /data/app/* -> setprop usejit -> ctl.restart zygote
+            val script = """
+                svc wifi disable
+                _n=0
+                while [ ${D}_n -lt 20 ]; do
+                  [ "${D}(ip rule show | grep -c 'oif wlan0')" = "0" ] && break
+                  sleep 1; _n=${D}((${D}_n + 1))
+                done
+                for _m in ${D}(grep ' /data/app/' /proc/mounts | awk '{print ${D}2}'); do
+                  umount -l "${D}_m" 2>/dev/null
+                done
+                setprop dalvik.vm.usejit $valStr
+                setprop dalvik.vm.usejitprofiles $valStr
+                setprop ctl.restart zygote
+            """.trimIndent()
             val t0 = System.currentTimeMillis()
             val ret = runSuCommand(script)
             val t1 = System.currentTimeMillis()
 
             steps.add(
                 ToolsStep(
-                    step = "perf_prop",
-                    command = script,
+                    step = "perf_prop_zygote",
+                    command = "svc wifi disable; umount /data/app/*; setprop dalvik.vm.usejit=$valStr; ctl.restart zygote",
                     startedAtMs = t0,
                     finishedAtMs = t1,
                     exitCode = ret.exitCode,
-                    stdout = if (ret.exitCode == 0) "dalvik.vm.usejit=$valStr" else "",
-                    stderr = if (ret.exitCode != 0) ret.output else "",
-                    status = if (ret.exitCode == 0) ToolsStep.Status.OK else ToolsStep.Status.PARTIAL
+                    stdout = "dalvik.vm.usejit=$valStr -> ZYGOTE RESTART",
+                    stderr = ret.output,
+                    status = ToolsStep.Status.OK
                 )
             )
 
@@ -283,10 +297,10 @@ object AppPerformance {
                 } catch (t: Throwable) {
                     Log.w(TAG, "Asset copy error", t)
                 }
-
+                val D = "$"
                 val prepScript = """
                     mkdir -p /data/local/tmp
-                    if [ "$(${'$'}(md5sum $STAGING_VCODEC_PATH 2>/dev/null | cut -d' ' -f1))" != "$EXPECTED_VCODEC_MD5" ]; then
+                    if [ "${D}(md5sum $STAGING_VCODEC_PATH 2>/dev/null | cut -d' ' -f1)" != "${D}EXPECTED_VCODEC_MD5" ]; then
                       [ -f '${cacheFile.absolutePath}' ] && cp -f '${cacheFile.absolutePath}' $STAGING_VCODEC_PATH 2>&1 || true
                     fi
                     chown 0:0 $STAGING_VCODEC_PATH 2>/dev/null || true
@@ -427,17 +441,17 @@ object AppPerformance {
 
     data class ExecResult(val exitCode: Int, val output: String)
 
+    /**
+     * Аудит §5.7: БАГ был — для iptables/setprop/mount/dex2oat требовался root,
+     * а код запускал команду через простой Runtime.exec("sh"), который работает
+     * от пользователя u0_a* без прав. В других инструментах (TTL, LockSound)
+     * используется AdbClient (локальный ADB сокет 127.0.0.1:5555 с adbd в
+     * режиме root) — единый путь выполнения команд с правами root.
+     */
     private fun runSuCommand(command: String): ExecResult {
         return try {
-            val process = Runtime.getRuntime().exec(arrayOf("sh", "-c", command))
-            val reader = BufferedReader(InputStreamReader(process.inputStream))
-            val sb = java.lang.StringBuilder()
-            var line: String?
-            while (reader.readLine().also { line = it } != null) {
-                sb.append(line).append("\n")
-            }
-            val exitCode = process.waitFor()
-            ExecResult(exitCode, sb.toString().trim())
+            val (code, out) = AdbClient.execute(command, 30000)
+            ExecResult(code, out)
         } catch (e: Exception) {
             Log.w(TAG, "Command failed: $command", e)
             ExecResult(-1, e.message ?: "Exec error")

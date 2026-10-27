@@ -26,7 +26,10 @@ import java.io.File
 object ScreenBrightness {
 
     const val TAG = "BrightMem"
-    const val PREFS_NAME = "centralex_tools"
+    // ОДИН файл prefs на всю вкладку «Инструменты» — иначе запись из ToolsBackend
+    // (voiceapp3) и чтение из ScreenBrightness (centralex_tools) расходились, и
+    // «Запоминать яркость по фарам» не видела собственный ключ PREF_REMEMBER.
+    const val PREFS_NAME = "voiceapp3"
 
     const val SETTINGS_KEY = "screen_brightness"
     const val PERSIST_PROP = "persist.sys.geely.screen_brightness"
@@ -50,23 +53,7 @@ object ScreenBrightness {
 
     fun prefs(ctx: Context) = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
-    /**
-     * Однократное автоматическое исправление системного screen_off_timeout.
-     * Защищает от зависания ГУ в глубоком сне при перезагрузках или обновлениях.
-     */
-    fun healScreenTimeoutOnce(ctx: Context) {
-        val p = prefs(ctx)
-        if (!p.getBoolean(PREF_HEALED_V1, false)) {
-            try {
-                Log.i(TAG, "Healing screen_off_timeout to safe value (Int.MAX_VALUE)...")
-                writeSystemInt(ctx, Settings.System.SCREEN_OFF_TIMEOUT, Int.MAX_VALUE)
-                Runtime.getRuntime().exec(arrayOf("sh", "-c", "settings put system screen_off_timeout 2147483647 2>/dev/null || true"))
-                p.edit().putBoolean(PREF_HEALED_V1, true).apply()
-            } catch (t: Throwable) {
-                Log.w(TAG, "healScreenTimeoutOnce error", t)
-            }
-        }
-    }
+
 
     fun isHeadlightsOn(ctx: Context): Boolean {
         val uiMode = ctx.resources.configuration.uiMode
@@ -207,19 +194,42 @@ object ScreenBrightness {
         }
     }
 
+
+
+    data class WriteResult(val ok: Boolean, val readback: Int?, val error: String?)
+
+    /**
+     * Постоянный pin screen_off_timeout в Int.MAX_VALUE (~24.8 суток), чтобы
+     * OEM-прошивка не сбрасывала на 10 сек. Пишем через ContentResolver + shell
+     * settings put (двойная страховка). Вызывается на каждом watchdog-тике.
+     */
+    fun healScreenTimeoutOnce(ctx: Context) {
+        try {
+            val target = Int.MAX_VALUE
+            runCatching { writeSystemInt(ctx, Settings.System.SCREEN_OFF_TIMEOUT, target) }
+            runCatching { AdbClient.execute(
+                "settings put system screen_off_timeout  2>/dev/null;" +
+                "settings put secure screen_off_timeout  2>/dev/null;" +
+                "settings put global stay_on_while_plugged_in 7 2>/dev/null || true", 5000) }
+            val pp = prefs(ctx)
+            if (!pp.getBoolean(PREF_HEALED_V1, false)) {
+                pp.edit().putBoolean(PREF_HEALED_V1, true).apply()
+                Log.i(TAG, "screen_off_timeout pinned to Int.MAX_VALUE (~24.8д) — ГУ больше не тухнет сам")
+            }
+        } catch (t: Throwable) { Log.w(TAG, "healScreenTimeoutOnce error", t) }
+    }
+
     fun scheduleRestWatchdog(ctx: Context) {
         restWatchdogRunnable?.let { mainHandler.removeCallbacks(it) }
+        // Watchdog раз в 30 секунд держит таймаут сна в Int.MAX_VALUE
+        val pin = object : Runnable {
+            override fun run() { healScreenTimeoutOnce(ctx); mainHandler.postDelayed(this, 30_000L) }
+        }
+        mainHandler.post(pin)
         val sec = restSeconds(ctx)
         if (sec <= 0) return
-
-        val r = object : Runnable {
-            override fun run() {
-                ScreenSaverOverlay.show(ctx)
-            }
-        }
+        val r = object : Runnable { override fun run() { ScreenSaverOverlay.show(ctx) } }
         restWatchdogRunnable = r
         mainHandler.postDelayed(r, sec * 1000L)
     }
-
-    data class WriteResult(val ok: Boolean, val readback: Int?, val error: String?)
 }

@@ -70,9 +70,9 @@ object TelemetryPrefsMirror {
      */
     val THEME_IDS = setOf(
         "light", "dark", "midnight", "sepia", "nordic",
-        "daylight", "tokyoNeon", "sunsetDrive", "bubblegum"
+        "daylight", "tokyoNeon", "sunsetDrive", "pearl"
     )
-    private val LIGHT_THEME_IDS = setOf("light", "sepia", "daylight", "bubblegum")
+    private val LIGHT_THEME_IDS = setOf("light", "sepia", "daylight", "pearl")
 
     /** Запомнить ВЫБОР пользователя (плитки палитры). Только эта запись
      *  меняет ключ настройки; ui.theme/tab.change пишут действующую палитру. */

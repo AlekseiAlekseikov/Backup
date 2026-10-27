@@ -51,6 +51,11 @@ object LockSound {
     private val soundExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
     @Volatile
     private var mediaPlayer: MediaPlayer? = null
+    /** Дебаунс: не играть повторный звук того же типа чаще чем раз в DEBOUNCE_MS
+     *  (защита от двойных событий от двери/экрана). */
+    private const val DEBOUNCE_MS = 800L
+    @Volatile private var lastPlayAtMs: Long = 0L
+    @Volatile private var lastPlayKind: String = ""
 
     fun getSoundsDir(ctx: Context): File {
         return File(ctx.filesDir, "carlock_sounds").apply { if (!exists()) mkdirs() }
@@ -152,32 +157,74 @@ object LockSound {
         )
 
         // Предотвращение дублирования:
-        val oemSysVal = if (enabled) 0 else 1
-        var sysErr = ""
-        try {
-            Settings.System.putInt(ctx.contentResolver, SETTINGS_LOCK_CAR_AUDIO_ENABLE, oemSysVal)
-        } catch (t: Throwable) {
-            sysErr = "${t.javaClass.simpleName}: ${t.message ?: "Permission denied"}"
-            AppLog.w(ctx, TAG, "Settings.System write failed: $sysErr")
+        // OEM-логика (w0/qd.smali:1183-1200): Settings.System.putString("lock_car_audio_path", path)
+        //   + putString("lock_car_audio_enable", "1") — фреймворк Geely играет звук ПО ЭТОМУ ПУТИ
+        //   вместо заводского, если enable=1. Ранее я ошибочно ставил enable=0
+        //   (это полностью отключает звук блокировки, из-за чего слышен только
+        //   системный fallback или тишина). Правильная последовательность:
+        //     enabled=true  → lock_car_audio_path = <кастомный путь>
+        //                     lock_car_audio_enable = "1" (включить кастомный)
+        //     enabled=false → lock_car_audio_path = "" (сбросить путь)
+        //                     lock_car_audio_enable = "1" (вернуть заводской)
+        val customPath = if (enabled) getSelectedPath(ctx) else ""
+        var sysPathErr = ""
+        var sysEnableErr = ""
+        var pathActual = ""
+        var enableActual = -1
+
+        if (customPath.isNotEmpty() && File(customPath).exists()) {
+            try {
+                Settings.System.putString(ctx.contentResolver, SETTINGS_LOCK_CAR_AUDIO_PATH, customPath)
+                pathActual = Settings.System.getString(ctx.contentResolver, SETTINGS_LOCK_CAR_AUDIO_PATH) ?: ""
+            } catch (t: Throwable) {
+                sysPathErr = "${t.javaClass.simpleName}: ${t.message ?: "path-denied"}"
+                AppLog.w(ctx, TAG, "Settings.System.putString(lock_car_audio_path) failed: $sysPathErr")
+            }
+        } else if (!enabled) {
+            try {
+                Settings.System.putString(ctx.contentResolver, SETTINGS_LOCK_CAR_AUDIO_PATH, "")
+                pathActual = ""
+            } catch (t: Throwable) {
+                sysPathErr = "${t.javaClass.simpleName}: ${t.message ?: "path-denied"}"
+            }
         }
-        val sysActual = try {
-            Settings.System.getInt(ctx.contentResolver, SETTINGS_LOCK_CAR_AUDIO_ENABLE, -1)
-        } catch (_: Exception) { -1 }
+
+        val oemSysVal = if (enabled) "1" else "1" // enable=1 — звук ВКЛЮЧЁН: кастомный или заводской
+        try {
+            Settings.System.putString(ctx.contentResolver, SETTINGS_LOCK_CAR_AUDIO_ENABLE, oemSysVal)
+            val sVal = Settings.System.getString(ctx.contentResolver, SETTINGS_LOCK_CAR_AUDIO_ENABLE) ?: ""
+            enableActual = if (sVal == "1") 1 else if (sVal == "0") 0 else -1
+        } catch (t: Throwable) {
+            sysEnableErr = "${t.javaClass.simpleName}: ${t.message ?: "Permission denied"}"
+            AppLog.w(ctx, TAG, "Settings.System write failed: $sysEnableErr")
+        }
 
         steps += ToolsStep(
-            step = "suppress_oem_duplicate",
-            command = "Settings.System.putInt($SETTINGS_LOCK_CAR_AUDIO_ENABLE, $oemSysVal)",
+            step = "system_path",
+            command = "Settings.System.putString($SETTINGS_LOCK_CAR_AUDIO_PATH, $customPath)",
             startedAtMs = t0,
             finishedAtMs = SystemClock.elapsedRealtime(),
-            exitCode = if (sysActual == oemSysVal) 0 else 1,
-            stdout = "sys_oem_sound=$sysActual (1=active, 0=suppressed)",
-            stderr = sysErr,
-            expected = oemSysVal.toString(),
-            actual = sysActual.toString(),
-            status = if (sysActual == oemSysVal) ToolsStep.Status.OK else ToolsStep.Status.PARTIAL
+            exitCode = if (pathActual == customPath) 0 else 1,
+            stdout = "lock_car_audio_path=$pathActual",
+            stderr = sysPathErr,
+            expected = customPath,
+            actual = pathActual,
+            status = if (pathActual == customPath) ToolsStep.Status.OK else ToolsStep.Status.PARTIAL
         )
 
-        val customPath = getSelectedPath(ctx)
+        steps += ToolsStep(
+            step = "system_enable",
+            command = "Settings.System.putString($SETTINGS_LOCK_CAR_AUDIO_ENABLE, $oemSysVal)",
+            startedAtMs = t0,
+            finishedAtMs = SystemClock.elapsedRealtime(),
+            exitCode = if (enableActual == oemSysVal.toInt()) 0 else 1,
+            stdout = "lock_car_audio_enable=$enableActual (1=sound on)",
+            stderr = sysEnableErr,
+            expected = oemSysVal,
+            actual = enableActual.toString(),
+            status = if (enableActual == oemSysVal.toInt()) ToolsStep.Status.OK else ToolsStep.Status.PARTIAL
+        )
+
         val fileValid = if (enabled) {
             val sp = getSelectedPath(ctx); if (sp.isNotEmpty() && File(sp).exists()) applySystemLockSoundBind(ctx, File(sp))
             customPath.isNotEmpty() && File(customPath).exists()
@@ -415,10 +462,12 @@ object LockSound {
             .commit()
 
         if (isLock) {
+            // Выбор кастомного файла → пишем путь и enable=1.
             try {
-                Settings.System.putInt(ctx.contentResolver, SETTINGS_LOCK_CAR_AUDIO_ENABLE, 0)
+                Settings.System.putString(ctx.contentResolver, SETTINGS_LOCK_CAR_AUDIO_PATH, targetFile.absolutePath)
+                Settings.System.putString(ctx.contentResolver, SETTINGS_LOCK_CAR_AUDIO_ENABLE, "1")
             } catch (t: Throwable) {
-                AppLog.w(ctx, TAG, "Cannot write Settings.System: ${t.message}")
+                AppLog.w(ctx, TAG, "Cannot write Settings.System lock path: ${t.message}")
             }
         }
 
@@ -458,14 +507,63 @@ object LockSound {
 
     fun restoreFactory(ctx: Context): ToolsResult = restoreFactorySound(ctx, isLock = true)
 
-    fun playSound(ctx: Context, isLock: Boolean) {
+    /**
+     * Общий проигрыватель звука замка (lock + unlock общий, с задержкой и громкостью).
+     * Задержка берётся из настроек; при delayMs=0 — играем сразу.
+     * Событие и старт логируются с таймстампом для замера «событие→звук» на ГУ.
+     * @param explicitFile если не null — использовать именно этот файл (вызывающий уже
+     *                     определил путь/существование), иначе взять из настроек.
+     */
+    fun playSound(ctx: Context, isLock: Boolean, explicitFile: File? = null) {
         val enabled = if (isLock) isEnabled(ctx) else isUnlockSoundEnabled(ctx)
         if (!enabled) return
 
-        val soundPath = if (isLock) getSelectedPath(ctx) else getUnlockSelectedPath(ctx)
-        val file = if (soundPath.isNotEmpty()) File(soundPath) else null
+        val kind = if (isLock) "lock" else "unlock"
+        // Дебаунс: не играть тот же вид звука чаще чем раз в DEBOUNCE_MS
+        // (защита от дублей событий от разных датчиков/экранов).
+        val now = SystemClock.elapsedRealtime()
+        if (lastPlayKind == kind && (now - lastPlayAtMs) < DEBOUNCE_MS) {
+            AppLog.i(ctx, TAG, "playSound[$kind] debounce (Δ=${now - lastPlayAtMs}ms < ${DEBOUNCE_MS}ms) — skip")
+            return
+        }
+        lastPlayKind = kind
+        lastPlayAtMs = now
 
-        playExternalSound(ctx, file, getVolume(ctx))
+        val file = when {
+            explicitFile != null && explicitFile.exists() -> explicitFile
+            else -> {
+                val soundPath = if (isLock) getSelectedPath(ctx) else getUnlockSelectedPath(ctx)
+                if (soundPath.isNotEmpty()) File(soundPath).takeIf { it.exists() } else null
+            }
+        }
+        val volume = getVolume(ctx)
+        val delayMs = getDelayMs(ctx).coerceAtLeast(0)
+        val eventTs = now
+
+        AppLog.i(ctx, TAG, "playSound[$kind] event at t=$eventTs, file=${file?.name ?: "OEM"}, vol=$volume%, delay=${delayMs}ms")
+
+        val appCtx = ctx.applicationContext
+        val runnable = Runnable {
+            val startTs = SystemClock.elapsedRealtime()
+            val delta = startTs - eventTs
+            playExternalSound(appCtx, file, volume)
+            // Предпрослушка также в салоне для unlock (на закрытии это делает фреймворк Geely сам).
+            if (!isLock) {
+                playCabinSound(appCtx, file)
+            }
+            AppLog.i(ctx, TAG, "playSound[$kind] started Δt=${delta}ms (target delay=${delayMs}ms)")
+        }
+        if (delayMs == 0) {
+            soundExecutor.execute(runnable)
+        } else {
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(runnable, delayMs.toLong())
+        }
+    }
+
+    /** Совместимость: воспроизведение unlock-звука с явно переданным файлом
+     *  (вызывается из WindowDoors.onDoorChanged и screenWakeReceiver). */
+    fun playUnlockSound(ctx: Context, soundFile: File?) {
+        playSound(ctx, isLock = false, explicitFile = soundFile)
     }
 
     fun playPreview(ctx: Context, isLock: Boolean): ToolsResult {
@@ -533,16 +631,6 @@ object LockSound {
         }
     }
 
-    /**
-     * Воспроизведение звука открытия/приветствия при просыпании ГУ.
-     */
-    fun playUnlockSound(ctx: Context, soundFile: File?) {
-        soundExecutor.execute {
-            playCabinSound(ctx, soundFile)
-            playExternalSound(ctx, soundFile, getVolume(ctx))
-        }
-    }
-
     fun restoreFactorySound(ctx: Context, isLock: Boolean): ToolsResult {
         val prefs = ctx.getSharedPreferences("voiceapp3", Context.MODE_PRIVATE)
         val pathKey = if (isLock) PREF_LOCK_SOUND_PATH else PREF_UNLOCK_SOUND_PATH
@@ -557,7 +645,8 @@ object LockSound {
 
         if (isLock) {
             try {
-                Settings.System.putInt(ctx.contentResolver, SETTINGS_LOCK_CAR_AUDIO_ENABLE, 1)
+                Settings.System.putString(ctx.contentResolver, SETTINGS_LOCK_CAR_AUDIO_PATH, "")
+                Settings.System.putString(ctx.contentResolver, SETTINGS_LOCK_CAR_AUDIO_ENABLE, "1")
             } catch (t: Throwable) {
                 AppLog.w(ctx, TAG, "Cannot restore Settings.System: ${t.message}")
             }
@@ -625,14 +714,48 @@ object LockSound {
 
     fun onBootOrWatchdog(ctx: Context) {
         val lockEnabled = isEnabled(ctx)
-        AppLog.i(ctx, TAG, "onBootOrWatchdog: проверка звуков замка (кастом=$lockEnabled)")
+        val unlockEnabled = isUnlockSoundEnabled(ctx)
+        AppLog.i(ctx, TAG, "onBootOrWatchdog: проверка звуков замка (lock=$lockEnabled unlock=$unlockEnabled) vol=${getVolume(ctx)}% delay=${getDelayMs(ctx)}ms")
         if (lockEnabled) {
+            val path = getSelectedPath(ctx)
+            // OEM-логика при boot: пишем путь в lock_car_audio_path и enable=1
+            // (чтобы фреймворк играл кастомный звук вместо заводского).
             try {
-                Settings.System.putInt(ctx.contentResolver, SETTINGS_LOCK_CAR_AUDIO_ENABLE, 0)
+                if (path.isNotEmpty() && File(path).exists()) {
+                    Settings.System.putString(ctx.contentResolver, SETTINGS_LOCK_CAR_AUDIO_PATH, path)
+                }
+                Settings.System.putString(ctx.contentResolver, SETTINGS_LOCK_CAR_AUDIO_ENABLE, "1")
             } catch (t: Throwable) {
-                AppLog.w(ctx, TAG, "onBootOrWatchdog write failed: ${t.message}")
+                AppLog.w(ctx, TAG, "onBootOrWatchdog write settings failed: ${t.message}")
+            }
+            // Bind-mount сбрасывается при перезагрузке — переставляем его заново
+            // на сохранённый кастомный файл (как CentralWatchdogService.v()).
+            if (path.isNotEmpty()) {
+                val f = File(path)
+                if (f.exists()) applySystemLockSoundBind(ctx, f)
+            }
+        } else {
+            // Если выключено — на всякий случай убираем чужой bind mount.
+            runCatching { restoreSystemLockSoundBind(ctx) }
+        }
+        if (unlockEnabled) {
+            // Звук открытия — наш проигрыватель (не OEM-механизм), просто пишем путь
+            // в Settings.System для симметрии и консистентности.
+            val uPath = getUnlockSelectedPath(ctx)
+            try {
+                if (uPath.isNotEmpty() && File(uPath).exists()) {
+                    Settings.System.putString(ctx.contentResolver, SETTINGS_UNLOCK_CAR_AUDIO_PATH, uPath)
+                }
+                Settings.System.putString(ctx.contentResolver, SETTINGS_UNLOCK_CAR_AUDIO_ENABLE, "1")
+            } catch (t: Throwable) {
+                AppLog.w(ctx, TAG, "onBootOrWatchdog unlock write failed: ${t.message}")
             }
         }
+        // ВАЖНО: подписка на события дверей (для звука открытия + filete de ar)
+        // инициируется из VoiceAssistantService.onCreate ТОЛЬКО если включены
+        // тумблеры окон или звук открытия — см. EXTRA_BOOT_RESTORE в сервисе.
+        // Не вызываем initCarService здесь безусловно, чтобы не открывать окна
+        // при выключенных тумблерах (баг 5.1).
     }
 
     private fun applySystemLockSoundBind(ctx: Context, soundFile: File) {

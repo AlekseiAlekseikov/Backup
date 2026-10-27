@@ -438,7 +438,7 @@ class QuickPanel(
             "daylight" to Pair(0xFFFFFF.opaque(), 0x000000.opaque()),
             "tokyoNeon" to Pair(0xE9DDFF.opaque(), 0x150E24.opaque()),
             "sunsetDrive" to Pair(0xFFE0CF.opaque(), 0x2A1728.opaque()),
-            "bubblegum" to Pair(0xFFFFFF.opaque(), 0x2B1030.opaque()),
+            "pearl" to Pair(0xFFFFFF.opaque(), 0x1A1A1A.opaque()),
         )
         val SEL_SEPIA: Pair<Int, Int> = SEL_BY_THEME.getValue("sepia")
 

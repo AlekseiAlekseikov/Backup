@@ -31,6 +31,10 @@ import com.example.voiceapp3.ui.UiBridge
  */
 class MainActivity : AppCompatActivity() {
 
+    override fun attachBaseContext(newBase: Context) {
+        super.attachBaseContext(AppTheme.attachBaseContext(newBase))
+    }
+
     private lateinit var shellRoot: ViewGroup
     private lateinit var bridge: UiBridge
     // GeelyTools deviation: тонкий live-фид движка телеметрии для шелла

@@ -9,7 +9,7 @@ import android.util.Log
  * Stage CXT · срез №6: Сеть — Фиксация TTL 65 (IPv4/IPv6 iptables mangle).
  *
  * Точный перенос механизма CentralEXAuto (w0.z8, w0.s8):
- * Выполнение правил iptables/ip6tables через локальный ADB сокет 5555.
+ * Выполнение правил iptables/ip6tables через loopback ADB порт 65010 (root adbd).
  */
 object NetworkTtl {
     private const val TAG = "NetworkTtl"

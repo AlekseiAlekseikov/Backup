@@ -39,8 +39,13 @@ import com.example.voiceapp3.car.VehiclePropertyDumper
 import com.example.voiceapp3.car.VehiclePropertyHelper
 import com.example.voiceapp3.handlers.AcControlHandler
 import com.example.voiceapp3.media.MediaSessionCoordinator
+import com.example.voiceapp3.tools.AppPerformance
+import com.example.voiceapp3.tools.HuNightMode
+import com.example.voiceapp3.tools.LockSound
+import com.example.voiceapp3.tools.NetworkTtl
 import com.example.voiceapp3.tools.ScreenBrightness
 import com.example.voiceapp3.tools.StatusIcons
+import com.example.voiceapp3.tools.WindowDoors
 import com.example.voiceapp3.ui.UiBridge
 import org.vosk.Model
 import org.vosk.android.StorageService
@@ -334,8 +339,86 @@ class VoiceAssistantService : Service() {
                периодический цикл (как CentralWatchdogService.Q0 + r2 case 10). */
             runCatching { StatusIcons.syncAll(this) }
             runCatching { StatusIcons.startPeriodicSync(this) }
+            /* Аудит §5.4/§5.5/§5.7: восстановление настроек, которые держатся
+               только в оперативной памяти / в iptables / в bind-mount: TTL 65,
+               кастомный звук замка, оптимизация видео 60fps, подписка на двери. */
+            runCatching { NetworkTtl.bootRestore(this) }
+            runCatching { LockSound.onBootOrWatchdog(this) }
+            // Подписка на события дверей (filete de ar) — только если хотя бы один
+            // из двух тумблеров окон включен. Важно: без этой проверки initCarService
+            // безусловно подписывался на события дверей даже при ВЫКЛюченных функциях,
+            // что приводило к самопроизвольному открытию/закрытию стёкол (баг 5.1).
+            runCatching {
+                val prefs = try {
+                    createDeviceProtectedStorageContext()
+                        .getSharedPreferences("voiceapp3", Context.MODE_PRIVATE)
+                } catch (_: Throwable) {
+                    getSharedPreferences("voiceapp3", Context.MODE_PRIVATE)
+                }
+                val driverOn = prefs.getBoolean(WindowDoors.PREF_WINDOW_DRIVER_ON_DOOR, false)
+                val oppOn = prefs.getBoolean(WindowDoors.PREF_WINDOW_OPPOSITE_ON_DOOR, false)
+                val unlockOn = prefs.getBoolean(LockSound.PREF_UNLOCK_SOUND_ENABLED, false)
+                if (driverOn || oppOn || unlockOn) {
+                    WindowDoors.initCarService(this)
+                }
+            }
+            // Восстановление persist.sys.hvacdigital.* после ребута
+            // (флаги плагина цифровой индикации статус-бара).
+            runCatching { StatusIcons.bootRestoreHvacDigital(this) }
+            // Оптимизация видео 60fps: bind-mount сбрасывается при перезагрузке,
+            // поэтому если тумблер включен — заново монтируем декодер.
+            runCatching {
+                if (AppPerformance.isVideo60FpsEnabled(this)) {
+                    AppPerformance.setVideo60Fps(this, true)
+                }
+            }
+            // Смена «день/ночь» без открытия приложения — чтобы яркость тоже
+            // переключалась живьём (watchdog brightnessSync опирается на
+            // isHeadlightsOn, которое читает актуальную uiMode).
+            HuNightMode.observe(this) {
+                runCatching { ScreenBrightness.restoreIfEnabled(this) }
+                runCatching { StatusIcons.syncAll(this) }
+            }
+            // Watchdog-цикл раз в 60 с: повторно применяет настройки, которые
+            // могли слететь при force-stop, при входе/выходе из сна ГУ или при
+            // сбросе системных пропертей. Аналог цикла r2 в CentralWatchdogService,
+            // который помимо публикации иконок раз в 15 с проверяет все флаги.
+            handler.postDelayed(settingsWatchdog, SETTINGS_WATCHDOG_MS)
         }
         return START_STICKY
+    }
+
+    /**
+     * Периодическое восстановление настроек Инструментов. Если после рестарта
+     * процесса или длительной стоянки какой-то флаг остался включённым в prefs,
+     * но эффект не применён в системе — переприменяем. Не выдаёт ошибки пользователю.
+     */
+    private val settingsWatchdog = object : Runnable {
+        override fun run() {
+            runCatching {
+                // TTL — перепостановка правил если они слетели
+                NetworkTtl.bootRestore(this@VoiceAssistantService)
+            }
+            runCatching {
+                // Кастомный звук блокировки — пере-запись lock_car_audio_path/enable
+                LockSound.onBootOrWatchdog(this@VoiceAssistantService)
+            }
+            runCatching {
+                // hvacdigital — повтор setprop на случай очистки системных пропертей
+                StatusIcons.bootRestoreHvacDigital(this@VoiceAssistantService)
+            }
+            runCatching {
+                // Яркость
+                ScreenBrightness.restoreIfEnabled(this@VoiceAssistantService)
+            }
+            runCatching {
+                // Оптимизация видео
+                if (AppPerformance.isVideo60FpsEnabled(this@VoiceAssistantService)) {
+                    AppPerformance.setVideo60Fps(this@VoiceAssistantService, true)
+                }
+            }
+            handler.postDelayed(this, SETTINGS_WATCHDOG_MS)
+        }
     }
 
     override fun onDestroy() {
@@ -455,6 +538,7 @@ class VoiceAssistantService : Service() {
 
     /** Каденция синхронизации яркости (аналог watchdog-цикла APK, ~2.5 c). */
     private val BRIGHTNESS_SYNC_MS = 60_000L
+    private val SETTINGS_WATCHDOG_MS = 60_000L
 
     private fun registerScreenWakeReceiver() {
         if (screenWakeReceiver != null) return
@@ -477,6 +561,15 @@ class VoiceAssistantService : Service() {
                            текущий уровень в корзину режима. */
                         runCatching { ScreenBrightness.captureLevel(this@VoiceAssistantService) }
                     }
+                    "com.example.voiceapp3.ACTION_APPLY_STATUS_WIFI" -> {
+                        /* Нажатие на иконку Wi‑Fi на панели уведомлений —
+                           открываем системные настройки Wi‑Fi поверх всего. */
+                        runCatching {
+                            val wifiIntent = Intent(android.provider.Settings.ACTION_WIFI_SETTINGS)
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            startActivity(wifiIntent)
+                        }
+                    }
                 }
             }
         }
@@ -484,6 +577,7 @@ class VoiceAssistantService : Service() {
             addAction(Intent.ACTION_SCREEN_ON)
             addAction(Intent.ACTION_USER_PRESENT)
             addAction(Intent.ACTION_SCREEN_OFF)
+            addAction("com.example.voiceapp3.ACTION_APPLY_STATUS_WIFI")
         }
         runCatching {
             registerReceiver(screenWakeReceiver, filter)

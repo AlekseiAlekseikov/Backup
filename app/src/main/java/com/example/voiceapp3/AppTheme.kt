@@ -14,34 +14,62 @@ import androidx.core.content.ContextCompat
 /**
  * Тема приложения и цвет верхней полосы IHU629G.
  *
- * Три режима: система / тёмная / светлая.
- * MODE_NIGHT_FOLLOW_SYSTEM — AndroidX, на API 14+ (Android 9 в порядке).
- * На ГУ «система» следует дню/ночи машины (uiMode).
+ * Поведение — точный порт w0/y7.n() из CentralEXAuto:
+ *  - ключ theme_mode в SharedPreferences "voiceapp3":
+ *      "auto"   — следовать конфигурации ГУ (день/ночь по configuration.uiMode),
+ *      "light"  — принудительно светлая,
+ *      "dark"   — принудительно тёмная.
+ *  - по умолчанию — "auto" (в OEM — "auto", legacy: light_mode=true/false).
+ *  - Вместо AppCompatDelegate.setDefaultNightMode применяем паттерн OEM:
+ *    оборачиваем Context через createConfigurationContext, выставляя
+ *    uiMode = UI_MODE_NIGHT_YES/NO поверх текущей конфигурации. Это гарантирует,
+ *    что ночной режим переключается на лету при ACTION_CONFIGURATION_CHANGED.
+ *  - AppCompatDelegate.setDefaultNightMode всё же вызываем для совместимости
+ *    с компонентами, которые смотрят на него (AppCompatDialogs и т.п.).
  */
 object AppTheme {
 
     const val PREFS = "voiceapp3"
     private const val PREF_MODE = "theme_mode"
-    private const val PREF_LIGHT = "light_theme"
+    private const val PREF_LIGHT_LEGACY = "light_theme"
 
-    enum class Mode { SYSTEM, DARK, LIGHT }
+    enum class Mode { AUTO, LIGHT, DARK }
 
     fun mode(context: Context): Mode {
-        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val prefs = dps(context).getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         return when (prefs.getString(PREF_MODE, null)) {
             "light" -> Mode.LIGHT
             "dark" -> Mode.DARK
-            "system" -> Mode.SYSTEM
-            else -> if (prefs.getBoolean(PREF_LIGHT, false)) Mode.LIGHT else Mode.DARK
+            "auto" -> Mode.AUTO
+            null, "system" -> {
+                // legacy-миграция из старого ключа PREF_LIGHT_LEGACY.
+                if (prefs.contains(PREF_LIGHT_LEGACY)) {
+                    if (prefs.getBoolean(PREF_LIGHT_LEGACY, false)) Mode.LIGHT else Mode.DARK
+                } else Mode.AUTO
+            }
+            else -> Mode.AUTO
         }
     }
 
     fun setMode(context: Context, mode: Mode) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        dps(context).getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .edit()
             .putString(PREF_MODE, mode.name.lowercase())
+            .remove(PREF_LIGHT_LEGACY)
             .apply()
         applySaved(context)
+    }
+
+    /**
+     * DeviceProtectedStorage — настройки читаются до разблокировки (как в OEM
+     * w0.zd.a() — createDeviceProtectedStorageContext).
+     */
+    private fun dps(context: Context): Context {
+        return try {
+            context.createDeviceProtectedStorageContext()
+        } catch (_: Throwable) {
+            context
+        }
     }
 
     fun applySaved(context: Context) {
@@ -49,20 +77,59 @@ object AppTheme {
             when (mode(context)) {
                 Mode.LIGHT -> AppCompatDelegate.MODE_NIGHT_NO
                 Mode.DARK -> AppCompatDelegate.MODE_NIGHT_YES
-                Mode.SYSTEM -> AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM
+                Mode.AUTO -> AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM
             }
         )
     }
 
     /**
-     * Светлая ли сейчас тема.
-     * Для обычного Activity (оверлей) configuration.uiMode не следует
-     * AppCompatDelegate — поэтому сначала смотрим сохранённый режим.
+     * Оборачивает base Context под текущую тему — точный порт y7.n().
+     * Должен вызываться из Activity.attachBaseContext() ДО super.attachBaseContext().
+     *
+     * Логика OEM (y7.java:872-901):
+     *  1. Читаем theme_mode, вычисляем z3 — ночь? (true/false).
+     *  2. Сравниваем z3 с текущим (configuration.uiMode & UI_MODE_NIGHT_MASK) == NIGHT_YES.
+     *  3. Если совпадает — возвращаем как есть; иначе создаём Configuration-copy,
+     *     выставляем правильный бит (32=НОЧЬ, 16=ДЕНЬ) и возвращаем
+     *     context.createConfigurationContext(newConfig).
+     */
+    fun attachBaseContext(context: Context): Context {
+        return try {
+            val prefs = dps(context).getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            val z3 = when (prefs.getString(PREF_MODE, null)) {
+                "light" -> false
+                "dark" -> true
+                else -> {
+                    val night = context.resources.configuration.uiMode and
+                            Configuration.UI_MODE_NIGHT_MASK
+                    night == Configuration.UI_MODE_NIGHT_YES
+                }
+            }
+            val configuration = context.resources.configuration
+            val currentIsNight =
+                (configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
+            if (z3 == currentIsNight) {
+                context
+            } else {
+                val newConfig = Configuration(configuration)
+                val newUiMode = (newConfig.uiMode and Configuration.UI_MODE_NIGHT_MASK.inv()) or
+                        (if (z3) Configuration.UI_MODE_NIGHT_YES else Configuration.UI_MODE_NIGHT_NO)
+                newConfig.uiMode = newUiMode
+                context.createConfigurationContext(newConfig)
+            }
+        } catch (_: Throwable) {
+            context
+        }
+    }
+
+    /**
+     * Светлая ли сейчас тема (для оконных флагов строки состояния).
+     * Учитывает и AUTO режим по реальному configuration.uiMode.
      */
     fun isLight(context: Context): Boolean = when (mode(context)) {
         Mode.LIGHT -> true
         Mode.DARK -> false
-        Mode.SYSTEM -> {
+        Mode.AUTO -> {
             val night = context.resources.configuration.uiMode and
                     Configuration.UI_MODE_NIGHT_MASK
             night != Configuration.UI_MODE_NIGHT_YES

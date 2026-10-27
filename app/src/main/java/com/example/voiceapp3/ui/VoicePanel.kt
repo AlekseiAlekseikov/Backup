@@ -410,7 +410,7 @@ class VoicePanel(
             "daylight" to 0xFFD8D8D8.toInt(),
             "tokyoNeon" to 0xFF251A3C.toInt(),
             "sunsetDrive" to 0xFF3E2238.toInt(),
-            "bubblegum" to 0xFFF3DCEE.toInt(),
+            "pearl" to 0xFFF3ECEE.toInt(),
         )
     }
 }

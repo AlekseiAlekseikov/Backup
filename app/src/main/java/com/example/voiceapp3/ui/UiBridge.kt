@@ -757,14 +757,36 @@ class UiBridge(
      * W3: действующая палитра шелла считается нативно (раньше — JS applyTheme).
      * Тёмная, если включены «Следовать теме ГУ» и тема ГУ тёмная; иначе — выбранная плитка.
      * Выбор по умолчанию совпадает с инструментами («sepia»).
+     *
+     * Аудит §5.1: БАГ БЫЛ — `gu` читалось из SharedPreferences
+     * (`ui_head_unit_theme_mode`), а это значение, выставленное сегментным
+     * переключателем «Светлая/Тёмная» на этой же странице, а не фактическая
+     * тема ГУ. Правильный источник — Configuration.uiMode
+     * (UI_MODE_NIGHT_YES = «ночь/фары включены»), читаемый через
+     * HuNightMode.isNight(). Тема ГУ для мануального режима (`gu`) теперь
+     * применяется только когда follow = false.
      */
     fun refreshShellTheme() {
         val prefs = activity.getSharedPreferences(ToolsBackend.Prefs.FILE, Context.MODE_PRIVATE)
         val follow = prefs.getBoolean(ToolsBackend.Prefs.THEME_FOLLOW_HU, true)
-        val gu = prefs.getString(ToolsBackend.Prefs.HEAD_UNIT_THEME, "light") ?: "light"
         val chosen = prefs.getString(TelemetryPrefsMirror.KEY_SHELL_THEME, null)
             ?.takeIf { it in TelemetryPrefsMirror.THEME_IDS } ?: "sepia"
-        applyShellTheme(if (follow && gu == "dark") "dark" else chosen)
+        val id: String = when {
+            follow && com.example.voiceapp3.tools.HuNightMode.isNight(activity) -> "dark"
+            follow -> chosen
+            else -> {
+                // Ручной режим: «Светлая/Тёмная» сегментом gu (как было).
+                val gu = prefs.getString(ToolsBackend.Prefs.HEAD_UNIT_THEME, "light") ?: "light"
+                if (gu == "dark") "dark" else chosen
+            }
+        }
+        applyShellTheme(id)
+    }
+
+    /** Слушатель живых смен темы ГУ — подцепляется один раз при создании UiBridge. */
+    private val huNightListener: () -> Unit = {
+        android.util.Log.i("UiBridge", "HU night-mode changed → refreshing shell theme")
+        activity.runOnUiThread { refreshShellTheme() }
     }
 
     private fun applyShellTheme(id: String) {
@@ -1064,6 +1086,8 @@ class UiBridge(
         companionInstance = this
         // Тумблер включён до запуска: первая проверка через 30 с (сеть успевает подняться).
         if (autoUpdateEnabled()) scheduleAutoCheck(30_000L)
+        // Аудит §5.1: живая смена темы ГУ (день↔ночь по фарам) — без перезапуска приложения.
+        com.example.voiceapp3.tools.HuNightMode.observe(activity, huNightListener)
     }
 
     companion object {
