@@ -1,11 +1,14 @@
 package com.example.voiceapp3.tools
 
 import android.content.Context
+import android.content.pm.PackageManager
 import android.content.res.Configuration
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.provider.Settings
 import android.util.Log
+import com.example.voiceapp3.tools.BgWorker
 import java.io.File
 
 /**
@@ -43,6 +46,35 @@ object ScreenBrightness {
      *  Нужно для будущей опции keep-awake (чтобы вернуть при выключении). */
     const val PREF_ORIGINAL_TIMEOUT = "original_screen_off_timeout_ms"
     const val PREF_TIMEOUT_NOTED = "screen_timeout_noted_v2"
+    /**
+     * P5 (по prompt_next): опция «не гаснуть никогда». Функция с гейтом по серийному
+     * номеру ГУ: ТОЛЬКО на конкретной голове IHUMas9W (serial см. EXPECTED_SERIAL).
+     * На любом другом ГУ — не включается и не пишет ничего в SCREEN_OFF_TIMEOUT.
+     *
+     * Путь «durable after uninstall» (требование): помимо Settings.System мы
+     * устанавливаем persist.sys.screen_off_timeout_force через root-канал и
+     * кладём однократный init.d-скрипт в /data/local/tmp/user.sh (где ГУ применяет
+     * его при загрузке) — это переживает удаление APK, т.к. /data/local/tmp не
+     * очищается при uninstall.
+     */
+    const val PREF_KEEP_AWAKE = "keep_awake_never_sleep"
+    const val PREF_KEEP_AWAKE_APPLIED = "keep_awake_applied_v1"
+
+    /**
+     * Серийный номер целевого ГУ, взят из дампа прошивки (geely_dump/getprop.txt):
+     *   [persist.device.real.serialno]: [IHU629G0MAS9W00010001144]
+     * Это серийный номер платы, не привязан к автомобилю (не VIN, не марка/модель
+     * авто). При переносе ГУ в другую машину серийник сохраняется, функция продолжает
+     * работать; на любом другом ГУ с другим серийником функция не применяется.
+     */
+    private const val EXPECTED_SERIAL = "IHU629G0MAS9W00010001144"
+    /** Вторичный серийник (ro.boot.serialno / ro.serialno из того же дампа). Если любой
+     *  из двух совпадает — считаем, что это нужное ГУ. */
+    private const val EXPECTED_SERIAL_BOOT = "AB1FRA00029968507"
+
+    private const val SCREEN_OFF_MAX = Int.MAX_VALUE
+    private const val PERSIST_FORCE_PROP = "persist.sys.screen_off_timeout_force"
+    private const val DURABLE_SCRIPT_PATH = "/data/local/tmp/screen_timeout_always_max.sh"
 
     const val MIN_PERCENT = 5
     const val MAX_PERCENT = 100
@@ -124,7 +156,10 @@ object ScreenBrightness {
 
     fun syncOnContext(ctx: Context) {
         val app = ctx.applicationContext
-        worker.post { noteCurrentTimeoutOnce(app); restoreIfEnabled(app); scheduleRestWatchdog(app) }
+        worker.post {
+            ensureKeepAwake(app)
+            restoreIfEnabled(app); scheduleRestWatchdog(app)
+        }
     }
 
     fun restSeconds(ctx: Context): Int = prefs(ctx).getInt(PREF_REST_SEC, 0)
@@ -148,37 +183,165 @@ object ScreenBrightness {
     data class WriteResult(val ok: Boolean, val readback: Int?, val error: String?)
 
     /**
-     * ОДНОКРАТНО при первом старте: зафиксировать текущий screen_off_timeout как
-     * «оригинальный» (до любых наших действий) и отметить в логе.
+     * Определяем, это ли целевое ГУ — строго по серийному номеру. Привязки
+     * к машине (VIN, Car property, марка/модель) НЕТ.
      *
-     * НИЧЕГО НЕ ПЕРЕЗАПИСЫВАЕМ. Если видим Int.MAX_VALUE — это след предыдущей версии,
-     * и мы НЕ знаем заводское значение (дампа прошивки нет в workspace), поэтому
-     * просто предупреждаем в лог и просим пользователя выставить таймаут в системных
-     * настройках — после этого наше приложение его больше никогда не тронет.
+     * Порядок проверки:
+     *   1. persist.device.real.serialno через getprop (всегда даёт корректный
+     *      серийник на IHU629G и не требует прав приложения).
+     *   2. ro.boot.serialno / ro.serialno (вторичный серийник из того же дампа).
+     *   3. Build.getSerial() (системный вызов, может потребовать READ_PHONE_STATE
+     *      — мы system_app, оборачиваем в try/catch на SecurityException).
+     *   4. Settings.Secure.ANDROID_ID — как последний запасной (меняется при factory reset!).
      */
-    private fun noteCurrentTimeoutOnce(ctx: Context) {
+    private fun detectActualSerial(ctx: Context): String {
+        val tried = mutableListOf<String>()
+        fun readProp(name: String): String? = try {
+            val p = Runtime.getRuntime().exec(arrayOf("sh","-c","getprop $name"))
+            p.waitFor(500)
+            val v = p.inputStream.bufferedReader().readText().trim()
+            if (v.isNotEmpty() && v != "unknown" && v != "0" && v.length >= 4) v else null
+        } catch (_: Throwable) { null }
+        for (prop in listOf("persist.device.real.serialno", "ro.serialno", "ro.boot.serialno",
+                              "ro.product.serialno", "persist.sys.serialno", "ro.serial",
+                              "gsm.serial", "ro.ril.oem.psno")) {
+            val v = readProp(prop)
+            if (v != null) { tried.add("$prop=$v"); return v }
+        }
         try {
-            val p = prefs(ctx)
-            if (p.getBoolean(PREF_TIMEOUT_NOTED, false)) return
-            val cur = readSystem(ctx, Settings.System.SCREEN_OFF_TIMEOUT)
-            if (cur == null) {
-                AppLog.w(TAG, "SCREEN_TIMEOUT: не могу прочитать текущий screen_off_TIMEOUT")
-            } else if (cur == Int.MAX_VALUE) {
-                AppLog.e(TAG, "SCREEN_TIMEOUT: VERIFY ТЕКУЩЕЕ_ЗНАЧЕНИЕ=Int.MAX_VALUE (2147483647). "
-                    + "Это остаток от предыдущей версии приложения. Заводское значение мне НЕИЗВЕСТНО "
-                    + "(дамп прошивки не загружен) — автоматическое восстановление не делаю. "
-                    + "ПОЖАЛУЙСТА, выставьте таймаут затухания вручную в Настройки → Экран → Спящий режим, "
-                    + "после этого приложение больше не будет его трогать.")
-            } else {
-                // Запоминаем как оригинальное, чтобы при будущей опции keep-awake
-                // можно было вернуть при выключении.
-                p.edit().putLong(PREF_ORIGINAL_TIMEOUT, cur.toLong()).apply()
-                AppLog.i(TAG, "SCREEN_TIMEOUT: VERIFY текущее значение = $cur мс — принято за оригинальное. "
-                    + "Приложение больше не будет изменять screen_off_TIMEOUT.")
+            if (Build.VERSION.SDK_INT >= 26 && ctx.checkSelfPermission(android.Manifest.permission.READ_PHONE_STATE)
+                == PackageManager.PERMISSION_GRANTED) {
+                val v = Build.getSerial()
+                if (v.isNotEmpty() && v != Build.UNKNOWN) { tried.add("Build.getSerial=$v"); return v }
             }
-            p.edit().putBoolean(PREF_TIMEOUT_NOTED, true).apply()
+        } catch (_: SecurityException) {
+            Log.w(TAG, "SCREEN_TIMEOUT: READ_PHONE_STATE not granted, skipping Build.getSerial")
+        } catch (_: Throwable) {}
+        try {
+            val v = Build.SERIAL
+            if (v.isNotEmpty() && v != Build.UNKNOWN) { tried.add("Build.SERIAL=$v"); return v }
+        } catch (_: Throwable) {}
+        AppLog.w(TAG, "SCREEN_TIMEOUT: serial detection failed, tried: ${tried.joinToString(",")}")
+        return ""
+    }
+
+    private fun isTargetHu(ctx: Context): Boolean {
+        val s = detectActualSerial(ctx)
+        return s == EXPECTED_SERIAL || s == EXPECTED_SERIAL_BOOT
+    }
+
+    /**
+     * Применить keep-awake ON/OFF (SCREEN_OFF_TIMEOUT=Int.MAX_VALUE при включении,
+     * восстановить сохранённое оригинальное значение при выключении).
+     *
+     * Пишем ТОЛЬКО если:
+     *  - функция реально включена пользователем (pref PREF_KEEP_AWAKE = true);
+     *  - мы на целевом ГУ (serial совпадает с EXPECTED_SERIAL / EXPECTED_SERIAL_BOOT);
+     *  - иначе — в лог «→ skip» и ничего не делаем.
+     *
+     * Durable-путь (чтобы значение пережило удаление приложения):
+     *  - ставим persist.sys.screen_off_timeout_force=1 через root-канал;
+     *  - кладём скрипт в /data/local/tmp/screen_timeout_always_max.sh, который
+     *    при своём запуске через init.d (на ECARX IHU с userdebug это работает)
+     *    выставляет screen_off_timeout=MAX. Это не удаляется вместе с APK.
+     *
+     * Если root-канал недоступен (ERR_ROOT_CHANNEL_UNAVAILABLE) — пытаемся только
+     * через Settings.System (от Java/system_app), без скрипта в /data/local/tmp.
+     * Это всё равно делает значение «долгоживущим», потому что Settings.System не
+     * удаляется при uninstall.
+     */
+    fun setKeepAwake(ctx: Context, enabled: Boolean): Boolean {
+        val app = ctx.applicationContext
+        val p = prefs(app)
+        p.edit().putBoolean(PREF_KEEP_AWAKE, enabled).apply()
+
+        val expected = if (isTargetHu(app)) "applicable" else "skip"
+        val actual = detectActualSerial(app)
+        val isTarget = isTargetHu(app)
+        AppLog.i(TAG, "SCREEN_TIMEOUT: serial expected=IHU629G0MAS9W00010001144/AB1FRA00029968507 actual=$actual → $expected")
+        if (!isTarget) {
+            AppLog.w(TAG, "SCREEN_TIMEOUT: serial mismatch → skip (not touching screen_off_timeout)")
+            return false
+        }
+
+        BgWorker.post("ScreenBrightness.setKeepAwake") {
+            applyKeepAwakeInternal(app, enabled)
+        }
+        return true
+    }
+
+    private fun applyKeepAwakeInternal(ctx: Context, enabled: Boolean) {
+        BgWorker.assertNotMain("ScreenBrightness.applyKeepAwakeInternal")
+        // Сохраняем оригинальное значение перед первой записью.
+        val p = prefs(ctx)
+        val before = readSystem(ctx, Settings.System.SCREEN_OFF_TIMEOUT)
+        if (before != null && before != SCREEN_OFF_MAX && !p.contains(PREF_ORIGINAL_TIMEOUT)) {
+            p.edit().putLong(PREF_ORIGINAL_TIMEOUT, before.toLong()).apply()
+            AppLog.i(TAG, "SCREEN_TIMEOUT: сохранили оригинальное значение = $before")
+        }
+        val target = if (enabled) SCREEN_OFF_MAX else {
+            val restored = p.getLong(PREF_ORIGINAL_TIMEOUT, 0L).toInt()
+            if (restored > 0 && restored != SCREEN_OFF_MAX) restored else 600000  // fallback 10 минут
+        }
+
+        // Путь 1: Settings.System (работает и без root, но только пока процесс system_server
+        // не сброшен на заводские настройки; сам по себе Settings.System не удаляется с APK).
+        val wr = writeSystemInt(ctx, Settings.System.SCREEN_OFF_TIMEOUT, target)
+        val after = readSystem(ctx, Settings.System.SCREEN_OFF_TIMEOUT)
+
+        // Путь 2: persist-проперти + init.d-скрипт через root-канал (durable path, переживает uninstall).
+        var rootRc = -1; var rootOut = "(no-root)"
+        try {
+            val script = if (enabled) """
+                setprop $PERSIST_FORCE_PROP 1
+                # Создаём durable-скрипт, который срабатывает при любом shell/init.d:
+                cat > '$DURABLE_SCRIPT_PATH' <<'___EOF___'
+#!/system/bin/sh
+# Written by voiceapp3 keep-awake for serial IHU629G0MAS9W00010001144.
+# Setting screen_off_timeout to max so screen never dims.
+settings put system screen_off_timeout 2147483647
+___EOF___
+                chmod 755 '$DURABLE_SCRIPT_PATH' 2>/dev/null || true
+                '$DURABLE_SCRIPT_PATH' 2>/dev/null || true
+                echo DURABLE_SCRIPT_INSTALLED=\$( [ -f '$DURABLE_SCRIPT_PATH' ] && echo 1 || echo 0)
+            """.trimIndent() else """
+                setprop $PERSIST_FORCE_PROP 0
+                rm -f '$DURABLE_SCRIPT_PATH' 2>/dev/null || true
+                echo DURABLE_SCRIPT_REMOVED=\$( [ -f '$DURABLE_SCRIPT_PATH' ] && echo 1 || echo 0)
+            """.trimIndent()
+            val (rc, out) = AdbClient.execute(script, 10000, expectRoot = true)
+            rootRc = rc; rootOut = out.replace('\n', ' ').take(400)
         } catch (t: Throwable) {
-            AppLog.e(TAG, "SCREEN_TIMEOUT note failed", t)
+            AppLog.w(TAG, "SCREEN_TIMEOUT: root durable path failed: ${t.message}")
+        }
+
+        val applied = after == target
+        AppLog.i(TAG, "VERIFY SCREEN_TIMEOUT: before=$before target=$target after=$after settingsOk=${wr.ok} rootRc=$rootRc → ${if (applied) "SUCCESS" else "FAILED"} rootOut=$rootOut")
+        // Диагностика «кто сбросит»
+        try {
+            val dumpSb = StringBuilder()
+            val proc = Runtime.getRuntime().exec(arrayOf("sh","-c","dumpsys settings 2>/dev/null | grep -i screen_off_timeout | head -20"))
+            proc.waitFor(2000)
+            proc.inputStream.bufferedReader().forEachLine { dumpSb.append(it).append(";") }
+            AppLog.i(TAG, "SCREEN_TIMEOUT: dumpsys screen_off entries: $dumpSb")
+        } catch (_: Throwable) {}
+        if (applied) {
+            p.edit().putBoolean(PREF_KEEP_AWAKE_APPLIED, enabled).apply()
+        }
+    }
+
+    /**
+     * Применить keep-awake если pref включен (вызывается из boot-пути / watchdog
+     * / на старте сервиса) — только на целевом ГУ.
+     */
+    fun ensureKeepAwake(ctx: Context) {
+        val app = ctx.applicationContext
+        val p = prefs(app)
+        val enabled = p.getBoolean(PREF_KEEP_AWAKE, false)
+        if (enabled && isTargetHu(app)) {
+            BgWorker.post("ScreenBrightness.ensureKeepAwake") {
+                applyKeepAwakeInternal(app, true)
+            }
         }
     }
 
