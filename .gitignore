@@ -1,0 +1,32 @@
+*.apk
+*.idsig
+*.log
+build/
+local.properties
+.gradle/
+.idea/
+*.iml
+captures/
+.externalNativeBuild/
+.cxx/
+/tmp/
+
+# Signing keys must never leave the build machine
+platform-keys/
+*.keystore
+*.jks
+
+# macOS trash
+.DS_Store
+
+# Local diagnostic helpers
+check-centralex-tools.sh
+check-fix.sh
+diag-*.sh
+install-as-privapp.sh
+publish-ota.sh
+release.sh
+
+# IDE / build
+.gradle/
+.idea/

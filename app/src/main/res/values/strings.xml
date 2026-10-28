@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">GeelyTools</string>
+
+    <!-- Telemetry (Capy Energy, Apache 2.0) -->
+    <string name="telemetry_notification_channel_description">Persistent vehicle telemetry collection status.</string>
+    <string name="telemetry_notification_channel_name">Telemetry collection</string>
+    <string name="telemetry_notification_text">Vehicle telemetry collector is running.</string>
+    <string name="telemetry_notification_title">Collecting telemetry</string>
+</resources>
