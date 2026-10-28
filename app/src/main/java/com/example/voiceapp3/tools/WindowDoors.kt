@@ -37,7 +37,7 @@ import android.util.Log
  * rawVal DOOR_POS: 1 = открыта, 2 = закрыта (из w0.s2 case 4).
  */
 object WindowDoors {
-    private const val TAG = "WindowDoors"
+    private const val TAG = "CENTRAL_WindowDoors"
     private const val PREFS_NAME = "voiceapp3"
 
     const val PREF_WINDOW_DRIVER_ON_DOOR = "window_driver_on_door"

@@ -18,6 +18,7 @@ import android.net.wifi.WifiManager
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import java.util.concurrent.TimeUnit
 
 /**
  * Иконки статус-бара Geely — порт w0.kg.j из CentralEXAuto.
@@ -35,7 +36,7 @@ import android.util.Log
  * каналами — поэтому иконки больше не сливаются в одну.
  */
 object StatusIcons {
-    private const val TAG = "GeelyIcons"
+    private const val TAG = "CENTRAL_StatusIcons"
     const val PREF_BATTERY = "status_icon_battery"
     const val PREF_EXT_TEMP = "status_icon_temp_ext"
     const val PREF_WIFI = "status_icon_wifi"
@@ -47,7 +48,7 @@ object StatusIcons {
     const val PREF_HVAC_EXT_TEMP = "hvacdigital_temp_ext"
     private const val SYS_HVAC_BATT = "persist.sys.hvacdigital.batt"
     private const val SYS_HVAC_TEMP = "persist.sys.hvacdigital.temp"
-    private const val SYS_HVAC_EXT = "persist.sys.hvacdigital.temp_ext"
+    private const val SYS_HVAC_EXT = "persist.sys.hvacdigital.exttemp"
 
     private const val CHANNEL_BATT = "central_ex_status_batt"
     private const val CHANNEL_TEMP = "central_ex_status_temp"
@@ -65,6 +66,14 @@ object StatusIcons {
         0x16400017, 0x21600017, 0x16400001, 0x15500703, 0x11500703, 0x11600703,
         0x16400703, 0x21600703, 0x11600502, 0x11600204, 0x11400204)
 
+    // Подтверждённые ID VHAL по дампу geely_dump/car_service_dump.txt
+    // EV_BATTERY_LEVEL=0x11600309 (Float %, 0..100)
+    // ED_EV_BATTERY_PERCENTAGE=0x2140a6ed (Int, x10 — делим на 10)
+    // ENV_OUTSIDE_TEMPERATURE=0x11600703 (Float °C)
+    private const val PROP_EV_BATT_LEVEL = 0x11600309
+    private const val PROP_ED_EV_BATT_PCT = 0x2140a6ed
+    private const val PROP_ENV_OUT_TEMP = 0x11600703
+
     @Volatile private var cpm: android.car.hardware.property.CarPropertyManager? = null
     @Volatile private var carObj: Car? = null
     @Volatile private var h: Handler? = null
@@ -72,6 +81,9 @@ object StatusIcons {
 
     @Volatile private var socProp = 0; @Volatile private var socArea = 0
     @Volatile private var tmpProp = 0; @Volatile private var tmpArea = 0
+    /** Источник последнего прочитанного SOC/temp (для VERIFY в логе и в уведомлении). */
+    @Volatile private var socSource: String = "none"
+    @Volatile private var tempSource: String = "none"
 
     // ─── Prefs helper ───
     private fun prefs(c: Context): SharedPreferences =
@@ -117,63 +129,109 @@ object StatusIcons {
 
     private fun readSocScan(): Int? {
         val m = cpm ?: return null
+        fun tryProp(p: Int, a: Int, label: String, scale: Float = 1f): Int? {
+            try {
+                val raw = m.getFloatProperty(p, a)
+                if (!raw.isNaN() && raw != 0f) {
+                    val v = if (scale != 1f) raw / scale else raw
+                    if (v in 0f..101f) {
+                        socProp = p; socArea = a; socSource = label
+                        AppLog.i(TAG, "soc=${Math.round(v).coerceIn(0,100)} (src=$socSource raw=$raw area=$a)")
+                        return Math.round(v).coerceIn(0, 100)
+                    }
+                }
+            } catch (_: Exception) {}
+            try {
+                val raw = m.getIntProperty(p, a)
+                if (raw != 0) {
+                    val v = if (scale != 1f) raw.toFloat() / scale else raw.toFloat()
+                    if (v in 0f..101f) {
+                        socProp = p; socArea = a; socSource = label
+                        AppLog.i(TAG, "soc=${Math.round(v).coerceIn(0,100)} (src=$socSource raw=$raw area=$a)")
+                        return Math.round(v).coerceIn(0, 100)
+                    }
+                }
+            } catch (_: Exception) {}
+            return null
+        }
+        // 0) кэш
         if (socProp != 0) {
-            for (a in AREAS) {
-                try { normFloat(m.getFloatProperty(socProp,a),0f,101f)?.let { return Math.round(it).coerceIn(0,100)} } catch(_:Exception){}
-                try { normFloat(m.getIntProperty(socProp,a).toFloat(),0f,101f)?.let { return Math.round(it).coerceIn(0,100)} } catch(_:Exception){}
-            }
+            for (a in AREAS) tryProp(socProp, a, socSource)?.let { return it }
             socProp = 0
         }
-        for (r in RANGES) for (p in r step 256) for (a in AREAS) {
-            try { normFloat(m.getFloatProperty(p,a),0f,101f)?.let { socProp=p;socArea=a; Log.i(TAG,String.format("SOC HIT F 0x%08X@%d raw=%f -> %d%%",p,a,m.getFloatProperty(p,a),Math.round(it))); return Math.round(it).coerceIn(0,100)} } catch(_:Exception){}
-            try { normFloat(m.getIntProperty(p,a).toFloat(),0f,101f)?.let { socProp=p;socArea=a; Log.i(TAG,String.format("SOC HIT I 0x%08X@%d raw=%d -> %d%%",p,a,m.getIntProperty(p,a),Math.round(it))); return Math.round(it).coerceIn(0,100)} } catch(_:Exception){}
+        // 1) основной
+        tryProp(PROP_EV_BATT_LEVEL, 0, "VHAL:0x11600309/EV_BATTERY_LEVEL")?.let { return it }
+        // 2) ED_EV_BATTERY_PERCENTAGE — Int x10
+        tryProp(PROP_ED_EV_BATT_PCT, 0, "VHAL:0x2140a6ed/ED_EV_BATTERY_PERCENTAGE", scale = 10f)?.let { return it }
+        // 3) fallback по фиксированному списку (НЕ брутфорс диапазонов!)
+        for (p in PRECISE_COMMON) {
+            for (a in intArrayOf(0, 2, 7)) {
+                tryProp(p, a, "VHAL:0x${"%08X".format(p)}[fallback]")?.let { return it }
+            }
         }
-        for (p in PRECISE_COMMON) for (a in AREAS) {
-            try { normFloat(m.getFloatProperty(p,a),0f,101f)?.let { socProp=p; Log.i(TAG,String.format("SOC p F 0x%08X@%d -> %d%%",p,a,Math.round(it))); return Math.round(it).coerceIn(0,100)} } catch(_:Exception){}
-            try { normFloat(m.getIntProperty(p,a).toFloat(),0f,101f)?.let { socProp=p; Log.i(TAG,String.format("SOC p I 0x%08X@%d -> %d%%",p,a,Math.round(it))); return Math.round(it).coerceIn(0,100)} } catch(_:Exception){}
-        }
+        AppLog.w(TAG, "soc=? (ни один проп не дал валидного значения)")
+        socSource = "none"
         return null
     }
 
     private fun readTempScan(): Int? {
         val m = cpm ?: return null
+        fun tryFloatProp(p: Int, a: Int, label: String): Int? {
+            try {
+                val raw = m.getFloatProperty(p, a)
+                if (!raw.isNaN() && raw != 0f) {
+                    val v = Math.round(raw).coerceIn(-50, 70)
+                    if (v in -50..70) {
+                        tmpProp = p; tmpArea = a; tempSource = label
+                        AppLog.i(TAG, "temp=$v (src=$tempSource raw=$raw area=$a)")
+                        return v
+                    }
+                }
+            } catch (_: Exception) {}
+            return null
+        }
+        fun tryInt80Prop(p: Int, a: Int, label: String): Int? {
+            try {
+                val raw = m.getIntProperty(p, a)
+                if (raw != 0) normInt80(raw)?.let { v ->
+                    tmpProp = p; tmpArea = a; tempSource = label
+                    AppLog.i(TAG, "temp=$v (src=$tempSource raw=$raw area=$a norm=($raw-80)/2)")
+                    return v
+                }
+            } catch (_: Exception) {}
+            return null
+        }
         if (tmpProp != 0) {
             for (a in AREAS) {
-                try { normFloat(m.getFloatProperty(tmpProp,a),-50f,70f)?.let { return Math.round(it).coerceIn(-50,70)} } catch(_:Exception){}
-                try { normInt80(m.getIntProperty(tmpProp,a))?.let { return it } } catch(_:Exception){}
+                tryFloatProp(tmpProp, a, tempSource)?.let { return it }
+                tryInt80Prop(tmpProp, a, tempSource)?.let { return it }
             }
             tmpProp = 0
         }
-        // Float °C
-        for (r in RANGES) for (p in r step 256) for (a in AREAS) {
-            try { normFloat(m.getFloatProperty(p,a),-50f,70f)?.let { tmpProp=p;tmpArea=a; Log.i(TAG,String.format("TEMP HIT F 0x%08X@%d raw=%f -> %d°C",p,a,m.getFloatProperty(p,a),Math.round(it))); return Math.round(it).coerceIn(-50,70)} } catch(_:Exception){}
+        // 1) основной
+        tryFloatProp(PROP_ENV_OUT_TEMP, 0, "VHAL:0x11600703/ENV_OUTSIDE_TEMPERATURE")?.let { return it }
+        // 2) из hvacdigital-свойства (публикует плагин цифрового климата)
+        try {
+            val pp = Runtime.getRuntime().exec(arrayOf("sh","-c","getprop $SYS_HVAC_EXT"))
+            pp.waitFor(1500, java.util.concurrent.TimeUnit.MILLISECONDS)
+            val sVal = pp.inputStream.bufferedReader().readText().trim()
+            val v = sVal.toFloatOrNull()
+            if (v != null && v in -50f..70f) {
+                tempSource = "hvacdigital/$SYS_HVAC_EXT"
+                AppLog.i(TAG, "temp=${Math.round(v)} (src=$tempSource val=$sVal)")
+                return Math.round(v)
+            }
+        } catch (_: Exception) {}
+        // 3) fallback по PRECISE_COMMON (без брутфорса диапазонов!)
+        for (pp in PRECISE_COMMON) {
+            for (a in intArrayOf(0, 2, 7)) {
+                tryInt80Prop(pp, a, "VHAL:0x${"%08X".format(pp)}[fallback]")?.let { return it }
+                tryFloatProp(pp, a, "VHAL:0x${"%08X".format(pp)}[fallback]")?.let { return it }
+            }
         }
-        // Int (raw-80)/2
-        for (r in RANGES) for (p in r step 256) for (a in AREAS) {
-            try { normInt80(m.getIntProperty(p,a))?.let { tmpProp=p;tmpArea=a; Log.i(TAG,String.format("TEMP HIT I 0x%08X@%d raw=%d -> %d°C",p,a,m.getIntProperty(p,a),it)); return it } } catch(_:Exception){}
-        }
-        for (p in PRECISE_COMMON) for (a in AREAS) {
-            try { normFloat(m.getFloatProperty(p,a),-50f,70f)?.let { tmpProp=p; Log.i(TAG,String.format("TEMP p F 0x%08X@%d -> %d°C",p,a,Math.round(it))); return Math.round(it).coerceIn(-50,70)} } catch(_:Exception){}
-            try { normInt80(m.getIntProperty(p,a))?.let { tmpProp=p; Log.i(TAG,String.format("TEMP p I 0x%08X@%d -> %d°C",p,a,it)); return it } } catch(_:Exception){}
-        }
+        AppLog.w(TAG, "temp=? (ни один проп не дал валидного значения)")
+        tempSource = "none"
         return null
-    }
-
-    // ─── Notification drawing (w0.kg.j) ───
-    private fun makeTextIcon(ctx: Context, big: String, small: String, col: Int): Icon {
-        val dp = fun(i: Int) = (i * ctx.resources.displayMetrics.density + 0.5f).toInt()
-        val p = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = col; typeface = Typeface.DEFAULT; textSize = dp(56).toFloat() }
-        val bigW = p.measureText(big)
-        var smallW = 0f; var smSz = 0f
-        if (small.isNotEmpty()) { smSz = 0.55f * dp(56); p.textSize = smSz; smallW = p.measureText(small); p.textSize = dp(56).toFloat() }
-        val fm = p.fontMetrics; val h = ((fm.descent-fm.ascent)/0.61f).toInt().coerceAtLeast(1)
-        val pad = dp(5); val w = (pad*2 + bigW + smallW + dp(3)).toInt()
-        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        val cv = Canvas(bmp)
-        val y = ((h-(fm.descent-fm.ascent))/2f) - fm.ascent
-        cv.drawText(big, pad.toFloat(), y, p)
-        if (small.isNotEmpty()) { p.textSize = smSz; cv.drawText(small, pad+bigW+dp(2), y, p) }
-        return Icon.createWithBitmap(bmp)
     }
 
     private fun postNotif(ctx: Context, id: Int, channelId: String, icon: Icon, title: String, text: String, rank: Int) {
@@ -204,6 +262,7 @@ object StatusIcons {
 
     // ─── Public API (совместимый с существующими callers) ───
     @JvmStatic fun syncAll(ctx: Context) {
+        BgWorker.assertNotMain("StatusIcons.syncAll")
         val app = ctx.applicationContext; ensureCar(app)
         val showBatt = prefs(app).getBoolean(PREF_BATTERY, false)
         val showTemp = prefs(app).getBoolean(PREF_EXT_TEMP, false)
@@ -211,13 +270,19 @@ object StatusIcons {
         Log.d(TAG,"syncAll batt=$showBatt temp=$showTemp wifi=$showWifi cpm=${cpm!=null}")
         if (showBatt) {
             val soc = readSocScan()
-            if (soc != null) postNotif(app, NOTIF_BATT, CHANNEL_BATT, makeTextIcon(app, "$soc", "%", Color.WHITE), "Батарея", "$soc%", RANK_BATT)
-            else { cancel(app, NOTIF_BATT); Log.w(TAG,"SOC null") }
+            if (soc != null) {
+                val text = "$soc% · $socSource"
+                postNotif(app, NOTIF_BATT, CHANNEL_BATT, makeTextIcon(app, "$soc", "%", Color.WHITE), "Батарея", text, RANK_BATT)
+                AppLog.i(TAG, "VERIFY batt notif: soc=$soc% src=$socSource → posted")
+            } else { cancel(app, NOTIF_BATT); Log.w(TAG,"SOC null") }
         } else cancel(app, NOTIF_BATT)
         if (showTemp) {
             val t = readTempScan()
-            if (t != null) postNotif(app, NOTIF_TEMP, CHANNEL_TEMP, makeTextIcon(app, "$t", "°C", Color.WHITE), "Снаружи", "$t °C", RANK_TEMP)
-            else { cancel(app, NOTIF_TEMP); Log.w(TAG,"TEMP null") }
+            if (t != null) {
+                val text = "$t °C · $tempSource"
+                postNotif(app, NOTIF_TEMP, CHANNEL_TEMP, makeTextIcon(app, "$t", "°C", Color.WHITE), "Снаружи", text, RANK_TEMP)
+                AppLog.i(TAG, "VERIFY temp notif: temp=$t°C src=$tempSource → posted")
+            } else { cancel(app, NOTIF_TEMP); Log.w(TAG,"TEMP null") }
         } else cancel(app, NOTIF_TEMP)
         if (showWifi) {
             try {
@@ -235,13 +300,19 @@ object StatusIcons {
     @JvmStatic fun startPeriodicSync(ctx: Context) {
         h?.removeCallbacksAndMessages(null)
         val hh = Handler(Looper.getMainLooper()); h = hh
+        val app = ctx.applicationContext
         hh.post(object : Runnable {
             override fun run() {
-                try { syncAll(ctx) } catch (t: Throwable) { Log.e(TAG,"tick err",t) }
+                BgWorker.post("StatusIcons.tick") {
+                    try { syncAll(app) } catch (t: Throwable) { Log.e(TAG,"tick err",t) }
+                }
                 hh.postDelayed(this, 15000L)
             }
         })
-        Log.i(TAG,"startPeriodicSync (15s)")
+        BgWorker.post("StatusIcons.firstTick") {
+            try { syncAll(app) } catch (t: Throwable) { Log.e(TAG,"first tick err",t) }
+        }
+        Log.i(TAG,"startPeriodicSync (15s, tick on BgWorker)")
     }
     @JvmStatic fun stopPeriodicSync() { h?.removeCallbacksAndMessages(null); h=null; Log.i(TAG,"stopPeriodicSync") }
 

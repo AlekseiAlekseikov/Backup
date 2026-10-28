@@ -143,7 +143,6 @@ enum class Choice(
      * источника истины.
      */
     fun state(): JsonObject {
-        ScreenBrightness.healScreenTimeoutOnce(appContext)
         return JsonObject().apply {
         Toggle.values().forEach { t ->
             addProperty(t.key, prefs().getBoolean(t.pref, t.default))
@@ -826,7 +825,7 @@ enum class Choice(
     }
 
     private companion object {
-        const val TAG = "ToolsBackend"
+        const val TAG = "CENTRAL_ToolsBackend"
         const val READBACK_ATTEMPTS = 5
         const val READBACK_DELAY_MS = 100L
 
