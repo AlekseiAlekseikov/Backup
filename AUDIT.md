@@ -117,3 +117,69 @@
 1. **P4 screen_off_timeout keep-awake** (новое требование из prompt_continue.md): гейт на IHU629G, «один раз и навсегда» механизм, не ломающий поведение после удаления. Нужен запуск на ГУ и анализ `dumpsys settings`/`logcat` для определения виновника сброса.
 2. **Сборка APK и снятие нового voiceapp3.log** по §7 сценариям — на машине пользователя, после сборки.
 3. **Финальный merge в main** — только после валидации на устройстве.
+
+---
+
+## Обновление 2026-10-28 (вторая итерация, по prompt_next.md)
+
+### Раздел 3 — exttemp vs temp_ext (регресс)
+
+| Свойство | Источник | В коде | Статус |
+|---|---|---|---|
+| `persist.sys.hvacdigital.batt` | voiceapp3.log строки 445–486; CentralEXAuto w0/x7.java:138 | ✅ | OK |
+| `persist.sys.hvacdigital.temp` | voiceapp3.log строки 457–462; w0/x7.java:140 | ✅ | OK |
+| `persist.sys.hvacdigital.temp_ext` | **voiceapp3.log строки 469/471/473 (com.flyme.auto.systemuiplugin plugin на устройстве)** | ✅ SYS_HVAC_EXT_TEMP_EXT (primary) | OK — восстановлено |
+| `persist.sys.hvacdigital.exttemp` | w0/x7.java:142, w0/ah.java:17, w0/u5.java:27 (новая CentralEXAuto) | ✅ SYS_HVAC_EXT_EXTTEMP (secondary) | Пишется одновременно с temp_ext для совместимости с новым плагином |
+
+setHvacDigital и bootRestoreHvacDigital теперь пишут **в оба** свойства; readTempScan пробует оба, логируя `temp cross-check` со вторым значением для сверки.
+
+### Раздел 2 — TTL измерение
+
+Удалён фиктивный `ping -t 65` (он не измеряет ничего). Новая схема:
+1. **tcpdump** (tcpdump/toybox-tcpdump/busybox-tcpdump/system paths) — снимает 3 пакета на dst 1.1.1.1 при пинге (без `-t`, используется системный default TTL, который должно переписать mangle-правило); парсит `ttl N`.
+2. **Fallback** — счётчики iptables TTL правила ДО и ПОСЛЕ 3 пингов; если счётчик вырос → правило сработало на пакетах.
+3. Если ни tcpdump ни счётчики не дали результата — в логе честно `TTL_CHECK: ttl=unavailable метод=no-tcpdump-and-counters-not-incremented` без ложного SUCCESS.
+
+Лог-линии:
+- `TTL_BEFORE_V4=… TTL_BEFORE_V6=…`
+- `TTL_AFTER_V4=… TTL_AFTER_V6=… VERIFY=OK|FAIL/…`
+- `TTL_CHECK: фактический TTL = N (метод=tcpdump/iptables-counters-after-ping/unavailable)`
+- `TTL_CHECK: ИТОГ = N (ожидали 65|default) → SUCCESS|FAILED`
+
+### Раздел 5 — screen_off_timeout (серийный гейт + однократная запись + durable path)
+
+Серийник целевого ГУ найден в дампе прошивки (`geely_dump/getprop.txt`):
+```
+[persist.device.real.serialno]: [IHU629G0MAS9W00010001144]
+```
+Вторичный серийник `ro.boot.serialno = AB1FRA00029968507` принят как кросс-проверка.
+
+Реализация:
+- `detectActualSerial()` пробует в порядке: `persist.device.real.serialno` → `ro.serialno/ro.boot.serialno` → `Build.getSerial()` (с READ_PHONE_STATE guard) → `Build.SERIAL` → ANDROID_ID.
+- Гейт по серийному номеру: `isTargetHu()` = true ТОЛЬКО если фактический серийник совпал с одним из двух констант. Никаких привязок к машине (VIN, Car property, модель авто) нет — только серийник самой платы ГУ.
+- `setKeepAwake(true)` пишет `SCREEN_OFF_TIMEOUT=Int.MAX_VALUE` через Settings.System + VERIFY readback.
+- Durable path через root-канал: `setprop persist.sys.screen_off_timeout_force 1` + установка скрипта в `/data/local/tmp/screen_timeout_always_max.sh` с `chmod 755` + запуск его. Скрипт лежит в /data/local/tmp (не очищается при uninstall).
+- `setKeepAwake(false)` возвращает сохранённое оригинальное значение, удаляет скрипт, сбрасывает prop в 0.
+- При любом несовпадении серийника — `SCREEN_TIMEOUT: serial expected=… actual=… → skip` и НИЧЕГО не пишется.
+- Диагностика: `dumpsys settings | grep screen_off_timeout` добавляется в лог для поиска того, кто сбрасывает значение.
+- `ensureKeepAwake()` вызывается из `syncOnContext` на BgWorker при каждом старте сервиса (пере-применение).
+
+### Раздел 6 — проверка root-канала из UI
+
+- `AdbClient.probeRootChannel()` возвращает (port, state, uidLine, verdict) с BLOCKING на вызов с main.
+- UI endpoint `dev.checkRoot` (BgWorker.run) возвращает в tools panel 4 строки:
+  ```
+  PORT65010: connect → OK на порту N|no port
+  handshake CNXN → OK
+  id → uid=0(root) gid=0(root) …
+  ИТОГ = UP (uid=0)|DOWN (not root)|DOWN (reason)
+  ```
+- В логе при bootstrap уже есть полная PORT65010 пошаговая трассировка (шаги 1–4, диагностический дамп при AUTH/failure).
+
+### Раздел 7 — звук закрытия не сломан
+
+`applySystemLockSoundBind` делает bind-mount только для `/vendor/etc/carlock/*.wav` (это LOCK path). Путь unlock `/system/etc/avas/sound_type_*/*` затрагивается только если пользователь выбрал unlock-файл (PREF_UNLOCK_SOUND_PATH). Существующий OEM механизм воспроизведения lock-звука через Settings.System (lock_car_audio_enable/path) не трогается.
+
+### Обновление по §4 batt/temp сверка
+
+Источник привязан к подтверждённым VHAL property из дампа + обоим hvacdigital props (temp_ext primary, exttemp secondary). Кросс-чек обоих значений пишется в лог. **Сверку с реальным значением «Строки состояния» может сделать только владелец на устройстве** (запуск приложения, сравнение значения в иконке с тем, что показывает статус-бар).
