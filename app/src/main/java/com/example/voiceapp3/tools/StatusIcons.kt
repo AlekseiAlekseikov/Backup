@@ -48,7 +48,17 @@ object StatusIcons {
     const val PREF_HVAC_EXT_TEMP = "hvacdigital_temp_ext"
     private const val SYS_HVAC_BATT = "persist.sys.hvacdigital.batt"
     private const val SYS_HVAC_TEMP = "persist.sys.hvacdigital.temp"
-    private const val SYS_HVAC_EXT = "persist.sys.hvacdigital.exttemp"
+    // §3 регрессия exttemp/temp_ext: на устройстве владельца установлен плагин
+    // com.flyme.auto.systemuiplugin, который слушает `persist.sys.hvacdigital.temp_ext`
+    // (см. строки 469/471/473 голоса и log «setprop persist.sys.hvacdigital.temp_ext»).
+    // В новых версиях CentralEXAuto (w0/x7.java, ah.java, u5.java) фигурирует имя
+    // `persist.sys.hvacdigital.exttemp`. Для совместимости с ОБЕИМИ версиями плагина —
+    // пишем В ОБА свойства сразу; при чтении наружной температуры в readTempScan пробуем
+    // оба, предпочитая то, которое установлено.
+    private const val SYS_HVAC_EXT_TEMP_EXT = "persist.sys.hvacdigital.temp_ext"   // старый плагин (на устройстве)
+    private const val SYS_HVAC_EXT_EXTTEMP = "persist.sys.hvacdigital.exttemp"    // новый CentralEXAuto v3.3.9+
+    @Deprecated("Use SYS_HVAC_EXT_TEMP_EXT/SYS_HVAC_EXT_EXTTEMP explicitly; kept for sysPropFor mapping")
+    private const val SYS_HVAC_EXT = SYS_HVAC_EXT_TEMP_EXT
 
     private const val CHANNEL_BATT = "central_ex_status_batt"
     private const val CHANNEL_TEMP = "central_ex_status_temp"
@@ -210,18 +220,31 @@ object StatusIcons {
         }
         // 1) основной
         tryFloatProp(PROP_ENV_OUT_TEMP, 0, "VHAL:0x11600703/ENV_OUTSIDE_TEMPERATURE")?.let { return it }
-        // 2) из hvacdigital-свойства (публикует плагин цифрового климата)
-        try {
-            val pp = Runtime.getRuntime().exec(arrayOf("sh","-c","getprop $SYS_HVAC_EXT"))
-            pp.waitFor(1500, java.util.concurrent.TimeUnit.MILLISECONDS)
-            val sVal = pp.inputStream.bufferedReader().readText().trim()
-            val v = sVal.toFloatOrNull()
-            if (v != null && v in -50f..70f) {
-                tempSource = "hvacdigital/$SYS_HVAC_EXT"
-                AppLog.i(TAG, "temp=${Math.round(v)} (src=$tempSource val=$sVal)")
-                return Math.round(v)
-            }
-        } catch (_: Exception) {}
+        // 2) из hvacdigital-свойств (публикует плагин цифрового климата). Пробуем ОБА
+        //    имени свойства (старый temp_ext = рабочий плагин на ГУ пользователя,
+        //    новый exttemp = из последней CentralEXAuto v3.3.9). Логируем оба значения
+        //    для сверки.
+        for (prop in SYS_HVAC_EXT_ALL) {
+            try {
+                val pp = Runtime.getRuntime().exec(arrayOf("sh","-c","getprop $prop"))
+                pp.waitFor(1500, java.util.concurrent.TimeUnit.MILLISECONDS)
+                val sVal = pp.inputStream.bufferedReader().readText().trim()
+                val v = sVal.toFloatOrNull()
+                if (v != null && v in -50f..70f) {
+                    tempSource = "hvacdigital/$prop"
+                    AppLog.i(TAG, "temp=${Math.round(v)} (src=$tempSource val=$sVal)")
+                    // Логируем и второе свойство для сверки расхождений
+                    val other = SYS_HVAC_EXT_ALL.firstOrNull { it != prop }
+                    if (other != null) {
+                        val pp2 = Runtime.getRuntime().exec(arrayOf("sh","-c","getprop $other"))
+                        pp2.waitFor(800, java.util.concurrent.TimeUnit.MILLISECONDS)
+                        val v2 = pp2.inputStream.bufferedReader().readText().trim()
+                        AppLog.i(TAG, "temp cross-check: hvacdigital/$other=$v2")
+                    }
+                    return Math.round(v)
+                }
+            } catch (_: Exception) {}
+        }
         // 3) fallback по PRECISE_COMMON (без брутфорса диапазонов!)
         for (pp in PRECISE_COMMON) {
             for (a in intArrayOf(0, 2, 7)) {
@@ -329,26 +352,46 @@ object StatusIcons {
     fun sysPropFor(pref: String): String = when (pref) {
         PREF_HVAC_BATT -> SYS_HVAC_BATT
         PREF_HVAC_TEMP -> SYS_HVAC_TEMP
-        PREF_HVAC_EXT_TEMP -> SYS_HVAC_EXT
+        PREF_HVAC_EXT_TEMP -> SYS_HVAC_EXT_TEMP_EXT  // primary = старый плагин
         else -> ""
     }
+
+    /** Все свойства внешней температуры, которые надо выставлять одновременно. */
+    private val SYS_HVAC_EXT_ALL = arrayOf(SYS_HVAC_EXT_TEMP_EXT, SYS_HVAC_EXT_EXTTEMP)
 
     @JvmStatic fun setHvacDigital(ctx: Context, pref: String, value: Boolean): ToolsResult {
         val t0 = android.os.SystemClock.uptimeMillis()
         prefs(ctx).edit().putBoolean(pref, value).commit()
-        val prop = sysPropFor(pref)
-        val cmd = "setprop $prop ${if(value)1 else 0}; echo $prop=\$(getprop $prop)"
+        val v = if (value) 1 else 0
+        // Для batt/temp одно свойство; для ext_temp пишем в ОБА имени (temp_ext — старый
+        // плагин на устройстве, exttemp — новый CentralEXAuto).
+        val props = when (pref) {
+            PREF_HVAC_BATT -> listOf(SYS_HVAC_BATT)
+            PREF_HVAC_TEMP -> listOf(SYS_HVAC_TEMP)
+            PREF_HVAC_EXT_TEMP -> SYS_HVAC_EXT_ALL.toList()
+            else -> listOf(sysPropFor(pref))
+        }.filter { it.isNotEmpty() }
+        val cmd = buildString {
+            for (prop in props) append("setprop $prop $v; ")
+            append("echo ")
+            var first = true
+            for (prop in props) {
+                if (!first) append(" "); first = false
+                append("$prop=\$(getprop $prop)")
+            }
+        }
         val (exit, out) = AdbClient.execute(cmd, 5000)
-        val applied = out.contains("$prop=1") || (value && exit == 0)
+        val allApplied = props.all { p -> out.contains("$p=$v") }
         val step = ToolsStep(
             step = "hvacdigital.$pref",
-            command = cmd,
+            command = cmd.take(200),
             startedAtMs = t0, finishedAtMs = android.os.SystemClock.uptimeMillis(),
             exitCode = exit, stdout = out, stderr = "",
-            expected = "$prop=${if(value)1 else 0}",
-            actual = out.lines().firstOrNull { it.startsWith(prop) } ?: out,
-            status = if ((value && applied) || (!value && exit==0)) ToolsStep.Status.OK else ToolsStep.Status.PARTIAL
+            expected = props.joinToString(" ") { "$it=$v" },
+            actual = out.lines().lastOrNull { it.contains(if(pref==PREF_HVAC_EXT_TEMP) "temp_ext" else props.first()) } ?: out,
+            status = if ((value && allApplied) || (!value && exit==0)) ToolsStep.Status.OK else ToolsStep.Status.PARTIAL
         )
+        AppLog.i(TAG, "VERIFY hvacdigital set $pref=$v: applied=$allApplied props=$props out=${out.replace('\n',' ').take(300)}")
         return ToolsResult(
             action = "hvacdigital",
             title = "Цифровая индикация климата",
@@ -362,11 +405,16 @@ object StatusIcons {
     @JvmStatic fun bootRestoreHvacDigital(ctx: Context) {
         val p = prefs(ctx)
         val sb = StringBuilder()
-        for ((k,sp) in listOf(PREF_HVAC_BATT to SYS_HVAC_BATT, PREF_HVAC_TEMP to SYS_HVAC_TEMP, PREF_HVAC_EXT_TEMP to SYS_HVAC_EXT)) {
+        val pairs = mutableListOf(
+            PREF_HVAC_BATT to SYS_HVAC_BATT,
+            PREF_HVAC_TEMP to SYS_HVAC_TEMP,
+        )
+        for (prop in SYS_HVAC_EXT_ALL) pairs.add(PREF_HVAC_EXT_TEMP to prop)
+        for ((k,sp) in pairs) {
             val v = if (p.getBoolean(k, false)) 1 else 0
             sb.append("setprop $sp $v; ")
         }
-        sb.append("echo batt=\$(getprop $SYS_HVAC_BATT) temp=\$(getprop $SYS_HVAC_TEMP) ext=\$(getprop $SYS_HVAC_EXT)")
+        sb.append("echo batt=\$(getprop $SYS_HVAC_BATT) temp=\$(getprop $SYS_HVAC_TEMP) ext_temp_ext=\$(getprop $SYS_HVAC_EXT_TEMP_EXT) ext_exttemp=\$(getprop $SYS_HVAC_EXT_EXTTEMP)")
         val (_,out) = AdbClient.execute(sb.toString(), 5000)
         Log.i(TAG,"bootRestoreHvacDigital: $out")
     }

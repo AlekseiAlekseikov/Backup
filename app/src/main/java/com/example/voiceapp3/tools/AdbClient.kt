@@ -608,4 +608,37 @@ object AdbClient {
 
     fun currentPort(): Int = workingPort.get()
     fun currentState(): ChannelState = state.get()
+
+    /**
+     * Проверка root-канала для UI (вкладка «Инструменты»): выполняет `id` и
+     * возвращает короткую сводку — порт, uid строка, статус UP/DOWN с причиной.
+     * Никогда не выполняется на main-thread; на случай вызова с main — возвращает
+     * ERR_MAIN_THREAD немедленно.
+     */
+    fun probeRootChannel(): RootProbeResult {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            return RootProbeResult(-1, "ERR_MAIN_THREAD", "main thread", "probe must run off main")
+        }
+        start()
+        if (!ready) awaitReady(15000)
+        val port = workingPort.get()
+        val st = state.get()
+        return try {
+            val (rc, out) = execOnChannel("id", timeoutMs = 5000, expectRoot = false)
+            val uidLine = out.lineSequence().firstOrNull { it.trimStart().startsWith("uid=") } ?: out.take(120)
+            RootProbeResult(port, st.name, uidLine, if (isRootUid(out)) "UP (uid=0)" else "DOWN (not root)")
+        } catch (e: Exception) {
+            RootProbeResult(port, st.name, e.javaClass.simpleName + ": " + e.message, "DOWN")
+        }
+    }
+
+    private fun execOnChannel(cmd: String, timeoutMs: Int, expectRoot: Boolean): Pair<Int, String> =
+        runCommand(cmd, timeoutMs, expectRoot)
+
+    data class RootProbeResult(
+        val port: Int,
+        val state: String,
+        val uidLine: String,
+        val verdict: String
+    )
 }

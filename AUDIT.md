@@ -183,3 +183,80 @@ setHvacDigital и bootRestoreHvacDigital теперь пишут **в оба** �
 ### Обновление по §4 batt/temp сверка
 
 Источник привязан к подтверждённым VHAL property из дампа + обоим hvacdigital props (temp_ext primary, exttemp secondary). Кросс-чек обоих значений пишется в лог. **Сверку с реальным значением «Строки состояния» может сделать только владелец на устройстве** (запуск приложения, сравнение значения в иконке с тем, что показывает статус-бар).
+
+---
+
+## Обновление 2026-10-28 (итерация 3, по prompt_four_fixes.md → fix/v2)
+
+### Перенос ветки на `main` (раздел 1)
+
+- Сделан свежий `git clone`, checkout `main` (1650 файлов), новая ветка `fix/v2`.
+- **Группа A** (новые файлы) скопированы целиком из `fix/log-driven-fixes`:
+  `AUDIT.md`, `WORKLOG.md`, `BgWorker.kt`, `decompiled/centralex/`.
+- **Группа B** (совпадающая база, безопасно): `VoiceAssistantService.kt`, `UiBridge.kt`, `AppFileLogger.kt`, `AppPerformance.kt`, `HuNightMode.kt`, `HvacDigitalPlugin.kt`, `LockSound.kt`, `NetworkTtl.kt`, `ScreenSaverOverlay.kt`, `StatusIcons.kt`, `WindowDoors.kt`.
+- **Группа C** (расходятся): `AdbClient.kt` (132 → 644 строк), `AppLog.kt` (117 → 262), `ScreenBrightness.kt` (235 → ~450), `ToolsBackend.kt` (836 → 835) — в каждый перенесена СУТЬ фикса (порт-65010 hardening, false-success бан, BgWorker, CENTRAL_* тэги, P3 hvacdigital, P4 TTL, P5 keep-awake).
+- **Проверки после переноса**:
+  - `git diff --diff-filter=D main` → ПУСТО (0 файлов удалено из main)
+  - `git ls-files | wc -l` → 1663 (main было 1650, +13 новых)
+  - `platform-keys/`, `app/src/main/jniLibs/arm64-v8a/`, `flutter_telemetry/lib/l10n/` присутствуют (libjnidispatch.so, libonnxruntime*.so, libroadcast_client.so, libsherpa-onnx-jni.so, app_en.arb, app_es.arb, app_localizations*.dart на месте)
+
+### Раздел 3 — блокировка главного потока в setKeepAwake ИСПРАВЛЕНА
+
+Было: `setKeepAwake` на вызывающем потоке синхронно делал `isTargetHu() → detectActualSerial() → isTargetHu()` — три вызова с 8×`Runtime.exec("getprop X")` × `waitFor(500)` → потенциально 12 секунд на main-thread (тот же класс бага, что вызывал белый экран).
+
+Стало:
+- `detectActualSerialBg(ctx)` — **ТОЛЬКО для фонового потока** (BgWorker.assertNotMain).
+- **ОДИН** запуск `getprop` без аргументов (парсит весь вывод за ~10 мс) вместо 8 отдельных exec.
+- Кэш серийника в `SharedPreferences` + in-memory `@Volatile cachedSerial`, TTL 1 час, явная инвалидация.
+- `setKeepAwake` на вызывающем потоке делает ТОЛЬКО `prefs.edit().putBoolean(PREF_KEEP_AWAKE, …)` и BgWorker.post — ноль exec/блокировок.
+- `ensureKeepAwake` и `syncOnContext` — тоже только планируют фон; `ensureSerialProbeAsync` заранее прогревает кэш.
+- Лог: `SCREEN_TIMEOUT: serial detect dt=…ms src=getprop:persist.device.real.serialno val=…`.
+- Нет ни одного вызова Runtime.exec в синхронной части setKeepAwake.
+
+### Раздел 2 — фиктивный durable-скрипт УДАЛЁН
+
+- Скрипт `/data/local/tmp/screen_timeout_always_max.sh` убран (не создаём, не удаляем).
+- В коде и комментарии ясно сказано: файлы в `/data/local/tmp` **сами не запускаются**; на IHU629G нет подтверждённого init.d-хука; создание такого файла — мусор в системе.
+- Фактическая причина, по которой значение переживает uninstall — **Settings.System не очищается Android при удалении APK**. Это честно зафиксировано в комментарии и в логе:
+  `SCREEN_TIMEOUT: NOTE — значение держится в Settings.System (переживает uninstall); init.d/durable-скрипт НЕ ставится (нет подтверждённого init.d-хука на IHU629G; файл в /data/local/tmp не самозапускается)`
+- persist.sys.screen_off_timeout_force по-прежнему ставится через root-канал как сигнал намерения, но не выдаётся за самостоятельный durable-механизм.
+- Для настоящего durable-механизма (с защитой от сброса OEM-сервисом) нужен подтверждённый хук в прошивке — без дампа init-скриптов (.rc / install-recovery.sh / init.d) делать это вслепую некорректно.
+
+### Раздел 4 — проверка серийника на устройстве
+
+Добавлен UI-эндпоинт `dev.checkSerial` (в tools dev-панели), который вызывает `ScreenBrightness.serialCheckReport()` и выводит пользователю:
+
+```
+SCREEN_TIMEOUT: device serial check
+  persist.device.real.serialno   = IHU629G0MAS9W00010001144
+  ro.serialno                    = AB1FRA00029968507
+  ro.boot.serialno               = AB1FRA00029968507
+  expected                       = IHU629G0MAS9W00010001144 / AB1FRA00029968507
+  → applicable | mismatch (detected src=… dt=…ms)
+```
+
+Владелец должен:
+1. Открыть dev-панель в приложении;
+2. Нажать `checkSerial`;
+3. Сравнить показанные `persist.device.real.serialno` и `ro.serialno` с ожидаемыми;
+4. Если verdict = `applicable` — функция keep-awake применится; если `mismatch` — гейт не сработал и присылаем нам снятые значения для корректировки констант.
+
+**Замечание безопасности:** серийники захардкожены в открытом репозитории. Лучше вынести в `local.properties` → `buildConfigField "String", "EXPECTED_SERIAL", "\"…\""` и в коде использовать `BuildConfig.EXPECTED_SERIAL`, а в публичный репозиторий добавить `local.properties` в `.gitignore`. Это на усмотрение владельца; текущее состояние не ломает работу, но публикует серийник платы.
+
+### Раздел 5 — документация TTL и temp_ext (закрепление)
+
+**TTL (NetworkTtl.kt)** — ping -t больше не используется. Схема:
+1. Пробуем tcpdump (ищем в `tcpdump`, `toybox-tcpdump`, `busybox-tcpdump`, `/system/bin/tcpdump`, `/system/xbin/tcpdump`), запускаем в фоне на `ip and dst host 1.1.1.1`, шлём 3 пинга **без** -t (с системным default TTL, который mangle-правило должно переписать в 65), парсим в выводе поле `ttl N`.
+2. Если tcpdump не найден/не дал результата — fallback: iptables-счётчики на TTL/HL правилах ДО и ПОСЛЕ пинга; если счётчик инкрементировался — правило сработало.
+3. Если ничего не получилось — в лог честно `TTL_CHECK: ttl=unavailable метод=no-tcpdump-and-counters-not-incremented` без ложного SUCCESS.
+Логи: TTL_BEFORE_V4/V6, TTL_AFTER_V4/V6, `TTL_CHECK: фактический TTL = N (метод=tcpdump|iptables-counters-after-ping|unavailable)`, `TTL_CHECK: ИТОГ = N (ожидали 65|default) → SUCCESS|FAILED`.
+
+**temp_ext / exttemp (StatusIcons.kt)** — dual-write:
+| Свойство | Источник | Роль |
+|---|---|---|
+| `persist.sys.hvacdigital.batt` | voiceapp3.log 445–486; w0/x7.java:138 | batt |
+| `persist.sys.hvacdigital.temp` | voiceapp3.log 457–462; w0/x7.java:140 | внутренняя t° |
+| `persist.sys.hvacdigital.temp_ext` | voiceapp3.log 469/471/473 (`com.flyme.auto.systemuiplugin`) | **primary** (на устройстве сейчас работает) |
+| `persist.sys.hvacdigital.exttemp` | w0/x7.java:142, w0/ah.java:17, w0/u5.java:27 (новый CentralEXAuto) | secondary (для forward-compat с новым плагином) |
+
+setHvacDigital и bootRestore пишут оба свойства; readTempScan пробует оба и логирует cross-check.

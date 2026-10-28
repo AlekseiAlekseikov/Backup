@@ -59,12 +59,43 @@ object NetworkTtl {
             echo TTL_V6=$($IPT6 -t mangle -S POSTROUTING 2>/dev/null | grep -c 'hl-set 65')
             echo TTL_CNTR_AFTER_V4=$($IPT -t mangle -L POSTROUTING -v -n 2>/dev/null | grep -F 'TTL' | awk '{print ${'$'}1}' | head -1)
             echo TTL_CNTR_AFTER_V6=$($IPT6 -t mangle -L POSTROUTING -v -n 2>/dev/null | grep -F 'HL' | awk '{print ${'$'}1}' | head -1)
-            # Пытаемся измерить фактический исходящий TTL косвенно:
-            # ping -t (IPv4 TTL) на 1.1.1.1 — это задаёт TTL ИСХОДЯЩИХ пакетов пинга.
-            # Ошибка "Time to live exceeded" или "ttl=0" при -t 1 подтвердит, что TTL был применён.
-            # Прямого измерения без tcpdump нет — честно помечаем как heuristic.
-            PING_OUT=$(ping -c 1 -W 2 -t 65 1.1.1.1 2>&1 | head -5 | tr '\n' ';')
-            echo "TTL_PING_HEURISTIC=$PING_OUT"
+            # === Попытка РЕАЛЬНО измерить исходящий TTL ===
+            # Метод 1 (предпочтительный): tcpdump. Пробуем все известные пути (system, toybox, busybox).
+            # tcpdump -ni any -c 5 -v 'ip' — снимает 5 IP-пакетов и печатает ttl N в каждом.
+            TTL_MEASURED=""
+            TTL_METHOD=""
+            for TCPDUMP in tcpdump toybox-tcpdump busybox-tcpdump /system/bin/tcpdump /system/xbin/tcpdump; do
+              if command -v $TCPDUMP >/dev/null 2>&1; then
+                # Запускаем tcpdump в фоне и инициируем один ICMP пакет ping-ом (без -t!
+                # он использует системный TTL, который и должно переписать mangle-правило).
+                $TCPDUMP -ni any -c 3 -v -s 0 'ip and dst host 1.1.1.1' -w /dev/null 2>/tmp/ttl_tcpdump.out &
+                TD_PID=$!
+                sleep 1
+                ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1 || true
+                wait $TD_PID 2>/dev/null || true
+                TTL_MEASURED=$(grep -oE 'ttl [0-9]+' /tmp/ttl_tcpdump.out | head -1 | awk '{print $2}')
+                if [ -n "$TTL_MEASURED" ]; then TTL_METHOD="tcpdump($TCPDUMP)"; break; fi
+              fi
+            done
+            # Метод 2 (fallback): сравниваем счётчики правил TTL/HL ДО и ПОСЛЕ порции трафика.
+            # Если счётчик увеличился — значит правило реально сработало на пакетах и TTL
+            # переписан. Это не даёт числа TTL, но доказывает, что правило применяется.
+            if [ -z "$TTL_MEASURED" ]; then
+              CNTR_BEFORE=$($IPT -t mangle -L POSTROUTING -v -n 2>/dev/null | grep -F 'TTL' | awk '{print ${'$'}1}' | head -1)
+              ping -c 3 -W 2 1.1.1.1 >/dev/null 2>&1 || true
+              sleep 1
+              CNTR_AFTER=$($IPT -t mangle -L POSTROUTING -v -n 2>/dev/null | grep -F 'TTL' | awk '{print ${'$'}1}' | head -1)
+              echo TTL_CNTR_PING_BEFORE=$CNTR_BEFORE TTL_CNTR_PING_AFTER=$CNTR_AFTER
+              if [ -n "$CNTR_BEFORE" ] && [ -n "$CNTR_AFTER" ] && [ "$CNTR_AFTER" -gt "$CNTR_BEFORE" ] 2>/dev/null; then
+                TTL_MEASURED="counters_incremented($CNTR_BEFORE->$CNTR_AFTER)"
+                TTL_METHOD="iptables-counters-after-ping"
+              else
+                TTL_MEASURED=unavailable
+                TTL_METHOD="no-tcpdump-and-counters-not-incremented"
+              fi
+            fi
+            echo "TTL_CHECK: метод=$TTL_METHOD ttl=$TTL_MEASURED"
+            rm -f /tmp/ttl_tcpdump.out
         """.trimIndent()
     }
 
@@ -130,8 +161,18 @@ object NetworkTtl {
         }
 
         val expectedStr = if (enabled) "TTL_V4=1 TTL_V6=1 VERIFY=OK/OK" else "TTL_V4=0 TTL_V6=0 VERIFY=FAIL/FAIL"
-        val actualLines = output.lineSequence().filter { it.startsWith("TTL_") || it.startsWith("VERIFY_") || it.contains("TTL_PING") }
-            .joinToString(" | ")
+        // Парсим строку TTL_CHECK: метод=... ttl=...
+        val ttlCheckLine = output.lineSequence().firstOrNull { it.startsWith("TTL_CHECK:") } ?: ""
+        val ttlMethod = Regex("метод=([^ ]+)").find(ttlCheckLine)?.groupValues?.get(1) ?: "none"
+        val ttlValue  = Regex("ttl=([^ ]+)").find(ttlCheckLine)?.groupValues?.get(1) ?: "unavailable"
+        val actualLines = output.lineSequence().filter {
+            it.startsWith("TTL_") || it.startsWith("VERIFY_") || it.startsWith("TTL_CHECK:")
+        }.joinToString(" | ")
+        val ttlExpected = if (enabled) "65" else "default"
+        Log.i(TAG, "TTL_BEFORE_V4=${kv["TTL_BEFORE_V4"]} TTL_BEFORE_V6=${kv["TTL_BEFORE_V6"]}")
+        Log.i(TAG, "TTL_AFTER_V4=${kv["TTL_V4"]} TTL_AFTER_V6=${kv["TTL_V6"]} VERIFY=${kv["VERIFY_V4"]}/${kv["VERIFY_V6"]}")
+        Log.i(TAG, "TTL_CHECK: фактический TTL = $ttlValue (метод=$ttlMethod)")
+        Log.i(TAG, "TTL_CHECK: ИТОГ = $ttlValue (ожидали $ttlExpected) → $status ($reason)")
         Log.i(TAG, "VERIFY TTL: expected enabled=$enabled ($expectedStr) → got $actualLines rc=$exitCode → $status ($reason)")
 
         val step = ToolsStep(
