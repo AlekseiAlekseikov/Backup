@@ -34,7 +34,7 @@ import java.util.Locale
  *   CENTRAL_Init        — стартовая инициализация
  */
 object AppLog {
-    private const val TAG_BASE = "GeelyTools"
+    private const val TAG_BASE = "CENTRAL"
     private const val LOG_NAME = "voiceapp3.log"
     private const val MAX = 2L * 1024 * 1024
     private const val EARLY_CAP = 512

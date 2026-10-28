@@ -27,7 +27,7 @@ import java.io.File
  */
 object ScreenBrightness {
 
-    const val TAG = "CENTRAL_Brightness"
+    const val TAG = "CENTRAL_ScreenBrightness"
     const val PREFS_NAME = "voiceapp3"
 
     const val SETTINGS_KEY = "screen_brightness"
@@ -77,7 +77,15 @@ object ScreenBrightness {
 
     fun writeSystemInt(ctx: Context, key: String, value: Int): WriteResult = try {
         val ok = Settings.System.putInt(ctx.contentResolver, key, value)
-        WriteResult(ok, readSystem(ctx, key), null)
+        // P8 VERIFY: readback через settings get после записи
+        val got = readSystem(ctx, key)
+        val verified = got == value
+        if (verified) {
+            AppLog.i(TAG, "VERIFY settings write: key=$key expected=$value got=$got → SUCCESS")
+        } else {
+            AppLog.w(TAG, "VERIFY settings write: key=$key expected=$value got=$got (setProp ok=$ok) → FAILED")
+        }
+        WriteResult(ok && verified, got, if (!verified) "readback=$got expected=$value" else null)
     } catch (t: Throwable) { WriteResult(false, null, t.message) }
 
     fun readSysfs(): Int? = try { File(SYSFS_PATH).readText().trim().toIntOrNull() } catch (_: Throwable) { null }

@@ -25,7 +25,7 @@ import java.io.FileOutputStream
  * 4. Воспроизведение через наружный динамик автомобиля (AudioAttributes usage 29 / AVAS).
  */
 object LockSound {
-    private const val TAG = "GeelyTools"
+    private const val TAG = "CENTRAL_LockSound"
 
     const val PREF_LOCK_SOUND_ENABLED = "lock_car_audio_enable"
     const val PREF_LOCK_SOUND_PATH = "lock_car_audio_path"
@@ -49,6 +49,14 @@ object LockSound {
     val DELAY_CHOICES = setOf("0", "150", "300")
 
     private val soundExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+
+    // P7: счётчик неудачных попыток bind-mount'а звука. При ≥3 детерминированных
+    // ошибок (Permission/ENOENT/ERR_ROOT_CHANNEL_UNAVAILABLE) — отключаем тумблер
+    // и перестаём штурмовать каждые 60 секунд watchdog'ом.
+    private const val MAX_BIND_RETRIES = 3
+    @Volatile private var bindFailCount = 0
+    @Volatile private var bindDisabledUntilBoot = false
+    @Volatile private var lastBindFailReason: String? = null
     @Volatile
     private var mediaPlayer: MediaPlayer? = null
     /** Дебаунс: не играть повторный звук того же типа чаще чем раз в DEBOUNCE_MS
@@ -758,60 +766,152 @@ object LockSound {
         // при выключенных тумблерах (баг 5.1).
     }
 
+    /**
+     * P7 — bind-mount кастомного звука замка в /vendor/etc/carlock.
+     *
+     * Исправления по логу:
+     *  1. Копирование wav в /data/local/tmp — ЧЕРЕЗ ADB (base64 pipe), а не Java
+     *     copyTo от uid=1000 (на что было Permission denied).
+     *  2. Нет бесконечных ретраев: после MAX_BIND_RETRIES=3 детерминированных
+     *     ошибок (Permission/ENOENT/ERR_ROOT_CHANNEL_UNAVAILABLE) — отключаем
+     *     тумблер и больше не штурмим до ребута.
+     *  3. setenforce 0 убран (P5).
+     *  4. VERIFY по SRC_INODE/TGT_INODE и по /proc/mounts.
+     */
     private fun applySystemLockSoundBind(ctx: Context, soundFile: File) {
-        soundExecutor.execute {
+        // Если ранее тумблер был отключён из-за детерминированной ошибки — не штурмим
+        if (bindDisabledUntilBoot) {
+            AppLog.i(ctx, TAG, "VERIFY lockSound: skip (disabled until boot, reason=$lastBindFailReason)")
+            return
+        }
+        val appCtx = ctx.applicationContext
+        // P1: всё что ниже — ADB/mount, на BgWorker а не на main.
+        BgWorker.post("LockSound.bind") {
             try {
                 val stagePath = "/data/local/tmp/carlock_custom.wav"
-                val stageFile = File(stagePath)
-                
-                try {
-                    soundFile.inputStream().use { input ->
-                        java.io.FileOutputStream(stageFile).use { output ->
-                            input.copyTo(output)
-                        }
-                    }
-                    stageFile.setReadable(true, false)
-                    stageFile.setWritable(true, false)
-                } catch (e: Throwable) {
-                    AppLog.w(ctx, TAG, "Java copyTo /data/local/tmp failed: ${e.message}")
+                if (!soundFile.exists() || !soundFile.canRead()) {
+                    recordBindFailure("source file unreadable: ${soundFile.absolutePath}", appCtx, deterministic = true)
+                    return@post
                 }
+                AppLog.i(ctx, TAG, "lockSound bind: copying ${soundFile.name} via ADB root channel to $stagePath...")
 
-                val script = """
-                    setenforce 0 2>/dev/null || true
-                    if [ ! -s '$stagePath' ]; then
-                        cp -f '${soundFile.absolutePath}' '$stagePath' 2>&1 || true
-                    fi
-                    chown root:root '$stagePath' 2>&1 || true
+                // P7: копируем через ADB (base64). Java uid=1000 прав на /data/local/tmp нет.
+                val bytes = soundFile.readBytes()
+                val b64 = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
+                val copyScript = """
+                    cat > '$stagePath'.b64 <<'___B64_EOF___'
+                    $b64
+                    ___B64_EOF___
+                    base64 -d '$stagePath'.b64 > '$stagePath' 2>&1 || echo B64_DECODE_FAIL
+                    rm -f '$stagePath'.b64
+                    chown 0:0 '$stagePath' 2>&1 || echo CHOWN_FAIL
                     chmod 644 '$stagePath' 2>&1 || true
                     chcon u:object_r:vendor_configs_file:s0 '$stagePath' 2>/dev/null || chcon u:object_r:vendor_file:s0 '$stagePath' 2>/dev/null || true
-                    
+                    echo STAGE_SIZE=$(stat -c '%s' '$stagePath' 2>/dev/null)
+                    echo STAGE_INODE=$(stat -c '%i' '$stagePath' 2>/dev/null)
+                """.trimIndent()
+                val copyRes = AdbClient.execute(copyScript, 30000)
+                AppLog.i(ctx, TAG, "lockSound copy rc=${copyRes.first}: ${copyRes.second.replace('\n', ' ').take(400)}")
+                if (copyRes.first != 0) {
+                    recordBindFailure("copy failed rc=${copyRes.first} out=${copyRes.second.take(200)}", appCtx,
+                        deterministic = copyRes.second.contains("ERR_ROOT_CHANNEL_UNAVAILABLE")
+                                    || copyRes.second.contains("Permission denied"))
+                    return@post
+                }
+
+                val stageSizeOk = copyRes.second.contains("STAGE_SIZE=") &&
+                    !copyRes.second.contains("STAGE_SIZE=0") &&
+                    !copyRes.second.contains("B64_DECODE_FAIL")
+                if (!stageSizeOk) {
+                    recordBindFailure("stage file empty/b64 decode fail", appCtx, deterministic = false)
+                    return@post
+                }
+
+                val bindScript = """
+                    SELINUX_BEFORE=$(getenforce 2>/dev/null)
+                    AUDIOSRV_PID_BEFORE=$(pidof audioserver 2>/dev/null)
+                    MOUNTED_COUNT=0
                     if [ -s '$stagePath' ]; then
+                        STAGE_INODE=$(stat -c '%i' '$stagePath' 2>/dev/null)
                         for f in /vendor/etc/carlock/*.wav /system/etc/avas/sound_type_*/*.wav; do
-                            if [ -f "${"$" + "f"}" ]; then
+                            if [ -f "${"$"}f" ]; then
                                 for _i in 1 2 3 4; do
-                                    grep -F " ${"$" + "f"} " /proc/mounts >/dev/null 2>&1 || break
-                                    umount "${"$" + "f"}" 2>/dev/null || umount -l "${"$" + "f"}" 2>/dev/null || true
+                                    grep -F " ${"$"}f " /proc/mounts >/dev/null 2>&1 || break
+                                    umount "${"$"}f" 2>/dev/null || umount -l "${"$"}f" 2>/dev/null || true
                                 done
-                                mount -o bind '$stagePath' "${"$" + "f"}" 2>&1
-                                restorecon -v "${"$" + "f"}" 2>/dev/null || true
+                                mount -o bind '$stagePath' "${"$"}f" 2>&1 || echo MOUNT_FAIL:${"$"}f
+                                TGT_INODE=$(stat -c '%i' "${"$"}f" 2>/dev/null)
+                                if [ "$STAGE_INODE" = "$TGT_INODE" ] && grep -qF " ${"$"}f " /proc/mounts; then
+                                    echo MOUNTED_OK:${"$"}f
+                                    MOUNTED_COUNT=$((MOUNTED_COUNT+1))
+                                else
+                                    echo MOUNT_VERIFY_FAIL:${"$"}f inode=$TGT_INODE
+                                fi
+                                restorecon -v "${"$"}f" 2>/dev/null || true
                             fi
                         done
                     fi
-                    
                     killall -9 audioserver 2>/dev/null || true
                     pkill -9 -f avas 2>/dev/null || true
-                    pkill -9 -f audioserver 2>/dev/null || true
-                    
-                    echo "MOUNTS_COUNT=$(grep carlock /proc/mounts | wc -l)"
+                    sleep 2
+                    AUDIOSRV_PID_AFTER=$(pidof audioserver 2>/dev/null)
+                    SELINUX_AFTER=$(getenforce 2>/dev/null)
+                    echo SELINUX_BEFORE=$SELINUX_BEFORE SELINUX_AFTER=$SELINUX_AFTER
+                    echo AUDIOSRV_PID_BEFORE=$AUDIOSRV_PID_BEFORE AUDIOSRV_PID_AFTER=$AUDIOSRV_PID_AFTER
+                    echo MOUNTS_COUNT=$(grep carlock /proc/mounts | wc -l)
+                    echo MOUNTED_OK_COUNT=$MOUNTED_COUNT
                 """.trimIndent()
+                val bindRes = AdbClient.execute(bindScript, 20000)
+                AppLog.i(ctx, TAG, "lockSound bind rc=${bindRes.first}: ${bindRes.second.replace('\n', ' ').take(500)}")
 
-                AppLog.i(ctx, TAG, "applySystemLockSoundBind: запуск скрипта (${soundFile.name})...")
-                val res = AdbClient.execute(script, 20000)
-                AppLog.i(ctx, TAG, "applySystemLockSoundBind [exitCode=${res.first}]: ${res.second.trim()}")
+                val failDeterm = bindRes.second.contains("ERR_ROOT_CHANNEL_UNAVAILABLE")
+                    || bindRes.second.contains("Permission denied")
+                    || bindRes.second.contains("avc: denied")
+                    || bindRes.second.contains("No such file")
+                    || bindRes.second.contains("MOUNT_VERIFY_FAIL") && bindRes.first == 0 && !bindRes.second.contains("MOUNTED_OK:")
+                val ok = bindRes.first == 0 && bindRes.second.contains("MOUNTED_OK:") && !failDeterm
+
+                if (ok) {
+                    bindFailCount = 0
+                    lastBindFailReason = null
+                    AppLog.i(ctx, TAG, "VERIFY lockSound: SUCCESS (MOUNTED_OK_COUNT present)")
+                } else {
+                    val reason = if (bindRes.second.contains("ERR_ROOT_CHANNEL_UNAVAILABLE")) "root unavailable"
+                                 else if (bindRes.second.contains("Permission denied")) "Permission denied"
+                                 else "rc=${bindRes.first}: ${bindRes.second.take(200)}"
+                    recordBindFailure(reason, appCtx, deterministic = failDeterm)
+                }
             } catch (t: Throwable) {
-                AppLog.w(ctx, TAG, "applySystemLockSoundBind error: ${t.message}")
+                AppLog.w(ctx, TAG, "applySystemLockSoundBind error: ${t.message}", t)
+                recordBindFailure("exception: ${t.message}", appCtx, deterministic = false)
             }
         }
+    }
+
+    private fun recordBindFailure(reason: String, ctx: Context, deterministic: Boolean) {
+        lastBindFailReason = reason
+        AppLog.e(ctx, TAG, "VERIFY lockSound: FAILED ($reason), deterministic=$deterministic")
+        if (!deterministic) {
+            // Временная ошибка (таймаут, рестарт adbd) — увеличиваем счётчик, но не отключаем.
+            bindFailCount += 1
+            if (bindFailCount < MAX_BIND_RETRIES) {
+                AppLog.i(ctx, TAG, "lockSound retry scheduled (attempt ${bindFailCount+1}/$MAX_BIND_RETRIES)")
+                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                    val path = getSelectedPath(ctx)
+                    if (path.isNotEmpty() && File(path).exists()) applySystemLockSoundBind(ctx, File(path))
+                }, (5000L * (1 shl (bindFailCount - 1).coerceAtMost(3)))) // exponential backoff 5/10/20s
+                return
+            }
+        }
+        // Детерминированная ошибка или кончились повторы — отключаем тумблер,
+        // пишем причину и больше не пытаемся до ребута.
+        bindDisabledUntilBoot = true
+        AppLog.e(ctx, TAG, "lockSound отключён до следующей загрузки: $reason")
+        try {
+            ctx.getSharedPreferences("voiceapp3", Context.MODE_PRIVATE)
+                .edit().putBoolean(PREF_LOCK_SOUND_ENABLED, false).apply()
+        } catch (_: Throwable) {}
+        // TODO: показать нотификацию/Toast пользователю с причиной (след. итерация)
     }
 
     private fun restoreSystemLockSoundBind(ctx: Context) {

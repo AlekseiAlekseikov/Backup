@@ -21,7 +21,7 @@ import java.util.Locale
  * Ротация: при превышении 256 КБ файл переименовывается в .log.1, старый .log.1 удаляется.
  */
 object AppFileLogger {
-    private const val TAG = "AppFileLogger"
+    private const val TAG = "CENTRAL_AppFileLogger"
     private const val NAME = "voiceapp3.log"
     private const val MAX_SIZE_BYTES = 256 * 1024  // 256 KB
     private val DATE_FMT = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)

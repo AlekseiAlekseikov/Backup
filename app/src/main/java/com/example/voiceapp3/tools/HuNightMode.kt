@@ -35,7 +35,7 @@ import android.util.Log
  */
 object HuNightMode {
 
-    private const val TAG = "HuNightMode"
+    private const val TAG = "CENTRAL_HuNightMode"
 
     /** Чтение без подписки: текущее значение дня/ночи ГУ. */
     fun isNight(ctx: Context): Boolean {

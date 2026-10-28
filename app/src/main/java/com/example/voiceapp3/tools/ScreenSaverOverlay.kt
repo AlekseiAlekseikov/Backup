@@ -26,7 +26,7 @@ import java.io.File
  * 4. По тапу на экран мгновенно убирает оверлей и восстанавливает прежнюю яркость.
  */
 object ScreenSaverOverlay {
-    private const val TAG = "ScreenSaverOverlay"
+    private const val TAG = "CENTRAL_ScreenSaverOverlay"
     private const val SYSFS_PATH = "/sys/class/leds/lcd-backlight/brightness"
 
     private val mainHandler = Handler(Looper.getMainLooper())
