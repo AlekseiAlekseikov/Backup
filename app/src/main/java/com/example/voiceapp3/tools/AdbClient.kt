@@ -123,11 +123,28 @@ object AdbClient {
     }
 
     /**
-     * Асинхронный вариант, когда не нужно ждать результат (например огневые команды).
+     * Асинхронный вариант (fire-and-forget) — результат игнорируется.
      */
     fun executeAsync(command: String, timeoutMs: Int = 20000, expectRoot: Boolean = true) {
         start()
         queue.offer(Job(command, timeoutMs, expectRoot) { })
+    }
+
+    /**
+     * submit — асинхронное выполнение с доставкой результата в [onResult] на main-Looper.
+     *
+     * Используется из UI-кода (клики по тумблерам, обработчики системных broadcast),
+     * когда нужно и выполнить команду в фоне, и обновить UI по результату.
+     */
+    fun submit(command: String, timeoutMs: Int = 20000, expectRoot: Boolean = true,
+               onResult: ((Pair<Int, String>) -> Unit)? = null) {
+        start()
+        queue.offer(Job(command, timeoutMs, expectRoot) { r ->
+            if (onResult != null) {
+                Handler(Looper.getMainLooper()).post { onResult(r) }
+            }
+        })
+    }
 
     // ─────────── worker loop ───────────
 
@@ -187,7 +204,7 @@ object AdbClient {
             if (probe != null) {
                 workingPort.set(port)
                 val (uid, _) = probe
-                if (uid.contains("uid=0")) {
+                if (isRootUid(uid)) {
                     state.set(if (port == ADB_PORT_ROOT) ChannelState.ROOT_65010 else ChannelState.ROOT_5555)
                     AppLog.i(TAG, "PORT65010 ИТОГ = UP on port=$port, shell uid=$uid (dt=${dt}ms) — root канал готов")
                     logInitDiagnostics()
@@ -252,7 +269,7 @@ object AdbClient {
                 if (probe != null) {
                     val (uid, _) = probe
                     AppLog.i(TAG, "PORT65010: слушатель появился id=$uid")
-                    if (uid.contains("uid=0")) {
+                    if (isRootUid(uid)) {
                         workingPort.set(ADB_PORT_ROOT); state.set(ChannelState.ROOT_65010); ok = true; break
                     }
                 }
@@ -271,18 +288,20 @@ object AdbClient {
         val probe5555 = tryProbePort(ADB_PORT_DEFAULT, 1000, 3000)
         if (probe5555 != null) {
             val (uid, _) = probe5555
-            if (uid.contains("uid=0")) {
+            if (isRootUid(uid)) {
                 workingPort.set(ADB_PORT_DEFAULT); state.set(ChannelState.ROOT_5555)
                 AppLog.w(TAG, "PORT65010 ИТОГ = UP на порту 5555 (не 65010!) но shell uid=$uid — работаем через 5555")
                 logInitDiagnostics()
                 return
             }
             AppLog.e(TAG, "PORT65010 FAILED: порт 5555 reachable но shell uid=$uid (не root)")
+            portDiagnosticDump("port 5555 reachable but uid=$uid (not root)")
             fallbackNoRoot("ADB reachable but not root (uid=$uid)")
             return
         }
 
         AppLog.e(TAG, "PORT65010 FAILED: ни 65010 ни 5555 не дают root. Смотри PORT65010 строки выше.")
+        portDiagnosticDump("all ports failed to give root")
         fallbackNoRoot("adbd unreachable after ctl.restart")
     }
 
@@ -291,42 +310,130 @@ object AdbClient {
         AppLog.e(TAG, "PORT65010 ИТОГ = NO_ROOT ($reason). Команды пойдут через Runtime.sh uid=1000 (root не гарантирован).")
     }
 
-    /** Выполняет команду на рабочем канале. */
+    /**
+     * Выполняет команду на рабочем канале.
+     *
+     * Жёсткий контракт (false-success ban, P0/P8):
+     *  - root-команды (expectRoot=true) НИКОГДА не падают в Runtime.sh uid=1000,
+     *    если нет работающего root-канала (состояние ROOT_65010/ROOT_5555) — сразу
+     *    возвращается ERR_ROOT_CHANNEL_UNAVAILABLE.
+     *  - alt-port retry делается ТОЛЬКО при IOException на работающем порту (не
+     *    при ошибках в выводе), и никогда — для fallback в sh.
+     *  - classifyOutput(out) детектирует маркеры провала (Permission denied,
+     *    FAILBIND, xtables lock, No such file, must be root, err:, uid!=0,
+     *    Read-only file system, adbd error) и превращает их в rc=1 с понятной
+     *    причиной.
+     *  - Каждый вызов логирует VERIFY EXEC с портом/rc/expectRoot/первыми
+     *    буквами команды и вердиктом SUCCESS/FAILED(reason).
+     */
     private fun runCommand(cmd: String, timeoutMs: Int, expectRoot: Boolean): Pair<Int, String> {
-        when (state.get()) {
-            ChannelState.ROOT_65010, ChannelState.ROOT_5555 -> {
-                val port = workingPort.get()
-                try {
-                    val out = execAdbSocket(cmd, port, timeoutMs)
-                    // Простая эвристика: если вывод содержит маркеры отказа прав — переотметить
-                    val lower = out.lowercase()
-                    if (lower.contains("permission denied") || lower.contains("avc: denied")
-                        || lower.contains("operation not permitted")) {
-                        AppLog.w(TAG, "execute on port=$port: вывод содержит ошибку прав — верифицируйте uid")
-                    }
-                    return Pair(0, out)
-                } catch (e: Exception) {
-                    AppLog.w(TAG, "execute port=$port failed: ${e.javaClass.simpleName}: ${e.message}")
-                    // Пробуем другой порт
-                    for (p in PORTS) if (p != port) {
-                        try {
-                            val out = execAdbSocket(cmd, p, timeoutMs)
-                            workingPort.set(p)
-                            AppLog.i(TAG, "execute switched to port=$p after failure on $port")
-                            return Pair(0, out)
-                        } catch (_: Exception) {}
-                    }
-                    // Не вышло — фоллбэк
-                    AppLog.w(TAG, "execute no ADB port worked, falling back to Runtime.sh")
-                }
-            }
-            ChannelState.PERM_FAIL -> {
-                return Pair(1, "ERR_ROOT_CHANNEL_UNAVAILABLE")
-            }
-            else -> { /* BOOTING or NO_ROOT_SH */ }
+        val shortCmd = cmd.replace("\s+".toRegex(), " ").take(160)
+        val st = state.get()
+
+        if (expectRoot && st !in setOf(ChannelState.ROOT_65010, ChannelState.ROOT_5555)) {
+            // Жёсткий запрет: root-команда без root-канала — не падаем в sh.
+            val reason = "ERR_ROOT_CHANNEL_UNAVAILABLE (state=$st)"
+            AppLog.e(TAG, "VERIFY EXEC port=- rc=1 expectRoot=true cmd=${shortCmd} → FAILED ($reason)")
+            return Pair(1, reason)
         }
-        return runShellFallbackWithRc(cmd, timeoutMs)
+
+        if (st in setOf(ChannelState.ROOT_65010, ChannelState.ROOT_5555)) {
+            val port = workingPort.get()
+            var out = try {
+                execAdbSocket(cmd, port, timeoutMs)
+            } catch (e: IOException) {
+                AppLog.w(TAG, "VERIFY EXEC port=$port IOE: ${e.javaClass.simpleName}: ${e.message} — retrying alt port")
+                // Только IOException (порт упал) — пробуем другой порт. Не fallback в sh.
+                var alt: String? = null
+                var altPort: Int = -1
+                for (p in PORTS) if (p != port) {
+                    try { alt = execAdbSocket(cmd, p, timeoutMs); altPort = p; break } catch (_: Exception) {}
+                }
+                if (alt != null) {
+                    workingPort.set(altPort)
+                    AppLog.i(TAG, "VERIFY EXEC switched to port=$altPort after IOException on $port")
+                    return classify(altPort, true, shortCmd, alt, 0)
+                }
+                val msg = "ERR_ADB_IO: ${e.message} (no alt port worked)"
+                AppLog.e(TAG, "VERIFY EXEC port=$port rc=1 expectRoot=$expectRoot cmd=${shortCmd} → FAILED ($msg)")
+                return Pair(1, msg)
+            } catch (e: Exception) {
+                val msg = "ERR_ADB: ${e.javaClass.simpleName}: ${e.message}"
+                AppLog.e(TAG, "VERIFY EXEC port=$port rc=1 expectRoot=$expectRoot cmd=${shortCmd} → FAILED ($msg)")
+                return Pair(1, msg)
+            }
+            return classify(port, expectRoot, shortCmd, out, 0)
+        }
+
+        // НЕ-root команда и нет ADB — допускается Runtime.sh (от uid=1000, для отладочных команд).
+        val (rc, out) = runShellFallbackWithRc(cmd, timeoutMs)
+        return classify(0, expectRoot, shortCmd, out, rc)
     }
+
+    private fun classify(port: Int, expectRoot: Boolean, shortCmd: String, out: String, rc: Int): Pair<Int, String> {
+        val (failReason, isFail) = classifyOutput(out, expectRoot)
+        val finalRc = if (rc != 0) rc else if (isFail) 1 else 0
+        val verdict = if (finalRc == 0) "SUCCESS" else "FAILED (${failReason ?: "rc=$rc"})"
+        val portLabel = if (port == 0) "sh" else port.toString()
+        AppLog.i(TAG, "VERIFY EXEC port=$portLabel rc=$finalRc expectRoot=$expectRoot cmd=${shortCmd} → $verdict")
+        if (finalRc != 0) {
+            val tail = out.replace('\n', ' ').take(300)
+            AppLog.w(TAG, "VERIFY EXEC tail: $tail")
+        }
+        return Pair(finalRc, out)
+    }
+
+    /**
+     * classifyOutput — ищет в выводе известные маркеры провала и возвращает
+     * (читаемая причина, true — это провал).
+     *
+     * Список маркеров из лога и из w0/n:
+     *  - Permission denied / avc: denied / Operation not permitted — SELinux/права
+     *  - xtables lock — iptables удерживается другим процессом (нужен -w)
+     *  - No such file or directory / Read-only file system
+     *  - FAILBIND — наш маркер неудачного mount --bind
+     *  - err: / Exec error / adbd error / must be root
+     *  - sh: / sh: line / /system/bin/sh: — ошибка интерпретатора
+     *  - uid=1000 / uid=2000 / uid=0 без полного "uid=0(root)" при expectRoot
+     *  - iptables/ip6tables: ... No chain/target/match by that name
+     */
+    private fun classifyOutput(out: String, expectRoot: Boolean): Pair<String?, Boolean> {
+        val lower = out.lowercase()
+        return when {
+            lower.contains("permission denied") -> "Permission denied" to true
+            lower.contains("avc: denied") -> "SELinux avc denied" to true
+            lower.contains("operation not permitted") -> "Operation not permitted" to true
+            lower.contains("xtables lock") -> "xtables lock held" to true
+            lower.contains("no such file or directory") -> "No such file/dir" to true
+            lower.contains("read-only file system") -> "Read-only filesystem" to true
+            lower.contains("failbind") -> "FAILBIND (mount failed)" to true
+            lower.contains("exec error") -> "Exec error" to true
+            lower.contains("adbd error") -> "adbd error" to true
+            lower.contains("must be root") -> "must be root" to true
+            lower.contains("sh:") || lower.contains("/system/bin/sh:") -> "sh error" to true
+            lower.contains("no chain/target/match") -> "iptables target missing" to true
+            lower.contains("err:") && !lower.contains("errno: 0") -> "err marker in output" to true
+            expectRoot && !isRootUid(out) && (lower.contains("uid=") || lower.contains("uid=0")) ->
+                // в выводе есть uid-строка, но это не uid=0(root)
+                "uid != 0(root) (got: ${findUid(out) ?: "unknown"})" to true
+            else -> null to false
+        }
+    }
+
+    /**
+     * isRootUid — строгая проверка на uid=0.
+     *
+     * `uid=0` в выводе `id` всегда идёт как `uid=0(root)` или как начало
+     * `uid=0 gid=0(root)`. Важно не спутать с `uid=1000(system)`, где подстрока
+     * "uid=0" тоже встречается в числе 1000 — используем regex \b.
+     */
+    private fun isRootUid(output: String): Boolean {
+        val line = output.lineSequence().firstOrNull { it.trimStart().startsWith("uid=") } ?: return false
+        return Regex("""^uid=0(\(root\))?\b""").containsMatchIn(line.trimStart())
+    }
+
+    private fun findUid(output: String): String? =
+        output.lineSequence().map { it.trim() }.firstOrNull { it.startsWith("uid=") }
 
     private fun runShellFallback(cmd: String, timeoutMs: Int): String = runShellFallbackWithRc(cmd, timeoutMs).second
 
@@ -376,7 +483,12 @@ object AdbClient {
                 val msg = readMsg(dis)
                 when (msg.cmd) {
                     CNXN -> break
-                    AUTH -> throw IOException("adbd requires RSA auth on port $port (banner=${msg.txt()})")
+                    AUTH -> {
+                        val authMsg = "adbd requires RSA auth on port $port (banner=${msg.txt()})"
+                        AppLog.e(TAG, "PORT65010: $authMsg")
+                        portDiagnosticDump(authMsg)
+                        throw IOException(authMsg)
+                    }
                     else -> Log.d(TAG, "ADB $port rx ${cmdName(msg.cmd)} during CNXN (ignored)")
                 }
             }
@@ -397,7 +509,7 @@ object AdbClient {
                         writeMsg(os, CLSE, 1, localId, ByteArray(0))
                         return out.toString("UTF-8").trim()
                     }
-                    AUTH -> throw IOException("adbd AUTH after OPEN on port $port")
+                    AUTH -> { val m="adbd AUTH after OPEN on port $port"; AppLog.e(TAG,"PORT65010: $m"); portDiagnosticDump(m); throw IOException(m) }
                     else -> Log.d(TAG, "ADB $port rx ${cmdName(msg.cmd)} (ignored)")
                 }
             }
@@ -436,6 +548,35 @@ object AdbClient {
         var sum = 0; for (b in payload) sum += b.toInt() and 0xFF
         buf.putInt(sum); buf.putInt(cmd.inv())
         os.write(buf.array()); os.write(payload); os.flush()
+    }
+
+    /**
+     * portDiagnosticDump — снимает диагностический слепок состояния adbd при ошибке.
+     * Вызывается из bootstrap когда не удалось поднять порт, и когда AUTH сработал.
+     */
+    private fun portDiagnosticDump(reason: String) {
+        AppLog.e(TAG, "PORT65010 diagnostic dump — reason=$reason")
+        val diagCmds = listOf(
+            "getenforce" to "selinux",
+            "ls -l /dev/socket/adbd 2>&1 || echo '/dev/socket/adbd not found'" to "adbd_socket",
+            "netstat -ltnp 2>/dev/null | grep -E '5555|65010' || ss -ltnp 2>/dev/null | grep -E '5555|65010' || echo 'no listeners'" to "listeners",
+            "ps -A 2>/dev/null | grep -i adbd || ps 2>/dev/null | grep adbd" to "adbd_proc",
+            "getprop ro.adb.secure; getprop service.adb.tcp.port; getprop persist.adb.tcp.port; getprop init.svc.adbd" to "adbd_props"
+        )
+        // diag через shell-фоллбэк (не через ADB — он и так сломан).
+        for ((c, n) in diagCmds) {
+            try {
+                val r = runShellFallback(c, 2000).replace('\n',' ').trim()
+                AppLog.e(TAG, "PORT65010 diag [$n]: $r")
+            } catch (t: Throwable) {
+                AppLog.w(TAG, "PORT65010 diag [$n] failed: ${t.message}")
+            }
+        }
+        // logcat adbd
+        try {
+            val lc = runShellFallback("logcat -b all -d -t 30 -s adbd '*:S' 2>/dev/null | tail -30", 2000)
+            AppLog.e(TAG, "PORT65010 logcat adbd tail:\n$lc")
+        } catch (_: Throwable) {}
     }
 
     private fun logInitDiagnostics() {
