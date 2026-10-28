@@ -107,3 +107,51 @@
 6. **Слить в main + push** после валидации на реальном устройстве (новый voiceapp3.log по всем §7 сценариям).
 
 - **HvacDigitalPlugin / LockSound**: дочистил `setenforce 0` (был пропущен в enable/disable HvacDigitalPlugin и в LockSound.applySystemLockSoundBind). Вместо него — SELINUX_BEFORE/AFTER логи + pid before/after для SystemUI/audioserver + MOUNT_VERIFY_FAIL по inode в LockSound (P5/P6/P8).
+
+---
+
+## 2026-10-28 (вторая итерация, sandbox пересоздался между сессиями — все фиксы накатил заново)
+
+### Сделано
+- Инициализирован git в `/home/user/repo`, коммит `initial: import voiceapp3 Backup (pre-fixes baseline)`.
+- Ветка `fix/log-driven-fixes`.
+- BgWorker.kt: 4-поточный пул, post/run/assertNotMain/isMainThread, slow-task warning.
+- AdbClient: фикс пропавшей `}` в executeAsync; добавлен submit() async c main-callback;
+  строгая проверка uid=0(root) по regex; classifyOutput на 12+ маркеров;
+  VERIFY EXEC линия на каждый вызов; жёсткий запрет на фоллбэк в sh для root-команд;
+  пошаговая PORT65010 трассировка; portDiagnosticDump при AUTH/failure (getenforce,
+  ls /dev/socket/adbd, netstat/ss listeners, ps adbd, adbd props, logcat -t 30 adbd).
+- StatusIcons: убран брутфорс диапазонов; прямые VHAL-пропы из дампа
+  (EV_BATTERY_LEVEL=0x11600309, ED_EV_BATT_PCT=0x2140a6ed/10, ENV_OUT_TEMP=0x11600703);
+  SYS_HVAC_EXT=persist.sys.hvacdigital.exttemp; @Volatile socSource/tempSource;
+  отдельные notification ID/каналы; syncAll на BgWorker; периодика постит тик через BgWorker.
+- NetworkTtl: переписан с нуля; `-w 5` везде; TTL_BEFORE_*; VERIFY_V4/V6 через -C;
+  счётчики до/после; ping-heuristic для фактического TTL; автоткл. тумблера при провале;
+  BootReceiver VERIFY; CONNECTIVITY_ACTION ресивер пере-применяет при wlan0 up.
+- AppPerformance: JIT — trap restore_wifi EXIT/INT/TERM, ZYGOTE_PID_BEFORE/AFTER,
+  USEJIT_AFTER; video60fps — setenforce 0 убран, SELINUX_BEFORE/AFTER, MEDIA_PID_BEFORE/AFTER,
+  SRC_INODE==TGT_INODE проверка + MOUNT_PRESENT, статусы OK/FAILED/PARTIAL/BLOCKED, VERIFY линия;
+  assertNotMain на setAutoOptimize/setVideo60Fps.
+- LockSound: копирование через ADB root-канал (base64 pipe); MAX_BIND_RETRIES=3 с backoff;
+  детерминированные ошибки отключают тумблер (bindDisabledUntilBoot); VERIFY по inode;
+  setenforce 0 убран; bind работает на BgWorker.
+- VoiceAssistantService.onStartCommand boot-ветка вся на BgWorker; watchdog-тик тоже;
+  NetworkTtl.registerNetworkReceiver вызывается при старте; HuNightMode.observe callback
+  работает через BgWorker.
+- UiBridge: onEvent settings.change/dev.runCommand/dev.getLogcat/simulateDoor*/
+  testNotificationIcons/perf.* и onResume syncAll/syncOnContext обёрнуты в BgWorker
+  с возвратом результата на main Looper.
+- ScreenBrightness.writeSystemInt: readback VERIFY после записи.
+- HvacDigitalPlugin enable/disable: setenforce 0 убран; SYSUI_PID_BEFORE/AFTER,
+  SELINUX_BEFORE/AFTER, SRC_INODE/TGT_INODE; VERIFY линия; строгая классификация
+  OK/FAILED/PARTIAL/BLOCKED.
+- Единые теги CENTRAL_* на всех tools/+VoiceAssistantService/+UiBridge; AppLog.TAG_BASE=CENTRAL.
+- Создан AUDIT.md с таблицей и разделами: «Ложный успех», «Порт 65010»,
+  «Оставшиеся блокеры», «Требует проверки на устройстве», «Отличия от оригинала».
+- Два пуша в origin fix/log-driven-fixes.
+
+### Оставшиеся блокеры
+1. screen_off_timeout keep-awake gate на IHU629G и durable-механизм (нужен запуск на ГУ
+   и анализ, кто именно сбрасывает значение — наш код или OEM DisplayManager).
+2. Сборка APK и снятие нового voiceapp3.log — на машине пользователя.
+3. Финальный merge в main — после валидации на устройстве.
