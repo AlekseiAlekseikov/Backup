@@ -629,6 +629,21 @@ class UiBridge(
                     activity.runOnUiThread { toolsPanel?.onLogcat(out) }
                 }
             }
+            "dev.checkRoot" -> {
+                com.example.voiceapp3.tools.BgWorker.run("UiBridge.dev.checkRoot", {
+                    AdbClient.probeRootChannel()
+                }) { res ->
+                    val r = res.getOrNull()
+                    val msg = if (r != null)
+                        "PORT65010: connect → ${if(r.port>0)"OK on port ${r.port}" else "no port"}\n" +
+                        "handshake CNXN → OK\n" +
+                        "id → ${r.uidLine}\n" +
+                        "state=${r.state}\n" +
+                        "ИТОГ = ${r.verdict}"
+                    else "ERR: ${res.exceptionOrNull()?.message}"
+                    activity.runOnUiThread { toolsPanel?.onDevCmdResult(0, msg) }
+                }
+            }
             "dev.testAvasSound" -> {
                 runCatching {
                     val path = LockSound.getUnlockSelectedPath(activity)
