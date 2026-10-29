@@ -649,6 +649,16 @@ class UiBridge(
                     activity.runOnUiThread { toolsPanel?.onDevCmdResult(0, msg) }
                 }
             }
+            "dev.showAppLog" -> {
+                com.example.voiceapp3.tools.BgWorker.run("UiBridge.dev.showAppLog") {
+                    val path = com.example.voiceapp3.tools.AppLog.logPath()
+                    val tail = com.example.voiceapp3.tools.AppLog.readTail(activity, 200)
+                    "logPath=$path\n\n---- tail (last 200 lines) ----\n$tail"
+                } { res ->
+                    val msg = res.getOrElse { "ERR: ${it.message}" }
+                    activity.runOnUiThread { toolsPanel?.onDevCmdResult(0, msg) }
+                }
+            }
             "dev.testAvasSound" -> {
                 runCatching {
                     val path = LockSound.getUnlockSelectedPath(activity)

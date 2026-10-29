@@ -50,22 +50,53 @@ object AppLog {
 
     // ───────────────────── init ─────────────────────
     @JvmStatic fun init(c: Context) {
+        // ВСЕГДА сначала ставим ctx и флаг inited в try, чтобы при падении init
+        // логгер хотя бы не терял сообщения (продолжал копить в early и в Logcat).
+        val appCtx = try { c.applicationContext } catch (t: Throwable) { c }
+        ctx = appCtx
         synchronized(lock) {
             if (inited) return
-            ctx = c.applicationContext
-            val dir = try { c.getExternalFilesDir(null) } catch (_: Throwable) { null } ?: c.filesDir
-            runCatching { if (!dir.exists()) dir.mkdirs() }
-            primaryPath = File(dir, LOG_NAME).absolutePath
-            // Пишем первое сообщение и вываливаем накопленные early-строки
-            writeRaw("INFO", "CENTRAL_Init",
-                "AppLog.init pid=${android.os.Process.myPid()} uid=${android.os.Process.myUid()} " +
-                "thread=${Thread.currentThread().name} file=$primaryPath", null)
-            flushEarly()
-            inited = true
-            Log.i(TAG_BASE, "AppLog file: $primaryPath")
+            var initErr: Throwable? = null
+            try {
+                // Пытаемся создать primary path на внешнем storage; если он не доступен —
+                // фоллбэк на внутренний filesDir/logs/. Оба пути инициализируем сразу,
+                // чтобы внешний сбой не убил внутреннюю запись.
+                val extDir = try { appCtx.getExternalFilesDir(null) } catch (_: Throwable) { null }
+                val intDir = File(appCtx.filesDir, "logs").apply { runCatching { mkdirs() } }
+                val primary: File = when {
+                    extDir != null -> { runCatching { if (!extDir.exists()) extDir.mkdirs() }; File(extDir, LOG_NAME) }
+                    else -> File(intDir, LOG_NAME)
+                }
+                primaryPath = primary.absolutePath
+                // Пишем первое сообщение; writeRaw сам умеет фоллбэк в intDir при ошибке.
+                writeRaw("INFO", "CENTRAL_Init",
+                    "AppLog.init pid=${android.os.Process.myPid()} uid=${android.os.Process.myUid()} " +
+                    "thread=${Thread.currentThread().name} file=$primaryPath intDir=${intDir.absolutePath}", null)
+                flushEarly()
+                inited = true
+                Log.i(TAG_BASE, "AppLog.init path=$primaryPath ok=true")
+            } catch (t: Throwable) {
+                initErr = t
+                Log.e(TAG_BASE, "AppLog.init FAIL path=$primaryPath err=${t.message}", t)
+                // Даже при падении — оставить inited=false, сообщения продолжат копиться в early.
+                // Logcat всегда работает.
+            }
+            // Дополнительная запись во внутренний файл на случай если внешний не создался.
+            try {
+                val intDir = File(appCtx.filesDir, "logs").apply { runCatching { mkdirs() } }
+                val intFile = File(intDir, LOG_NAME)
+                if (intFile.parentFile?.exists() == true) {
+                    val line = "[${df.format(Date())}] [${Thread.currentThread().name}] [INIT] [CENTRAL_Init] AppLog init internal path=${intFile.absolutePath} err=${initErr?.message}"
+                    PrintWriter(FileWriter(intFile, true)).use { it.println(line); it.flush() }
+                    if (primaryPath != intFile.absolutePath) primaryPath = "${primaryPath}|${intFile.absolutePath}"
+                }
+            } catch (_: Throwable) {}
         }
-        // Тяжёлый init (getprop/iptables/prefs) делаем на фоне, чтобы не тормозить onCreate.
-        Thread({ logInitHeavy(c.applicationContext) }, "AppLog-init").start()
+        // Тяжёлый init (getprop/iptables/prefs) делаем на фоне, оборачиваем весь в try.
+        Thread({
+            try { logInitHeavy(appCtx) }
+            catch (t: Throwable) { Log.e(TAG_BASE, "logInitHeavy FAIL ${t.message}", t) }
+        }, "AppLog-init").start()
     }
 
     /** Диагностическая информация при старте (в фоне, не блокирует UI). */

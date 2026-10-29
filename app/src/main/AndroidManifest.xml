@@ -99,6 +99,7 @@
         android:required="true" />
 
     <application
+        android:name="com.example.voiceapp3.App"
         android:allowBackup="false"
         android:label="@string/app_name"
         android:icon="@mipmap/ic_launcher"
