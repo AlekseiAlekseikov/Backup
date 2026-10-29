@@ -187,10 +187,10 @@ object AppPerformance {
             // P6: Гарантированно возвращаем Wi-Fi обратно через trap (в т.ч. при EXIT/INT/TERM/ошибке).
             // P6: Логируем ZYGOTE_PID_BEFORE/AFTER и USEJIT_AFTER для VERIFY.
             val script = """
-                WIFI_BEFORE=$(settings get global wifi_on)
-                echo WIFI_BEFORE=$WIFI_BEFORE
+                WIFI_BEFORE=${'$'}(settings get global wifi_on)
+                echo WIFI_BEFORE=${'$'}WIFI_BEFORE
                 restore_wifi() {
-                  if [ "$WIFI_BEFORE" = "1" ]; then
+                  if [ "${'$'}WIFI_BEFORE" = "1" ]; then
                     svc wifi enable
                     echo WIFI_RESTORED=1
                   else
@@ -198,14 +198,14 @@ object AppPerformance {
                   fi
                 }
                 trap restore_wifi EXIT INT TERM
-                ZYGOTE_PID_BEFORE=$(pidof zygote 2>/dev/null; pidof zygote64 2>/dev/null)
-                echo ZYGOTE_PID_BEFORE=$ZYGOTE_PID_BEFORE
+                ZYGOTE_PID_BEFORE=${'$'}(pidof zygote 2>/dev/null; pidof zygote64 2>/dev/null)
+                echo ZYGOTE_PID_BEFORE=${'$'}ZYGOTE_PID_BEFORE
                 svc wifi disable
                 echo WIFI_WAIT_DONE=waiting
                 _n=0
                 while [ ${D}_n -lt 30 ]; do
                   sleep 1; _n=${D}((${D}_n + 1))
-                  if [ "$(ip rule show 2>/dev/null | grep -c 'oif wlan0')" = "0" ]; then echo WIFI_WAIT_DONE=down; break; fi
+                  if [ "${'$'}(ip rule show 2>/dev/null | grep -c 'oif wlan0')" = "0" ]; then echo WIFI_WAIT_DONE=down; break; fi
                 done
                 for _m in ${D}(grep ' /data/app/' /proc/mounts 2>/dev/null | awk '{print ${D}2}'); do
                   umount -l "${D}_m" 2>/dev/null
@@ -214,11 +214,11 @@ object AppPerformance {
                 setprop dalvik.vm.usejitprofiles $valStr
                 setprop ctl.restart zygote
                 sleep 4
-                ZYGOTE_PID_AFTER=$(pidof zygote 2>/dev/null; pidof zygote64 2>/dev/null)
-                USEJIT_AFTER=$(getprop dalvik.vm.usejit)
-                echo ZYGOTE_PID_AFTER=$ZYGOTE_PID_AFTER
-                echo USEJIT_AFTER=$USEJIT_AFTER
-                echo ZYGOTE_RESTARTED=$([ "$ZYGOTE_PID_BEFORE" != "$ZYGOTE_PID_AFTER" ] && echo YES || echo NO)
+                ZYGOTE_PID_AFTER=${'$'}(pidof zygote 2>/dev/null; pidof zygote64 2>/dev/null)
+                USEJIT_AFTER=${'$'}(getprop dalvik.vm.usejit)
+                echo ZYGOTE_PID_AFTER=${'$'}ZYGOTE_PID_AFTER
+                echo USEJIT_AFTER=${'$'}USEJIT_AFTER
+                echo ZYGOTE_RESTARTED=${'$'}([ "${'$'}ZYGOTE_PID_BEFORE" != "${'$'}ZYGOTE_PID_AFTER" ] && echo YES || echo NO)
             """.trimIndent()
             val t0 = System.currentTimeMillis()
             val ret = runSuCommand(script)
@@ -354,10 +354,10 @@ object AppPerformance {
                 // P6: VERIFY по SRC_INODE == TGT_INODE + MOUNT_PRESENT в /proc/mounts;
                 //     MEDIA_PID_BEFORE/AFTER для подтверждения рестарта сервиса.
                 val mountScript = """
-                    SELINUX_BEFORE=$(getenforce 2>/dev/null)
-                    echo SELINUX_BEFORE=$SELINUX_BEFORE
-                    MEDIA_PID_BEFORE=$(pidof media.swcodec 2>/dev/null; pidof mediacodec 2>/dev/null; pidof android.hardware.media.omx 2>/dev/null)
-                    echo MEDIA_PID_BEFORE=$MEDIA_PID_BEFORE
+                    SELINUX_BEFORE=${'$'}(getenforce 2>/dev/null)
+                    echo SELINUX_BEFORE=${'$'}SELINUX_BEFORE
+                    MEDIA_PID_BEFORE=${'$'}(pidof media.swcodec 2>/dev/null; pidof mediacodec 2>/dev/null; pidof android.hardware.media.omx 2>/dev/null)
+                    echo MEDIA_PID_BEFORE=${'$'}MEDIA_PID_BEFORE
                     _n=0; while grep -F " $TARGET_VCODEC_PATH " /proc/mounts >/dev/null 2>&1 && [ ${'$'}_n -lt 12 ]; do
                       umount $TARGET_VCODEC_PATH 2>/dev/null || umount -l $TARGET_VCODEC_PATH 2>/dev/null || break
                       _n=${'$'}((${'$'}_n+1))
@@ -366,12 +366,12 @@ object AppPerformance {
                     if grep -F " $TARGET_VCODEC_PATH " /proc/mounts >/dev/null 2>&1; then echo MOUNT_PRESENT=1; else echo MOUNT_PRESENT=0; fi
                     setprop ctl.restart $RESTART_SERVICE_NAME 2>/dev/null || true
                     sleep 3
-                    MEDIA_PID_AFTER=$(pidof media.swcodec 2>/dev/null; pidof mediacodec 2>/dev/null; pidof android.hardware.media.omx 2>/dev/null)
-                    echo MEDIA_PID_AFTER=$MEDIA_PID_AFTER
-                    echo "SRC_INODE=$(stat -c %i $STAGING_VCODEC_PATH 2>/dev/null)"
-                    echo "TGT_INODE=$(stat -c %i $TARGET_VCODEC_PATH 2>/dev/null)"
-                    SELINUX_AFTER=$(getenforce 2>/dev/null)
-                    echo SELINUX_AFTER=$SELINUX_AFTER
+                    MEDIA_PID_AFTER=${'$'}(pidof media.swcodec 2>/dev/null; pidof mediacodec 2>/dev/null; pidof android.hardware.media.omx 2>/dev/null)
+                    echo MEDIA_PID_AFTER=${'$'}MEDIA_PID_AFTER
+                    echo "SRC_INODE=${'$'}(stat -c %i $STAGING_VCODEC_PATH 2>/dev/null)"
+                    echo "TGT_INODE=${'$'}(stat -c %i $TARGET_VCODEC_PATH 2>/dev/null)"
+                    SELINUX_AFTER=${'$'}(getenforce 2>/dev/null)
+                    echo SELINUX_AFTER=${'$'}SELINUX_AFTER
                 """.trimIndent()
 
                 val t0 = System.currentTimeMillis()

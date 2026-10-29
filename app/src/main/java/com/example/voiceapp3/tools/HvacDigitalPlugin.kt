@@ -106,7 +106,7 @@ object HvacDigitalPlugin {
         val (rc, out) = AdbClient.execute(script, 40000)
         AppFileLogger.i(TAG, "enable script rc=$rc out=${out.take(1000)}")
         val mountOk = out.contains("HVAC_DIGITAL_OK") && !out.contains("MOUNT_FAIL")
-        val inodeMatch = Regex("SRC_INODE=(\d+) TGT_INODE=(\d+)").find(out)?.let {
+        val inodeMatch = Regex("SRC_INODE=(\\d+) TGT_INODE=(\\d+)").find(out)?.let {
             it.groupValues[1] == it.groupValues[2] && it.groupValues[1].isNotEmpty() && it.groupValues[1] != "0"
         } ?: false
         val activateStatus = when {

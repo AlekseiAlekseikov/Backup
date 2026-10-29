@@ -279,6 +279,35 @@ object StatusIcons {
         catch (t: Throwable) { Log.e(TAG,"notify $id err", t) }
     }
 
+    private fun makeTextIcon(ctx: Context, main: String, suffix: String, color: Int): Icon {
+        val dp = ctx.resources.displayMetrics.density
+        val size = (24 * dp).toInt().coerceAtLeast(24)
+        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bmp)
+        val pMain = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            this.color = color; typeface = Typeface.DEFAULT_BOLD
+            textSize = size * 0.55f; textAlign = Paint.Align.CENTER
+        }
+        val pSfx = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            this.color = color; typeface = Typeface.DEFAULT
+            textSize = size * 0.35f; textAlign = Paint.Align.LEFT
+        }
+        if (main == "wifi") {
+            pMain.textSize = size * 0.38f
+            canvas.drawText("WiFi", size/2f, size*0.7f, pMain)
+        } else {
+            val mainW = pMain.measureText(main)
+            val sfxW = if (suffix.isNotEmpty()) pSfx.measureText(suffix) else 0f
+            val totalW = mainW + sfxW
+            val startX = (size - totalW) / 2f
+            canvas.drawText(main, startX + mainW/2f, size*0.72f, pMain)
+            if (suffix.isNotEmpty()) {
+                canvas.drawText(suffix, startX + mainW, size*0.72f, pSfx)
+            }
+        }
+        return Icon.createWithBitmap(bmp)
+    }
+
     private fun cancel(ctx: Context, id: Int) {
         try { (ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).cancel(id) } catch(_:Throwable){}
     }

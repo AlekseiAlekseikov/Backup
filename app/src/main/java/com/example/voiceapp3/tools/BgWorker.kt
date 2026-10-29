@@ -86,7 +86,7 @@ object BgWorker {
     fun <T> run(name: String, block: () -> T, onResult: (Result<T>) -> Unit) {
         executor.execute {
             val start = System.currentTimeMillis()
-            return@execute try {
+            try {
                 val value = block()
                 val dt = System.currentTimeMillis() - start
                 if (dt > SLOW_TASK_MS) {

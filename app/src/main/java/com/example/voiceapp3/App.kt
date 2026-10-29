@@ -34,7 +34,7 @@ class App : Application() {
             runTest "su -c"
             echo "=== sysfs battery ==="
             for f in /sys/class/power_supply/*/capacity; do
-                [ -e "${'$'}f" ] && echo "${'$'}f = $(cat ${'$'}f 2>&1)"
+                [ -e "${'$'}f" ] && echo "${'$'}f = ${'$'}(cat ${'$'}f 2>&1)"
             done
             echo "=== outside temp props ==="
             getprop 2>&1 | grep -iE "outside|exttemp|ambient_temp|out_temp|hvac" | head -20

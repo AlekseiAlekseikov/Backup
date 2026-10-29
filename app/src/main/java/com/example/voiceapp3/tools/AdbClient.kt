@@ -115,7 +115,7 @@ object AdbClient {
             return Pair(1, "ERR_MAIN_THREAD_FORBIDDEN (command queued for background execution)")
         }
         val latch = CountDownLatch(1)
-        @Volatile var res: Pair<Int, String> = Pair(1, "pending")
+        var res: Pair<Int, String> = Pair(1, "pending")
         queue.offer(Job(command, timeoutMs, expectRoot) { r -> res = r; latch.countDown() })
         val ok = latch.await((timeoutMs + 5000).toLong(), TimeUnit.MILLISECONDS)
         if (!ok) return Pair(137, "ERR_ADB_TIMEOUT after ${timeoutMs}ms")
@@ -223,19 +223,19 @@ object AdbClient {
         // Проверим ещё раз 5555 отдельно без ожидания uid=0 — для выполнения setprop/ctl.restart.
         AppLog.i(TAG, "PORT65010 миграция: пробуем выполнить setprop+ctl.restart adbd через ADB 5555...")
         val migrateScript = """
-            cur="$(getprop service.adb.tcp.port)"
-            per="$(getprop persist.adb.tcp.port)"
-            echo "PORT65010: step1 cur=$cur per=$per"
-            if [ "$cur" = "65010" ] && [ "$per" = "65010" ]; then
+            cur="${'$'}(getprop service.adb.tcp.port)"
+            per="${'$'}(getprop persist.adb.tcp.port)"
+            echo "PORT65010: step1 cur=${'$'}cur per=${'$'}per"
+            if [ "${'$'}cur" = "65010" ] && [ "${'$'}per" = "65010" ]; then
               echo "PORT65010: step2 props already 65010"
             else
               setprop persist.adb.tcp.port 65010
               setprop service.adb.tcp.port 65010
-              echo "PORT65010: step2 setprop rc=$? -> $(getprop persist.adb.tcp.port)/$(getprop service.adb.tcp.port)"
+              echo "PORT65010: step2 setprop rc=${'$'}? -> ${'$'}(getprop persist.adb.tcp.port)/${'$'}(getprop service.adb.tcp.port)"
               (sleep 1; setprop ctl.restart adbd >/dev/null 2>&1) &
               echo "PORT65010: step3 ctl.restart adbd dispatched"
             fi
-            echo "PORT65010: step4 id=$(id)"
+            echo "PORT65010: step4 id=${'$'}(id)"
         """.trimIndent()
 
         var migrateOut: String? = null
@@ -255,7 +255,7 @@ object AdbClient {
         } else {
             AppLog.e(TAG, "PORT65010 migrate: не удалось запустить скрипт ни через 5555, ни через 65010 (ADB не работает)")
             // Падаем в Runtime.sh как фоллбэк последней надежды
-            fallbackNoRoot("ADB unreachable on 5555/65010 — shell uid=$(runShellFallback("id", 1000))")
+            fallbackNoRoot("ADB unreachable on 5555/65010 — shell uid=${runShellFallback("id", 1000)}")
             return
         }
 
@@ -327,7 +327,7 @@ object AdbClient {
      *    буквами команды и вердиктом SUCCESS/FAILED(reason).
      */
     private fun runCommand(cmd: String, timeoutMs: Int, expectRoot: Boolean): Pair<Int, String> {
-        val shortCmd = cmd.replace("\s+".toRegex(), " ").take(160)
+        val shortCmd = cmd.replace("\\s+".toRegex(), " ").take(160)
         val st = state.get()
 
         if (expectRoot && st !in setOf(ChannelState.ROOT_65010, ChannelState.ROOT_5555)) {

@@ -807,8 +807,8 @@ object LockSound {
                     chown 0:0 '$stagePath' 2>&1 || echo CHOWN_FAIL
                     chmod 644 '$stagePath' 2>&1 || true
                     chcon u:object_r:vendor_configs_file:s0 '$stagePath' 2>/dev/null || chcon u:object_r:vendor_file:s0 '$stagePath' 2>/dev/null || true
-                    echo STAGE_SIZE=$(stat -c '%s' '$stagePath' 2>/dev/null)
-                    echo STAGE_INODE=$(stat -c '%i' '$stagePath' 2>/dev/null)
+                    echo STAGE_SIZE=${'$'}(stat -c '%s' '$stagePath' 2>/dev/null)
+                    echo STAGE_INODE=${'$'}(stat -c '%i' '$stagePath' 2>/dev/null)
                 """.trimIndent()
                 val copyRes = AdbClient.execute(copyScript, 30000)
                 AppLog.i(ctx, TAG, "lockSound copy rc=${copyRes.first}: ${copyRes.second.replace('\n', ' ').take(400)}")
@@ -828,11 +828,11 @@ object LockSound {
                 }
 
                 val bindScript = """
-                    SELINUX_BEFORE=$(getenforce 2>/dev/null)
-                    AUDIOSRV_PID_BEFORE=$(pidof audioserver 2>/dev/null)
+                    SELINUX_BEFORE=${'$'}(getenforce 2>/dev/null)
+                    AUDIOSRV_PID_BEFORE=${'$'}(pidof audioserver 2>/dev/null)
                     MOUNTED_COUNT=0
                     if [ -s '$stagePath' ]; then
-                        STAGE_INODE=$(stat -c '%i' '$stagePath' 2>/dev/null)
+                        STAGE_INODE=${'$'}(stat -c '%i' '$stagePath' 2>/dev/null)
                         for f in /vendor/etc/carlock/*.wav /system/etc/avas/sound_type_*/*.wav; do
                             if [ -f "${"$"}f" ]; then
                                 for _i in 1 2 3 4; do
@@ -840,12 +840,12 @@ object LockSound {
                                     umount "${"$"}f" 2>/dev/null || umount -l "${"$"}f" 2>/dev/null || true
                                 done
                                 mount -o bind '$stagePath' "${"$"}f" 2>&1 || echo MOUNT_FAIL:${"$"}f
-                                TGT_INODE=$(stat -c '%i' "${"$"}f" 2>/dev/null)
-                                if [ "$STAGE_INODE" = "$TGT_INODE" ] && grep -qF " ${"$"}f " /proc/mounts; then
+                                TGT_INODE=${'$'}(stat -c '%i' "${"$"}f" 2>/dev/null)
+                                if [ "${'$'}STAGE_INODE" = "${'$'}TGT_INODE" ] && grep -qF " ${"$"}f " /proc/mounts; then
                                     echo MOUNTED_OK:${"$"}f
-                                    MOUNTED_COUNT=$((MOUNTED_COUNT+1))
+                                    MOUNTED_COUNT=${'$'}((MOUNTED_COUNT+1))
                                 else
-                                    echo MOUNT_VERIFY_FAIL:${"$"}f inode=$TGT_INODE
+                                    echo MOUNT_VERIFY_FAIL:${"$"}f inode=${'$'}TGT_INODE
                                 fi
                                 restorecon -v "${"$"}f" 2>/dev/null || true
                             fi
@@ -854,12 +854,12 @@ object LockSound {
                     killall -9 audioserver 2>/dev/null || true
                     pkill -9 -f avas 2>/dev/null || true
                     sleep 2
-                    AUDIOSRV_PID_AFTER=$(pidof audioserver 2>/dev/null)
-                    SELINUX_AFTER=$(getenforce 2>/dev/null)
-                    echo SELINUX_BEFORE=$SELINUX_BEFORE SELINUX_AFTER=$SELINUX_AFTER
-                    echo AUDIOSRV_PID_BEFORE=$AUDIOSRV_PID_BEFORE AUDIOSRV_PID_AFTER=$AUDIOSRV_PID_AFTER
-                    echo MOUNTS_COUNT=$(grep carlock /proc/mounts | wc -l)
-                    echo MOUNTED_OK_COUNT=$MOUNTED_COUNT
+                    AUDIOSRV_PID_AFTER=${'$'}(pidof audioserver 2>/dev/null)
+                    SELINUX_AFTER=${'$'}(getenforce 2>/dev/null)
+                    echo SELINUX_BEFORE=${'$'}SELINUX_BEFORE SELINUX_AFTER=${'$'}SELINUX_AFTER
+                    echo AUDIOSRV_PID_BEFORE=${'$'}AUDIOSRV_PID_BEFORE AUDIOSRV_PID_AFTER=${'$'}AUDIOSRV_PID_AFTER
+                    echo MOUNTS_COUNT=${'$'}(grep carlock /proc/mounts | wc -l)
+                    echo MOUNTED_OK_COUNT=${'$'}MOUNTED_COUNT
                 """.trimIndent()
                 val bindRes = AdbClient.execute(bindScript, 20000)
                 AppLog.i(ctx, TAG, "lockSound bind rc=${bindRes.first}: ${bindRes.second.replace('\n', ' ').take(500)}")
@@ -926,7 +926,7 @@ object LockSound {
                     done
                     killall -9 audioserver 2>/dev/null || true
                     pkill -9 -f avas 2>/dev/null || true
-                    echo "MOUNTS_LEFT=$(grep carlock /proc/mounts | wc -l)"
+                    echo "MOUNTS_LEFT=${'$'}(grep carlock /proc/mounts | wc -l)"
                 """.trimIndent()
                 val res = AdbClient.execute(script, 20000)
                 AppLog.i(ctx, TAG, "restoreSystemLockSoundBind [exitCode=${res.first}]: ${res.second.trim()}")

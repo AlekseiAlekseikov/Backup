@@ -239,7 +239,7 @@ object ScreenBrightness {
         val props = LinkedHashMap<String,String>()
         try {
             val p = Runtime.getRuntime().exec(arrayOf("sh","-c","getprop"))
-            p.waitFor(500)
+            if (!p.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)) { p.destroyForcibly() }
             p.inputStream.bufferedReader().forEachLine { line ->
                 val m = Regex("^\\[([^]]+)]:\\s*\\[([^]]*)]\\s*$").find(line)
                 if (m != null) props[m.groupValues[1]] = m.groupValues[2]
@@ -406,7 +406,7 @@ object ScreenBrightness {
         try {
             val dumpSb = StringBuilder()
             val proc = Runtime.getRuntime().exec(arrayOf("sh","-c","dumpsys settings 2>/dev/null | grep -i screen_off_timeout | head -20"))
-            proc.waitFor(2000)
+            proc.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)
             proc.inputStream.bufferedReader().forEachLine { dumpSb.append(it).append(";") }
             AppLog.i(TAG, "SCREEN_TIMEOUT: dumpsys screen_off entries: $dumpSb")
         } catch (_: Throwable) {}
