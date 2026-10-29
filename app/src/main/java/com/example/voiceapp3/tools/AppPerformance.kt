@@ -224,16 +224,52 @@ object AppPerformance {
             val ret = runSuCommand(script)
             val t1 = System.currentTimeMillis()
 
+            // P6 VERIFY: разбираем диагностические маркеры из stdout скрипта
+            // (WIFI_BEFORE, WIFI_RESTORED, ZYGOTE_PID_BEFORE/AFTER, USEJIT_AFTER,
+            // ZYGOTE_RESTARTED, WIFI_WAIT_DONE) — по ним определяем РЕАЛЬНЫЙ статус
+            // шага вместо безусловного OK.
+            val wifiBefore = parseTag(ret.output, "WIFI_BEFORE")
+            val wifiRestored = parseTag(ret.output, "WIFI_RESTORED")
+            val zygBefore = parseTag(ret.output, "ZYGOTE_PID_BEFORE")
+            val zygAfter = parseTag(ret.output, "ZYGOTE_PID_AFTER")
+            val usejitAfter = parseTag(ret.output, "USEJIT_AFTER")
+            val zygRestarted = parseTag(ret.output, "ZYGOTE_RESTARTED")
+            val wifiWaitDone = parseTag(ret.output, "WIFI_WAIT_DONE")
+            val rootUnavailable = ret.output.contains("ERR_ROOT_CHANNEL_UNAVAILABLE")
+            val zygOk = zygRestarted == "YES" && (zygBefore != zygAfter)
+            val jitOk = usejitAfter == valStr
+            val wifiRestoredOk = (wifiBefore != "1") || (wifiRestored == "1")
+            val zygStatus: ToolsStep.Status = when {
+                rootUnavailable -> ToolsStep.Status.BLOCKED
+                !zygOk -> ToolsStep.Status.FAILED   // Zygote не рестартовал
+                !jitOk -> ToolsStep.Status.FAILED   // usejit не применился
+                !wifiRestoredOk -> ToolsStep.Status.PARTIAL  // Wi-Fi не вернулся
+                ret.exitCode != 0 -> ToolsStep.Status.FAILED
+                else -> ToolsStep.Status.OK
+            }
+            val zygReason = buildString {
+                append("WIFI_BEFORE=").append(wifiBefore).append(" WIFI_RESTORED=").append(wifiRestored)
+                append(" ZYGOTE_BEFORE=").append(zygBefore).append(" AFTER=").append(zygAfter)
+                append(" RESTARTED=").append(zygRestarted).append(" USEJIT_AFTER=").append(usejitAfter)
+                append(" WIFI_WAIT=").append(wifiWaitDone)
+                if (!wifiRestoredOk) append(" | Wi-Fi НЕ БЫЛ ВОЗВРАЩЁН — возможен обрыв")
+                if (!zygOk) append(" | Zygote PID совпадает — рестарта НЕ произошло")
+                if (!jitOk) append(" | usejit=$usejitAfter после setprop (ожидалось $valStr)")
+            }
+            AppLog.i(TAG, "VERIFY jit_zygote: $zygStatus ($zygReason)")
+
             steps.add(
                 ToolsStep(
                     step = "perf_prop_zygote",
-                    command = "svc wifi disable; umount /data/app/*; setprop dalvik.vm.usejit=$valStr; ctl.restart zygote",
+                    command = "svc wifi disable; umount /data/app/*; setprop dalvik.vm.usejit=$valStr; ctl.restart zygote; trap restore_wifi EXIT",
                     startedAtMs = t0,
                     finishedAtMs = t1,
                     exitCode = ret.exitCode,
-                    stdout = "dalvik.vm.usejit=$valStr -> ZYGOTE RESTART",
-                    stderr = ret.output,
-                    status = ToolsStep.Status.OK
+                    expected = "ZYGOTE_RESTARTED=YES USEJIT_AFTER=$valStr WIFI_RESTORED=1(if was on)",
+                    actual = zygReason,
+                    stdout = "dalvik.vm.usejit=$valStr → $zygReason",
+                    stderr = ret.output.take(2000),
+                    status = zygStatus
                 )
             )
 

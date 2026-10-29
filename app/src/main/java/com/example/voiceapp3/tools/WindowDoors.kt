@@ -43,9 +43,12 @@ object WindowDoors {
     const val PREF_WINDOW_DRIVER_ON_DOOR = "window_driver_on_door"
     const val PREF_WINDOW_OPPOSITE_ON_DOOR = "window_opposite_on_door"
 
-    // VHAL VehiclePropertyIds (IHU629G Geely EX2)
-    const val PROP_DOOR_POS = 373295872     // 0x16400b00
-    const val PROP_WINDOW_POS = 322964416   // 0x13400bc0
+    // VHAL VehiclePropertyIds (IHU629G Geely EX2) из ex2_carprops.csv:
+    const val PROP_DOOR_POS = 373295872     // 0x16400b00 — позиция двери (1=открыта,2=закрыта)
+    const val PROP_WINDOW_POS = 322964416   // 0x13400bc0 — позиция СТЕКЛА (НЕ смешивать с дверью)
+    // События ЗАМКА (реальный lock/unlock по RKE или кнопке на двери)
+    const val PROP_DOOR_LOCK_STATE = 0x214020bc.toInt()   // 557918524 — BODY_DOOR_LOCK_STATE
+    const val PROP_DOOR_UNLOCK_STATE = 0x214020bd.toInt() // 557918525 — BODY_DOOR_UNLOCK_STATE
 
     // Пороги из CentralWatchdogService.k0():
     private const val WINDOW_OPEN_THRESHOLD = 7   // pos > 7 → уже приоткрыто
@@ -84,6 +87,34 @@ object WindowDoors {
     private var screenWakeReceiver: android.content.BroadcastReceiver? = null
     private var lastSleepTimeMs: Long = SystemClock.elapsedRealtime()
 
+    /**
+     * Дебаунс unlock-звука: не повторять чаще чем раз в UNLOCK_DEBOUNCE_MS,
+     * даже если VHAL пришлёт несколько событий (RKE+кнопка+дверь одновременно).
+     */
+    private var lastUnlockSoundAtMs: Long = 0L
+    private const val UNLOCK_DEBOUNCE_MS = 5000L
+
+    private fun fireUnlockSound(ctx: Context, reason: String) {
+        if (!LockSound.isUnlockSoundEnabled(ctx)) {
+            AppLog.i(ctx, TAG, "UNLOCK sound: disabled, skip (reason=$reason)")
+            return
+        }
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastUnlockSoundAtMs < UNLOCK_DEBOUNCE_MS) {
+            AppLog.i(ctx, TAG, "UNLOCK sound: debounce Δ=${now - lastUnlockSoundAtMs}ms, skip (reason=$reason)")
+            return
+        }
+        lastUnlockSoundAtMs = now
+        val soundPath = LockSound.getUnlockSelectedPath(ctx)
+        val soundFile = if (soundPath.isNotEmpty()) java.io.File(soundPath) else java.io.File(LockSound.OEM_CARLOCK_DEFAULT_WAV)
+        if (soundFile.exists()) {
+            AppLog.i(ctx, TAG, "UNLOCK sound: firing (reason=$reason, file=${soundFile.name})")
+            LockSound.playUnlockSound(ctx, soundFile)
+        } else {
+            AppLog.w(ctx, TAG, "UNLOCK sound: file not found ${soundFile.path}, skip (reason=$reason)")
+        }
+    }
+
     fun registerWakeReceiver(context: Context) {
         if (screenWakeReceiver != null) return
         val filter = android.content.IntentFilter().apply {
@@ -96,15 +127,9 @@ object WindowDoors {
                 val now = SystemClock.elapsedRealtime()
                 val idleSeconds = (now - lastSleepTimeMs) / 1000
                 lastSleepTimeMs = now
-                AppLog.i(ctx, TAG, "ГУ проснулось (${intent?.action}), простой = ${idleSeconds} с")
-
-                if (LockSound.isUnlockSoundEnabled(ctx)) {
-                    val soundPath = LockSound.getUnlockSelectedPath(ctx)
-                    val soundFile = if (soundPath.isNotEmpty()) java.io.File(soundPath) else java.io.File(OEM_CARLOCK_DEFAULT_WAV)
-                    if (soundFile.exists()) {
-                        LockSound.playUnlockSound(ctx, soundFile)
-                    }
-                }
+                AppLog.i(ctx, TAG, "ГУ проснулось (${intent?.action}), простой = ${idleSeconds} с — unlock звук ЗДЕСЬ НЕ ИГРАЕТ (играется только на реальный unlock по VHAL)")
+                // P4 фикс: SCREEN_ON ≠ открытие замка. Звук играется только из
+                // carCallback.onChangeEvent при приходе PROP_DOOR_UNLOCK_STATE.
             }
         }
         try {
@@ -116,12 +141,34 @@ object WindowDoors {
 
     private val carCallback = object : CarPropertyManager.CarPropertyEventCallback {
         override fun onChangeEvent(value: CarPropertyValue<*>) {
-            if (value.propertyId == PROP_DOOR_POS) {
-                val areaId = value.areaId
-                val rawVal = (value.value as? Number)?.toInt() ?: return
-                // rawVal == 1: открыта, rawVal == 2: закрыта
-                val isOpen = (rawVal == 1)
-                onDoorChanged(areaId, isOpen)
+            val propId = value.propertyId
+            when (propId) {
+                PROP_DOOR_POS -> {
+                    val areaId = value.areaId
+                    val rawVal = (value.value as? Number)?.toInt() ?: return
+                    // rawVal == 1: открыта, rawVal == 2: закрыта
+                    val isOpen = (rawVal == 1)
+                    AppLog.i(appContext ?: return, TAG,
+                        "DOOR_POS area=0x${Integer.toHexString(areaId)} raw=$rawVal open=$isOpen")
+                    onDoorChanged(areaId, isOpen)
+                }
+                PROP_DOOR_UNLOCK_STATE -> {
+                    // Реальное событие РАЗБЛОКИРОВКИ замка (RKE unlock, или кнопка на двери).
+                    // СЮДА — а не на дверь или окно — привязан unlock-звук приветствия.
+                    val rawVal = (value.value as? Number)?.toInt() ?: -1
+                    val areaId = value.areaId
+                    AppLog.i(appContext ?: return, TAG,
+                        "DOOR_UNLOCK_STATE area=0x${Integer.toHexString(areaId)} raw=$rawVal")
+                    val ctx = appContext ?: return
+                    fireUnlockSound(ctx, "PROP_DOOR_UNLOCK_STATE(0x214020bd) raw=$rawVal area=0x${Integer.toHexString(areaId)}")
+                }
+                PROP_DOOR_LOCK_STATE -> {
+                    // Только логируем; звук ЗАКРЫТИЯ играется фреймворком Geely через
+                    // Settings.System lock_car_audio_path — не дублируем.
+                    val rawVal = (value.value as? Number)?.toInt() ?: -1
+                    AppLog.i(appContext ?: return, TAG,
+                        "DOOR_LOCK_STATE area=0x${Integer.toHexString(value.areaId)} raw=$rawVal (lock sound via Geely FW, not us)")
+                }
             }
         }
 
@@ -173,13 +220,30 @@ object WindowDoors {
     private fun registerDoorListener() {
         val cpm = carPropertyManager ?: return
         if (isRegistered) return
+        // Подписка на позицию двери (для режима «опустить стекло при открытии двери»).
         try {
             cpm.registerCallback(carCallback, PROP_DOOR_POS, 0.0f)
-            isRegistered = true
             Log.i(TAG, "Подписка на DOOR_POS (0x16400b00) активна")
         } catch (e: Throwable) {
             Log.w(TAG, "registerCallback DOOR_POS failed", e)
         }
+        // Подписка на СОБЫТИЯ ЗАМКА (P4): звук открытия привязан к unlock-state,
+        // а не к факту открытия двери (дверь можно открыть и изнутри при снятом замке,
+        // и тем более не к позиции стекла — у того другое свойство PROP_WINDOW_POS).
+        try {
+            cpm.registerCallback(carCallback, PROP_DOOR_UNLOCK_STATE, 0.0f)
+            Log.i(TAG, "Подписка на DOOR_UNLOCK_STATE (0x214020bd) активна → сюда привязан unlock-звук")
+        } catch (e: Throwable) {
+            Log.w(TAG, "registerCallback DOOR_UNLOCK_STATE failed: ${e.message}")
+            appContext?.let { AppLog.w(it, TAG, "registerCallback DOOR_UNLOCK_STATE failed: ${e.message}") }
+        }
+        try {
+            cpm.registerCallback(carCallback, PROP_DOOR_LOCK_STATE, 0.0f)
+            Log.i(TAG, "Подписка на DOOR_LOCK_STATE (0x214020bc) активна (логируем, звук закрытия играет FW Geely)")
+        } catch (e: Throwable) {
+            Log.w(TAG, "registerCallback DOOR_LOCK_STATE failed: ${e.message}")
+        }
+        isRegistered = true
     }
 
     /**
@@ -204,15 +268,14 @@ object WindowDoors {
         val prefOwn = getPrefs(ctx).getBoolean(PREF_WINDOW_DRIVER_ON_DOOR, false)
         val prefOpp = getPrefs(ctx).getBoolean(PREF_WINDOW_OPPOSITE_ON_DOOR, false)
 
-        // Звук приветствия при открытии двери (если включен в LockSound).
-        if (isOpen && LockSound.isUnlockSoundEnabled(ctx)) {
-            val soundPath = LockSound.getUnlockSelectedPath(ctx)
-            val soundFile = if (soundPath.isNotEmpty()) java.io.File(soundPath) else java.io.File(OEM_CARLOCK_DEFAULT_WAV)
-            if (soundFile.exists()) {
-                LockSound.playUnlockSound(ctx, soundFile)
-            }
-        }
-
+        // P4: unlock-звук здесь БОЛЬШЕ НЕ ИГРАЕТ. Он привязан к событию
+        // PROP_DOOR_UNLOCK_STATE (VHAL-ивент разблокировки замка), а не к факту
+        // открытия двери. Благодаря этому:
+        //   • при открытых стёклах (PROP_WINDOW_POS) звук не срабатывает — это вообще
+        //     другое VHAL-свойство;
+        //   • при открытии двери изнутри при уже снятом замке звук не дублируется;
+        //   • при открытии второй двери подряд — дебаунс в fireUnlockSound().
+        // Продолжаем логику стеклоподъёмников ("filete de ar"):
         // Список окон для вентиляции: own и/или opposite в зависимости от префов.
         val targets = mutableListOf<Pair<Int, /*oposta*/ Boolean>>()
         if (prefOwn) targets.add(ownWindow to false)
@@ -297,7 +360,8 @@ object WindowDoors {
         true
     }.getOrDefault(false)
 
-    private const val OEM_CARLOCK_DEFAULT_WAV = "/vendor/etc/carlock/dajidali.wav"
+    // P4: OEM wav-путь берём из LockSound (он же для звука открытия), чтобы не разъехаться.
+    // Используем LockSound.OEM_CARLOCK_DEFAULT_WAV напрямую.
 
     fun setWindowDriverOnDoor(context: Context, enabled: Boolean): ToolsResult {
         val t0 = SystemClock.uptimeMillis()

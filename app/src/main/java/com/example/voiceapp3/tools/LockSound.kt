@@ -508,8 +508,16 @@ object LockSound {
     }
 
     // ──────────────────────────────────────────────────────────────
-    // Воспроизведение через наружный динамик (AVAS usage 29)
+    // Воспроизведение через наружный динамик (AVAS). Важно:
+    //   - на Geely IHU629G внешний динамик AVAS цепляется за USAGE=29
+    //     (vendor STARSHIP, не Android SDK константа).
+    //   - если 29 не сработал (ошибка setDataSource/prepare) — пробуем 73 (E5),
+    //     затем 13 (assistance_sonification) — только в исключительном случае.
+    //   - НЕ играем unlock-приветствие в кабину через USAGE_MEDIA: на EX2 это
+    //     означает «звук в салоне вместо улицы», что владелец и слышит.
     // ──────────────────────────────────────────────────────────────
+    private const val CAR_EXTERNAL_USAGE_STARSHIP = 29
+    private const val CAR_EXTERNAL_USAGE_E5 = 73
 
     fun preview(ctx: Context): ToolsResult = playPreview(ctx, isLock = true)
 
@@ -554,12 +562,13 @@ object LockSound {
         val runnable = Runnable {
             val startTs = SystemClock.elapsedRealtime()
             val delta = startTs - eventTs
-            playExternalSound(appCtx, file, volume)
-            // Предпрослушка также в салоне для unlock (на закрытии это делает фреймворк Geely сам).
-            if (!isLock) {
-                playCabinSound(appCtx, file)
-            }
-            AppLog.i(ctx, TAG, "playSound[$kind] started Δt=${delta}ms (target delay=${delayMs}ms)")
+            // Звук lock/unlock ИДЁТ ВО ВНЕШНИЙ AVAS-ДИНАМИК. НЕ дублировать в салон:
+            // это вызывало «звук играет внутри при открытии окна/двери».
+            // Звук ЗАКРЫТИЯ играется самим фреймворком Geely по lock_car_audio_path,
+            // а наш вызов ниже — только для ОТКРЫТИЯ (isLock=false), но ТОЛЬКО через
+            // внешний usage (29/73/13 fallback), не USAGE_MEDIA.
+            val ok = playExternalSound(appCtx, file, volume)
+            AppLog.i(ctx, TAG, "playSound[$kind] started Δt=${delta}ms (target delay=${delayMs}ms, external=$ok)")
         }
         if (delayMs == 0) {
             soundExecutor.execute(runnable)
@@ -680,44 +689,56 @@ object LockSound {
     }
 
     fun playExternalSound(ctx: Context, soundFile: File?, volumePercent: Int = DEFAULT_VOLUME): Boolean {
-        return try {
-            mediaPlayer?.release()
-            val mp = MediaPlayer()
-
-            val audioAttributes = AudioAttributes.Builder()
-                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                .setUsage(AudioAttributes.USAGE_ASSISTANCE_SONIFICATION) // AVAS usage exterior speaker
-                .build()
-
-            mp.setAudioAttributes(audioAttributes)
-            val vol = (volumePercent.coerceIn(5, 100) / 100f)
-            mp.setVolume(vol, vol)
-
-            if (soundFile != null && soundFile.exists()) {
-                mp.setDataSource(soundFile.absolutePath)
-            } else {
+        // Решаем файл (явный → OEM)
+        val target: File = when {
+            soundFile != null && soundFile.exists() -> soundFile
+            else -> {
                 val oemWav = File(OEM_CARLOCK_DEFAULT_WAV)
-                if (oemWav.exists()) {
-                    mp.setDataSource(oemWav.absolutePath)
-                } else {
+                if (!oemWav.exists()) {
                     AppLog.w(ctx, TAG, "playExternalSound: OEM wav $OEM_CARLOCK_DEFAULT_WAV not found")
                     return false
                 }
+                oemWav
             }
-
-            mp.prepare()
-            mp.start()
-            mp.setOnCompletionListener {
-                it.release()
-                if (mediaPlayer === it) mediaPlayer = null
-            }
-            mediaPlayer = mp
-            AppLog.i(ctx, TAG, "playExternalSound: воспроизводится ${soundFile?.name ?: "OEM"} (громкость $volumePercent%)")
-            true
-        } catch (t: Throwable) {
-            AppLog.e(ctx, TAG, "playExternalSound failed: ${t.javaClass.simpleName}: ${t.message}", t)
-            false
         }
+        val vol = (volumePercent.coerceIn(5, 100) / 100f)
+        // Порядок попыток: 29 (Geely STARSHIP = AVAS внешний) → 73 (E5 запас) →
+        // 13 (USAGE_ASSISTANCE_SONIFICATION — бипы, обычно тоже наружу).
+        val usages = intArrayOf(
+            CAR_EXTERNAL_USAGE_STARSHIP,
+            CAR_EXTERNAL_USAGE_E5,
+            AudioAttributes.USAGE_ASSISTANCE_SONIFICATION
+        )
+        var lastErr: Throwable? = null
+        for (usage in usages) {
+            val mp = MediaPlayer()
+            try {
+                val attrs = AudioAttributes.Builder()
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                    .setUsage(usage)
+                    .build()
+                mp.setAudioAttributes(attrs)
+                mp.setVolume(vol, vol)
+                mp.setDataSource(target.absolutePath)
+                mp.prepare()
+                // Если дошли до start() без исключения — считаем успешным.
+                mediaPlayer?.release()
+                mp.start()
+                mp.setOnCompletionListener {
+                    it.release()
+                    if (mediaPlayer === it) mediaPlayer = null
+                }
+                mediaPlayer = mp
+                AppLog.i(ctx, TAG, "playExternalSound: playing ${target.name} vol=$volumePercent% usage=$usage (AVAS external)")
+                return true
+            } catch (t: Throwable) {
+                AppLog.w(ctx, TAG, "playExternalSound: usage=$usage failed: ${t.javaClass.simpleName}: ${t.message}")
+                lastErr = t
+                runCatching { mp.release() }
+            }
+        }
+        AppLog.e(ctx, TAG, "playExternalSound: all usages failed for ${target.name}: ${lastErr?.message}", lastErr)
+        return false
     }
 
     fun onBootOrWatchdog(ctx: Context) {

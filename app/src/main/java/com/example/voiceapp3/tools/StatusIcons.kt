@@ -355,6 +355,72 @@ object StatusIcons {
         return Icon.createWithBitmap(bmp)
     }
 
+    /**
+     * Иконка температуры «снаружи»: компактный термометр (глиф, НЕ текст-заглушка)
+     * слева + цифра значения справа. Аналогично Wi-Fi: рисуется в Canvas, без
+     * использования эмодзи/текста как иконки — чтобы статус-бар не показывал
+     * регрессию "голое +12° вместо значка".
+     * DO NOT replace with text placeholder.
+     */
+    private fun makeTempIcon(ctx: Context, valueStr: String, color: Int): Icon {
+        val dp = ctx.resources.displayMetrics.density
+        val size = (24 * dp).toInt().coerceAtLeast(24)
+        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bmp)
+
+        // Glyph-термометр слева:
+        //   ─ вертикальная колба (stroke-прямоугольник со скруглённым верхом),
+        //   ─ круглый шарик внизу (заполненный),
+        //   ─ короткая ртутная колонка внутри (для индикации «температура»).
+        val glyph = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            this.color = color; style = Paint.Style.STROKE
+            strokeWidth = size * 0.09f; strokeCap = Paint.Cap.ROUND
+        }
+        val gx0 = size * 0.15f                // левая граница глифа
+        val gx1 = size * 0.38f                // правая граница глифа
+        val colW = gx1 - gx0
+        val cx = (gx0 + gx1) / 2f
+        val topY = size * 0.15f
+        val midY = size * 0.66f                // нижняя точка колбы (без шарика)
+        // Колба (прямоугольник + скруглённый верх): рисуем двумя линиями (лево/право) + дуга верха.
+        canvas.drawLine(cx, topY + colW/2, cx, midY, glyph) // линия уже толще strokeWidth — используем прямо
+        // Прямоугольник колбы:
+        val bulbTop = midY - colW * 0.4f
+        canvas.drawLine(gx0 + colW*0.25f, topY + colW/2, gx0 + colW*0.25f, bulbTop, glyph)
+        canvas.drawLine(gx1 - colW*0.25f, topY + colW/2, gx1 - colW*0.25f, bulbTop, glyph)
+        // Верхнее скругление (дуга 180° над колбой):
+        val topOval = RectF(gx0 + colW*0.25f, topY, gx1 - colW*0.25f, topY + colW)
+        canvas.drawArc(topOval, 180f, 180f, false, glyph)
+        // Нижнее скругление колбы (переход к шарику):
+        val botOval = RectF(gx0 + colW*0.25f, bulbTop, gx1 - colW*0.25f, bulbTop + colW)
+        canvas.drawArc(botOval, 0f, 180f, false, glyph)
+        // Шарик внизу (заполненный):
+        val bulbR = colW * 0.75f
+        val bulbCy = midY + bulbR * 0.3f
+        glyph.style = Paint.Style.FILL
+        canvas.drawCircle(cx, bulbCy, bulbR, glyph)
+        // "Ртуть" внутри шарика (чуть темнее — не выйдет в монохроме,
+        // в small icon статус-бара всё равно одноцветно, поэтому пропускаем).
+
+        // Значение температуры справа:
+        val num = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            this.color = color; typeface = Typeface.DEFAULT_BOLD
+            textSize = size * 0.55f; textAlign = Paint.Align.LEFT
+            style = Paint.Style.FILL
+        }
+        val deg = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            this.color = color; typeface = Typeface.DEFAULT
+            textSize = size * 0.32f; textAlign = Paint.Align.LEFT
+        }
+        val numX = size * 0.46f
+        val numY = size * 0.74f
+        canvas.drawText(valueStr, numX, numY, num)
+        val degX = numX + num.measureText(valueStr) - size * 0.02f
+        canvas.drawText("°", degX, numY - size*0.22f, deg)
+        AppLog.i(TAG, "TEMP: icon glyph=thermometer size=${size}x${size}px value=$valueStr")
+        return Icon.createWithBitmap(bmp)
+    }
+
     private fun makeWifiIconWithLevel(ctx: Context, level: Int, color: Int): Icon {
         // Тоже дуги, но активные дуги только до level (0..4 или -1 при disc/off).
         // Для small icon статуса-бара всё же рисуем все дуги (размер не разглядеть),
@@ -393,9 +459,11 @@ object StatusIcons {
                 val sign = if (t > 0) "+" else ""
                 val text = "$sign$tStr °C · $tempSource"
                 val w = (24 * app.resources.displayMetrics.density).toInt().coerceAtLeast(24)
-                postNotif(app, NOTIF_TEMP, CHANNEL_TEMP, makeTextIcon(app, "$sign$tStr", "°", Color.WHITE), "Снаружи", text, RANK_TEMP,
+                // P3: отдельный значок с глифом термометра (НЕ просто "+12°" текстом,
+                // иначе в статус-баре не видно иконки вообще).
+                postNotif(app, NOTIF_TEMP, CHANNEL_TEMP, makeTempIcon(app, "$sign$tStr", Color.WHITE), "Снаружи", text, RANK_TEMP,
                     telemetryPi(app, NOTIF_TEMP))
-                AppLog.i(TAG, "TEMP: notify id=$NOTIF_TEMP channel=$CHANNEL_TEMP value=$sign$tStr°C size=${w}x${w}px src=$tempSource → posted")
+                AppLog.i(TAG, "TEMP: notify id=$NOTIF_TEMP channel=$CHANNEL_TEMP value=$sign$tStr°C size=${w}x${w}px src=$tempSource icon=thermometer-glyph → posted")
             } else {
                 cancel(app, NOTIF_TEMP)
                 AppLog.w(TAG, "TEMP: notify ERROR: value=null (all probes failed, see TEMP: lines above for which props were tried)")

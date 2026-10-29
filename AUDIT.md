@@ -260,3 +260,21 @@ SCREEN_TIMEOUT: device serial check
 | `persist.sys.hvacdigital.exttemp` | w0/x7.java:142, w0/ah.java:17, w0/u5.java:27 (новый CentralEXAuto) | secondary (для forward-compat с новым плагином) |
 
 setHvacDigital и bootRestore пишут оба свойства; readTempScan пробует оба и логирует cross-check.
+
+### Раздел 6 — Регрессия «Wi-Fi = текст "WiFi" вместо иконки» (fix/v2 P1, hard rule)
+
+**История проблемы:** во время групповой заливки group B/C в fix/log-driven-fixes в `StatusIcons.kt` был скопирован артефактный вариант `makeTextIcon`, где ветка `main=="wifi"` вместо дуг рисовала обычный `drawText("WiFi", …)`. Результат на ГУ: в статус-баре виден текст "WiFi" там, где ожидается значок сигнала.
+
+**Причина корневая:** файл был скопирован *целиком* из ветки, а не применён дельта-фикс поверх main — из-за чего всплыл старый сломанный кусок. См. правило §8 "любой файл, расходящийся с main, обязан стартовать с main-версии и нести только дельту фикса".
+
+**Исправление (fix/v2, commit 5477c9a):**
+- `StatusIcons.makeTextIcon` ветка `main=="wifi"` заменена на Canvas-дуги (3 концентрических дуги radii 0.22/0.38/0.54 размера + точка снизу, всё через `Paint.Style.STROKE`, `strokeCap=ROUND`). Иконка — это вектор в Bitmap, а не текст.
+- Рядом добавлен комментарий-предохранитель: `// DO NOT replace with text placeholder`.
+- Click по Wi-Fi-уведомлению открывает `Settings.ACTION_WIFI_SETTINGS` (а не `telemetryPi`, как у батареи/температуры).
+- В лог пишется `WIFI: level=N rssi=N icon=arcs click→android.settings.WIFI_SETTINGS`.
+- NOTIF_WIFI=15024, отдельный канал CHANNEL_WIFI — не пересекается с batt/temp.
+
+**Никогда впредь:**
+1. Не заменять значок Wi-Fi текстом "WiFi" / "W" / "📶" и т.п. — только Canvas-глиф.
+2. Не копировать StatusIcons.kt целым файлом из других веток — только точечные diff-фиксы поверх main.
+
