@@ -250,10 +250,10 @@ class UiBridge(
         // приложение сверяемся с режимом день/ночь (аналог watchdog-шага
         // APK): сменился — применить сохранённую корзину, иначе снять
         // текущий уровень. До включённого тумблера — no-op.
-        runCatching { ScreenBrightness.syncOnContext(activity) }
-        // Срез №3: синхронизация статус-иконок при возвращении приложения
-        // (как watchdog-цикл APK при SCREEN_ON/USER_PRESENT).
-        runCatching { StatusIcons.syncAll(activity) }
+        com.example.voiceapp3.tools.BgWorker.post("UiBridge.onResume") {
+            runCatching { ScreenBrightness.syncOnContext(activity) }
+            runCatching { StatusIcons.syncAll(activity) }
+        }
     }
 
     /**
@@ -477,26 +477,37 @@ class UiBridge(
             // cycle.sessions, places.*, lab.*, tool.act) удалены вместе с
             // экранами — эти операции выполняет Flutter-приложение телеметрии.
             "settings.change" -> {
-                runCatching {
+                // P1: applyFromUi для TTL/perf/mount/brightness — тяжёлые adb/iptables/VHAL.
+                // Парсим JSON на UI-потоке (быстро), работу — в BgWorker, результат возвращаем на main.
+                val parsed = runCatching {
                     val obj: JsonObject = JsonParser.parseString(data).asJsonObject
                     val key = obj.get("key")?.asString
                     val element = obj.get("value")
-                    if (key != null && element != null) {
+                    if (key == null || element == null) null
+                    else {
                         val value: Any = if (element.isJsonPrimitive && element.asJsonPrimitive.isBoolean) {
                             element.asBoolean
                         } else {
                             element.asString
                         }
-                        val result = tools.applyFromUi(key, value)
-                        if (result != null) {
+                        key to value
+                    }
+                }.getOrElse { Log.w(TAG, "settings.change parse failed", it); null }
+                if (parsed != null) {
+                    val (key, value) = parsed
+                    if (key == "theme") {
+                        TelemetryPrefsMirror.rememberShellTheme(activity, value.toString())
+                    }
+                    com.example.voiceapp3.tools.BgWorker.run("UiBridge.settings.change/$key", {
+                        tools.applyFromUi(key, value)
+                    }) { res ->
+                        res.getOrNull()?.let { result ->
                             lastToolsResult = result
-                            if (key == "theme") {
-                                TelemetryPrefsMirror.rememberShellTheme(activity, value.toString())
-                            }
                             pushToolsState()
                         }
+                        res.exceptionOrNull()?.let { Log.w(TAG, "settings.change $key failed", it) }
                     }
-                }.onFailure { Log.w(TAG, "settings.change parse failed", it) }
+                }
             }
             // Срез №4: Звук блокировки замка (§7 ТЗ)
             "audio.copyFromUsb" -> {
@@ -600,26 +611,42 @@ class UiBridge(
                 }
             }
             "dev.runCommand" -> {
-                runCatching {
-                    val obj = try { JsonParser.parseString(data).asJsonObject } catch (_: Exception) { null }
-                    val cmd = obj?.get("command")?.asString ?: "id"
-                    val (exitCode, output) = AdbClient.execute(cmd, 15000)
-                    val resObj = com.google.gson.JsonObject().apply {
-                        addProperty("exitCode", exitCode)
-                        addProperty("output", output)
-                    }
-                    activity.runOnUiThread {
-                        toolsPanel?.onDevCmdResult(exitCode, output)
-                    }
+                val cmd = runCatching {
+                    (JsonParser.parseString(data).asJsonObject?.get("command")?.asString) ?: "id"
+                }.getOrDefault("id")
+                com.example.voiceapp3.tools.BgWorker.run("UiBridge.dev.runCommand", {
+                    AdbClient.execute(cmd, 15000)
+                }) { res ->
+                    val (rc, out) = res.getOrDefault(1 to "ERR: ${res.exceptionOrNull()?.message}")
+                    activity.runOnUiThread { toolsPanel?.onDevCmdResult(rc, out) }
                 }
             }
             "dev.getLogcat" -> {
-                runCatching {
-                    val (exitCode, output) = AdbClient.execute("logcat -d -t 120 -s CentralWatchdog:V LockSound:V WindowDoors:V NetworkTtl:V UiBridge:V ToolsBackend:V", 8000)
-                    val escaped = com.google.gson.Gson().toJson(output)
-                    activity.runOnUiThread {
-                        toolsPanel?.onLogcat(output)
-                    }
+                com.example.voiceapp3.tools.BgWorker.run("UiBridge.dev.getLogcat", {
+                    AdbClient.execute("logcat -d -t 120 -s CENTRAL_*:V", 8000)
+                }) { res ->
+                    val (_, out) = res.getOrDefault(1 to "ERR: ${res.exceptionOrNull()?.message}")
+                    activity.runOnUiThread { toolsPanel?.onLogcat(out) }
+                }
+            }
+            "dev.checkRoot" -> {
+                com.example.voiceapp3.tools.BgWorker.run("UiBridge.dev.checkRoot", {
+                    AdbClient.probeRootChannel()
+                }) { res ->
+                    val r = res.getOrNull()
+                    val msg = if (r != null)
+                        "PORT65010: connect → ${if(r.port>0)"OK on port ${r.port}" else "no port"}\n" +
+                        "handshake CNXN → OK\n" +
+                        "id → ${r.uidLine}\n" +
+                        "state=${r.state}\n" +
+                        "ИТОГ = ${r.verdict}"
+                    else "ERR: ${res.exceptionOrNull()?.message}"
+                    activity.runOnUiThread { toolsPanel?.onDevCmdResult(0, msg) }
+                }
+            }
+            "dev.checkSerial" -> {
+                com.example.voiceapp3.tools.ScreenBrightness.serialCheckReport(activity) { msg ->
+                    activity.runOnUiThread { toolsPanel?.onDevCmdResult(0, msg) }
                 }
             }
             "dev.testAvasSound" -> {
@@ -630,49 +657,53 @@ class UiBridge(
                 }
             }
             "dev.simulateDoorOpen" -> {
-                runCatching {
-                    WindowDoors.initCarService(activity)
-                    // Водительская дверь (зона 1 -> открыта 1)
-                    val cpm = WindowDoors.PROP_WINDOW_POS
-                    // приоткрываем водительское окно на 10%
-                    AdbClient.execute("dumpsys car_service inject-event 0x16400b00 1 1 2>/dev/null")
-                    // и сразу вызываем воспроизведение звука
-                    val file = java.io.File("/vendor/etc/carlock/dajidali.wav")
-                    LockSound.playExternalSound(activity, file, LockSound.getVolume(activity))
+                com.example.voiceapp3.tools.BgWorker.post("UiBridge.dev.simulateDoorOpen") {
+                    runCatching {
+                        WindowDoors.initCarService(activity)
+                        AdbClient.execute("dumpsys car_service inject-event 0x16400b00 1 1 2>/dev/null")
+                    }
+                    // playExternalSound работает с MediaPlayer/AudioTrack — можно на main, но запуск из фона безопаснее
+                    Handler(Looper.getMainLooper()).post {
+                        val file = java.io.File("/vendor/etc/carlock/dajidali.wav")
+                        LockSound.playExternalSound(activity, file, LockSound.getVolume(activity))
+                    }
                 }
             }
             "dev.simulateDoorClose" -> {
-                runCatching {
-                    WindowDoors.initCarService(activity)
-                    AdbClient.execute("dumpsys car_service inject-event 0x16400b00 1 2 2>/dev/null")
+                com.example.voiceapp3.tools.BgWorker.post("UiBridge.dev.simulateDoorClose") {
+                    runCatching {
+                        WindowDoors.initCarService(activity)
+                        AdbClient.execute("dumpsys car_service inject-event 0x16400b00 1 2 2>/dev/null")
+                    }
                 }
             }
             "dev.testNotificationIcons" -> {
-                runCatching {
-                    StatusIcons.syncAll(activity)
+                com.example.voiceapp3.tools.BgWorker.post("UiBridge.dev.testNotif") {
+                    runCatching { StatusIcons.syncAll(activity) }
                 }
             }
             "perf.getKeepAliveList" -> {
-                runCatching {
-                    val list = AppPerformance.getInstalledAppsInfo(activity)
-                    activity.runOnUiThread {
-                        toolsPanel?.onKeepAliveApps(list.toString())
-                    }
+                com.example.voiceapp3.tools.BgWorker.run("UiBridge.perf.appList", {
+                    AppPerformance.getInstalledAppsInfo(activity)
+                }) { res ->
+                    val list = res.getOrDefault(emptyList())
+                    activity.runOnUiThread { toolsPanel?.onKeepAliveApps(list.toString()) }
                 }
             }
             "perf.saveKeepAlive" -> {
-                runCatching {
-                    val obj = try { JsonParser.parseString(data).asJsonObject } catch (_: Exception) { null }
-                    val pkgsArr = obj?.getAsJsonArray("packages")
-                    val pkgs = ArrayList<String>()
-                    if (pkgsArr != null) {
-                        for (el in pkgsArr) {
-                            pkgs.add(el.asString)
-                        }
+                val pkgs = runCatching {
+                    val arr = JsonParser.parseString(data).asJsonObject?.getAsJsonArray("packages")
+                    val list = ArrayList<String>()
+                    arr?.forEach { list.add(it.asString) }
+                    list
+                }.getOrDefault(ArrayList())
+                com.example.voiceapp3.tools.BgWorker.run("UiBridge.perf.saveKeepAlive", {
+                    AppPerformance.setKeepAliveApps(activity, pkgs)
+                }) { res ->
+                    res.getOrNull()?.let { result ->
+                        lastToolsResult = result
+                        pushToolsState()
                     }
-                    val result = AppPerformance.setKeepAliveApps(activity, pkgs)
-                    lastToolsResult = result
-                    pushToolsState()
                 }
             }
         }
@@ -1091,7 +1122,7 @@ class UiBridge(
     }
 
     companion object {
-        private const val TAG = "UiBridge"
+        private const val TAG = "CENTRAL_UiBridge"
         private const val AUTO_CHECK_INTERVAL_MS = 6L * 60 * 60 * 1000
 
         /** Единственный живой мост UI (сервис голоса ищет его для voice.ui). */

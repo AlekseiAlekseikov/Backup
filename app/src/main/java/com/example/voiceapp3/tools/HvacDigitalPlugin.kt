@@ -12,7 +12,7 @@ import java.io.FileOutputStream
  * Все ключевые шаги пишутся в AppFileLogger.
  */
 object HvacDigitalPlugin {
-    private const val TAG = "HvacDigital"
+    private const val TAG = "CENTRAL_HvacDigitalPlugin"
     private const val STAGE_DIR = "/data/local/hvac-digital"
     private const val STAGE_APK = "$STAGE_DIR/sysui.apk"
     private const val OEM_PKG = "com.flyme.auto.systemuiplugin"
@@ -76,31 +76,50 @@ object HvacDigitalPlugin {
         if (!extracted) return ToolsResult("hvacdigital.plugin.enable", "Цифровой климат", steps)
 
         val tmp = tmpFile.absolutePath.replace("'", "'\\''")
+        BgWorker.assertNotMain("HvacDigitalPlugin.enable")
         val script = """
             id
-            _we=${'$'}(getenforce 2>/dev/null)
-            setenforce 0 2>/dev/null; true
+            SELINUX_BEFORE=${'$'}(getenforce 2>/dev/null)
+            # P5: setenforce 0 удалён — на user-билде отклоняется и маскирует ошибку mount.
             mkdir -p $STAGE_DIR
             cp -f '$tmp' $STAGE_APK
-            chown root:root $STAGE_APK 2>/dev/null || true
+            chown root:root $STAGE_APK 2>/dev/null || echo CHOWN_FAIL
             chmod 644 $STAGE_APK
             chcon u:object_r:system_app_file:s0 $STAGE_APK 2>/dev/null || chcon u:object_r:vendor_file:s0 $STAGE_APK 2>/dev/null || true
             DST="$dst"
             umount ${'$'}DST 2>/dev/null || true
+            SYSUI_PID_BEFORE=${'$'}(pidof com.android.systemui)
             mount --bind $STAGE_APK ${'$'}DST 2>&1 || echo MOUNT_FAIL
             restorecon -v ${'$'}DST 2>/dev/null || true
             rm -rf /data/dalvik-cache/*/*GeelyAutoSystemUIPlugin* 2>/dev/null || true
             rm -rf /data/dalvik-cache/*/*systemuiplugin* 2>/dev/null || true
-            kill ${'$'}(pidof com.android.systemui) 2>/dev/null || true
+            kill ${'$'}SYSUI_PID_BEFORE 2>/dev/null || true
             sleep 3
+            SYSUI_PID_AFTER=${'$'}(pidof com.android.systemui)
+            SELINUX_AFTER=${'$'}(getenforce 2>/dev/null)
+            echo SELINUX_BEFORE=${'$'}SELINUX_BEFORE SELINUX_AFTER=${'$'}SELINUX_AFTER SYSUI_PID_BEFORE=${'$'}SYSUI_PID_BEFORE SYSUI_PID_AFTER=${'$'}SYSUI_PID_AFTER
+            SRC_INODE=${'$'}(stat -c '%i' $STAGE_APK 2>/dev/null)
+            TGT_INODE=${'$'}(stat -c '%i' ${'$'}DST 2>/dev/null)
+            echo SRC_INODE=${'$'}SRC_INODE TGT_INODE=${'$'}TGT_INODE
             if grep -F " $STAGE_APK " /proc/mounts >/dev/null 2>&1 || grep -F GeelyAutoSystemUIPlugin /proc/mounts >/dev/null 2>&1; then echo HVAC_DIGITAL_OK; else echo HVAC_DIGITAL_FALHOU; fi
-            case "${'$'}_we" in Enforcing) setenforce 1 2>/dev/null;; *) setenforce 1 2>/dev/null;; esac; true
         """.trimIndent()
         val (rc, out) = AdbClient.execute(script, 40000)
         AppFileLogger.i(TAG, "enable script rc=$rc out=${out.take(1000)}")
-        val ok = rc == 0 && out.contains("HVAC_DIGITAL_OK")
-        steps += stepOf("activate", "cp+chcon+mount", if (ok) ToolsStep.Status.OK else ToolsStep.Status.FAILED,
-            expected = "HVAC_DIGITAL_OK", actual = "rc=$rc", stdout = out)
+        val mountOk = out.contains("HVAC_DIGITAL_OK") && !out.contains("MOUNT_FAIL")
+        val inodeMatch = Regex("SRC_INODE=(\\d+) TGT_INODE=(\\d+)").find(out)?.let {
+            it.groupValues[1] == it.groupValues[2] && it.groupValues[1].isNotEmpty() && it.groupValues[1] != "0"
+        } ?: false
+        val activateStatus = when {
+            out.contains("ERR_ROOT_CHANNEL_UNAVAILABLE") -> ToolsStep.Status.BLOCKED
+            out.contains("Permission denied") || out.contains("avc: denied") -> ToolsStep.Status.FAILED
+            mountOk && inodeMatch -> ToolsStep.Status.OK
+            mountOk -> ToolsStep.Status.PARTIAL
+            else -> ToolsStep.Status.FAILED
+        }
+        val reason = "rc=$rc inode=$inodeMatch mount=$mountOk"
+        AppLog.i(TAG, "VERIFY hvacdigital.enable: $activateStatus ($reason)")
+        steps += stepOf("activate", "cp+chcon+mount", activateStatus,
+            expected = "HVAC_DIGITAL_OK + inode match", actual = reason, stdout = out)
         val post = checkStatus(ctx)
         steps += stepOf("post_check", "grep mounts", if (post.overlayMounted) ToolsStep.Status.OK else ToolsStep.Status.PARTIAL,
             expected = "mounted", actual = "mounted=${post.overlayMounted}", stdout = post.mountLine)
@@ -115,19 +134,23 @@ object HvacDigitalPlugin {
             expected = "mounted", actual = "mounted=${status0.overlayMounted}", stdout = status0.mountLine)
         val dst = status0.oemPkgPath
         if (dst == null) return ToolsResult("hvacdigital.plugin.disable", "Откат к OEM", steps)
+        BgWorker.assertNotMain("HvacDigitalPlugin.disable")
         val script = """
             id
-            _we=${'$'}(getenforce 2>/dev/null)
-            setenforce 0 2>/dev/null; true
+            SELINUX_BEFORE=${'$'}(getenforce 2>/dev/null)
             umount '$dst' 2>/dev/null || true
-            kill ${'$'}(pidof com.android.systemui) 2>/dev/null || true
+            SYSUI_PID_BEFORE=${'$'}(pidof com.android.systemui)
+            kill ${'$'}SYSUI_PID_BEFORE 2>/dev/null || true
             sleep 3
+            SYSUI_PID_AFTER=${'$'}(pidof com.android.systemui)
+            SELINUX_AFTER=${'$'}(getenforce 2>/dev/null)
+            echo SELINUX_BEFORE=${'$'}SELINUX_BEFORE SELINUX_AFTER=${'$'}SELINUX_AFTER SYSUI_PID_BEFORE=${'$'}SYSUI_PID_BEFORE SYSUI_PID_AFTER=${'$'}SYSUI_PID_AFTER
             if grep -F GeelyAutoSystemUIPlugin /proc/mounts >/dev/null 2>&1; then echo REVERTED_FAIL; else echo REVERTED_OK; fi
-            case "${'$'}_we" in Enforcing) setenforce 1 2>/dev/null;; *) setenforce 1 2>/dev/null;; esac; true
         """.trimIndent()
         val (rc, out) = AdbClient.execute(script, 25000)
         AppFileLogger.i(TAG, "disable script rc=$rc out=${out.take(500)}")
         val ok = rc == 0 && out.contains("REVERTED_OK")
+        AppLog.i(TAG, "VERIFY hvacdigital.disable: expected REVERTED_OK got rc=$rc → ${if(ok)"SUCCESS"else"FAILED"}")
         steps += stepOf("revert", "umount", if (ok) ToolsStep.Status.OK else ToolsStep.Status.PARTIAL,
             expected = "REVERTED_OK", actual = "rc=$rc", stdout = out)
         val post = checkStatus(ctx)

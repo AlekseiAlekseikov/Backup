@@ -39,7 +39,9 @@ import com.example.voiceapp3.car.VehiclePropertyDumper
 import com.example.voiceapp3.car.VehiclePropertyHelper
 import com.example.voiceapp3.handlers.AcControlHandler
 import com.example.voiceapp3.media.MediaSessionCoordinator
+import com.example.voiceapp3.tools.AppLog
 import com.example.voiceapp3.tools.AppPerformance
+import com.example.voiceapp3.tools.BgWorker
 import com.example.voiceapp3.tools.HuNightMode
 import com.example.voiceapp3.tools.LockSound
 import com.example.voiceapp3.tools.NetworkTtl
@@ -135,7 +137,7 @@ class VoiceAssistantService : Service() {
         const val EXTRA_VALUE = "value"
         const val EXTRA_DIRECTION = "direction"
 
-        private const val TAG = "VoiceAssistantService"
+        private const val TAG = "CENTRAL_VoiceAssistantService"
         private const val MAIN_CHANNEL_ID = "voice_assistant_channel"
         private const val PERMISSION_CHANNEL_ID = "permission_channel"
         private const val PERMISSION_NOTIFICATION_ID = 1001
@@ -334,56 +336,54 @@ class VoiceAssistantService : Service() {
            яркость (порт w() с boot-события; при обычном старте из приложения
            шаг не выполняется, чтобы не перебивать яркость штатной панели). */
         if (intent?.getBooleanExtra(EXTRA_BOOT_RESTORE, false) == true) {
-            runCatching { ScreenBrightness.restoreIfEnabled(this) }
-            /* Срез №3: при загрузке ГУ синхронизируем статус-иконки и запускаем
-               периодический цикл (как CentralWatchdogService.Q0 + r2 case 10). */
-            runCatching { StatusIcons.syncAll(this) }
-            runCatching { StatusIcons.startPeriodicSync(this) }
-            /* Аудит §5.4/§5.5/§5.7: восстановление настроек, которые держатся
-               только в оперативной памяти / в iptables / в bind-mount: TTL 65,
-               кастомный звук замка, оптимизация видео 60fps, подписка на двери. */
-            runCatching { NetworkTtl.bootRestore(this) }
-            runCatching { LockSound.onBootOrWatchdog(this) }
-            // Подписка на события дверей (filete de ar) — только если хотя бы один
-            // из двух тумблеров окон включен. Важно: без этой проверки initCarService
-            // безусловно подписывался на события дверей даже при ВЫКЛюченных функциях,
-            // что приводило к самопроизвольному открытию/закрытию стёкол (баг 5.1).
-            runCatching {
-                val prefs = try {
-                    createDeviceProtectedStorageContext()
-                        .getSharedPreferences("voiceapp3", Context.MODE_PRIVATE)
-                } catch (_: Throwable) {
-                    getSharedPreferences("voiceapp3", Context.MODE_PRIVATE)
+            // P1: bootRestore тяжёлый (iptables/mount/adb) — ВСЕГДА на BgWorker, не на main.
+            // Регистрация наблюдателя HuNightMode лёгкая — остаётся на месте.
+            val app = this
+            BgWorker.post("VoiceAssistant.bootRestore") {
+                runCatching { ScreenBrightness.restoreIfEnabled(app) }
+                runCatching { StatusIcons.syncAll(app) }
+                runCatching { StatusIcons.startPeriodicSync(app) }
+                runCatching { NetworkTtl.bootRestore(app) }
+                runCatching { LockSound.onBootOrWatchdog(app) }
+                runCatching {
+                    val prefs = try {
+                        app.createDeviceProtectedStorageContext()
+                            .getSharedPreferences("voiceapp3", Context.MODE_PRIVATE)
+                    } catch (_: Throwable) {
+                        app.getSharedPreferences("voiceapp3", Context.MODE_PRIVATE)
+                    }
+                    val driverOn = prefs.getBoolean(WindowDoors.PREF_WINDOW_DRIVER_ON_DOOR, false)
+                    val oppOn = prefs.getBoolean(WindowDoors.PREF_WINDOW_OPPOSITE_ON_DOOR, false)
+                    val unlockOn = prefs.getBoolean(LockSound.PREF_UNLOCK_SOUND_ENABLED, false)
+                    if (driverOn || oppOn || unlockOn) {
+                        WindowDoors.initCarService(app)
+                    }
                 }
-                val driverOn = prefs.getBoolean(WindowDoors.PREF_WINDOW_DRIVER_ON_DOOR, false)
-                val oppOn = prefs.getBoolean(WindowDoors.PREF_WINDOW_OPPOSITE_ON_DOOR, false)
-                val unlockOn = prefs.getBoolean(LockSound.PREF_UNLOCK_SOUND_ENABLED, false)
-                if (driverOn || oppOn || unlockOn) {
-                    WindowDoors.initCarService(this)
+                runCatching { StatusIcons.bootRestoreHvacDigital(app) }
+                runCatching {
+                    if (AppPerformance.isVideo60FpsEnabled(app)) {
+                        AppPerformance.setVideo60Fps(app, true)
+                    }
                 }
+                runCatching { NetworkTtl.registerNetworkReceiver(app) }
+                AppLog.i(TAG, "bootRestore complete (BgWorker)")
             }
-            // Восстановление persist.sys.hvacdigital.* после ребута
-            // (флаги плагина цифровой индикации статус-бара).
-            runCatching { StatusIcons.bootRestoreHvacDigital(this) }
-            // Оптимизация видео 60fps: bind-mount сбрасывается при перезагрузке,
-            // поэтому если тумблер включен — заново монтируем декодер.
-            runCatching {
-                if (AppPerformance.isVideo60FpsEnabled(this)) {
-                    AppPerformance.setVideo60Fps(this, true)
-                }
-            }
-            // Смена «день/ночь» без открытия приложения — чтобы яркость тоже
-            // переключалась живьём (watchdog brightnessSync опирается на
-            // isHeadlightsOn, которое читает актуальную uiMode).
             HuNightMode.observe(this) {
-                runCatching { ScreenBrightness.restoreIfEnabled(this) }
-                runCatching { StatusIcons.syncAll(this) }
+                BgWorker.post("VoiceAssistant.nightMode") {
+                    runCatching { ScreenBrightness.restoreIfEnabled(app) }
+                    runCatching { StatusIcons.syncAll(app) }
+                }
             }
-            // Watchdog-цикл раз в 60 с: повторно применяет настройки, которые
-            // могли слететь при force-stop, при входе/выходе из сна ГУ или при
-            // сбросе системных пропертей. Аналог цикла r2 в CentralWatchdogService,
-            // который помимо публикации иконок раз в 15 с проверяет все флаги.
+            // Watchdog-цикл раз в 60 с — постим на BgWorker, не выполняем на main.
             handler.postDelayed(settingsWatchdog, SETTINGS_WATCHDOG_MS)
+        }
+        // Регистрируем сетевой ресивер всегда (не только при boot-ветке) — чтобы
+        // правило TTL подхватывалось и при обычном старте приложения.
+        if (intent?.getBooleanExtra(EXTRA_BOOT_RESTORE, false) != true) {
+            val app = this
+            BgWorker.post("NetworkTtl.registerReceiver") {
+                runCatching { NetworkTtl.registerNetworkReceiver(app) }
+            }
         }
         return START_STICKY
     }
@@ -395,26 +395,17 @@ class VoiceAssistantService : Service() {
      */
     private val settingsWatchdog = object : Runnable {
         override fun run() {
-            runCatching {
-                // TTL — перепостановка правил если они слетели
-                NetworkTtl.bootRestore(this@VoiceAssistantService)
-            }
-            runCatching {
-                // Кастомный звук блокировки — пере-запись lock_car_audio_path/enable
-                LockSound.onBootOrWatchdog(this@VoiceAssistantService)
-            }
-            runCatching {
-                // hvacdigital — повтор setprop на случай очистки системных пропертей
-                StatusIcons.bootRestoreHvacDigital(this@VoiceAssistantService)
-            }
-            runCatching {
-                // Яркость
-                ScreenBrightness.restoreIfEnabled(this@VoiceAssistantService)
-            }
-            runCatching {
-                // Оптимизация видео
-                if (AppPerformance.isVideo60FpsEnabled(this@VoiceAssistantService)) {
-                    AppPerformance.setVideo60Fps(this@VoiceAssistantService, true)
+            val app = this@VoiceAssistantService
+            // P1: тик watchdog'а только планируется с main, сама работа — на BgWorker.
+            BgWorker.post("VoiceAssistant.watchdog") {
+                runCatching { NetworkTtl.bootRestore(app) }
+                runCatching { LockSound.onBootOrWatchdog(app) }
+                runCatching { StatusIcons.bootRestoreHvacDigital(app) }
+                runCatching { ScreenBrightness.restoreIfEnabled(app) }
+                runCatching {
+                    if (AppPerformance.isVideo60FpsEnabled(app)) {
+                        AppPerformance.setVideo60Fps(app, true)
+                    }
                 }
             }
             handler.postDelayed(this, SETTINGS_WATCHDOG_MS)
