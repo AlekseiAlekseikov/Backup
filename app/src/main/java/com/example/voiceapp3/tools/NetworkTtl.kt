@@ -128,20 +128,21 @@ object NetworkTtl {
         val v6Ok = if (expected) v6 == "1" && v6Verify == "OK" else (v6 == "0" || v6 == null) && v6Verify == "FAIL"
 
         val reason = when {
-            hasNoRoot -> "ERR_ROOT_CHANNEL_UNAVAILABLE"
-            hasPerm   -> "Permission denied"
-            hasLock   -> "xtables lock"
-            noTarget  -> "iptables target 'TTL' not available (module missing)"
+            hasNoRoot -> "требуется root-канал (порт 65010 не поднят). Проверьте в dev.checkRoot."
+            hasPerm   -> "Permission denied (нужен root-шелл uid=0)"
+            hasLock   -> "xtables lock (iptables занят, попробуйте снова)"
+            noTarget  -> "iptables target 'TTL' не поддерживается ядром (модуль отсутствует)"
             !v4Ok     -> "TTL_V4 mismatch (expected=${if (expected) 1 else 0}, got=$v4 verify=$v4Verify)"
             !v6Ok     -> "TTL_V6 mismatch (expected=${if (expected) 1 else 0}, got=$v6 verify=$v6Verify)"
             else      -> null
         }
-        val status = when {
+        val stepStatus = when {
             reason == null -> ToolsStep.Status.OK
-            hasNoRoot || hasPerm || noTarget -> ToolsStep.Status.FAILED
+            hasNoRoot -> ToolsStep.Status.BLOCKED
+            hasPerm || noTarget -> ToolsStep.Status.FAILED
             else -> ToolsStep.Status.PARTIAL
         }
-        return status to (reason ?: "TTL_V4=$v4 TTL_V6=$v6 VERIFY=$v4Verify/$v6Verify")
+        return stepStatus to (reason ?: "TTL_V4=$v4 TTL_V6=$v6 VERIFY=$v4Verify/$v6Verify")
     }
 
     fun setTtl65Active(context: Context, enabled: Boolean): ToolsResult {
@@ -154,10 +155,13 @@ object NetworkTtl {
 
         val (status, reason) = parseVerifyResult(enabled, output)
 
-        // P8: toggle back OFF if failed and we were trying to turn ON
+        // P8: toggle back OFF if failed and we were trying to turn ON (PARTIAL/BLOCKED оставляем как есть — пользователь должен видеть не-идеал)
         if (enabled && status == ToolsStep.Status.FAILED) {
             AppLog.w(TAG, "TTL: toggle FAILED ($reason) — turning pref OFF to reflect reality")
             getPrefs(context).edit().putBoolean(PREF_TTL_65_ACTIVE, false).apply()
+        }
+        if (status == ToolsStep.Status.BLOCKED) {
+            AppLog.w(TAG, "TTL: toggle BLOCKED ($reason). rootChannel state=${AdbClient.currentState()} port=${AdbClient.currentPort()}")
         }
 
         val expectedStr = if (enabled) "TTL_V4=1 TTL_V6=1 VERIFY=OK/OK" else "TTL_V4=0 TTL_V6=0 VERIFY=FAIL/FAIL"
@@ -183,7 +187,7 @@ object NetworkTtl {
             finishedAtMs = SystemClock.uptimeMillis(),
             exitCode = exitCode,
             stdout = output,
-            stderr = "",
+            stderr = if (status == ToolsStep.Status.OK) "" else (reason ?: "неизвестная ошибка") + " | rootState=${AdbClient.currentState()} port=${AdbClient.currentPort()}",
             expected = expectedStr,
             actual = actualLines,
             status = status

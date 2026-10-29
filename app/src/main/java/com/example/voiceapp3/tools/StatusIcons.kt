@@ -109,10 +109,10 @@ object StatusIcons {
         var v = raw; if (v > 100f) v /= 10f
         return if (v in lo..hi) v else null
     }
-    private fun normInt80(raw: Int?): Int? {
+    private fun normInt80(raw: Int?): Float? {
         if (raw == null || raw == 0) return null
-        val t = (raw - 80) / 2
-        return if (t in -50..70) t else null
+        val t = (raw - 80).toFloat() / 2f
+        return if (t in -50f..70f) t else null
     }
 
     // ─── VHAL scan ───
@@ -141,17 +141,17 @@ object StatusIcons {
         Log.i(TAG,"=== VHAL dump end ===")
     }
 
-    private fun readSocScan(): Int? {
+    private fun readSocScan(): Float? {
         val m = cpm ?: return null
-        fun tryProp(p: Int, a: Int, label: String, scale: Float = 1f): Int? {
+        fun tryProp(p: Int, a: Int, label: String, scale: Float = 1f): Float? {
             try {
                 val raw = m.getFloatProperty(p, a)
                 if (!raw.isNaN() && raw != 0f) {
                     val v = if (scale != 1f) raw / scale else raw
                     if (v in 0f..101f) {
                         socProp = p; socArea = a; socSource = label
-                        AppLog.i(TAG, "soc=${Math.round(v).coerceIn(0,100)} (src=$socSource raw=$raw area=$a)")
-                        return Math.round(v).coerceIn(0, 100)
+                        AppLog.i(TAG, "soc=%.1f (src=$socSource raw=$raw area=$a scale=$scale)".format(v))
+                        return v.coerceIn(0f, 100f)
                     }
                 }
             } catch (_: Exception) {}
@@ -161,23 +161,19 @@ object StatusIcons {
                     val v = if (scale != 1f) raw.toFloat() / scale else raw.toFloat()
                     if (v in 0f..101f) {
                         socProp = p; socArea = a; socSource = label
-                        AppLog.i(TAG, "soc=${Math.round(v).coerceIn(0,100)} (src=$socSource raw=$raw area=$a)")
-                        return Math.round(v).coerceIn(0, 100)
+                        AppLog.i(TAG, "soc=%.1f (src=$socSource raw=$raw area=$a scale=$scale)".format(v))
+                        return v.coerceIn(0f, 100f)
                     }
                 }
             } catch (_: Exception) {}
             return null
         }
-        // 0) кэш
         if (socProp != 0) {
             for (a in AREAS) tryProp(socProp, a, socSource)?.let { return it }
             socProp = 0
         }
-        // 1) основной
         tryProp(PROP_EV_BATT_LEVEL, 0, "VHAL:0x11600309/EV_BATTERY_LEVEL")?.let { return it }
-        // 2) ED_EV_BATTERY_PERCENTAGE — Int x10
         tryProp(PROP_ED_EV_BATT_PCT, 0, "VHAL:0x2140a6ed/ED_EV_BATTERY_PERCENTAGE", scale = 10f)?.let { return it }
-        // 3) fallback по фиксированному списку (НЕ брутфорс диапазонов!)
         for (p in PRECISE_COMMON) {
             for (a in intArrayOf(0, 2, 7)) {
                 tryProp(p, a, "VHAL:0x${"%08X".format(p)}[fallback]")?.let { return it }
@@ -188,31 +184,32 @@ object StatusIcons {
         return null
     }
 
-    private fun readTempScan(): Int? {
+    private fun readTempScan(): Float? {
         val m = cpm ?: return null
-        fun tryFloatProp(p: Int, a: Int, label: String): Int? {
+        AppLog.i(TAG, "TEMP: toggle=on read start")
+        fun tryFloatProp(p: Int, a: Int, label: String): Float? {
             try {
                 val raw = m.getFloatProperty(p, a)
                 if (!raw.isNaN() && raw != 0f) {
-                    val v = Math.round(raw).coerceIn(-50, 70)
-                    if (v in -50..70) {
+                    val v = raw.coerceIn(-50f, 70f)
+                    if (v in -50f..70f) {
                         tmpProp = p; tmpArea = a; tempSource = label
-                        AppLog.i(TAG, "temp=$v (src=$tempSource raw=$raw area=$a)")
+                        AppLog.i(TAG, "TEMP: read raw=$raw v=%.1f src=$tempSource area=$a".format(v))
                         return v
-                    }
+                    } else { AppLog.d(TAG, "TEMP: $label raw=$raw out of range") }
                 }
-            } catch (_: Exception) {}
+            } catch (e: Exception) { AppLog.d(TAG, "TEMP: $label float err=${e.message}") }
             return null
         }
-        fun tryInt80Prop(p: Int, a: Int, label: String): Int? {
+        fun tryInt80Prop(p: Int, a: Int, label: String): Float? {
             try {
                 val raw = m.getIntProperty(p, a)
                 if (raw != 0) normInt80(raw)?.let { v ->
                     tmpProp = p; tmpArea = a; tempSource = label
-                    AppLog.i(TAG, "temp=$v (src=$tempSource raw=$raw area=$a norm=($raw-80)/2)")
-                    return v
+                    AppLog.i(TAG, "TEMP: read raw=$raw v=$v (norm=($raw-80)/2) src=$tempSource")
+                    return v.toFloat()
                 }
-            } catch (_: Exception) {}
+            } catch (e: Exception) { AppLog.d(TAG, "TEMP: $label int err=${e.message}") }
             return null
         }
         if (tmpProp != 0) {
@@ -230,24 +227,28 @@ object StatusIcons {
         //    для сверки.
         for (prop in SYS_HVAC_EXT_ALL) {
             try {
+                AppLog.d(TAG, "TEMP: probing prop $prop")
                 val pp = Runtime.getRuntime().exec(arrayOf("sh","-c","getprop $prop"))
-                pp.waitFor(1500, java.util.concurrent.TimeUnit.MILLISECONDS)
+                if (!pp.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)) { pp.destroyForcibly() }
                 val sVal = pp.inputStream.bufferedReader().readText().trim()
+                val errVal = pp.errorStream.bufferedReader().readText().trim()
                 val v = sVal.toFloatOrNull()
+                AppLog.d(TAG, "TEMP: prop $prop raw="$sVal" err="$errVal" parsed=$v")
                 if (v != null && v in -50f..70f) {
                     tempSource = "hvacdigital/$prop"
-                    AppLog.i(TAG, "temp=${Math.round(v)} (src=$tempSource val=$sVal)")
-                    // Логируем и второе свойство для сверки расхождений
+                    AppLog.i(TAG, "TEMP: norm=%.1f (src=$tempSource val="$sVal")".format(v))
                     val other = SYS_HVAC_EXT_ALL.firstOrNull { it != prop }
                     if (other != null) {
-                        val pp2 = Runtime.getRuntime().exec(arrayOf("sh","-c","getprop $other"))
-                        pp2.waitFor(800, java.util.concurrent.TimeUnit.MILLISECONDS)
-                        val v2 = pp2.inputStream.bufferedReader().readText().trim()
-                        AppLog.i(TAG, "temp cross-check: hvacdigital/$other=$v2")
+                        try {
+                            val pp2 = Runtime.getRuntime().exec(arrayOf("sh","-c","getprop $other"))
+                            pp2.waitFor(1, java.util.concurrent.TimeUnit.SECONDS)
+                            val v2 = pp2.inputStream.bufferedReader().readText().trim()
+                            AppLog.i(TAG, "TEMP: cross-check hvacdigital/$other="$v2"")
+                        } catch (_: Exception) {}
                     }
-                    return Math.round(v)
+                    return v
                 }
-            } catch (_: Exception) {}
+            } catch (e: Exception) { AppLog.w(TAG, "TEMP: getprop $prop err=${e.message}") }
         }
         // 3) fallback по PRECISE_COMMON (без брутфорса диапазонов!)
         for (pp in PRECISE_COMMON) {
@@ -256,7 +257,7 @@ object StatusIcons {
                 tryFloatProp(pp, a, "VHAL:0x${"%08X".format(pp)}[fallback]")?.let { return it }
             }
         }
-        AppLog.w(TAG, "temp=? (ни один проп не дал валидного значения)")
+        AppLog.w(TAG, "TEMP: notify ERROR: ни один источник (VHAL float/int 0x%x@0/2/7, hvacdigital.temp_ext/exttemp) не дал валидного значения".format(PROP_ENV_OUT_TEMP))
         tempSource = "none"
         return null
     }
@@ -374,28 +375,32 @@ object StatusIcons {
         val showWifi = prefs(app).getBoolean(PREF_WIFI, false)
         Log.d(TAG,"syncAll batt=$showBatt temp=$showTemp wifi=$showWifi cpm=${cpm!=null}")
         if (showBatt) {
-            val socInt = readSocScan()
-            if (socInt != null) {
-                val soc = socInt.toFloat()
+            AppLog.d(TAG, "BATT: toggle=on read start")
+            val soc = readSocScan()
+            if (soc != null) {
                 val socStr = if (soc == soc.toInt().toFloat()) "${soc.toInt()}" else String.format(Locale.US, "%.1f", soc)
                 val text = "$socStr% · $socSource"
+                val w = (24 * app.resources.displayMetrics.density).toInt().coerceAtLeast(24)
                 postNotif(app, NOTIF_BATT, CHANNEL_BATT, makeTextIcon(app, socStr, "%", Color.WHITE), "Батарея", text, RANK_BATT,
                     telemetryPi(app, NOTIF_BATT))
-                AppLog.i(TAG, "BATT: value=$socStr% iconSize=24dp click→telemetry src=$socSource → posted")
+                AppLog.i(TAG, "BATT: value=$socStr% iconSize=${w}x${w}px click→telemetry src=$socSource → posted")
             } else { cancel(app, NOTIF_BATT); AppLog.w(TAG,"BATT: SOC null") }
         } else cancel(app, NOTIF_BATT)
         if (showTemp) {
-            val tInt = readTempScan()
-            if (tInt != null) {
-                val t = tInt.toFloat()
+            val t = readTempScan()
+            if (t != null) {
                 val tStr = if (t == t.toInt().toFloat()) "${t.toInt()}" else String.format(Locale.US, "%.1f", t)
                 val sign = if (t > 0) "+" else ""
                 val text = "$sign$tStr °C · $tempSource"
+                val w = (24 * app.resources.displayMetrics.density).toInt().coerceAtLeast(24)
                 postNotif(app, NOTIF_TEMP, CHANNEL_TEMP, makeTextIcon(app, "$sign$tStr", "°", Color.WHITE), "Снаружи", text, RANK_TEMP,
                     telemetryPi(app, NOTIF_TEMP))
-                AppLog.i(TAG, "TEMP: notify id=$NOTIF_TEMP channel=$CHANNEL_TEMP value=$sign$tStr°C src=$tempSource → posted")
-            } else { cancel(app, NOTIF_TEMP); AppLog.w(TAG,"TEMP: value null (no hvacdigital prop found, see trace above)") }
-        } else cancel(app, NOTIF_TEMP)
+                AppLog.i(TAG, "TEMP: notify id=$NOTIF_TEMP channel=$CHANNEL_TEMP value=$sign$tStr°C size=${w}x${w}px src=$tempSource → posted")
+            } else {
+                cancel(app, NOTIF_TEMP)
+                AppLog.w(TAG, "TEMP: notify ERROR: value=null (all probes failed, see TEMP: lines above for which props were tried)")
+            }
+        } else { cancel(app, NOTIF_TEMP); AppLog.d(TAG, "TEMP: toggle=off") }
         if (showWifi) {
             try {
                 val wm = app.getSystemService(Context.WIFI_SERVICE) as WifiManager
