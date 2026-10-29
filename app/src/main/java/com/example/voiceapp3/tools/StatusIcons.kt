@@ -233,17 +233,17 @@ object StatusIcons {
                 val sVal = pp.inputStream.bufferedReader().readText().trim()
                 val errVal = pp.errorStream.bufferedReader().readText().trim()
                 val v = sVal.toFloatOrNull()
-                AppLog.d(TAG, "TEMP: prop $prop raw="$sVal" err="$errVal" parsed=$v")
+                AppLog.d(TAG, "TEMP: prop $prop raw=\"$sVal\" err=\"$errVal\" parsed=$v")
                 if (v != null && v in -50f..70f) {
                     tempSource = "hvacdigital/$prop"
-                    AppLog.i(TAG, "TEMP: norm=%.1f (src=$tempSource val="$sVal")".format(v))
+                    AppLog.i(TAG, "TEMP: norm=%.1f (src=$tempSource val=\"$sVal\")".format(v))
                     val other = SYS_HVAC_EXT_ALL.firstOrNull { it != prop }
                     if (other != null) {
                         try {
                             val pp2 = Runtime.getRuntime().exec(arrayOf("sh","-c","getprop $other"))
                             pp2.waitFor(1, java.util.concurrent.TimeUnit.SECONDS)
                             val v2 = pp2.inputStream.bufferedReader().readText().trim()
-                            AppLog.i(TAG, "TEMP: cross-check hvacdigital/$other="$v2"")
+                            AppLog.i(TAG, "TEMP: cross-check hvacdigital/$other=\"$v2\"")
                         } catch (_: Exception) {}
                     }
                     return v
@@ -382,25 +382,26 @@ object StatusIcons {
         val cx = (gx0 + gx1) / 2f
         val topY = size * 0.15f
         val midY = size * 0.66f                // нижняя точка колбы (без шарика)
-        // Колба (прямоугольник + скруглённый верх): рисуем двумя линиями (лево/право) + дуга верха.
-        canvas.drawLine(cx, topY + colW/2, cx, midY, glyph) // линия уже толще strokeWidth — используем прямо
-        // Прямоугольник колбы:
+        // Колба (прямоугольник со скруглённым верхом и переходом в шарик внизу).
+        // Рисуем левую/правую вертикали + верхнюю дугу (нижняя дуга и шарик — ниже).
         val bulbTop = midY - colW * 0.4f
-        canvas.drawLine(gx0 + colW*0.25f, topY + colW/2, gx0 + colW*0.25f, bulbTop, glyph)
-        canvas.drawLine(gx1 - colW*0.25f, topY + colW/2, gx1 - colW*0.25f, bulbTop, glyph)
-        // Верхнее скругление (дуга 180° над колбой):
-        val topOval = RectF(gx0 + colW*0.25f, topY, gx1 - colW*0.25f, topY + colW)
+        val stemLeft = gx0 + colW * 0.25f
+        val stemRight = gx1 - colW * 0.25f
+        canvas.drawLine(stemLeft, topY + colW / 2f, stemLeft, bulbTop, glyph)
+        canvas.drawLine(stemRight, topY + colW / 2f, stemRight, bulbTop, glyph)
+        // Верхнее скругление (180° дуга от левой вертикали к правой):
+        val topOval = RectF(stemLeft, topY, stemRight, topY + colW)
         canvas.drawArc(topOval, 180f, 180f, false, glyph)
-        // Нижнее скругление колбы (переход к шарику):
-        val botOval = RectF(gx0 + colW*0.25f, bulbTop, gx1 - colW*0.25f, bulbTop + colW)
+        // Нижнее скругление колбы — переход к шарику (180° дуга вниз):
+        val botOval = RectF(stemLeft, bulbTop, stemRight, bulbTop + colW)
         canvas.drawArc(botOval, 0f, 180f, false, glyph)
-        // Шарик внизу (заполненный):
+        // Шарик внизу (заполненный круг, центр ниже низа колбы):
         val bulbR = colW * 0.75f
         val bulbCy = midY + bulbR * 0.3f
         glyph.style = Paint.Style.FILL
         canvas.drawCircle(cx, bulbCy, bulbR, glyph)
-        // "Ртуть" внутри шарика (чуть темнее — не выйдет в монохроме,
-        // в small icon статус-бара всё равно одноцветно, поэтому пропускаем).
+        // Иконка в статус-баре одноцветная, поэтому ртутную колонку внутри
+        // не рисуем (в монохроме она не видна и только ломает глиф).
 
         // Значение температуры справа:
         val num = Paint(Paint.ANTI_ALIAS_FLAG).apply {
