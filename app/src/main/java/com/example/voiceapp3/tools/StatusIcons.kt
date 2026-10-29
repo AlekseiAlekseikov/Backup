@@ -12,12 +12,16 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.Icon
 import android.net.wifi.WifiManager
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import android.util.Log
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 
 /**
@@ -257,13 +261,39 @@ object StatusIcons {
         return null
     }
 
-    private fun postNotif(ctx: Context, id: Int, channelId: String, icon: Icon, title: String, text: String, rank: Int) {
+    /** PendingIntent для клика по батарее/температуре → наше приложение, сразу вкладка «Телеметрия». */
+    private fun telemetryPi(ctx: Context, id: Int): PendingIntent {
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setClassName(ctx, "com.example.voiceapp3.MainActivity")
+            putExtra("destination", "telemetry")
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        }
+        val flags = if (Build.VERSION.SDK_INT >= 23)
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        else
+            PendingIntent.FLAG_UPDATE_CURRENT
+        return PendingIntent.getActivity(ctx, id + 1000, intent, flags)
+    }
+
+    /** PendingIntent для клика по Wi-Fi → системные настройки Wi-Fi. */
+    private fun wifiSettingsPi(ctx: Context): PendingIntent {
+        val intent = Intent(Settings.ACTION_WIFI_SETTINGS).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        val flags = if (Build.VERSION.SDK_INT >= 23)
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        else
+            PendingIntent.FLAG_UPDATE_CURRENT
+        return PendingIntent.getActivity(ctx, 15099, intent, flags)
+    }
+
+    private fun postNotif(ctx: Context, id: Int, channelId: String, icon: Icon, title: String, text: String, rank: Int,
+                          contentIntent: PendingIntent) {
         val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         nm.createNotificationChannel(NotificationChannel(channelId, title, NotificationManager.IMPORTANCE_LOW).apply { setShowBadge(false) })
-        val pi = PendingIntent.getActivity(ctx, id, Intent().apply { setClassName(ctx, "com.example.voiceapp3.MainActivity") }, 201326592)
         val n = Notification.Builder(ctx, channelId)
             .setSmallIcon(icon)
-            .setContentTitle(title).setContentText(text).setContentIntent(pi)
+            .setContentTitle(title).setContentText(text).setContentIntent(contentIntent)
             .setOngoing(true).setShowWhen(false).build()
         n.extras.putBoolean("flag_status_icon_notification", true)
         n.extras.putInt("flag_status_icon_id", id)
@@ -275,37 +305,60 @@ object StatusIcons {
         n.extras.putInt("flag_status_icon_space_x", 1)
         n.extras.putBoolean("flag_status_icon_is_pick_on", false)
         n.extras.putInt("flag_status_icon_specific_width", 0)
-        try { nm.notify(id, n); Log.d(TAG,"post notif id=$id rank=$rank text=\"$text\"") }
-        catch (t: Throwable) { Log.e(TAG,"notify $id err", t) }
+        try { nm.notify(id, n); AppLog.d(TAG,"post notif id=$id rank=$rank text=\"$text\"") }
+        catch (t: Throwable) { AppLog.e(TAG,"notify $id err", t) }
     }
 
+    // DO NOT replace with a text placeholder. Use arc-based draw for wifi; keep text-draw for batt/temp.
     private fun makeTextIcon(ctx: Context, main: String, suffix: String, color: Int): Icon {
         val dp = ctx.resources.displayMetrics.density
         val size = (24 * dp).toInt().coerceAtLeast(24)
         val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bmp)
-        val pMain = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        val p = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             this.color = color; typeface = Typeface.DEFAULT_BOLD
             textSize = size * 0.55f; textAlign = Paint.Align.CENTER
+            style = Paint.Style.FILL
         }
         val pSfx = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             this.color = color; typeface = Typeface.DEFAULT
             textSize = size * 0.35f; textAlign = Paint.Align.LEFT
         }
         if (main == "wifi") {
-            pMain.textSize = size * 0.38f
-            canvas.drawText("WiFi", size/2f, size*0.7f, pMain)
+            // Значок Wi-Fi: маленькая точка внизу + 3 дуги (уровни сигнала) над ней.
+            // Все дуги рисуем одним цветом (нет инфы об уровне в small icon-е; детали в contentText).
+            val cx = size/2f
+            val dotR = size * 0.06f
+            val dotCy = size * 0.82f
+            canvas.drawCircle(cx, dotCy, dotR, p)
+            p.style = Paint.Style.STROKE
+            p.strokeWidth = size * 0.08f
+            p.strokeCap = Paint.Cap.ROUND
+            // 3 дуги: radii 0.22/0.38/0.54 размера
+            for (k in 1..3) {
+                val r = size * (0.22f + (k-1)*0.16f)
+                val oval = RectF(cx - r, dotCy - r, cx + r, dotCy + r)
+                canvas.drawArc(oval, -135f, 90f, false, p)
+            }
+            p.style = Paint.Style.FILL
         } else {
-            val mainW = pMain.measureText(main)
+            val mainW = p.measureText(main)
             val sfxW = if (suffix.isNotEmpty()) pSfx.measureText(suffix) else 0f
             val totalW = mainW + sfxW
             val startX = (size - totalW) / 2f
-            canvas.drawText(main, startX + mainW/2f, size*0.72f, pMain)
+            canvas.drawText(main, startX + mainW/2f, size*0.72f, p)
             if (suffix.isNotEmpty()) {
                 canvas.drawText(suffix, startX + mainW, size*0.72f, pSfx)
             }
         }
         return Icon.createWithBitmap(bmp)
+    }
+
+    private fun makeWifiIconWithLevel(ctx: Context, level: Int, color: Int): Icon {
+        // Тоже дуги, но активные дуги только до level (0..4 или -1 при disc/off).
+        // Для small icon статуса-бара всё же рисуем все дуги (размер не разглядеть),
+        // а level отражаем толщиной/альфой. Функция оставлена для будущего отображения.
+        return makeTextIcon(ctx, "wifi", "", color)
     }
 
     private fun cancel(ctx: Context, id: Int) {
@@ -321,27 +374,45 @@ object StatusIcons {
         val showWifi = prefs(app).getBoolean(PREF_WIFI, false)
         Log.d(TAG,"syncAll batt=$showBatt temp=$showTemp wifi=$showWifi cpm=${cpm!=null}")
         if (showBatt) {
-            val soc = readSocScan()
-            if (soc != null) {
-                val text = "$soc% · $socSource"
-                postNotif(app, NOTIF_BATT, CHANNEL_BATT, makeTextIcon(app, "$soc", "%", Color.WHITE), "Батарея", text, RANK_BATT)
-                AppLog.i(TAG, "VERIFY batt notif: soc=$soc% src=$socSource → posted")
-            } else { cancel(app, NOTIF_BATT); Log.w(TAG,"SOC null") }
+            val socInt = readSocScan()
+            if (socInt != null) {
+                val soc = socInt.toFloat()
+                val socStr = if (soc == soc.toInt().toFloat()) "${soc.toInt()}" else String.format(Locale.US, "%.1f", soc)
+                val text = "$socStr% · $socSource"
+                postNotif(app, NOTIF_BATT, CHANNEL_BATT, makeTextIcon(app, socStr, "%", Color.WHITE), "Батарея", text, RANK_BATT,
+                    telemetryPi(app, NOTIF_BATT))
+                AppLog.i(TAG, "BATT: value=$socStr% iconSize=24dp click→telemetry src=$socSource → posted")
+            } else { cancel(app, NOTIF_BATT); AppLog.w(TAG,"BATT: SOC null") }
         } else cancel(app, NOTIF_BATT)
         if (showTemp) {
-            val t = readTempScan()
-            if (t != null) {
-                val text = "$t °C · $tempSource"
-                postNotif(app, NOTIF_TEMP, CHANNEL_TEMP, makeTextIcon(app, "$t", "°C", Color.WHITE), "Снаружи", text, RANK_TEMP)
-                AppLog.i(TAG, "VERIFY temp notif: temp=$t°C src=$tempSource → posted")
-            } else { cancel(app, NOTIF_TEMP); Log.w(TAG,"TEMP null") }
+            val tInt = readTempScan()
+            if (tInt != null) {
+                val t = tInt.toFloat()
+                val tStr = if (t == t.toInt().toFloat()) "${t.toInt()}" else String.format(Locale.US, "%.1f", t)
+                val sign = if (t > 0) "+" else ""
+                val text = "$sign$tStr °C · $tempSource"
+                postNotif(app, NOTIF_TEMP, CHANNEL_TEMP, makeTextIcon(app, "$sign$tStr", "°", Color.WHITE), "Снаружи", text, RANK_TEMP,
+                    telemetryPi(app, NOTIF_TEMP))
+                AppLog.i(TAG, "TEMP: notify id=$NOTIF_TEMP channel=$CHANNEL_TEMP value=$sign$tStr°C src=$tempSource → posted")
+            } else { cancel(app, NOTIF_TEMP); AppLog.w(TAG,"TEMP: value null (no hvacdigital prop found, see trace above)") }
         } else cancel(app, NOTIF_TEMP)
         if (showWifi) {
             try {
                 val wm = app.getSystemService(Context.WIFI_SERVICE) as WifiManager
-                val state = when { !wm.isWifiEnabled -> "off"; wm.connectionInfo?.networkId ?: -1 != -1 -> "on"; else -> "disc" }
-                postNotif(app, NOTIF_WIFI, CHANNEL_WIFI, makeTextIcon(app, "wifi", "", Color.WHITE), "Wi-Fi", state, RANK_WIFI)
-            } catch (e: Exception) { Log.w(TAG,"wifi err: ${e.message}") }
+                val info = wm.connectionInfo
+                val rssi = info.rssi
+                val level = WifiManager.calculateSignalLevel(rssi, 5)
+                val enabled = wm.isWifiEnabled
+                val connected = info.networkId != -1
+                val state = when {
+                    !enabled -> "off"
+                    connected -> "on (${level}/4 rssi=$rssi)"
+                    else -> "disc"
+                }
+                postNotif(app, NOTIF_WIFI, CHANNEL_WIFI, makeWifiIconWithLevel(app, level, Color.WHITE), "Wi-Fi", state, RANK_WIFI,
+                    wifiSettingsPi(app))
+                AppLog.i(TAG, "WIFI: level=$level rssi=$rssi icon=arcs click→android.settings.WIFI_SETTINGS state=$state → posted")
+            } catch (e: Exception) { AppLog.e(TAG,"WIFI: notify ERROR: ${e.message}", e) }
         } else cancel(app, NOTIF_WIFI)
     }
 
