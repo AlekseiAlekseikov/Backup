@@ -137,20 +137,17 @@ object StatusIcons {
             carObj = Car.createCar(app, null, 0L) { c: Car, ready: Boolean ->
                 if (ready) try {
                     cpm = c.getCarManager(Car.PROPERTY_SERVICE) as? android.car.hardware.property.CarPropertyManager
-                    AppLog.i(TAG, "CarPropertyManager ready=${cpm != null}")
+                    Log.i(TAG,"CarPropertyManager ready=${cpm != null}")
                     if (!dumpLogged && cpm != null) { dumpLogged = true; dumpKnownProps() }
-                } catch (e: Exception) { AppLog.w(TAG, "getCarManager err: ${e.message}", e) }
+                } catch (e: Exception) { Log.w(TAG,"getCarManager err",e) }
             }
             carObj?.connect()
-        } catch (e: Exception) { AppLog.w(TAG, "Car.createCar: ${e.message}", e) }
+        } catch (e: Exception) { Log.w(TAG,"Car.createCar: ${e.message}") }
     }
 
     private fun dumpKnownProps() {
         val m = cpm ?: return
-        // Итерация 11 fix: все дампы и диагностика — через AppLog (пишет в файл!),
-        // а не только в Logcat. В логе с ГУ строк DUMP/PREF TRACE не было (только
-        // Logcat), потому что владелец смотрит voiceapp3.log, а не logcat.
-        AppLog.i(TAG, "=== VHAL dump start (look for TEMP/BATT in -50..70°C, 0..101%) ===")
+        AppLog.i(TAG,"=== VHAL dump start (look for TEMP/BATT in -50..70°C, 0..101%) ===")
         val TEMP_RANGES = arrayOf(
             0x11400000..0x117FFFFF,
             0x15400000..0x167FFFFF,
@@ -160,22 +157,18 @@ object StatusIcons {
         val ALL_AREAS = intArrayOf(0, 1, 2, 3, 4, 5, 7, 8, 0xF, 0x10, 0x20, 0x30)
         try {
             val propList = m.propertyList
-            AppLog.i(TAG, "VHAL: propertyList size=${propList?.size ?: "null"}")
-            // Для каждого релевантного свойства — его конфиг (areaType, access,
-            // supportedAreas), чтобы понимать, поддерживается ли свойство вообще.
+            AppLog.i(TAG,"VHAL: propertyList size=${propList?.size ?: "null"}")
             for (cfg in (propList ?: emptyList())) {
                 val pid = cfg.propertyId
-                val inRange = TEMP_RANGES.any { pid in it }
+                // Итерация 11: dump конфига свойства (доступ/areaType/supportedAreas)
+                // — по этому можно понять, какое свойство реально поддерживается ГУ.
+                val inRange = TEMP_RANGES.any { pid in it } ||
+                        pid == 0x11600703 || pid == 0x15400701 || pid == 0x15400703
+                if (inRange) {
+                    val areaIds = try { cfg.areaIds?.joinToString(",") { "0x%x".format(it) } } catch (_: Throwable) { "n/a" }
+                    AppLog.i(TAG, String.format("CFG 0x%08X access=%d areaType=0x%08X areas=[$areaIds]", pid, cfg.access, cfg.areaType))
+                }
                 if (!inRange) continue
-                // Конфигурация свойства (CarPropertyConfig) — доступ, area type, area IDs.
-                val configLine = runCatching {
-                    val cc = m.getCarPropertyConfig(pid)
-                    if (cc != null) {
-                        val areas = cc.areaIds?.joinToString(",") { "0x${it.toString(16)}" } ?: "?"
-                        "CFG 0x%08X access=%d areaType=0x%x areas=[%s]".format(pid, cc.access, cc.areaType, areas)
-                    } else "CFG 0x%08X config=null".format(pid)
-                }.getOrElse { "CFG 0x%08X err=${it.message}".format(pid) }
-                AppLog.i(TAG, configLine)
                 for (a in ALL_AREAS) {
                     try {
                         val v = m.getFloatProperty(pid, a)
@@ -207,14 +200,7 @@ object StatusIcons {
                 } catch(_:Exception){}
             }
         }
-        // Дополнительная диагностика: проверить демо-режим HVAC android.car.hvac.demo
-        try {
-            val demoProp = Runtime.getRuntime().exec(arrayOf("sh","-c","getprop android.car.hvac.demo"))
-            if (!demoProp.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)) demoProp.destroyForcibly()
-            val demoVal = demoProp.inputStream.bufferedReader().readText().trim()
-            AppLog.i(TAG, "VHAL: android.car.hvac.demo = '$demoVal' (true=демо-заглушки ВСЕХ значений)")
-        } catch (_: Exception) {}
-        AppLog.i(TAG, "=== VHAL dump end ===")
+        AppLog.i(TAG,"=== VHAL dump end ===")
     }
 
     private fun readSocScan(): Float? {
@@ -478,26 +464,29 @@ object StatusIcons {
             textAlign = Paint.Align.CENTER
             style = Paint.Style.FILL
         }
+        // Итерация 12: авто-fit размера шрифта по measureText. НИКОГДА не
+        // обрезаем число — уменьшаем шрифт от 0.55*size до 0.28*size, пока
+        // ширина не влезет в 0.94*size (1 знак после запятой влезает всегда).
         val pSfx = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             this.color = color; typeface = Typeface.DEFAULT
             textAlign = Paint.Align.LEFT
         }
-        // Итерация 11 fix: автоподбор кегля по измеренной ширине.
-        // Начинаем с 0.55*size, уменьшаем до 0.28*size, пока ширина основного
-        // текста (+ суффикса) не влезет в 0.94*size. Это позволяет уместить
-        // "32.3" и "-12.5" без обрезания значения (запрет ревью: обрезать число нельзя).
-        fun fitTextSize(paint: Paint, text: String, targetMaxW: Float, maxSz: Float, minSz: Float): Float {
-            var sz = maxSz
-            while (sz > minSz) {
-                paint.textSize = sz
-                if (paint.measureText(text) <= targetMaxW) return sz
-                sz -= size * 0.02f
-            }
-            paint.textSize = minSz
-            return sz
+        // Подбираем textSize для main и суффикса синхронно.
+        var mainSize = size * 0.55f
+        val maxW = size * 0.94f
+        while (mainSize > size * 0.28f) {
+            p.textSize = mainSize
+            pSfx.textSize = mainSize * 0.65f
+            val mw = p.measureText(main)
+            val sw = if (suffix.isNotEmpty()) pSfx.measureText(suffix) else 0f
+            if (mw + sw <= maxW) break
+            mainSize -= size * 0.02f
         }
+        p.textSize = mainSize
+        pSfx.textSize = mainSize * 0.65f
         if (main == "wifi") {
-            p.textSize = size * 0.55f
+            // Значок Wi-Fi: маленькая точка внизу + 3 дуги (уровни сигнала) над ней.
+            // Все дуги рисуем одним цветом (нет инфы об уровне в small icon-е; детали в contentText).
             val cx = size/2f
             val dotR = size * 0.06f
             val dotCy = size * 0.82f
@@ -505,6 +494,7 @@ object StatusIcons {
             p.style = Paint.Style.STROKE
             p.strokeWidth = size * 0.08f
             p.strokeCap = Paint.Cap.ROUND
+            // 3 дуги: radii 0.22/0.38/0.54 размера
             for (k in 1..3) {
                 val r = size * (0.22f + (k-1)*0.16f)
                 val oval = RectF(cx - r, dotCy - r, cx + r, dotCy + r)
@@ -512,10 +502,6 @@ object StatusIcons {
             }
             p.style = Paint.Style.FILL
         } else {
-            val maxW = size * 0.94f
-            val fitted = fitTextSize(p, main, maxW - if (suffix.isNotEmpty()) size*0.32f else 0f,
-                    size * 0.55f, size * 0.28f)
-            pSfx.textSize = fitted * 0.65f
             val mainW = p.measureText(main)
             val sfxW = if (suffix.isNotEmpty()) pSfx.measureText(suffix) else 0f
             val totalW = mainW + sfxW
@@ -634,7 +620,7 @@ object StatusIcons {
         // (чтобы понять, кто пишет false между тиками).
         val pf = prefs(app)
         val pPath = "/data/data/${app.packageName}/shared_prefs/voiceapp3.xml"
-        Log.i(TAG, "PREF TRACE: read  file=$pPath key=$PREF_EXT_TEMP value=$showTemp seq=$seq thread=${Thread.currentThread().name}")
+        AppLog.i(TAG, "PREF TRACE: read  file=$pPath key=$PREF_EXT_TEMP value=$showTemp seq=$seq thread=${Thread.currentThread().name}")
 
         var battStr: String? = null; var battPct: Float? = null; var battHas = false
         var tempStr: String? = null; var tempVal: Float? = null; var tempHas = false
@@ -644,19 +630,17 @@ object StatusIcons {
             AppLog.d(TAG, "BATT: toggle=on read start")
             val soc = readSocScan()
             if (soc != null) {
-                // Итерация 11 fix: socStr и smallIconText всегда с одним знаком после
-                // запятой (BatteryStats/AUDIT §7 использует 42.4, а не 42). Убираем
-                // toInt() — обрезание было только из-за того что шрифт не влезал в 24dp,
-                // теперь в makeTextIcon стоит авто-подбор кегля.
+                // Итерация 12: батарея — всегда ОДИН знак после запятой
+                // (42.4, 100.0, 7.0), без toInt() обрезания в "32".
                 val socStr = String.format(Locale.US, "%.1f", soc)
+                val smallBattText = socStr
                 val text = "$socStr% · $socSource"
                 val w = (24 * app.resources.displayMetrics.density).toInt().coerceAtLeast(24)
-                val smallBattText = socStr  // "42.4" / "100.0" / "7.0"
                 postNotif(app, NOTIF_BATT, CHANNEL_BATT,
                     makeTextIcon(app, smallBattText, "", Color.WHITE),
                     "Батарея $socStr%", text, RANK_BATT,
                     telemetryPi(app, NOTIF_BATT))
-                AppLog.i(TAG, "BATT: soc=$soc → value=$socStr% smallIconSize=${w}x${w}px smallIconText=\"$smallBattText\" click→telemetry src=$socSource → posted + OVERLAY")
+                AppLog.i(TAG, "BATT: value=$socStr% smallIconSize=${w}x${w}px smallIconText=\"$smallBattText\" click→telemetry src=$socSource → posted + OVERLAY")
                 battStr = "$socStr%"; battPct = soc; battHas = true
             } else { cancel(app, NOTIF_BATT); AppLog.w(TAG,"BATT: SOC null") }
         } else cancel(app, NOTIF_BATT)
@@ -664,19 +648,20 @@ object StatusIcons {
         if (showTemp) {
             val t = readTempScan()
             if (t != null) {
+                // Итерация 12: температура — один знак после запятой если
+                // дробная часть не нулевая, иначе целое (7.2/-3.5 → "7.2"/"-3.5";
+                // 7/-3 → "7"/"-3").
+                val tStr = if (kotlin.math.abs(t - t.toInt().toFloat()) < 0.05f)
+                    "${t.toInt()}" else String.format(Locale.US, "%.1f", t)
                 val sign = if (t > 0) "+" else ""
-                val tInt = (if (t > 0) t.toInt() else kotlin.math.ceil(t).toInt())
-                // Один знак после запятой, если дробь не ноль; иначе целое. Без потери
-                // дробной части — smallTempText несёт то же число, что и overlay.
-                val tStr = if (Math.abs(t - tInt.toFloat()) < 0.05f) "$tInt" else String.format(Locale.US, "%.1f", t)
-                val smallTempText = tStr  // "7" или "7.2", "-3" или "-3.5", "12" или "12.4"
+                val smallTempText = tStr  // с дробной частью, без обрезания
                 val text = "$sign$tStr °C · $tempSource"
                 val w = (24 * app.resources.displayMetrics.density).toInt().coerceAtLeast(24)
                 postNotif(app, NOTIF_TEMP, CHANNEL_TEMP,
                     makeTextIcon(app, smallTempText, "", Color.WHITE),
                     "Снаружи $sign$tStr°C", text, RANK_TEMP,
                     telemetryPi(app, NOTIF_TEMP))
-                AppLog.i(TAG, "TEMP: t=$t → value=$sign$tStr°C smallIconSize=${w}x${w}px smallIconText=\"$smallTempText\" src=$tempSource → posted + OVERLAY")
+                AppLog.i(TAG, "TEMP: value=$sign$tStr°C smallIconSize=${w}x${w}px smallIconText=\"$smallTempText\" src=$tempSource → posted + OVERLAY")
                 tempStr = "$sign$tStr°"; tempVal = t; tempHas = true
             } else {
                 cancel(app, NOTIF_TEMP)

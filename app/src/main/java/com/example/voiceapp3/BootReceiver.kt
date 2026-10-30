@@ -21,7 +21,9 @@ class BootReceiver : BroadcastReceiver() {
             val serviceIntent = Intent(context, VoiceAssistantService::class.java)
                 .putExtra(VoiceAssistantService.EXTRA_BOOT_RESTORE, true)
             context.startForegroundService(serviceIntent)
-            // Проводим keep-awake (применение SCREEN_OFF_TIMEOUT) ПОСЛЕ ребута.
+            // Итерация 11/12: keep-awake применяем при каждом boot-событии
+            // (чтобы после перезагрузки screen_off_timeout восстановился до
+            // ~24дн без необходимости открывать UI).
             ScreenBrightness.ensureKeepAwake(context)
         }
     }

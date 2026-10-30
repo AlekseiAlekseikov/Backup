@@ -34,6 +34,17 @@ val chargeControlManifestUrl by lazy { envProp("CHARGE_CONTROL_MANIFEST_URL") }
 // добавления библиотеки.
 val roadcastClientLib = file("src/main/jniLibs/arm64-v8a/libroadcast_client.so")
 
+// Итерация 12: пробрасываем SHA коммита в BuildConfig.GIT_COMMIT, чтобы
+// приложение писало его в файл-лог при старте (владелец видит точную сборку).
+val gitSha: String by lazy {
+    try {
+        val p = ProcessBuilder("git", "rev-parse", "--short=7", "HEAD")
+            .directory(rootProject.projectDir)
+            .redirectErrorStream(true).start()
+        p.inputStream.bufferedReader().readText().trim().also { p.waitFor() }
+    } catch (_: Throwable) { "unknown" }
+}
+
 android {
     namespace = "com.example.voiceapp3"
     compileSdk = 36
@@ -46,11 +57,12 @@ android {
         applicationId = "com.example.voiceapp3"
         minSdk = 28
         targetSdk = 32
-        versionCode = 37
-        versionName = "1.0.37"
+        versionCode = 42
+        versionName = "1.0.42"
 
         buildConfigField("String", "APP_UPDATE_MANIFEST_URL", "\"$appUpdateManifestUrl\"")
         buildConfigField("String", "CHARGE_CONTROL_MANIFEST_URL", "\"$chargeControlManifestUrl\"")
+        buildConfigField("String", "GIT_COMMIT", "\"$gitSha\"")
 
         ndk {
             abiFilters += "arm64-v8a"

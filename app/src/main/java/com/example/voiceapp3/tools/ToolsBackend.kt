@@ -7,6 +7,7 @@ import android.provider.Settings
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import android.util.Log
+import com.example.voiceapp3.tools.AppLog
 import android.view.View
 import com.example.voiceapp3.TelemetryPrefsMirror
 import com.google.gson.JsonObject
@@ -159,6 +160,9 @@ enum class Choice(
         )
         /* «Время заставки»: строкой — так значение сравнивает сегментный ряд. */
         addProperty("rest", ScreenBrightness.restSeconds(appContext).toString())
+        /* «Не гасить экран»: текущее состояние булевой фичи (UI читает, чтобы
+           тумблер показывал правильное положение после перезапуска). */
+        addProperty("keepawake", ScreenBrightness.isKeepAwake(appContext))
         /* Срез №3: hvac_digital_* — читаем актуальное состояние булевым флагом */
         addProperty("hvacBatt", StatusIcons.getHvacDigital(appContext, StatusIcons.PREF_HVAC_BATT))
         addProperty("hvacTemp", StatusIcons.getHvacDigital(appContext, StatusIcons.PREF_HVAC_TEMP))
@@ -209,7 +213,7 @@ enum class Choice(
                 val f = appContext.getSharedPreferences(Prefs.FILE, Context.MODE_PRIVATE)
                 val p = try { f.javaClass.getMethod("getFilePath").invoke(f)?.toString() } catch (_: Throwable) { null }
                     ?: "/data/data/${appContext.packageName}/shared_prefs/${Prefs.FILE}.xml"
-                Log.i("CENTRAL_ToolsBackend",
+                AppLog.i("CENTRAL_ToolsBackend",
                     "PREF TRACE: write file=$p key=${toggle.pref} value=$value actual=$actual thread=${Thread.currentThread().name}")
             }
             (actual == value.toString()) to actual
@@ -597,6 +601,58 @@ enum class Choice(
         }
     }
 
+    /** «Не гасить экран» — вызывает ScreenBrightness.setKeepAwake и возвращает
+     *  ToolsResult с тремя шагами: pref persist, apply (3-путная запись), readback. */
+    fun setKeepAwake(enabled: Boolean): ToolsResult {
+        val action = "settings.keepawake"
+        val title = "Не гасить экран"
+        val steps = ArrayList<ToolsStep>(3)
+
+        steps += toolsStep(
+            step = "pref",
+            command = "SharedPreferences[${Prefs.FILE}].putBoolean(${ScreenBrightness.PREF_KEEP_AWAKE})",
+            expected = enabled.toString()
+        ) {
+            prefs().edit().putBoolean(ScreenBrightness.PREF_KEEP_AWAKE, enabled).commit()
+            val actual = prefs().getBoolean(ScreenBrightness.PREF_KEEP_AWAKE, !enabled).toString()
+            (actual == enabled.toString()) to actual
+        }
+
+        steps += stepOf(
+            step = "apply",
+            command = "ScreenBrightness.applyKeepAwakeInternal(enabled=$enabled) → Settings.System + sh + ADB",
+            status = ToolsStep.Status.OK,
+            expected = enabled.toString(),
+            actual = "dispatched to BgWorker"
+        )
+        // Фактическое применение — на BgWorker, синхронно дождаться не можем
+        // (может занять до 10 с при подъёме ADB). Вызываем и возвращаем readback
+        // после короткой задержки, а результат запишется в файл-лог строкой
+        // "SCREEN_TIMEOUT: set X → readback=Y ... → PERSISTED".
+        ScreenBrightness.setKeepAwake(appContext, enabled)
+        Thread.sleep(300)
+        val rb = try {
+            android.provider.Settings.System.getInt(
+                appContext.contentResolver,
+                android.provider.Settings.System.SCREEN_OFF_TIMEOUT,
+                -1
+            )
+        } catch (_: Throwable) { -1 }
+        val expected = if (enabled) Int.MAX_VALUE else prefs().getLong(ScreenBrightness.PREF_ORIGINAL_TIMEOUT, 600000L).toInt()
+        steps += stepOf(
+            step = "readback",
+            command = "Settings.System.SCREEN_OFF_TIMEOUT (after 300ms; full result in file-log line 'SCREEN_TIMEOUT: set ... → PERSISTED')",
+            status = if (rb == expected) ToolsStep.Status.OK else ToolsStep.Status.PARTIAL,
+            expected = expected.toString(),
+            actual = rb.toString(),
+            stderr = if (rb != expected) "write may still apply asynchronously; see file log for final PERSISTED verdict" else ""
+        )
+
+        val res = ToolsResult(action, title, steps)
+        AppLog.logAction(appContext, "settings.keepawake=$enabled", res)
+        return res
+    }
+
     /**
      * Шаг с явным статусом — для случаев «шаг выполнен не полностью»
      * (prop/sysfs недоступны, заставка уже выключена): статус виден в
@@ -799,6 +855,15 @@ enum class Choice(
                 } else {
                     parseFailed(key, ScreenBrightness.REST_CHOICES.joinToString("|"), value)
                 }
+            }
+            "keepawake" -> {
+                val b = when (value) {
+                    is Boolean -> value
+                    is String -> value.toBooleanStrictOrNull()
+                    is Number -> value.toInt() != 0
+                    else -> null
+                } ?: return parseFailed(key, "true|false", value)
+                return setKeepAwake(b)
             }
             "lockSoundVol" -> {
                 val v = intValue(value)

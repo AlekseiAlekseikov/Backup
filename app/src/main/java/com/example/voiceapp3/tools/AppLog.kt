@@ -44,39 +44,28 @@ object AppLog {
     @Volatile private var ctx: Context? = null
     @Volatile private var inited = false
     @Volatile private var primaryPath: String = "(not initialised yet)"
-    @Volatile private var processStartUptime = 0L
+    @Volatile private var processStartUptimeMs: Long = 0L
 
     /** Кольцевой буфер сообщений до init(). */
     private val early = ArrayDeque<String>(EARLY_CAP)
 
     // ───────────────────── init ─────────────────────
     @JvmStatic fun init(c: Context) {
+        // Ставим UEH в САМОМ НАЧАЛЕ init — ДО любых других действий, чтобы
+        // перехватить падения даже в самом init (ранние сбои).
+        try {
+            val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
+            if (defaultHandler == null || defaultHandler !is UehBridge) {
+                Thread.setDefaultUncaughtExceptionHandler(UehBridge(defaultHandler))
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG_BASE, "AppLog: failed to install UEH: ${t.message}")
+        }
+        processStartUptimeMs = android.os.Process.getStartUptimeMillis()
+        // ВСЕГДА сначала ставим ctx и флаг inited в try, чтобы при падении init
+        // логгер хотя бы не терял сообщения (продолжал копить в early и в Logcat).
         val appCtx = try { c.applicationContext } catch (t: Throwable) { c }
         ctx = appCtx
-        processStartUptime = android.os.SystemClock.uptimeMillis()
-        // Итерация 11: глобальный handler необработанных исключений — ловим
-        // падения любого потока (в том числе тех, что приводят к «чёрному экрану
-        // и тишине») и пишем полный стек в файл-лог ПЕРЕД тем как пробросить
-        // дальше системному дефолтному handler'у (который убьёт процесс).
-        val def = Thread.getDefaultUncaughtExceptionHandler()
-        Thread.setDefaultUncaughtExceptionHandler { t, e ->
-            val sb = StringBuilder("=== UNCAUGHT EXCEPTION on thread '${t.name}' (tid=${t.id}) ===\n")
-            sb.append("  ${e.javaClass.name}: ${e.message}\n")
-            for ((i, frame) in e.stackTrace.take(40).withIndex()) {
-                sb.append("    at $frame\n")
-            }
-            var cause: Throwable? = e.cause
-            var depth = 0
-            while (cause != null && depth < 5) {
-                sb.append("  Caused by: ${cause.javaClass.name}: ${cause.message}\n")
-                for (frame in cause.stackTrace.take(20)) sb.append("    at $frame\n")
-                cause = cause.cause; depth++
-            }
-            // Пишем синхронно прямо в файл (writer thread уже может быть мёртв).
-            try { writeRawSync("FATAL", "CENTRAL_Crash", sb.toString(), null) } catch (_: Throwable) {}
-            Log.e(TAG_BASE, "UNCAUGHT on ${t.name}", e)
-            def?.uncaughtException(t, e)
-        }
         synchronized(lock) {
             if (inited) return
             var initErr: Throwable? = null
@@ -277,9 +266,60 @@ object AppLog {
     }
 
     private fun formatLine(lvl: String, tag: String, msg: String, _th: Throwable?): String {
-        val tNow = if (processStartUptime > 0) android.os.SystemClock.uptimeMillis() - processStartUptime else 0
-        val threadName = Thread.currentThread().name.take(18)
-        return "[${df.format(Date())}] [+${tNow}ms] [${threadName}] [$lvl] [$tag] $msg"
+        val now = android.os.SystemClock.uptimeMillis()
+        val dt = now - processStartUptimeMs
+        val tname = Thread.currentThread().name.take(14)
+        return "[${df.format(Date())}] [+${dt}ms] [$tname] [$lvl] [$tag] $msg"
+    }
+
+    /** Синхронная запись строки в файл — БЕЗ Logcat и без очереди (для UEH:
+     *  после написания процесс умирает, нельзя полагаться на планирование). */
+    private fun writeRawSync(line: String, th: Throwable?) {
+        val c = ctx ?: return
+        try {
+            val dir = (try { c.getExternalFilesDir(null) } catch (_: Throwable) { null }) ?: c.filesDir
+            runCatching { if (!dir.exists()) dir.mkdirs() }
+            val f = File(dir, LOG_NAME)
+            FileWriter(f, true).use { fw ->
+                fw.write(line)
+                fw.write("\n")
+                if (th != null) PrintWriter(fw).use { pw -> th.printStackTrace(pw); pw.flush() }
+                fw.flush()
+            }
+        } catch (_: Throwable) {
+            try {
+                val f = File(c.filesDir, "logs").apply { runCatching { if (!exists()) mkdirs() } }.let { File(it, LOG_NAME) }
+                FileWriter(f, true).use { fw ->
+                    fw.write(line)
+                    fw.write("\n")
+                    if (th != null) PrintWriter(fw).use { pw -> th.printStackTrace(pw); pw.flush() }
+                    fw.flush()
+                }
+            } catch (_: Throwable) {}
+        }
+    }
+
+    /** UncaughtExceptionHandler-мост: пишет стек в файл СИНХРОННО, затем
+     *  делегирует дефолтному handler'у (который убьёт процесс и укажет систему). */
+    private class UehBridge(val delegate: Thread.UncaughtExceptionHandler?) : Thread.UncaughtExceptionHandler {
+        override fun uncaughtException(t: Thread, e: Throwable) {
+            try {
+                val sb = StringBuilder("\n=== UNCAUGHT EXCEPTION on thread '${t.name}' (tid=${t.id}) ===\n")
+                var cur: Throwable? = e
+                var depth = 0
+                while (cur != null && depth < 5) {
+                    sb.append("Cause #$depth: ${cur.javaClass.name}: ${cur.message}\n")
+                    val frames = cur.stackTrace
+                    val n = minOf(frames.size, 40)
+                    for (i in 0 until n) sb.append("    at ${frames[i]}\n")
+                    if (frames.size > n) sb.append("    ... ${frames.size - n} more\n")
+                    cur = cur.cause; depth++
+                }
+                val line = "[${df.format(Date())}] [CRASH] [${t.name}] EXCEPTION: $sb"
+                AppLog.writeRawSync(line, e)
+            } catch (_: Throwable) {}
+            delegate?.uncaughtException(t, e)
+        }
     }
 
     private fun pickFile(c: Context): File {
@@ -290,30 +330,6 @@ object AppLog {
 
     private fun intFile(c: Context): File =
         File(c.filesDir, "logs").apply { runCatching { if(!exists()) mkdirs() } }.let { File(it, LOG_NAME) }
-
-    /** Синхронная запись в файл (для аварийных ситуаций: crash, shutdown). */
-    private fun writeRawSync(lvl: String, tag: String, msg: String, th: Throwable?) {
-        val c = ctx ?: return
-        val line = formatLine(lvl, tag, msg, null)
-        try {
-            val f = pickFile(c)
-            f.parentFile?.mkdirs()
-            FileWriter(f, true).use { w ->
-                w.appendLine(line)
-                th?.printStackTrace(PrintWriter(w))
-                w.flush()
-            }
-        } catch (_: Throwable) {
-            try {
-                val f2 = intFile(c); f2.parentFile?.mkdirs()
-                FileWriter(f2, true).use { w ->
-                    w.appendLine(line)
-                    th?.printStackTrace(PrintWriter(w))
-                    w.flush()
-                }
-            } catch (_: Throwable) {}
-        }
-    }
 
     private fun rotateIfNeeded(f: File) {
         if (f.exists() && f.length() > MAX) {

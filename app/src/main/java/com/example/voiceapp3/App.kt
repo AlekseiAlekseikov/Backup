@@ -7,10 +7,15 @@ import com.example.voiceapp3.tools.ScreenBrightness
 class App : Application() {
     override fun onCreate() {
         super.onCreate()
+        // Инициализируем логгер ПЕРВЫМ делом — до любых других модулей.
         AppLog.init(this)
-        AppLog.i("App", "=== Application.onCreate (build 2026-10-30 iter11) ===")
-        // Итерация 11: ensureKeepAwake при старте процесса — применить
-        // SCREEN_OFF_TIMEOUT если pref включен, иначе проверить readback.
+        // Явная строка версии — чтобы владелец мгновенно видел в логе, какая
+        // сборка запущена (без гаданий по размеру APK).
+        AppLog.i("App", "BUILD: versionCode=${BuildConfig.VERSION_CODE} versionName=${BuildConfig.VERSION_NAME} commit=${BuildConfig.GIT_COMMIT}")
+        AppLog.i("App", "=== Application.onCreate ===")
+        // Итерация 12: ensureKeepAwake при старте процесса (чтобы при ребуте
+        // или прибитии процесса системой фича «Не гасить экран» применилась
+        // автоматически — не дожидаясь входа в UI).
         ScreenBrightness.ensureKeepAwake(this)
         // Фоновая диагностика при старте: uid/SELinux/su-бинарники/sysfs battery/temperature props
         Thread { rootDiagnostic() }.start()
@@ -39,7 +44,7 @@ class App : Application() {
                 [ -e "${'$'}f" ] && echo "${'$'}f = ${'$'}(cat ${'$'}f 2>&1)"
             done
             echo "=== outside temp props ==="
-            getprop 2>&1 | grep -iE "outside|exttemp|ambient_temp|out_temp|hvac" | head -20
+            getprop 2>&1 | grep -iE "outside|exttemp|ambient_temp|out_temp|hvac|android.car.hvac.demo" | head -20
             echo "=== ttl /proc ==="
             cat /proc/sys/net/ipv4/ip_default_ttl 2>&1
         """.trimIndent()
