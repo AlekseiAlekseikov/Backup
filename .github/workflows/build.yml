@@ -1,0 +1,80 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - 'fix/**'
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter version
+        run: flutter --version
+
+      - name: Flutter pub get (flutter_telemetry)
+        working-directory: flutter_telemetry
+        run: flutter pub get
+
+      - name: Flutter build AAR (flutter_telemetry)
+        working-directory: flutter_telemetry
+        run: flutter build aar --release
+
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK packages
+        run: |
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;27.3.13750724" \
+            "cmake;3.22.1"
+          yes | sdkmanager --licenses > /dev/null || true
+
+      - name: Sanity check (что нужно для сборки на месте)
+        run: |
+          echo "--- ключи подписи ---"; ls -la platform-keys/ || true
+          echo "--- jniLibs ---";      ls -la app/src/main/jniLibs/arm64-v8a/ || true
+          echo "--- l10n ---";         ls -la flutter_telemetry/lib/l10n/ || true
+          echo "--- flutter AAR repo ---"; ls -la flutter_telemetry/build/host/outputs/repo/ || true
+
+      - name: Gradle build (debug)
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon --stacktrace assembleDebug
+
+      - name: Upload APK
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug
+          path: |
+            app/build/outputs/apk/**/*.apk
+            app/build/outputs/logs/**
+          if-no-files-found: warn
+          retention-days: 30
