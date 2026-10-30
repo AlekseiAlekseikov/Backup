@@ -57,9 +57,14 @@ class ShellTabs(
 
     /** Текущая вкладка (по tab.change); до первого события — стартовая «quick». */
     private var selected = "quick"
+    /** Флаг: publish был вызван хотя бы раз (шелл/док готовы к select). */
+    private var shellEverReady = false
 
     /** Отложенная цель destination: "carplay" | "androidAuto" (как PENDING_DEST). */
     private var pending: String? = null
+    /** Итерация 7 fix: холодный старт — если select приходит раньше готовности шелла,
+     * запоминаем цель и применяем при первом refresh (когда док уже подключен). */
+    private var pendingSelect: String? = null
 
     private class Shown(val carplay: Boolean, val aa: Boolean)
 
@@ -128,14 +133,23 @@ class ShellTabs(
                 val shown = resolve()
                 val id = if (destination == "carplay") "carplay" else "aa"
                 val isShown = if (id == "carplay") shown.carplay else shown.aa
-                if (isShown) select(id) else pending = destination
+                if (isShown) { select(id); selected = id; AppLogLike.i(TAG,"destination: applied $id (carplay/aa ready)") }
+                else { pending = destination; AppLogLike.i(TAG,"destination: queued $destination (projection tab not yet shown)") }
             }
             return
         }
-        // Переключаемся на вкладку сразу — если вкладка есть в MENU (telemetry/tools всегда есть).
+        // Холодный старт: select() требует, чтобы док уже был подключен к publish.
+        // Если refresh() ещё не вызывался (isFirstRun) — ставим в очередь.
+        if (!shellEverReady) {
+            pendingSelect = target
+            AppLogLike.i(TAG, "destination: queued $target (shell not ready yet)")
+            // Для carplay/aa pending тоже заполним:
+            if (target == "carplay" || target == "aa") pending = target
+            return
+        }
         select(target)
         selected = target
-        AppLogLike.i(TAG, "onDestination: selected=\"$target\" (requested=\"$destination\")")
+        AppLogLike.i(TAG, "destination: applied $target (requested=\"$destination\")")
     }
 
     /**
@@ -152,9 +166,25 @@ class ShellTabs(
                 else -> true
             }
         }
+        // При первом refresh применяем отложенный select (холодный старт).
+        val firstTime = !shellEverReady
+        shellEverReady = true
         publish(tabs, selected)
         if (!s.carplay && selected == "carplay") select("quick")
         if (!s.aa && selected == "aa") select("quick")
+        // pendingSelect: применили цель, если док готов.
+        val ps = pendingSelect
+        if (ps != null) {
+            pendingSelect = null
+            val tabExists = tabs.any { it.id == ps }
+            if (tabExists) {
+                select(ps)
+                selected = ps
+                AppLogLike.i(TAG, "destination: applied $ps (shell ready, firstRefresh=$firstTime)")
+            } else {
+                AppLogLike.i(TAG, "destination: queued $ps dropped (tab not in MENU)")
+            }
+        }
         when {
             pending == "carplay" && s.carplay -> {
                 pending = null

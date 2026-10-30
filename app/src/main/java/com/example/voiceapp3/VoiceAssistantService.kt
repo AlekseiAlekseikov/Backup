@@ -47,6 +47,7 @@ import com.example.voiceapp3.tools.LockSound
 import com.example.voiceapp3.tools.NetworkTtl
 import com.example.voiceapp3.tools.ScreenBrightness
 import com.example.voiceapp3.tools.StatusIcons
+import com.example.voiceapp3.tools.StatusOverlay
 import com.example.voiceapp3.tools.WindowDoors
 import com.example.voiceapp3.ui.UiBridge
 import org.vosk.Model
@@ -1654,6 +1655,8 @@ class VoiceAssistantService : Service() {
         handler.removeCallbacks(brightnessSync)
         /* Срез №3: останавливаем периодическую синхронизацию статус-иконок. */
         runCatching { StatusIcons.stopPeriodicSync() }
+        runCatching { NetworkTtl.unregisterNetworkReceiver(this) }
+        runCatching { StatusOverlay.hide(this) }
 
         runCatching { unregisterReceiver(keyEventReceiver) }
         runCatching { mediaCenterBridge.stop() }

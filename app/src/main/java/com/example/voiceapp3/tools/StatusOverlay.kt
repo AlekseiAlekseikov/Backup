@@ -2,24 +2,17 @@ package com.example.voiceapp3.tools
 
 import android.app.PendingIntent
 import android.content.Context
-import android.content.Intent
 import android.graphics.*
-import android.graphics.drawable.Drawable
 import android.graphics.drawable.Icon
-import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
-import android.provider.Settings
 import android.util.Log
 import android.view.Gravity
-import android.view.MotionEvent
-import android.view.PixelFormat
 import android.view.View
 import android.view.WindowManager
 import android.widget.LinearLayout
 import android.widget.TextView
-import java.util.Locale
 
 /**
  * P-фикс (раздел 0 из prompt_log_evidence.md): индикаторы батареи/температуры/Wi-Fi
@@ -140,12 +133,25 @@ object StatusOverlay {
 
     private fun showOnMain(app: Context) {
         if (showing) return
+        var path = "fail"
         try {
             // Пытаемся сами выдать SYSTEM_ALERT_WINDOW app-op (priv-app/platform-signed).
-            runCatching {
+            var canDraw = runCatching {
                 val cls = Class.forName("com.example.voiceapp3.OverlayPermission")
                 val m = cls.getMethod("ensure", Context::class.java)
-                m.invoke(null, app)
+                (m.invoke(null, app) as? Boolean) ?: false
+            }.getOrDefault(false)
+            if (!canDraw) {
+                canDraw = runCatching {
+                    val cls = Class.forName("com.example.voiceapp3.OverlayPermission")
+                    val m = cls.getMethod("canDraw", Context::class.java)
+                    (m.invoke(null, app) as? Boolean) ?: false
+                }.getOrDefault(false)
+            }
+            if (!canDraw) {
+                Log.w(TAG, "OVERLAY: path=fail (SYSTEM_ALERT_WINDOW не выдан, smallIcon-only fallback)")
+                AppLog.w(app, TAG, "OVERLAY: path=fail (SYSTEM_ALERT_WINDOW perm denied; индикаторы только в шторке)")
+                return
             }
             val wm = app.getSystemService(Context.WINDOW_SERVICE) as? WindowManager ?: return
             val root = LinearLayout(app).apply {
@@ -184,11 +190,13 @@ object StatusOverlay {
             wm.addView(root, params)
             this.root = root
             showing = true
-            Log.i(TAG, "StatusOverlay shown TYPE=$layoutType (APPLICATION_OVERLAY)")
+            path = "window"
+            Log.i(TAG, "StatusOverlay shown TYPE=$layoutType path=$path (APPLICATION_OVERLAY)")
         } catch (t: Throwable) {
-            Log.e(TAG, "StatusOverlay show FAILED (perm/BadToken): ${t.javaClass.simpleName}: ${t.message}", t)
-            AppLog.e(app, TAG, "OVERLAY: show failed ${t.javaClass.simpleName}: ${t.message}", t)
+            Log.e(TAG, "StatusOverlay show FAILED path=$path (${t.javaClass.simpleName}: ${t.message})", t)
+            AppLog.e(app, TAG, "OVERLAY: path=$path err=${t.javaClass.simpleName}: ${t.message}", t)
         }
+        AppLog.i(app, TAG, "OVERLAY: path=$path")
     }
 
     private fun hideOnMain() {

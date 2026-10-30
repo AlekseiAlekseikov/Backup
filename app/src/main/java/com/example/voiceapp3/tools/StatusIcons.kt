@@ -255,49 +255,47 @@ object StatusIcons {
             return pick(v, label)
         }
 
-        // 0) кеш прошлого источника
-        if (tmpProp != 0) {
-            for (a in AREAS) {
-                probe("$tempSource@$a(cache)") { tryFloatProp(tmpProp, a, tempSource) }
-                probe("$tempSource@$a(cache)") { tryInt80Prop(tmpProp, a, tempSource) }
-                if (chosen != null) break
-            }
-            tmpProp = 0
+        // Итерация 7 fix: кеш прошлого источника убран — если на ГУ не читается
+        // AC_AMBIENT_TEMP, в кеш навсегда сядет ENV_OUTSIDE_TEMPERATURE=25°C и владелец
+        // больше не увидит правильное значение. tmpProp используется ТОЛЬКО внутри
+        // одного прохода (но не сохраняется между вызовами — сбрасываем сразу).
+        tmpProp = 0
+
+        // 1) AC_AMBIENT_TEMP (Int, norm80 — (raw-80)/2 °C). Используется Capy Energy
+        //    телеметрией через GeelyProfile.AcAmbientTemp и VehicleLiveAdapter
+        //    ("outsideTemp" = OUTSIDE_TEMPERATURE fallback → AMBIENT_AIR_TEMPERATURE).
+        //    Нормализация совпадает с GeelyDeclarations.kt.
+        for (a in intArrayOf(0, 2, 7)) {
+            probe("VHAL:0x2140a377/AC_AMBIENT_TEMP@$a") { tryInt80Prop(PROP_AC_AMBIENT_TEMP, a, "VHAL:0x2140A377/AC_AMBIENT_TEMP") }
+            if (chosen != null) break
         }
-        // 1) AC_AMBIENT_TEMP (Int norm80) — primary
-        if (chosen == null) {
-            for (a in intArrayOf(0, 2, 7)) {
-                probe("VHAL:0x2140a377/AC_AMBIENT_TEMP@$a") { tryInt80Prop(PROP_AC_AMBIENT_TEMP, a, "VHAL:0x2140A377/AC_AMBIENT_TEMP") }
-                if (chosen != null) break
-            }
+        // 2) hvacdigital getprop'ы (temp_ext / exttemp — СИГНАЛЫ плагина). Важно:
+        //    плагин flyme получает значение из VHAL сам; мы читаем getprop как
+        //    кросс-проверку, но НЕ как primary, т.к. без рута setprop не проходит
+        //    и там может быть флаг включения (0/1), а не температура.
+        for (prop in SYS_HVAC_EXT_ALL) {
+            val v = runCatching {
+                val pp = Runtime.getRuntime().exec(arrayOf("sh","-c","getprop $prop"))
+                if (!pp.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)) { pp.destroyForcibly() }
+                val sVal = pp.inputStream.bufferedReader().readText().trim()
+                pp.errorStream.bufferedReader().readText().trim()
+                val fv = sVal.toFloatOrNull()
+                AppLog.d(TAG, "TEMP: getprop $prop raw=\"$sVal\" parsed=$fv")
+                if (fv != null && fv in -50f..70f) {
+                    tempSource = "hvacdigital/$prop"
+                    AppLog.i(TAG, "TEMP: norm=%.1f (src=$tempSource val=\"$sVal\")".format(fv))
+                }
+                fv
+            }.getOrNull()
+            pick(v, "hvacdigital/$prop")
+            if (chosen != null) break
         }
-        // 2) hvacdigital getprop'ы
-        if (chosen == null) {
-            for (prop in SYS_HVAC_EXT_ALL) {
-                val v = runCatching {
-                    val pp = Runtime.getRuntime().exec(arrayOf("sh","-c","getprop $prop"))
-                    if (!pp.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)) { pp.destroyForcibly() }
-                    val sVal = pp.inputStream.bufferedReader().readText().trim()
-                    pp.errorStream.bufferedReader().readText().trim()
-                    val fv = sVal.toFloatOrNull()
-                    AppLog.d(TAG, "TEMP: getprop $prop raw=\"$sVal\" parsed=$fv")
-                    if (fv != null && fv in -50f..70f) {
-                        tempSource = "hvacdigital/$prop"
-                        AppLog.i(TAG, "TEMP: norm=%.1f (src=$tempSource val=\"$sVal\")".format(fv))
-                    }
-                    fv
-                }.getOrNull()
-                pick(v, "hvacdigital/$prop")
-                if (chosen != null) break
-            }
+        // 3) ENV_OUTSIDE_TEMPERATURE (Float) — fallback; на этой прошивке даёт 25 при
+        //    реальных 7, но хоть что-то пока не доказано обратное.
+        probe("VHAL:0x11600703/ENV_OUTSIDE_TEMPERATURE@0") {
+            tryFloatProp(PROP_ENV_OUT_TEMP, 0, "VHAL:0x11600703/ENV_OUTSIDE_TEMPERATURE")
         }
-        // 3) ENV_OUTSIDE_TEMPERATURE — fallback (известно что врёт на этой прошивке)
-        if (chosen == null) {
-            probe("VHAL:0x11600703/ENV_OUTSIDE_TEMPERATURE@0") {
-                tryFloatProp(PROP_ENV_OUT_TEMP, 0, "VHAL:0x11600703/ENV_OUTSIDE_TEMPERATURE")
-            }
-        }
-        // 4) PRECISE_COMMON
+        // 4) PRECISE_COMMON fallback
         if (chosen == null) {
             outer@ for (pp in PRECISE_COMMON) {
                 for (a in intArrayOf(0, 2, 7)) {
