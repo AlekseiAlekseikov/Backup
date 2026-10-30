@@ -16,6 +16,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
+    env:
+      # ubuntu-latest приходит с уже установленным Android SDK — берём его,
+      # а не ставим заново через setup-android (пакет 'tools' удалён из
+      # репозитория Google, из-за него прогон 41052836550 упал на шаге «Android SDK»).
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+      ANDROID_HOME: /usr/local/lib/android/sdk
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -43,18 +50,35 @@ jobs:
         working-directory: flutter_telemetry
         run: flutter build aar --release
 
-      - name: Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install SDK packages
+      - name: Android SDK packages
         run: |
-          sdkmanager --install \
+          set -e
+          SDK="$ANDROID_SDK_ROOT"
+          SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SM" ]; then
+            SM="$(ls -1 "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -1)"
+          fi
+          echo "sdkmanager: $SM"
+          "$SM" --version
+          yes | "$SM" --licenses > /dev/null || true
+          "$SM" --install \
             "platform-tools" \
             "platforms;android-36" \
             "build-tools;36.0.0" \
             "ndk;27.3.13750724" \
             "cmake;3.22.1"
-          yes | sdkmanager --licenses > /dev/null || true
+
+      - name: local.properties (путь к SDK, ключи Supabase сохраняем)
+        run: |
+          set -e
+          if grep -q '^sdk.dir=' local.properties; then
+            sed -i "s|^sdk.dir=.*|sdk.dir=$ANDROID_SDK_ROOT|" local.properties
+          else
+            echo "sdk.dir=$ANDROID_SDK_ROOT" >> local.properties
+          fi
+          echo "--- sdk.dir ---"; grep '^sdk.dir=' local.properties
+          echo "--- ключи Supabase на месте: ---"
+          grep -c '^SUPABASE_' local.properties
 
       - name: Sanity check (что нужно для сборки на месте)
         run: |
@@ -75,6 +99,6 @@ jobs:
           name: app-debug
           path: |
             app/build/outputs/apk/**/*.apk
-            app/build/outputs/logs/**
+            app/build/outputs/logs/**/*
           if-no-files-found: warn
           retention-days: 30
