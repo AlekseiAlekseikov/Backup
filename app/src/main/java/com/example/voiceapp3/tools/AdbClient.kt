@@ -40,17 +40,28 @@ import java.util.concurrent.atomic.AtomicReference
 object AdbClient {
     private const val TAG = "CENTRAL_AdbClient"
 
-    const val ADB_PORT_ROOT = 65010
     const val ADB_PORT_DEFAULT = 5555
-    private const val CNXN = 0x4e595343
+    const val ADB_PORT_ROOT = 65010
+    // Итерация 11 fix: исправлены константы протокола ADB (были перепутаны байты).
+    // Эталон: ADB protocol v1, message.command uint32 little-endian (ASCII-строки).
+    //   CNXN = 0x4E584E43  ("CNXN")
+    //   AUTH = 0x48545541  ("AUTH")
+    //   OPEN = 0x4E45504F  ("OPEN")
+    //   OKAY = 0x59414B4F  ("OKAY")
+    //   WRTE = 0x45545257  ("WRTE")
+    //   CLSE = 0x45534C43  ("CLSE")
+    // Центральная ссылка: декомпилированный ADB-клиент CentralEXAuto v3.3.9
+    // (kotlinx.coroutines.scheduling.h) — отправляет CNXN(1314410051) = 0x4E584E43.
+    private const val CNXN = 0x4E584E43
     private const val AUTH = 0x48545541
-    private const val OPEN = 0x4e45504f
-    private const val OKAY = 0x4b414b4f
-    private const val WRTE = 0x57525445
-    private const val CLSE = 0x434c5345
+    private const val OPEN = 0x4E45504F
+    private const val OKAY = 0x59414B4F
+    private const val WRTE = 0x45545257
+    private const val CLSE = 0x45534C43
 
-    /** Стратегия выбора порта как в w0/n.case 0: сначала кэш, потом 65010, потом 5555. */
-    private val PORTS = intArrayOf(ADB_PORT_ROOT, ADB_PORT_DEFAULT)
+    /** Порядок опроса портов: сначала 5555 (дефолт adbd, именно его использует CentralEXAuto),
+     *  потом 65010 (кастомный root-порт, который прошивка сама объявляет через persist). */
+    private val PORTS = intArrayOf(ADB_PORT_DEFAULT, ADB_PORT_ROOT)
 
     private val worker = object : Thread("AdbWorker") {
         init { isDaemon = true }
@@ -330,20 +341,16 @@ object AdbClient {
         val shortCmd = cmd.replace("\\s+".toRegex(), " ").take(160)
         val st = state.get()
 
-        if (expectRoot && st !in setOf(ChannelState.ROOT_65010, ChannelState.ROOT_5555)) {
-            // Жёсткий запрет: root-команда без root-канала — не падаем в sh.
-            val reason = "ERR_ROOT_CHANNEL_UNAVAILABLE (state=$st)"
-            AppLog.e(TAG, "VERIFY EXEC port=- rc=1 expectRoot=true cmd=${shortCmd} → FAILED ($reason)")
-            return Pair(1, reason)
-        }
-
+        // Итерация 11 fix: убрали жёсткий запрет на выполнение без root-канала.
+        // Теперь всегда пытаемся выполнить: если ADB поднят — через него; если нет —
+        // через Runtime.sh фоллбэк. В classifyOutput определяем реальный rc и
+        // логируем uid, чтобы не терять команды и не гадать «сработало/нет».
         if (st in setOf(ChannelState.ROOT_65010, ChannelState.ROOT_5555)) {
             val port = workingPort.get()
             var out = try {
                 execAdbSocket(cmd, port, timeoutMs)
             } catch (e: IOException) {
                 AppLog.w(TAG, "VERIFY EXEC port=$port IOE: ${e.javaClass.simpleName}: ${e.message} — retrying alt port")
-                // Только IOException (порт упал) — пробуем другой порт. Не fallback в sh.
                 var alt: String? = null
                 var altPort: Int = -1
                 for (p in PORTS) if (p != port) {
@@ -352,20 +359,21 @@ object AdbClient {
                 if (alt != null) {
                     workingPort.set(altPort)
                     AppLog.i(TAG, "VERIFY EXEC switched to port=$altPort after IOException on $port")
-                    return classify(altPort, true, shortCmd, alt, 0)
+                    return classify(altPort, expectRoot, shortCmd, alt, 0)
                 }
-                val msg = "ERR_ADB_IO: ${e.message} (no alt port worked)"
-                AppLog.e(TAG, "VERIFY EXEC port=$port rc=1 expectRoot=$expectRoot cmd=${shortCmd} → FAILED ($msg)")
-                return Pair(1, msg)
+                // ADB упал на всех портах — пробуем sh-fallback, а не возвращаем ошибку сразу.
+                AppLog.w(TAG, "VERIFY EXEC ADB IO fail on all ports; falling back to Runtime.sh")
+                val (rc, fo) = runShellFallbackWithRc(cmd, timeoutMs)
+                return classify(0, expectRoot, shortCmd, fo, rc)
             } catch (e: Exception) {
-                val msg = "ERR_ADB: ${e.javaClass.simpleName}: ${e.message}"
-                AppLog.e(TAG, "VERIFY EXEC port=$port rc=1 expectRoot=$expectRoot cmd=${shortCmd} → FAILED ($msg)")
-                return Pair(1, msg)
+                AppLog.w(TAG, "VERIFY EXEC port=$port ${e.javaClass.simpleName}: ${e.message}; falling back to sh")
+                val (rc, fo) = runShellFallbackWithRc(cmd, timeoutMs)
+                return classify(0, expectRoot, shortCmd, fo, rc)
             }
             return classify(port, expectRoot, shortCmd, out, 0)
         }
 
-        // НЕ-root команда и нет ADB — допускается Runtime.sh (от uid=1000, для отладочных команд).
+        // ADB не поднят / NO_ROOT_SH / PERM_FAIL — используем Runtime.sh.
         val (rc, out) = runShellFallbackWithRc(cmd, timeoutMs)
         return classify(0, expectRoot, shortCmd, out, rc)
     }
@@ -581,7 +589,15 @@ object AdbClient {
 
     private fun logInitDiagnostics() {
         val port = workingPort.get()
-        AppLog.i(TAG, "PORT65010 diagnostics: port=$port state=${state.get()}")
+        AppLog.i(TAG, "ADB: connected port=$port state=${state.get()}")
+        // Сразу запрашиваем id — это единственная строка, которая доказывает,
+        // что ADB-канал живой и от какого пользователя выполняются команды.
+        val idOut = try {
+            execAdbSocket("id", port, 3000).replace('\n',' ').trim()
+        } catch (e: Exception) {
+            "${e.javaClass.simpleName}: ${e.message}"
+        }
+        AppLog.i(TAG, "ADB: id -> $idOut")
         val cmds = listOf(
             "id" to "shell_uid",
             "getprop service.adb.tcp.port; getprop persist.adb.tcp.port" to "adbd_props",
@@ -589,14 +605,27 @@ object AdbClient {
             "netstat -ltnp 2>/dev/null | grep -E '5555|65010' || ss -ltnp 2>/dev/null | grep -E '5555|65010' || (echo 'netstat/ss unavailable')" to "listeners",
             "iptables -t mangle -S POSTROUTING 2>/dev/null | grep -c ttl-set; ip6tables -t mangle -S POSTROUTING 2>/dev/null | grep -c hl-set" to "ttl_counts"
         )
-        // Блокируем на рабочем потоке до 8с на каждый.
         for ((c, n) in cmds) {
             try {
                 val r = execAdbSocket(c, port, 3000).replace('\n',' ').trim()
-                AppLog.i(TAG, "PORT65010 diag [$n]: $r")
+                AppLog.i(TAG, "ADB diag [$n]: $r")
             } catch (e: Exception) {
-                AppLog.w(TAG, "PORT65010 diag [$n]: ${e.javaClass.simpleName}: ${e.message}")
+                AppLog.w(TAG, "ADB diag [$n]: ${e.javaClass.simpleName}: ${e.message}")
             }
+        }
+        // Итерация 11: если видим демо-режим HVAC (android.car.hvac.demo=true) —
+        // пробуем выключить и перечитать наружную температуру. Демо-режим даёт
+        // фиктивные 25.0 °C во всех зонах VHAL и скрывает реальную температуру.
+        try {
+            val demo = execAdbSocket("getprop android.car.hvac.demo", port, 2000).trim()
+            AppLog.i(TAG, "ADB: android.car.hvac.demo='$demo'")
+            if (demo == "true" || demo == "1") {
+                AppLog.i(TAG, "ADB: HVAC demo ON — пробуем setprop android.car.hvac.demo false")
+                val s1 = execAdbSocket("setprop android.car.hvac.demo false; getprop android.car.hvac.demo", port, 3000).trim()
+                AppLog.i(TAG, "ADB: after setprop → android.car.hvac.demo='$s1'")
+            }
+        } catch (e: Exception) {
+            AppLog.w(TAG, "ADB HVAC demo check failed: ${e.javaClass.simpleName}: ${e.message}")
         }
     }
 

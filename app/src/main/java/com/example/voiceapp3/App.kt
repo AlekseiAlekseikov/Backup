@@ -2,14 +2,16 @@ package com.example.voiceapp3
 
 import android.app.Application
 import com.example.voiceapp3.tools.AppLog
+import com.example.voiceapp3.tools.ScreenBrightness
 
 class App : Application() {
     override fun onCreate() {
         super.onCreate()
-        // Инициализируем логгер ПЕРВЫМ делом — до любых других модулей, чтобы
-        // каждый вызов i/d/w/e попадал в /sdcard/Android/data/com.example.voiceapp3/files/voiceapp3.log
         AppLog.init(this)
-        AppLog.i("App", "=== Application.onCreate (build 2026-10-25) ===")
+        AppLog.i("App", "=== Application.onCreate (build 2026-10-30 iter11) ===")
+        // Итерация 11: ensureKeepAwake при старте процесса — применить
+        // SCREEN_OFF_TIMEOUT если pref включен, иначе проверить readback.
+        ScreenBrightness.ensureKeepAwake(this)
         // Фоновая диагностика при старте: uid/SELinux/su-бинарники/sysfs battery/temperature props
         Thread { rootDiagnostic() }.start()
     }

@@ -144,30 +144,27 @@ object StatusOverlay {
     private fun showOnMain(app: Context) {
         if (showing) return
         var path = "fail"
+        // Итерация 11 fix: гейт canDrawOverlays() убран.
+        // Причина: как показала декомпиляция CentralEXAuto (TempBattPillFloaterService
+        // v3.3.9), они вызывают wm.addView() сразу, без Settings.canDrawOverlays().
+        // Мы работаем как uid=1000 (system, sharedUserId=android.uid.system) и
+        // priv-app в /system/priv-app — TYPE_APPLICATION_OVERLAY для нас должен
+        // работать без appop, как и у CEX.
+        // Диагностика canDrawOverlays пишется в лог для справки, но НЕ блокирует addView.
+        val canDraw = runCatching {
+            val cls = Class.forName("com.example.voiceapp3.OverlayPermission")
+            val m = cls.getMethod("canDraw", Context::class.java)
+            (m.invoke(null, app) as? Boolean) ?: false
+        }.getOrDefault(false)
+        Log.i(TAG, "OVERLAY: attempting addView() (canDrawOverlays=$canDraw, uid=${android.os.Process.myUid()})")
+        AppLog.i(TAG, "OVERLAY: addView attempt (canDrawOverlays=$canDraw, uid=${android.os.Process.myUid()})")
         try {
-            // Пытаемся сами выдать SYSTEM_ALERT_WINDOW app-op (priv-app/platform-signed).
-            var canDraw = runCatching {
-                val cls = Class.forName("com.example.voiceapp3.OverlayPermission")
-                val m = cls.getMethod("ensure", Context::class.java)
-                (m.invoke(null, app) as? Boolean) ?: false
-            }.getOrDefault(false)
-            if (!canDraw) {
-                canDraw = runCatching {
-                    val cls = Class.forName("com.example.voiceapp3.OverlayPermission")
-                    val m = cls.getMethod("canDraw", Context::class.java)
-                    (m.invoke(null, app) as? Boolean) ?: false
-                }.getOrDefault(false)
-            }
-            if (!canDraw) {
-                Log.w(TAG, "OVERLAY: path=fail (SYSTEM_ALERT_WINDOW не выдан, smallIcon-only fallback)")
-                AppLog.w(app, TAG, "OVERLAY: path=fail (SYSTEM_ALERT_WINDOW perm denied; индикаторы только в шторке)")
-                return
-            }
-            val wm = app.getSystemService(Context.WINDOW_SERVICE) as? WindowManager ?: return
+            val wm = app.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
+                ?: throw IllegalStateException("WindowManager unavailable")
             val root = LinearLayout(app).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
-                setBackgroundColor(0x66000000.toInt()) // полупрозрачная подложка
+                setBackgroundColor(0x66000000.toInt())
             }
             val padV = dp(app, 2)
             root.setPadding(0, padV, 0, padV)
@@ -179,35 +176,22 @@ object StatusOverlay {
             root.addView(tempView)
             root.addView(battView)
 
-            // Единая декомпиляция: CentralEXAuto v3.3.9
-            // com/geely/autoservice/floater/TempBattPillFloaterService.java:
-            //   WindowManager.LayoutParams(-2, size, 2038, 264, -3)
-            //     2038 = TYPE_APPLICATION_OVERLAY,
-            //     264  = 0x108 = FLAG_LAYOUT_IN_SCREEN (0x100) | FLAG_NOT_FOCUSABLE (0x8),
-            //     -3   = PixelFormat.TRANSLUCENT.
-            // РИСК ДЛЯ ПРОВЕРКИ НА ГУ: без FLAG_NOT_TOUCH_MODAL (0x20) на некоторых
-            // прошивках окно может проглатывать тапы в пределах своего окна даже вне
-            // своих дочерних View; проверить на ГУ: тап по статус-бару вплотную к
-            // пилюле (часы/иконки) должен попадать в систему, а не в нас. Если тапы
-            // будут съедены — добавить FLAG_NOT_TOUCH_MODAL (0x20 → flags=296).
             val layoutType = if (Build.VERSION.SDK_INT >= 26)
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY // 2038
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
             else
-                @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_SYSTEM_ALERT // 2003
+                @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_SYSTEM_ALERT
             val flags = WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE // = 264 (CEX decompile)
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE // = 264 (CEX)
 
             val params = WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 dp(app, OVERLAY_HEIGHT_DP),
                 layoutType,
                 flags,
-                PixelFormat.TRANSLUCENT // -3
+                PixelFormat.TRANSLUCENT
             )
             params.gravity = Gravity.TOP or Gravity.END
             params.x = dp(app, OVERLAY_MARGIN_END_DP)
-            // Смещаем ПОД статус-бар, чтобы не перекрывать его и не глотать его тапы.
-            // В CentralEXAuto pill живёт с y=49dp — это как раз под статус-баром.
             val sb = statusBarHeightPx(app)
             params.y = sb + dp(app, OVERLAY_MARGIN_TOP_DP)
 
@@ -215,22 +199,20 @@ object StatusOverlay {
             this.root = root
             showing = true
             path = "window"
-            // Шторка уведомлений — системное окно слоем ВЫШЕ TYPE_APPLICATION_OVERLAY
-            // (как и у CentralEXAuto). При открытой шторке полоса временно скрывается
-            // под ней — это ожидаемое поведение, не баг; такое же у CEX.
-            Log.i(TAG, "StatusOverlay shown type=$layoutType flags=${params.flags} fmt=${params.format} path=$path sb=${sb}px y=${params.y}px (CentralEXAuto pattern; shade above overlay как в CEX)")
+            val okMsg = "StatusOverlay shown type=$layoutType flags=${params.flags} fmt=${params.format} path=$path sb=${sb}px y=${params.y}px gravity=TOP|END x=${params.x}px"
+            Log.i(TAG, okMsg)
+            AppLog.i(TAG, okMsg)
         } catch (t: Throwable) {
-            Log.e(TAG, "StatusOverlay show FAILED path=$path (${t.javaClass.simpleName}: ${t.message})", t)
-            AppLog.e(app, TAG, "OVERLAY: path=$path err=${t.javaClass.simpleName}: ${t.message}", t)
+            // Если addView упал — логируем класс и сообщение в файл (именно эту
+            // строку будем смотреть на ГУ, чтобы понять причину: SecurityException,
+            // BadTokenException, etc.).
+            Log.e(TAG, "StatusOverlay addView FAILED path=$path (${t.javaClass.simpleName}: ${t.message})", t)
+            AppLog.e(TAG, "OVERLAY: addView failed err=${t.javaClass.simpleName}: ${t.message}", t)
         }
-        // Итерация 9 fix: убрали запуск OverlayActivity из фоллбека — он был no-op
-        // (активити «Слушаю» тут же делала finish()). Реальный фоллбек при отказе
-        // overlay-permission — нотификации с ЧИТАЕМЫМИ цифрами в smallIcon
-        // (StatusIcons.postNotif выставляет их в makeTextIcon с цифрами).
         if (path != "window") {
-            Log.w(TAG, "OVERLAY: window-add failed (path=$path); индикаторы остаются в шторке уведомлений (smallIcon=число)")
+            Log.w(TAG, "OVERLAY: window-add failed (path=$path); индикаторы только в шторке (smallIcon=число)")
         }
-        AppLog.i(app, TAG, "OVERLAY: path=$path")
+        AppLog.i(TAG, "OVERLAY: path=$path")
     }
 
     private fun hideOnMain() {

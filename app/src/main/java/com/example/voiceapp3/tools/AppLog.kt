@@ -44,16 +44,39 @@ object AppLog {
     @Volatile private var ctx: Context? = null
     @Volatile private var inited = false
     @Volatile private var primaryPath: String = "(not initialised yet)"
+    @Volatile private var processStartUptime = 0L
 
     /** Кольцевой буфер сообщений до init(). */
     private val early = ArrayDeque<String>(EARLY_CAP)
 
     // ───────────────────── init ─────────────────────
     @JvmStatic fun init(c: Context) {
-        // ВСЕГДА сначала ставим ctx и флаг inited в try, чтобы при падении init
-        // логгер хотя бы не терял сообщения (продолжал копить в early и в Logcat).
         val appCtx = try { c.applicationContext } catch (t: Throwable) { c }
         ctx = appCtx
+        processStartUptime = android.os.SystemClock.uptimeMillis()
+        // Итерация 11: глобальный handler необработанных исключений — ловим
+        // падения любого потока (в том числе тех, что приводят к «чёрному экрану
+        // и тишине») и пишем полный стек в файл-лог ПЕРЕД тем как пробросить
+        // дальше системному дефолтному handler'у (который убьёт процесс).
+        val def = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { t, e ->
+            val sb = StringBuilder("=== UNCAUGHT EXCEPTION on thread '${t.name}' (tid=${t.id}) ===\n")
+            sb.append("  ${e.javaClass.name}: ${e.message}\n")
+            for ((i, frame) in e.stackTrace.take(40).withIndex()) {
+                sb.append("    at $frame\n")
+            }
+            var cause: Throwable? = e.cause
+            var depth = 0
+            while (cause != null && depth < 5) {
+                sb.append("  Caused by: ${cause.javaClass.name}: ${cause.message}\n")
+                for (frame in cause.stackTrace.take(20)) sb.append("    at $frame\n")
+                cause = cause.cause; depth++
+            }
+            // Пишем синхронно прямо в файл (writer thread уже может быть мёртв).
+            try { writeRawSync("FATAL", "CENTRAL_Crash", sb.toString(), null) } catch (_: Throwable) {}
+            Log.e(TAG_BASE, "UNCAUGHT on ${t.name}", e)
+            def?.uncaughtException(t, e)
+        }
         synchronized(lock) {
             if (inited) return
             var initErr: Throwable? = null
@@ -253,8 +276,11 @@ object AppLog {
         }
     }
 
-    private fun formatLine(lvl: String, tag: String, msg: String, _th: Throwable?): String =
-        "[${df.format(Date())}] [${Thread.currentThread().name}] [$lvl] [$tag] $msg"
+    private fun formatLine(lvl: String, tag: String, msg: String, _th: Throwable?): String {
+        val tNow = if (processStartUptime > 0) android.os.SystemClock.uptimeMillis() - processStartUptime else 0
+        val threadName = Thread.currentThread().name.take(18)
+        return "[${df.format(Date())}] [+${tNow}ms] [${threadName}] [$lvl] [$tag] $msg"
+    }
 
     private fun pickFile(c: Context): File {
         val dir = (try { c.getExternalFilesDir(null) } catch (_: Throwable) { null }) ?: c.filesDir
@@ -264,6 +290,30 @@ object AppLog {
 
     private fun intFile(c: Context): File =
         File(c.filesDir, "logs").apply { runCatching { if(!exists()) mkdirs() } }.let { File(it, LOG_NAME) }
+
+    /** Синхронная запись в файл (для аварийных ситуаций: crash, shutdown). */
+    private fun writeRawSync(lvl: String, tag: String, msg: String, th: Throwable?) {
+        val c = ctx ?: return
+        val line = formatLine(lvl, tag, msg, null)
+        try {
+            val f = pickFile(c)
+            f.parentFile?.mkdirs()
+            FileWriter(f, true).use { w ->
+                w.appendLine(line)
+                th?.printStackTrace(PrintWriter(w))
+                w.flush()
+            }
+        } catch (_: Throwable) {
+            try {
+                val f2 = intFile(c); f2.parentFile?.mkdirs()
+                FileWriter(f2, true).use { w ->
+                    w.appendLine(line)
+                    th?.printStackTrace(PrintWriter(w))
+                    w.flush()
+                }
+            } catch (_: Throwable) {}
+        }
+    }
 
     private fun rotateIfNeeded(f: File) {
         if (f.exists() && f.length() > MAX) {

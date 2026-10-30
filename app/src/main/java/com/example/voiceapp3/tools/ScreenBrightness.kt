@@ -359,57 +359,60 @@ object ScreenBrightness {
 
     private fun applyKeepAwakeInternal(ctx: Context, enabled: Boolean) {
         BgWorker.assertNotMain("ScreenBrightness.applyKeepAwakeInternal")
-        // Обязательно заново определяем серийник (фоново): кэш может быть пуст/устарел.
+        // Серийник: пишем в лог ФАКТИЧЕСКИЙ serial из всех трёх проперти, и
+        // вердикт match/mismatch — чтобы понять, сработал ли гейт.
         val serial = detectActualSerialBg(ctx)
         val isTarget = serial.serial == EXPECTED_SERIAL || serial.serial == EXPECTED_SERIAL_BOOT
         if (!isTarget) {
-            AppLog.w(TAG, "SCREEN_TIMEOUT: serial mismatch expected=$EXPECTED_SERIAL/$EXPECTED_SERIAL_BOOT actual=${serial.serial} (src=${serial.source} dt=${serial.dtMs}ms) → skip (not touching screen_off_timeout)")
+            AppLog.w(TAG, "SCREEN_TIMEOUT: serial mismatch (actual=${serial.serial} src=${serial.source}) → NOT touching screen_off_timeout (safety gate)")
             return
         }
-        AppLog.i(TAG, "SCREEN_TIMEOUT: serial match (src=${serial.source} dt=${serial.dtMs}ms) → applicable, applying enabled=$enabled")
+        AppLog.i(TAG, "SCREEN_TIMEOUT: serial match (src=${serial.source} dt=${serial.dtMs}ms) → applying enabled=$enabled")
 
         // Сохраняем оригинальное значение перед первой записью.
         val p = prefs(ctx)
         val before = readSystem(ctx, Settings.System.SCREEN_OFF_TIMEOUT)
         if (before != null && before != SCREEN_OFF_MAX && !p.contains(PREF_ORIGINAL_TIMEOUT)) {
             p.edit().putLong(PREF_ORIGINAL_TIMEOUT, before.toLong()).apply()
-            AppLog.i(TAG, "SCREEN_TIMEOUT: сохранили оригинальное значение = $before")
+            AppLog.i(TAG, "SCREEN_TIMEOUT: saved original=$before")
         }
         val target = if (enabled) SCREEN_OFF_MAX else {
             val restored = p.getLong(PREF_ORIGINAL_TIMEOUT, 0L).toInt()
             if (restored > 0 && restored != SCREEN_OFF_MAX) restored else 600000
         }
 
-        // Путь 1: Settings.System (переживает uninstall: Android НЕ удаляет
-        // Settings.System при удалении APK).
+        // Путь 1 (in-process): Settings.System.putInt (uid=1000).
         val wr = writeSystemInt(ctx, Settings.System.SCREEN_OFF_TIMEOUT, target)
-        val after = readSystem(ctx, Settings.System.SCREEN_OFF_TIMEOUT)
 
-        // Путь 2: persist-проперти (без init.d-скрипта — см. комментарий в блоке
-        // констант: на IHU629G нет подтверждённого init.d-хука, файл в /data/local/tmp
-        // не запускается сам и был бы мусором). persist prop сам по себе только
-        // сигнализирует намерение, но НЕ обеспечивает перезагрузку системы — это
-        // честно отмечаем в логе.
-        var rootRc = -1; var rootOut = "(no-root)"
+        // Путь 2: Runtime.exec(sh -c "settings put ...") — другой контекст
+        // (sh работает от нас же, но через сервис settings; на некоторых ГУ даёт
+        // другой результат, чем in-process putInt).
+        var shRc = -1; var shOut = ""
         try {
-            val setCmd = if (enabled) "setprop $PERSIST_FORCE_PROP 1" else "setprop $PERSIST_FORCE_PROP 0"
-            val (rc, out) = AdbClient.execute(setCmd, 5000, expectRoot = true)
-            rootRc = rc; rootOut = out.replace('\n',' ').take(200)
-        } catch (t: Throwable) {
-            AppLog.w(TAG, "SCREEN_TIMEOUT: root persist prop failed: ${t.message}")
+            val pp = Runtime.getRuntime().exec(arrayOf("sh","-c","settings put system screen_off_timeout $target; echo -n rc=\$?"))
+            if (!pp.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)) { pp.destroyForcibly(); shOut="timed out" }
+            else { shRc=pp.exitValue(); shOut=(pp.inputStream.bufferedReader().readText()+pp.errorStream.bufferedReader().readText()).replace('\n',' ').trim().take(100) }
+        } catch (t: Throwable) { shOut="sh err: ${t.message}" }
+
+        // Путь 3: через ADB (root) — после починки канала это uid=0.
+        var adbRc = -1; var adbOut = "(not executed)"
+        try {
+            val (rc, out) = AdbClient.execute("settings put system screen_off_timeout $target", 5000, expectRoot = false)
+            adbRc = rc; adbOut = out.replace('\n',' ').trim().take(100)
+        } catch (t: Throwable) { adbOut="adb err: ${t.message}" }
+
+        val readback = readSystem(ctx, Settings.System.SCREEN_OFF_TIMEOUT)
+        val applied = readback == target
+        AppLog.i(TAG, "SCREEN_TIMEOUT: set $target → readback=$readback (settings.put ok=${wr.ok}, sh rc=$shRc '$shOut', adb rc=$adbRc '$adbOut') → ${if(applied) "PERSISTED" else "NOT PERSISTED"}")
+
+        // Диагностика окружения при старте (один раз): dumpsys power/window timeout
+        if (!p.getBoolean("boot_screen_diag_done_v1", false)) {
+            try {
+                val diag = execShort("dumpsys power 2>/dev/null | grep -iE 'timeout|screenoff|screen' | head -20; echo ---; settings list system 2>/dev/null | grep -iE 'screen_off|screen_dim|screen_sleep|timeout' | head; echo ---; settings list global 2>/dev/null | grep -iE 'stay_on|screen_off|adb' | head; echo ---; settings list secure 2>/dev/null | grep -iE 'sleep|timeout' | head")
+                AppLog.i(TAG, "SCREEN_TIMEOUT: boot diagnostics:\n$diag")
+            } catch (t: Throwable) { AppLog.w(TAG, "diag err: ${t.message}") }
+            p.edit().putBoolean("boot_screen_diag_done_v1", true).apply()
         }
-
-        val applied = after == target
-        AppLog.i(TAG, "VERIFY SCREEN_TIMEOUT: before=$before target=$target after=$after settingsOk=${wr.ok} rootRc=$rootRc → ${if (applied) "SUCCESS" else "FAILED"} rootOut=$rootOut")
-        AppLog.i(TAG, "SCREEN_TIMEOUT: NOTE — значение держится в Settings.System (переживает uninstall); init.d/durable-скрипт НЕ ставится (нет подтверждённого init.d-хука на IHU629G; файл в /data/local/tmp не самозапускается)")
-        // Диагностика «кто сбросит»
-        try {
-            val dumpSb = StringBuilder()
-            val proc = Runtime.getRuntime().exec(arrayOf("sh","-c","dumpsys settings 2>/dev/null | grep -i screen_off_timeout | head -20"))
-            proc.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)
-            proc.inputStream.bufferedReader().forEachLine { dumpSb.append(it).append(";") }
-            AppLog.i(TAG, "SCREEN_TIMEOUT: dumpsys screen_off entries: $dumpSb")
-        } catch (_: Throwable) {}
         if (applied) p.edit().putBoolean(PREF_KEEP_AWAKE_APPLIED, enabled).apply()
     }
 
@@ -419,23 +422,37 @@ object ScreenBrightness {
      */
     fun ensureKeepAwake(ctx: Context) {
         val app = ctx.applicationContext
-        // Если кэш не свежий — запускаем асинхронную детекцию заранее (для UI).
         ensureSerialProbeAsync(app)
         val enabled = prefs(app).getBoolean(PREF_KEEP_AWAKE, false)
-        if (enabled) {
-            BgWorker.post("ScreenBrightness.ensureKeepAwake") {
-                applyKeepAwakeInternal(app, true)
-            }
+        BgWorker.post("ScreenBrightness.ensureKeepAwake") {
+            // Читаем текущее значение ДО применения — если expected=MAX и
+            // readback!=MAX, значит прошивка сбросила (ребаг 10-секундного).
+            val expected = if (enabled) SCREEN_OFF_MAX else prefs(app).getLong(PREF_ORIGINAL_TIMEOUT, 600000L).toInt()
+            val current = readSystem(app, Settings.System.SCREEN_OFF_TIMEOUT)
+            val needReapply = enabled && (current == null || current != SCREEN_OFF_MAX)
+            AppLog.i(TAG, "SCREEN_TIMEOUT: boot readback=$current expected=$expected enabled=$enabled → reapply=${if(needReapply) "yes" else "no"}")
+            if (enabled && needReapply) applyKeepAwakeInternal(app, true)
+            // Дополнительно: залогировать события ScreenSaverOverlay (кто гасит?).
+            scheduleRestWatchdog(app)
         }
     }
+
+    private fun execShort(cmd: String, timeoutMs: Long = 4000): String = try {
+        val p = Runtime.getRuntime().exec(arrayOf("sh","-c",cmd))
+        if (!p.waitFor(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)) { p.destroyForcibly(); "(timeout)" }
+        else { val o = p.inputStream.bufferedReader().readText(); val e = p.errorStream.bufferedReader().readText(); (o+e).trimEnd() }
+    } catch (t: Throwable) { "(exec err: ${t.message})" }
 
     private fun scheduleRestWatchdog(ctx: Context) {
         restWatchdogRunnable?.let { mainHandler.removeCallbacks(it) }
         val sec = restSeconds(ctx)
+        val sysTimeout = readSystem(ctx, Settings.System.SCREEN_OFF_TIMEOUT)
+        AppLog.i(TAG, "SCREEN_SAVER: scheduleWatchdog sec=$sec system screen_off_timeout=$sysTimeout (${if(sec<=0) "no screensaver overlay" else "overlay will show after ${sec}s"})")
         if (sec <= 0) return
         val r = object : Runnable {
             override fun run() {
-                AppLog.d(TAG, "screenSaver fired after ${sec}s")
+                val sysTo = readSystem(ctx, Settings.System.SCREEN_OFF_TIMEOUT)
+                AppLog.i(TAG, "SCREEN_SAVER: watchdog fired (scheduled=${sec}s ago); current system screen_off_timeout=$sysTo")
                 ScreenSaverOverlay.show(ctx)
             }
         }

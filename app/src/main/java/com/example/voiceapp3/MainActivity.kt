@@ -15,6 +15,7 @@ import android.database.Cursor
 import android.provider.OpenableColumns
 import com.google.gson.JsonObject
 import com.example.voiceapp3.ui.UiBridge
+import com.example.voiceapp3.tools.AppLog
 
 /**
  * Оболочка нового интерфейса (фаза 1 — только UI).
@@ -57,9 +58,14 @@ class MainActivity : AppCompatActivity() {
 
     private val handler = Handler(Looper.getMainLooper())
 
+    private fun lifecycle(ev: String) =
+        AppLog.i("CENTRAL_MainActivity", "MainActivity $ev (t+${android.os.SystemClock.uptimeMillis() - android.os.Process.getStartUptimeMillis()}ms)")
+
     override fun onCreate(savedInstanceState: Bundle?) {
+        val t0 = android.os.SystemClock.uptimeMillis()
         AppTheme.applySaved(this)
         super.onCreate(savedInstanceState)
+        lifecycle("onCreate (intent=${intent?.action} ${intent?.dataString})")
         AppTheme.applyToWindow(this)
         if (android.os.Build.VERSION.SDK_INT >= 29) {
             window.decorView.isForceDarkAllowed = false
@@ -205,6 +211,7 @@ class MainActivity : AppCompatActivity() {
         startVoiceService()
         startTelemetryCollector()
         handleDestination(intent)
+        AppLog.i("CENTRAL_MainActivity", "MainActivity onCreate done in ${android.os.SystemClock.uptimeMillis()-t0}ms")
     }
 
     private fun dpPx(v: Int): Int = (v * resources.displayMetrics.density + 0.5f).toInt()
@@ -310,9 +317,13 @@ class MainActivity : AppCompatActivity() {
         finish()
     }
 
+    override fun onStart() { super.onStart(); lifecycle("onStart") }
+    override fun onStop() { super.onStop(); lifecycle("onStop") }
+
     override fun onResume() {
         super.onResume()
         isResumed = true
+        lifecycle("onResume")
         // Stage SCR: как didChangeAppLifecycleState(resumed) в capy — режим
         // просится у окна на каждом resume: Android восстанавливает панели,
         // когда активность пересоздаётся или системный диалог уходил вперёд.
@@ -336,6 +347,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onPause() {
+        lifecycle("onPause")
         // Stage CPv2, R4 (как MainActivity.onPause в capy): release CarPlay,
         // release Android Auto и подъём активных touch-жестов — СИНХРОННО,
         // до super.onPause(). OEM CarplayActivity строит свою SurfaceView
@@ -351,6 +363,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        lifecycle("onDestroy")
         // Stage CPv2: dispose рендер-моста до UiBridge (аналог
         // cleanUpFlutterEngine в capy): хосты отпускают binder-связи,
         // touch-контроллер снимает свои binding-и.

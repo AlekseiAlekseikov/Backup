@@ -3,23 +3,26 @@ package com.example.voiceapp3
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.util.Log
+import com.example.voiceapp3.tools.AppLog
+import com.example.voiceapp3.tools.ScreenBrightness
 
 class BootReceiver : BroadcastReceiver() {
     companion object {
-        private const val TAG = "BootReceiver"
+        private const val TAG = "CENTRAL_BootReceiver"
     }
 
     override fun onReceive(context: Context, intent: Intent) {
-        if (intent.action == Intent.ACTION_BOOT_COMPLETED ||
-            intent.action == "android.intent.action.QUICKBOOT_POWERON") {
+        val action = intent.action
+        if (action == Intent.ACTION_BOOT_COMPLETED ||
+            action == Intent.ACTION_LOCKED_BOOT_COMPLETED ||
+            action == "android.intent.action.QUICKBOOT_POWERON") {
 
-            Log.i(TAG, "Boot completed, starting service")
+            AppLog.i(TAG, "Boot broadcast received: $action → starting service + ensureKeepAwake")
             val serviceIntent = Intent(context, VoiceAssistantService::class.java)
-                /* Stage CXT-2: сервис должен вернуть сохранённую яркость
-                   («Запоминать яркость по фарам») — порт boot-ветки w(). */
                 .putExtra(VoiceAssistantService.EXTRA_BOOT_RESTORE, true)
             context.startForegroundService(serviceIntent)
+            // Проводим keep-awake (применение SCREEN_OFF_TIMEOUT) ПОСЛЕ ребута.
+            ScreenBrightness.ensureKeepAwake(context)
         }
     }
 }
