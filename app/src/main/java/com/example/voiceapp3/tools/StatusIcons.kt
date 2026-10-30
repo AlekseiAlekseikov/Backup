@@ -310,116 +310,75 @@ object StatusIcons {
             } catch (e: Exception) { AppLog.d(TAG, "TEMP: $label int err=${e.message}") }
             return null
         }
-        // P-фикс: собираем ВСЕХ кандидатов и логируем единой строкой для сравнения
-        // с эталоном (Строка состояния). Приоритет выверен по декомпилу CentralEXAuto v3.3.9:
-        //   1) ENV_OUTSIDE_TEMPERATURE (0x11600703) по зонам {0,1,4,7} — primary,
-        //      с двойной нормализацией (float °C / int /10). Именно это читает
-        //      PillFloater/HvacStepper CentralEXAuto, который рисует "°C" в статус-баре.
-        //   2) hvacdigital getprop temp_ext/exttemp (сигнал flyme-плагина; без рута
-        //      может быть 0/1 — флаг включения, поэтому после VHAL).
-        //   3) AC_AMBIENT_TEMP (0x2140a377) — кабина HVAC, Int (raw-80)/2; это не
-        //      наружная, а ambient салона; оставляем как fallback.
-        //   4) PRECISE_COMMON (fallback).
-        // Кеш tmpProp между вызовами НЕ ИСПОЛЬЗУЕТСЯ — сбрасываем в 0 каждый проход,
-        // чтобы однажды залипшее 25°C не заблокировало нахождение реального значения.
-        data class Cand(val name: String, val value: Float?)
+        // Итерация 9 fix: удалены дубли объявлений Cand/candidates/chosen (compile error).
+        // Пока источник температуры не верифицирован логом с ГУ:
+        //   - читаем ENV_OUTSIDE_TEMPERATURE@0 КАК ЕСТЬ (как в прошлой рабочей сборке)
+        //     и показываем значение на экране (владелец просил: пусть даже неверное,
+        //     значок должен быть живой);
+        //   - РЯДОМ в лог пишем полный дамп всех температурных VHAL propertyId по всем
+        //     зонам — по нему определим реальный источник после прогона на ГУ;
+        //   - в tempSource пишем префикс UNVERIFIED, чтобы в логах видно было,
+        //     что это ещё не подтверждённое соответствие OEM-строке.
+        data class Cand(val name: String, val value: Float?, val area: Int = 0)
         val candidates = mutableListOf<Cand>()
         var chosen: Float? = null
         var chosenArea = 0
-
-        fun pick(v: Float?, label: String, area: Int = 0): Float? {
-            candidates.add(Cand(label, v))
-            if (v != null && chosen == null) { chosen = v; chosenArea = area }
-            return v
-        }
-        fun probe(label: String, area: Int = 0, get: () -> Float?): Float? {
-            val v = runCatching { get() }.getOrNull()
-            return pick(v, label, area)
-        }
-
-        // Итерация 8 fix: обходим ВСЕ зоны ENV_OUTSIDE_TEMPERATURE {0,1,2,3,4,5,7,0xF},
-        // собираем все кандидаты (float / int/10 / int-as-is), логируем каждое чтение
-        // и НТ возвращаемся по первой зоне=0 (владелец показал что area=0 стабильно врёт
-        // на +25°C, а реальные 7°C, видимо, живут в другой зоне).
-        // Выбор: среди валидных значений предпочитаем то, которое != 25.0 °C; если
-        // все кандидаты 25.0 — берём из первой ненулевой зоны; если только зона 0
-        // отдала значение (и оно 25.0) — НЕ возвращаем его как «правильное»,
-        // а идём дальше по другим пропам (hvacdigital/AC_AMBIENT/PRECISE_COMMON),
-        // чтобы не залипнуть на известном дефолте.
-        data class Cand(val name: String, val value: Float?, val area: Int = 0)
-        val candidates = mutableListOf<Cand>()
-
+        var chosenLabel = ""
         fun record(label: String, v: Float?, area: Int = 0): Float? {
             candidates.add(Cand(label, v, area))
             return v
         }
-        // Скан всех зон ENV_OUTSIDE без раннего return.
-        val outsideHits = mutableListOf<Pair<Int, Float>>()  // (area, value)
-        val OUTSIDE_AREAS = intArrayOf(0, 1, 2, 3, 4, 5, 7, 0xF)
-        for (a in OUTSIDE_AREAS) {
-            val v = tryOutsideCex(a, "VHAL:0x11600703/ENV_OUTSIDE_TEMPERATURE@$a")
-            if (v != null) outsideHits.add(a to v)
-        }
-        // Выбираем лучшее ENV_OUTSIDE значение:
-        //  - среди всех попаданий ищем != 25.0 °C (не дефолт прошивки);
-        //  - из нескольких не-25 берём наименьшее абсолютное (ближе к реальной уличной);
-        //  - если все == 25.0 и есть хоть одна ненулевая зона, считаем это подозрительным
-        //    (все зоны дали одинаковый 25 — возможно реально 25; но если только зона 0
-        //    дала 25, а остальные NaN/err — это сбой, пропускаем).
-        var chosen: Float? = null
-        var chosenArea = 0
-        var chosenLabel = ""
-        if (outsideHits.isNotEmpty()) {
-            val non25 = outsideHits.filter { Math.abs(it.second - 25f) > 0.5f }
-            val picked = when {
-                non25.isNotEmpty() -> non25.minByOrNull { Math.abs(it.second) }!!
-                outsideHits.any { it.first != 0 } -> outsideHits.first { it.first != 0 } // доверяем хоть какой-то зоне != 0
-                else -> null // только зона 0 и все 25.0 — не доверяем, идём дальше
-            }
-            if (picked != null) {
-                chosen = picked.second; chosenArea = picked.first
-                chosenLabel = "VHAL/ENV_OUTSIDE_TEMPERATURE@${picked.first}"
-                tmpProp = PROP_ENV_OUT_TEMP; tmpArea = picked.first
-                tempSource = chosenLabel
-            }
-            // Все кандидаты записываем в лог:
-            for ((a, v) in outsideHits) record("VHAL:0x11600703/ENV_OUTSIDE@$a", v, a)
+
+        // 1) PRIMARY (UNVERIFIED): ENV_OUTSIDE_TEMPERATURE@0 как есть.
+        //    Это то же самое, что читала прошлая сборка, дававшая 25 °C. Значение
+        //    показывается на экране (не прячем), а рядом — полный дамп для анализа.
+        val v0 = tryOutsideCex(0, "VHAL:0x11600703/ENV_OUTSIDE_TEMPERATURE@0")
+        record("VHAL:0x11600703/ENV_OUTSIDE@0", v0, 0)
+        if (v0 != null) {
+            chosen = v0; chosenArea = 0
+            chosenLabel = "VHAL/UNVERIFIED:ENV_OUTSIDE@0"
+            tmpProp = PROP_ENV_OUT_TEMP; tmpArea = 0; tempSource = chosenLabel
         }
 
-        // 2) hvacdigital getprop temp_ext / exttemp (кросс-проверка).
-        if (chosen == null) {
-            for (prop in SYS_HVAC_EXT_ALL) {
-                val v = runCatching {
-                    val pp = Runtime.getRuntime().exec(arrayOf("sh","-c","getprop $prop"))
-                    if (!pp.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)) { pp.destroyForcibly() }
-                    val sVal = pp.inputStream.bufferedReader().readText().trim()
-                    pp.errorStream.bufferedReader().readText().trim()
-                    val fv = sVal.toFloatOrNull()
-                    AppLog.d(TAG, "TEMP: getprop $prop raw=\"$sVal\" parsed=$fv")
-                    fv?.takeIf { it in -50f..70f && Math.abs(it - 1f) > 0.1f /* не флаг */ }?.also {
-                        AppLog.i(TAG, "TEMP: getprop $prop val=\"$sVal\" -> $it °C")
-                    }
-                }.getOrNull()
-                record("hvacdigital/$prop", v)
-                if (v != null && chosen == null && Math.abs(v - 1f) > 0.1f) {
-                    chosen = v; chosenLabel = "hvacdigital/$prop"; tempSource = chosenLabel
+        // 2) Сканируем ОСТАЛЬНЫЕ зоны ENV_OUTSIDE в диагностических целях (в лог)
+        //    — но не перезаписываем chosen автоматически (не угадываем).
+        for (a in intArrayOf(1, 2, 3, 4, 5, 7, 0xF)) {
+            val v = tryOutsideCex(a, "VHAL:0x11600703/ENV_OUTSIDE_TEMPERATURE@$a")
+            record("VHAL:0x11600703/ENV_OUTSIDE@$a", v, a)
+        }
+
+        // 3) hvacdigital getprop temp_ext / exttemp (кросс-проверка, не primary,
+        //    т.к. без рута там может быть флаг 0/1).
+        for (prop in SYS_HVAC_EXT_ALL) {
+            val v = runCatching {
+                val pp = Runtime.getRuntime().exec(arrayOf("sh","-c","getprop $prop"))
+                if (!pp.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)) { pp.destroyForcibly() }
+                val sVal = pp.inputStream.bufferedReader().readText().trim()
+                pp.errorStream.bufferedReader().readText().trim()
+                val fv = sVal.toFloatOrNull()
+                AppLog.d(TAG, "TEMP: getprop $prop raw=\"$sVal\" parsed=$fv")
+                fv?.takeIf { it in -50f..70f && Math.abs(it - 1f) > 0.1f }?.also {
+                    AppLog.i(TAG, "TEMP: getprop $prop val=\"$sVal\" -> $it °C")
                 }
-                if (chosen != null) break
+            }.getOrNull()
+            record("hvacdigital/$prop", v)
+            if (v != null && chosen == null && Math.abs(v - 1f) > 0.1f) {
+                chosen = v; chosenLabel = "hvacdigital/$prop"; tempSource = chosenLabel
             }
         }
-        // 3) AC_AMBIENT_TEMP (кабина) — fallback (norm (raw-80)/2 °C).
+        // 4) AC_AMBIENT_TEMP (кабина) — fallback (norm (raw-80)/2 °C).
         if (chosen == null) {
             for (a in intArrayOf(0, 2, 7)) {
                 val v = tryInt80Prop(PROP_AC_AMBIENT_TEMP, a, "VHAL:0x2140A377/AC_AMBIENT_TEMP@$a")
                 record("VHAL:0x2140a377/AC_AMBIENT@$a", v, a)
                 if (v != null && chosen == null) {
-                    chosen = v; chosenArea = a; chosenLabel = "VHAL/AC_AMBIENT_TEMP@$a"
+                    chosen = v; chosenArea = a; chosenLabel = "VHAL/UNVERIFIED:AC_AMBIENT@$a"
                     tmpProp = PROP_AC_AMBIENT_TEMP; tmpArea = a; tempSource = chosenLabel
                 }
                 if (chosen != null) break
             }
         }
-        // 4) PRECISE_COMMON fallback
+        // 5) PRECISE_COMMON fallback
         if (chosen == null) {
             outer@ for (pp in PRECISE_COMMON) {
                 for (a in intArrayOf(0, 2, 7)) {
@@ -433,7 +392,7 @@ object StatusIcons {
         }
         val finalV = chosen
         if (finalV != null) {
-            AppLog.i(TAG, "TEMP: candidates — " + candidates.joinToString(" | ") { "${it.name}=${it.value}" })
+            AppLog.i(TAG, "TEMP status=UNVERIFIED candidates — " + candidates.joinToString(" | ") { "${it.name}=${it.value}" })
             AppLog.i(TAG, "TEMP: chosen=%.1f (src=$chosenLabel area=$chosenArea)".format(finalV))
             return finalV
         }
@@ -524,6 +483,15 @@ object StatusIcons {
             }
             p.style = Paint.Style.FILL
         } else {
+            // Итерация 9 fix: адаптивный textSize под длину (для цифр "100"/"77"),
+            // чтобы smallIcon не обрезался и оставался читаемым в шторке (это
+            // реальный фоллбек при отказе overlay-permission).
+            val fitSize = when {
+                main.length <= 1 -> size * 0.60f
+                main.length == 2 -> size * 0.50f
+                else             -> size * 0.40f
+            }
+            p.textSize = fitSize
             val mainW = p.measureText(main)
             val sfxW = if (suffix.isNotEmpty()) pSfx.measureText(suffix) else 0f
             val totalW = mainW + sfxW
@@ -655,9 +623,14 @@ object StatusIcons {
                 val socStr = if (soc == soc.toInt().toFloat()) "${soc.toInt()}" else String.format(Locale.US, "%.1f", soc)
                 val text = "$socStr% · $socSource"
                 val w = (24 * app.resources.displayMetrics.density).toInt().coerceAtLeast(24)
-                postNotif(app, NOTIF_BATT, CHANNEL_BATT, makeTextIcon(app, "%", "", Color.WHITE), "Батарея", text, RANK_BATT,
+                // smallIcon — читаемое число процента (а не голый "%"), чтобы при
+                // отказе overlay-permission нотификация сама несла индикацию.
+                val smallBattText = "${soc.toInt()}"
+                postNotif(app, NOTIF_BATT, CHANNEL_BATT,
+                    makeTextIcon(app, smallBattText, "", Color.WHITE),
+                    "Батарея $socStr%", text, RANK_BATT,
                     telemetryPi(app, NOTIF_BATT))
-                AppLog.i(TAG, "BATT: value=$socStr% smallIconSize=${w}x${w}px click→telemetry src=$socSource → posted + OVERLAY")
+                AppLog.i(TAG, "BATT: value=$socStr% smallIconSize=${w}x${w}px smallIconText=\"$smallBattText\" click→telemetry src=$socSource → posted + OVERLAY")
                 battStr = "$socStr%"; battPct = soc; battHas = true
             } else { cancel(app, NOTIF_BATT); AppLog.w(TAG,"BATT: SOC null") }
         } else cancel(app, NOTIF_BATT)
@@ -669,9 +642,20 @@ object StatusIcons {
                 val sign = if (t > 0) "+" else ""
                 val text = "$sign$tStr °C · $tempSource"
                 val w = (24 * app.resources.displayMetrics.density).toInt().coerceAtLeast(24)
-                postNotif(app, NOTIF_TEMP, CHANNEL_TEMP, makeTextIcon(app, "°", "", Color.WHITE), "Снаружи", text, RANK_TEMP,
+                // Итерация 9 fix: в шторке показываем ЧИТАЕМУЮ цифру, а не голый "°",
+                // чтобы при отказе overlay-permission («path=fail») владелец всё равно
+                // видел температуру. smallIcon рендерится системой 24dp белым;
+                // contentTitle дублирует цифру в развёрнутой шторке.
+                val smallTempText = when {
+                    t >= 10f -> "${t.toInt()}"
+                    t > 0f   -> String.format(Locale.US, "%.0f", t)
+                    else     -> "${t.toInt()}"
+                }
+                postNotif(app, NOTIF_TEMP, CHANNEL_TEMP,
+                    makeTextIcon(app, smallTempText, "", Color.WHITE),
+                    "Снаружи $sign$tStr°C", text, RANK_TEMP,
                     telemetryPi(app, NOTIF_TEMP))
-                AppLog.i(TAG, "TEMP: value=$sign$tStr°C smallIconSize=${w}x${w}px src=$tempSource → posted + OVERLAY")
+                AppLog.i(TAG, "TEMP: value=$sign$tStr°C smallIconSize=${w}x${w}px smallIconText=\"$smallTempText\" src=$tempSource → posted + OVERLAY")
                 tempStr = "$sign$tStr°"; tempVal = t; tempHas = true
             } else {
                 cancel(app, NOTIF_TEMP)

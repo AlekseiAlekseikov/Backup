@@ -107,7 +107,6 @@ class OverlayActivity : Activity() {
         const val EXTRA_TEXT = "text"
         const val EXTRA_PHRASE = "phrase"       /* Stage VO2: финал */
         const val EXTRA_REPLY = "reply"
-        const val EXTRA_STATUS_PILL = "status_pill"  /* iter8: статусная плашка как fallback при отказе TYPE_APPLICATION_OVERLAY */
         private const val AUTO_CLOSE_MS = 15_000L
         private const val RESULT_CLOSE_MS = 2_400L
         private const val ACCENT = "#E86A33"       /* .micBtn.live из макета */
@@ -115,14 +114,6 @@ class OverlayActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // iter8: если запущены как fallback для статусных иконок (overlay-perm denied),
-        // просто логируем и сразу закрываемся — основной fallback работают иконки
-        // уведомлений (smallIcon) в шторке; активити «Слушаю» для этого не подходит.
-        if (intent?.getBooleanExtra(EXTRA_STATUS_PILL, false) == true) {
-            Log.w(TAG, "OVERLAY: path=activity invoked (status-pill fallback); not visible — индикаторы только в шторке уведомлений")
-            finish()
-            return
-        }
         pal = if (AppTheme.isLight(this)) lightPalette() else darkPalette()
 
         // Не вызываем AppTheme.applySaved: смена night mode перекрашивает

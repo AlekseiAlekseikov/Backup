@@ -2,7 +2,6 @@ package com.example.voiceapp3.tools
 
 import android.app.PendingIntent
 import android.content.Context
-import android.content.Intent
 import android.graphics.*
 import android.graphics.drawable.Icon
 import android.os.Build
@@ -175,23 +174,23 @@ object StatusOverlay {
             root.addView(tempView)
             root.addView(battView)
 
-            // Паттерн CentralEXAuto (TempBattPillFloaterService / WifiFloaterService /
-            // QuickAccessFloaterService v3.3.9):
-            //   new LayoutParams(-2, size, 2038, 264, -3)
-            // где 2038 = TYPE_APPLICATION_OVERLAY,
-            //     264 = 0x108 = FLAG_LAYOUT_IN_SCREEN (0x100) | FLAG_NOT_FOCUSABLE (0x8),
-            //     -3  = PixelFormat.TRANSLUCENT.
-            // ВАЖНО: FLAG_NOT_TOUCH_MODAL (0x20) в CEX НЕ используется! Окно перехватывает
-            // тапы только в своих границах; тапы за пределами пропускаются нижним окнам
-            // (NOT_FOCUSABLE это делает; NOT_TOUCH_MODAL нужен только если окно имеет
-            // собственный hit-test вне своих bounds, чего здесь нет).
+            // Единая декомпиляция: CentralEXAuto v3.3.9
+            // com/geely/autoservice/floater/TempBattPillFloaterService.java:
+            //   WindowManager.LayoutParams(-2, size, 2038, 264, -3)
+            //     2038 = TYPE_APPLICATION_OVERLAY,
+            //     264  = 0x108 = FLAG_LAYOUT_IN_SCREEN (0x100) | FLAG_NOT_FOCUSABLE (0x8),
+            //     -3   = PixelFormat.TRANSLUCENT.
+            // РИСК ДЛЯ ПРОВЕРКИ НА ГУ: без FLAG_NOT_TOUCH_MODAL (0x20) на некоторых
+            // прошивках окно может проглатывать тапы в пределах своего окна даже вне
+            // своих дочерних View; проверить на ГУ: тап по статус-бару вплотную к
+            // пилюле (часы/иконки) должен попадать в систему, а не в нас. Если тапы
+            // будут съедены — добавить FLAG_NOT_TOUCH_MODAL (0x20 → flags=296).
             val layoutType = if (Build.VERSION.SDK_INT >= 26)
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY // 2038
             else
                 @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_SYSTEM_ALERT // 2003
-            // Точное значение флагов из CEX: FLAG_LAYOUT_IN_SCREEN | FLAG_NOT_FOCUSABLE = 264.
             val flags = WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE // = 264
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE // = 264 (CEX decompile)
 
             val params = WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT,
@@ -219,22 +218,12 @@ object StatusOverlay {
             Log.e(TAG, "StatusOverlay show FAILED path=$path (${t.javaClass.simpleName}: ${t.message})", t)
             AppLog.e(app, TAG, "OVERLAY: path=$path err=${t.javaClass.simpleName}: ${t.message}", t)
         }
+        // Итерация 9 fix: убрали запуск OverlayActivity из фоллбека — он был no-op
+        // (активити «Слушаю» тут же делала finish()). Реальный фоллбек при отказе
+        // overlay-permission — нотификации с ЧИТАЕМЫМИ цифрами в smallIcon
+        // (StatusIcons.postNotif выставляет их в makeTextIcon с цифрами).
         if (path != "window") {
-            // Fallback path=activity: запускаем OverlayActivity, которая покажет
-            // статус-плашку (если overlay permission не выдан). OverlayActivity
-            // работает только когда мы на переднем плане, поэтому это лишь подстраховка.
-            val fb = Intent(app, OverlayActivity::class.java).apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-                putExtra(OverlayActivity.EXTRA_STATUS_PILL, true)
-            }
-            runCatching { app.startActivity(fb) }
-                .onSuccess {
-                    path = "activity"
-                    Log.i(TAG, "OVERLAY: started OverlayActivity as fallback (status-pill mode)")
-                }
-                .onFailure { t ->
-                    Log.e(TAG, "OVERLAY: path=activity failed: ${t.message}")
-                }
+            Log.w(TAG, "OVERLAY: window-add failed (path=$path); индикаторы остаются в шторке уведомлений (smallIcon=число)")
         }
         AppLog.i(app, TAG, "OVERLAY: path=$path")
     }
