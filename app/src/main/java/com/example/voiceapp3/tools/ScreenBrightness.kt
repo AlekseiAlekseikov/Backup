@@ -392,11 +392,18 @@ object ScreenBrightness {
 
         // Путь 2: sh 'settings put' (Runtime.exec, shell uid=2000, но часто
         // на Flyme у shell есть WRITE_SECURE_SETTINGS через priv-permission).
+        // Реальный rc извлекаем из вывода (echo rc=$?); захардкоженный 0 врал
+        // при Permission denied и т.п. (iter13).
         var shRc = -1; var shOut = "(not run)"
         try {
             val pp = Runtime.getRuntime().exec(arrayOf("sh","-c","settings put system screen_off_timeout $target; echo rc=\$?; settings get system screen_off_timeout"))
-            if (!pp.waitFor(4, java.util.concurrent.TimeUnit.SECONDS)) { pp.destroyForcibly(); shRc=-2; shOut="timeout" }
-            else { shRc=0; shOut = (pp.inputStream.bufferedReader().readText()+pp.errorStream.bufferedReader().readText()).replace('\n',' ').take(300) }
+            if (!pp.waitFor(4, TimeUnit.SECONDS)) { pp.destroyForcibly(); shRc=-2; shOut="timeout" }
+            else {
+                val raw = (pp.inputStream.bufferedReader().readText() + pp.errorStream.bufferedReader().readText()).replace('\n',' ').take(300)
+                shOut = raw
+                val m = Regex("""rc=(\d+)""").find(raw)
+                shRc = m?.groupValues?.get(1)?.toIntOrNull() ?: -1
+            }
         } catch (t: Throwable) { shOut = "sh err: ${t.message}" }
 
         // Путь 3: ADB 'settings put' (uid=0 root). expectRoot=false — канал

@@ -620,33 +620,54 @@ enum class Choice(
 
         steps += stepOf(
             step = "apply",
-            command = "ScreenBrightness.applyKeepAwakeInternal(enabled=$enabled) → Settings.System + sh + ADB",
+            command = "ScreenBrightness.setKeepAwake(enabled=$enabled) → BgWorker apply (Settings.System + sh + ADB, serial-gated)",
             status = ToolsStep.Status.OK,
             expected = enabled.toString(),
-            actual = "dispatched to BgWorker"
+            actual = "dispatched to BgWorker; polling Settings.System"
         )
-        // Фактическое применение — на BgWorker, синхронно дождаться не можем
-        // (может занять до 10 с при подъёме ADB). Вызываем и возвращаем readback
-        // после короткой задержки, а результат запишется в файл-лог строкой
-        // "SCREEN_TIMEOUT: set X → readback=Y ... → PERSISTED".
-        ScreenBrightness.setKeepAwake(appContext, enabled)
-        Thread.sleep(300)
-        val rb = try {
-            android.provider.Settings.System.getInt(
-                appContext.contentResolver,
-                android.provider.Settings.System.SCREEN_OFF_TIMEOUT,
-                -1
-            )
-        } catch (_: Throwable) { -1 }
+
+        // Фактическое применение — на BgWorker; перед write делается
+        // detectActualSerialBg (~ один getprop, до 2 с), поэтому короткий
+        // sleep(300) почти всегда ловил старое значение и помечал шаг как
+        // PARTIAL («применено частично»). Исправление iter13 — опрос до 4 с
+        // с шагом 200 мс. Этот метод выполняется на фоне (UiBridge вызывает
+        // applyFromUi через BgWorker.run), так что sleep допустим.
         val expected = if (enabled) Int.MAX_VALUE else prefs().getLong(ScreenBrightness.PREF_ORIGINAL_TIMEOUT, 600000L).toInt()
+        ScreenBrightness.setKeepAwake(appContext, enabled) // синхронно записывает pref, запускает apply в BgWorker
+        val tPoll0 = SystemClock.uptimeMillis()
+        var rb = -1
+        var polls = 0
+        val deadline = tPoll0 + 4000L
+        do {
+            polls++
+            Thread.sleep(200)
+            rb = try {
+                Settings.System.getInt(
+                    appContext.contentResolver,
+                    Settings.System.SCREEN_OFF_TIMEOUT,
+                    -1
+                )
+            } catch (_: Throwable) { -1 }
+            if (rb == expected) break
+        } while (SystemClock.uptimeMillis() < deadline)
+        val dt = SystemClock.uptimeMillis() - tPoll0
+        val readbackStatus = if (rb == expected) ToolsStep.Status.OK else ToolsStep.Status.PARTIAL
         steps += stepOf(
             step = "readback",
-            command = "Settings.System.SCREEN_OFF_TIMEOUT (after 300ms; full result in file-log line 'SCREEN_TIMEOUT: set ... → PERSISTED')",
-            status = if (rb == expected) ToolsStep.Status.OK else ToolsStep.Status.PARTIAL,
+            command = "Settings.System.SCREEN_OFF_TIMEOUT (poll up to 4000ms every 200ms; async BgWorker apply)",
+            status = readbackStatus,
             expected = expected.toString(),
             actual = rb.toString(),
-            stderr = if (rb != expected) "write may still apply asynchronously; see file log for final PERSISTED verdict" else ""
+            stderr = when {
+                rb == expected -> ""
+                else -> "not confirmed after $polls polls (${dt}ms); write may still apply asynchronously — see file-log 'SCREEN_TIMEOUT: set ... → PERSISTED' for final verdict"
+            }
         )
+        if (rb == expected) {
+            AppLog.i(TAG, "KEEPAWAKE: readback confirmed after $polls polls (${dt}ms) value=$rb")
+        } else {
+            AppLog.w(TAG, "KEEPAWAKE: readback NOT confirmed after $polls polls (${dt}ms) expected=$expected actual=$rb (async apply may still finish later; see SCREEN_TIMEOUT PERSISTED line)")
+        }
 
         val res = ToolsResult(action, title, steps)
         AppLog.logAction(appContext, "settings.keepawake=$enabled", res)

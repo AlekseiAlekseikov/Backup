@@ -54,8 +54,9 @@ object AdbClient {
     private const val WRTE = 0x45545257  // "WRTE" LE
     private const val CLSE = 0x45534C43  // "CLSE" LE
 
-    /** Стратегия выбора порта как в w0/n.case 0: сначала кэш, потом 65010, потом 5555. */
-    private val PORTS = intArrayOf(ADB_PORT_DEFAULT, ADB_PORT_ROOT)
+    /** Стратегия выбора порта как в w0/n.case 0: сначала кэш (workingPort), потом 65010, потом 5555.
+     *  Массив задаёт порядок перебора после кэша (см. bootstrap и retry alt-port). */
+    private val PORTS = intArrayOf(ADB_PORT_ROOT, ADB_PORT_DEFAULT)
 
     private val worker = object : Thread("AdbWorker") {
         init { isDaemon = true }
@@ -350,7 +351,7 @@ object AdbClient {
                 if (alt != null) {
                     workingPort.set(altPort)
                     AppLog.i(TAG, "VERIFY EXEC switched to port=$altPort after IOException on $port")
-                    return classify(altPort, true, shortCmd, alt, 0)
+                    return classify(altPort, expectRoot, shortCmd, alt, 0)
                 }
                 val msg = "ERR_ADB_IO: ${e.message} (no alt port worked)"
                 AppLog.e(TAG, "VERIFY EXEC port=$port rc=1 expectRoot=$expectRoot cmd=${shortCmd} → FAILED ($msg)")
