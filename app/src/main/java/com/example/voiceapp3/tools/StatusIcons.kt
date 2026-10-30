@@ -90,11 +90,11 @@ object StatusIcons {
     private const val PROP_ED_EV_BATT_PCT = 0x2140a6ed
     private const val PROP_ENV_OUT_TEMP = 0x11600703
     // AC_AMBIENT_TEMP (0x2140a377) — Int со смещением 80, половина градуса (norm: (raw-80)/2 °C).
-    // В GeelyProfile.kt сигнал AMBIENT_AIR_TEMPERATURE привязан именно к этому ID
-    // (IntProperty), а не к ENV_OUTSIDE_TEMPERATURE Float.
-    // У владельца ENV_OUTSIDE_TEMPERATURE (Float) давал 25.0°C при реальных ≈7°C,
-    // а правильный показатель живёт в AC_AMBIENT_TEMP — это и есть температура с
-    // датчика климата, которую показывает строка состояния.
+    // Это КАБИННЫЙ ambient-датчик HVAC, а не уличная температура.
+    // ПОСЛЕ декомпила CentralEXAuto v3.3.9 (com.geely.hvacstepperv2.TempStepperService.i()):
+    // наружка читается из ENV_OUTSIDE_TEMPERATURE (0x11600703) с двойной нормализацией
+    // (float °C, либо int/10, либо int как-есть); zones {0,1,4,7}. AC_AMBIENT_TEMP
+    // оставлен как fallback на случай, если на конкретной ГУ ENV_OUTSIDE_TEMPERATURE не отдаётся.
     private const val PROP_AC_AMBIENT_TEMP = 0x2140A377
 
     @Volatile private var cpm: android.car.hardware.property.CarPropertyManager? = null
@@ -206,6 +206,40 @@ object StatusIcons {
     private fun readTempScan(): Float? {
         val m = cpm ?: return null
         AppLog.i(TAG, "TEMP: toggle=on read start")
+
+        // CentralEXAuto pattern (com.geely.hvacstepperv2.TempStepperService.i()):
+        // PRIMARY = ENV_OUTSIDE_TEMPERATURE (0x11600703) по зонам {0,1,4,7},
+        // с двойной нормализацией:
+        //   1) getFloatProperty(p, area) — напрямую °C; валидный диапазон -55..70 °C
+        //   2) если float не дал, getIntProperty(p, area):
+        //        - если raw в [-550..700] → raw / 10.0f   (десятые доли градуса)
+        //        - иначе если raw в [-45..65] → raw.toFloat() (уже градусы)
+        // Декомпилировано из TempBattPillFloaterService/TempStepperService CentralEXAuto v3.3.9.
+        fun tryOutsideCex(area: Int, label: String): Float? {
+            // Float first
+            try {
+                val raw = m.getFloatProperty(PROP_ENV_OUT_TEMP, area)
+                if (!raw.isNaN() && raw > -55f && raw < 70f) {
+                    AppLog.i(TAG, "TEMP: ENV_OUTSIDE@$area float raw=$raw -> $raw °C (CentralEX)")
+                    return raw
+                }
+            } catch (e: Exception) { AppLog.d(TAG, "TEMP: $label float err=${e.message}") }
+            // Int fallback (two ranges, как у CentralEXAuto TempStepperService.i())
+            try {
+                val raw = m.getIntProperty(PROP_ENV_OUT_TEMP, area)
+                val v: Float? = when {
+                    raw in -550..700 -> raw / 10.0f
+                    raw in -45..65   -> raw.toFloat()
+                    else -> null
+                }
+                if (v != null && v > -55f && v < 70f) {
+                    AppLog.i(TAG, "TEMP: ENV_OUTSIDE@$area int raw=$raw -> $v °C (CentralEX /10 norm)")
+                    return v
+                }
+            } catch (e: Exception) { AppLog.d(TAG, "TEMP: $label int err=${e.message}") }
+            return null
+        }
+
         fun tryFloatProp(p: Int, a: Int, label: String): Float? {
             try {
                 val raw = m.getFloatProperty(p, a)
@@ -232,77 +266,76 @@ object StatusIcons {
             return null
         }
         // P-фикс: собираем ВСЕХ кандидатов и логируем единой строкой для сравнения
-        // с эталоном (Строка состояния). Раньше возвращали первый попавшийся
-        // (ENV_OUTSIDE_TEMPERATURE=25°C при реальных 7°C). Приоритет:
-        //   1) прошлый успешно-работавший источник (кеш tmpProp),
-        //   2) AC_AMBIENT_TEMP (Int norm80 — сигнал климата, используемый Строкой
-        //      состояния через GeelyProfile/AMBIENT_AIR_TEMPERATURE),
-        //   3) hvacdigital.temp_ext / .exttemp (публикует flyme-плагин после
-        //      setprop через рут; на устройстве без ру temp_ext=1 — это флаг, а не значение),
-        //   4) ENV_OUTSIDE_TEMPERATURE (Float; на этой прошивке врёт на +18°C),
-        //   5) прочие PRECISE_COMMON.
+        // с эталоном (Строка состояния). Приоритет выверен по декомпилу CentralEXAuto v3.3.9:
+        //   1) ENV_OUTSIDE_TEMPERATURE (0x11600703) по зонам {0,1,4,7} — primary,
+        //      с двойной нормализацией (float °C / int /10). Именно это читает
+        //      PillFloater/HvacStepper CentralEXAuto, который рисует "°C" в статус-баре.
+        //   2) hvacdigital getprop temp_ext/exttemp (сигнал flyme-плагина; без рута
+        //      может быть 0/1 — флаг включения, поэтому после VHAL).
+        //   3) AC_AMBIENT_TEMP (0x2140a377) — кабина HVAC, Int (raw-80)/2; это не
+        //      наружная, а ambient салона; оставляем как fallback.
+        //   4) PRECISE_COMMON (fallback).
+        // Кеш tmpProp между вызовами НЕ ИСПОЛЬЗУЕТСЯ — сбрасываем в 0 каждый проход,
+        // чтобы однажды залипшее 25°C не заблокировало нахождение реального значения.
         data class Cand(val name: String, val value: Float?)
         val candidates = mutableListOf<Cand>()
         var chosen: Float? = null
+        var chosenArea = 0
 
-        fun pick(v: Float?, label: String): Float? {
+        fun pick(v: Float?, label: String, area: Int = 0): Float? {
             candidates.add(Cand(label, v))
-            if (v != null && chosen == null) chosen = v
+            if (v != null && chosen == null) { chosen = v; chosenArea = area }
             return v
         }
-        fun probe(label: String, get: () -> Float?): Float? {
+        fun probe(label: String, area: Int = 0, get: () -> Float?): Float? {
             val v = runCatching { get() }.getOrNull()
-            return pick(v, label)
+            return pick(v, label, area)
         }
 
-        // Итерация 7 fix: кеш прошлого источника убран — если на ГУ не читается
-        // AC_AMBIENT_TEMP, в кеш навсегда сядет ENV_OUTSIDE_TEMPERATURE=25°C и владелец
-        // больше не увидит правильное значение. tmpProp используется ТОЛЬКО внутри
-        // одного прохода (но не сохраняется между вызовами — сбрасываем сразу).
         tmpProp = 0
 
-        // 1) AC_AMBIENT_TEMP (Int, norm80 — (raw-80)/2 °C). Используется Capy Energy
-        //    телеметрией через GeelyProfile.AcAmbientTemp и VehicleLiveAdapter
-        //    ("outsideTemp" = OUTSIDE_TEMPERATURE fallback → AMBIENT_AIR_TEMPERATURE).
-        //    Нормализация совпадает с GeelyDeclarations.kt.
-        for (a in intArrayOf(0, 2, 7)) {
-            probe("VHAL:0x2140a377/AC_AMBIENT_TEMP@$a") { tryInt80Prop(PROP_AC_AMBIENT_TEMP, a, "VHAL:0x2140A377/AC_AMBIENT_TEMP") }
-            if (chosen != null) break
+        // 1) PRIMARY: ENV_OUTSIDE_TEMPERATURE по зонам как в CentralEXAuto.
+        for (a in intArrayOf(0, 1, 4, 7)) {
+            probe("VHAL:0x11600703/ENV_OUTSIDE_TEMPERATURE@$a", a) {
+                tryOutsideCex(a, "VHAL:0x11600703/ENV_OUTSIDE_TEMPERATURE@$a")
+            }
+            if (chosen != null) { tempSource = "VHAL/CentralEX:ENV_OUTSIDE@$a"; tmpProp = PROP_ENV_OUT_TEMP; tmpArea = a; break }
         }
-        // 2) hvacdigital getprop'ы (temp_ext / exttemp — СИГНАЛЫ плагина). Важно:
-        //    плагин flyme получает значение из VHAL сам; мы читаем getprop как
-        //    кросс-проверку, но НЕ как primary, т.к. без рута setprop не проходит
-        //    и там может быть флаг включения (0/1), а не температура.
-        for (prop in SYS_HVAC_EXT_ALL) {
-            val v = runCatching {
-                val pp = Runtime.getRuntime().exec(arrayOf("sh","-c","getprop $prop"))
-                if (!pp.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)) { pp.destroyForcibly() }
-                val sVal = pp.inputStream.bufferedReader().readText().trim()
-                pp.errorStream.bufferedReader().readText().trim()
-                val fv = sVal.toFloatOrNull()
-                AppLog.d(TAG, "TEMP: getprop $prop raw=\"$sVal\" parsed=$fv")
-                if (fv != null && fv in -50f..70f) {
-                    tempSource = "hvacdigital/$prop"
-                    AppLog.i(TAG, "TEMP: norm=%.1f (src=$tempSource val=\"$sVal\")".format(fv))
+        // 2) hvacdigital getprop temp_ext / exttemp (кросс-проверка).
+        if (chosen == null) {
+            for (prop in SYS_HVAC_EXT_ALL) {
+                val v = runCatching {
+                    val pp = Runtime.getRuntime().exec(arrayOf("sh","-c","getprop $prop"))
+                    if (!pp.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)) { pp.destroyForcibly() }
+                    val sVal = pp.inputStream.bufferedReader().readText().trim()
+                    pp.errorStream.bufferedReader().readText().trim()
+                    val fv = sVal.toFloatOrNull()
+                    AppLog.d(TAG, "TEMP: getprop $prop raw=\"$sVal\" parsed=$fv")
+                    fv?.takeIf { it in -50f..70f }?.also {
+                        AppLog.i(TAG, "TEMP: getprop $prop val=\"$sVal\" -> $it")
+                    }
+                }.getOrNull()
+                pick(v, "hvacdigital/$prop")
+                if (chosen != null) { tempSource = "hvacdigital/$prop"; break }
+            }
+        }
+        // 3) AC_AMBIENT_TEMP (кабина) — fallback (norm (raw-80)/2 °C).
+        if (chosen == null) {
+            for (a in intArrayOf(0, 2, 7)) {
+                probe("VHAL:0x2140a377/AC_AMBIENT_TEMP@$a", a) {
+                    tryInt80Prop(PROP_AC_AMBIENT_TEMP, a, "VHAL:0x2140A377/AC_AMBIENT_TEMP@$a")
                 }
-                fv
-            }.getOrNull()
-            pick(v, "hvacdigital/$prop")
-            if (chosen != null) break
-        }
-        // 3) ENV_OUTSIDE_TEMPERATURE (Float) — fallback; на этой прошивке даёт 25 при
-        //    реальных 7, но хоть что-то пока не доказано обратное.
-        probe("VHAL:0x11600703/ENV_OUTSIDE_TEMPERATURE@0") {
-            tryFloatProp(PROP_ENV_OUT_TEMP, 0, "VHAL:0x11600703/ENV_OUTSIDE_TEMPERATURE")
+                if (chosen != null) break
+            }
         }
         // 4) PRECISE_COMMON fallback
         if (chosen == null) {
             outer@ for (pp in PRECISE_COMMON) {
                 for (a in intArrayOf(0, 2, 7)) {
                     val label = "VHAL:0x${"%08X".format(pp)}@$a[fallback]"
-                    probe(label) { tryInt80Prop(pp, a, label) }
+                    probe(label, a) { tryInt80Prop(pp, a, label) }
                     if (chosen != null) break@outer
-                    probe(label) { tryFloatProp(pp, a, label) }
+                    probe(label, a) { tryFloatProp(pp, a, label) }
                     if (chosen != null) break@outer
                 }
             }
@@ -310,7 +343,7 @@ object StatusIcons {
         val finalV = chosen
         if (finalV != null) {
             AppLog.i(TAG, "TEMP: candidates — " + candidates.joinToString(" | ") { "${it.name}=${it.value}" })
-            AppLog.i(TAG, "TEMP: chosen=%.1f (src=$tempSource)".format(finalV))
+            AppLog.i(TAG, "TEMP: chosen=%.1f (src=$tempSource area=$chosenArea)".format(finalV))
             return finalV
         }
         AppLog.w(TAG, "TEMP: candidates — " + candidates.joinToString(" | ") { "${it.name}=${it.value}" })

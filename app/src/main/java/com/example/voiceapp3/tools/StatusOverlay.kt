@@ -131,6 +131,11 @@ object StatusOverlay {
         }
     }
 
+    private fun statusBarHeightPx(app: Context): Int {
+        val resId = app.resources.getIdentifier("status_bar_height", "dimen", "android")
+        return if (resId > 0) app.resources.getDimensionPixelSize(resId) else dp(app, 24)
+    }
+
     private fun showOnMain(app: Context) {
         if (showing) return
         var path = "fail"
@@ -169,29 +174,40 @@ object StatusOverlay {
             root.addView(tempView)
             root.addView(battView)
 
+            // Паттерн CentralEXAuto (TempBattPillFloaterService / WifiFloaterService /
+            // QuickAccessFloaterService v3.3.9):
+            //   type = 2038 (TYPE_APPLICATION_OVERLAY),
+            //   flags = 264 (FLAG_NOT_FOCUSABLE | FLAG_NOT_TOUCH_MODAL),
+            //   format = -3 (PixelFormat.TRANSLUCENT).
+            // Повторяем точь-в-точь, чтобы не изобретать свой механизм.
             val layoutType = if (Build.VERSION.SDK_INT >= 26)
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY // 2038
             else
                 @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_SYSTEM_ALERT // 2003
+            val flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL // = 264 как в CentralEXAuto
+                // НЕ добавляем FLAG_NOT_TOUCHABLE по самим сегментам — они должны кликаться;
+                // FLAG_NOT_TOUCH_MODAL при этом НЕ ест тапы за пределами полосы.
 
             val params = WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 dp(app, OVERLAY_HEIGHT_DP),
                 layoutType,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-                PixelFormat.TRANSLUCENT
+                flags,
+                PixelFormat.TRANSLUCENT // -3
             )
             params.gravity = Gravity.TOP or Gravity.END
             params.x = dp(app, OVERLAY_MARGIN_END_DP)
-            params.y = dp(app, OVERLAY_MARGIN_TOP_DP)
+            // Смещаем ПОД статус-бар, чтобы не перекрывать его и не глотать его тапы.
+            // В CentralEXAuto pill живёт с y=49dp — это как раз под статус-баром.
+            val sb = statusBarHeightPx(app)
+            params.y = sb + dp(app, OVERLAY_MARGIN_TOP_DP)
 
             wm.addView(root, params)
             this.root = root
             showing = true
             path = "window"
-            Log.i(TAG, "StatusOverlay shown TYPE=$layoutType path=$path (APPLICATION_OVERLAY)")
+            Log.i(TAG, "StatusOverlay shown type=2038 flags=264 fmt=TRANSLUCENT path=$path sb=${sb}px y=${params.y}px (CentralEXAuto pattern)")
         } catch (t: Throwable) {
             Log.e(TAG, "StatusOverlay show FAILED path=$path (${t.javaClass.simpleName}: ${t.message})", t)
             AppLog.e(app, TAG, "OVERLAY: path=$path err=${t.javaClass.simpleName}: ${t.message}", t)
