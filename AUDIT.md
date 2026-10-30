@@ -278,3 +278,23 @@ setHvacDigital и bootRestore пишут оба свойства; readTempScan �
 1. Не заменять значок Wi-Fi текстом "WiFi" / "W" / "📶" и т.п. — только Canvas-глиф.
 2. Не копировать StatusIcons.kt целым файлом из других веток — только точечные diff-фиксы поверх main.
 
+
+### Раздел 7 — Статус root-канала на ГУ владельца (voiceapp3-2.log от 2026-10-30)
+
+**Доказательства из лога:**
+- Все 8 путей su-binaries отсутствуют (`/sbin/su`, `/system/bin/su`, …, `/vendor/bin/su` — MISSING).
+- ADB TCP порт 5555 — `ECONNREFUSED`; порт 65010 — `unreachable dt=3004ms`.
+- Приложение работает как `uid=1000(system) system_app`, контекст `u:r:system_app:s0`.
+- `service.adb.tcp.port=65010` в getprop выставлен, но adbd не слушает — порт не поднят.
+
+**Вывод:** на ГУ в текущем состоянии нет ни su, ни доступного ADB TCP. Функции, требующие root (TTL, mount --bind для звука/кодека, `setprop ctl.restart` для JIT/zygote, `iptables`, `svc wifi` для JIT-перенастройки) — не работают и честно рапортуют BLOCKED.
+
+**Что нужно от владельца:**
+1. Подключить ГУ USB-кабелем к ПК и выполнить `adb tcpip 5555` один раз (после этого канал поднимется и порт 65010 через перезагрузки может жить не всегда — но 5555 из adb shell работает).
+2. Либо установить APK как **priv-app** в `/system/priv-app/` (требует перепрошивки/кастомного recovery). `system_app` с sharedUserId=android.uid.system даёт часть системных прав, но `ctl.restart`, `iptables`, монтирование — требуют либо root, либо вызов через priv-app CarService/vendor.
+3. Либо установить Magisk (userdebug/root-прошивка) — это единственный способ получить постоянный su.
+
+**Что делает код:**
+- Все root-функции продолжают рапортовать BLOCKED с честной причиной (`root unavailable`, `ADB не работает`, `uid=1000(system)`) — нет ложного SUCCESS.
+- При появлении работающего канала (порт 5555/65010) AdbClient автоматически поднимает соединение и команды начнут проходить.
+
