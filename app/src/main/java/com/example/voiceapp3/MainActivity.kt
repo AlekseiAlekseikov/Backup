@@ -221,12 +221,15 @@ class MainActivity : AppCompatActivity() {
 
     private fun handleDestination(intent: Intent?) {
         val dest = intent?.getStringExtra("destination") ?: return
-        Log.i(TAG, "destination extra: $dest")
+        Log.i(TAG, "destination extra: $dest (resolved → tab)")
         if (::bridge.isInitialized) {
             bridge.shellTabs?.onDestination(dest)
-            // W3: авто-открытие зарядки — прямо в нативный telemetry.open (раньше через JS).
-            if (dest.contains("charg")) {
-                bridge.onEvent("telemetry.open", "{\"destination\":\"charging\"}")
+            // Если пользователь идёт в телеметрию — сообщаем JS открыть раздел
+            // (зарядка = отдельный subsection внутри telemetry).
+            if (dest == "telemetry" || dest.contains("charg")) {
+                val subDest = if (dest.contains("charg")) "charging" else "summary"
+                bridge.onEvent("telemetry.open", "{\"destination\":\"$subDest\"}")
+                Log.i(TAG, "destination: fired telemetry.open sub=$subDest")
             }
         }
     }

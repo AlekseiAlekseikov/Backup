@@ -31,6 +31,10 @@ object NetworkTtl {
     private const val TAG = "CENTRAL_NetworkTtl"
     private const val PREFS_NAME = "voiceapp3"
 
+    // P-фикс: один BroadcastReceiver на процесс — иначе registerReceiver
+    // вызывается на каждом onStartCommand и в логе дубли "network receiver registered" x6.
+    @Volatile private var networkReceiver: BroadcastReceiver? = null
+
     const val PREF_TTL_65_ACTIVE = "ttl_65_ativo"
 
     private const val IPT  = "iptables"
@@ -214,6 +218,12 @@ object NetworkTtl {
      */
     fun registerNetworkReceiver(context: Context) {
         val ctx = context.applicationContext
+        // P-фикс: idempotent — если ресивер уже зарегистрирован, не дублировать
+        // (иначе на каждом onStartCommand добавлялся ещё один = в логе x6).
+        if (networkReceiver != null) {
+            AppLog.i(TAG, "network receiver already registered — skip (single instance)")
+            return
+        }
         val filter = IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION).apply {
             addAction("android.net.conn.CONNECTIVITY_CHANGE")
             addAction("android.net.wifi.STATE_CHANGE")
@@ -241,7 +251,20 @@ object NetworkTtl {
                 }
             }
         }
-        ctx.registerReceiver(recv, filter)
-        AppLog.i(TAG, "network receiver registered")
+        try {
+            ctx.registerReceiver(recv, filter)
+            networkReceiver = recv
+            AppLog.i(TAG, "network receiver registered (single instance)")
+        } catch (t: Throwable) {
+            AppLog.e(TAG, "registerNetworkReceiver failed: ${t.message}", t)
+        }
+    }
+
+    @JvmStatic fun unregisterNetworkReceiver(context: Context) {
+        val ctx = context.applicationContext
+        val recv = networkReceiver ?: return
+        runCatching { ctx.unregisterReceiver(recv) }
+        networkReceiver = null
+        AppLog.i(TAG, "network receiver unregistered")
     }
 }

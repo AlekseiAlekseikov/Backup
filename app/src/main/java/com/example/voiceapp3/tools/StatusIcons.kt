@@ -23,6 +23,8 @@ import android.provider.Settings
 import android.util.Log
 import java.util.Locale
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Иконки статус-бара Geely — порт w0.kg.j из CentralEXAuto.
@@ -87,11 +89,23 @@ object StatusIcons {
     private const val PROP_EV_BATT_LEVEL = 0x11600309
     private const val PROP_ED_EV_BATT_PCT = 0x2140a6ed
     private const val PROP_ENV_OUT_TEMP = 0x11600703
+    // AC_AMBIENT_TEMP (0x2140a377) — Int со смещением 80, половина градуса (norm: (raw-80)/2 °C).
+    // В GeelyProfile.kt сигнал AMBIENT_AIR_TEMPERATURE привязан именно к этому ID
+    // (IntProperty), а не к ENV_OUTSIDE_TEMPERATURE Float.
+    // У владельца ENV_OUTSIDE_TEMPERATURE (Float) давал 25.0°C при реальных ≈7°C,
+    // а правильный показатель живёт в AC_AMBIENT_TEMP — это и есть температура с
+    // датчика климата, которую показывает строка состояния.
+    private const val PROP_AC_AMBIENT_TEMP = 0x2140A377
 
     @Volatile private var cpm: android.car.hardware.property.CarPropertyManager? = null
     @Volatile private var carObj: Car? = null
     @Volatile private var h: Handler? = null
     @Volatile private var dumpLogged = false
+    // P-фикс: защита от гонки — один syncAll за раз, иначе 4 потока публикуют
+    // в одни и те же notification id и перебивают друг друга (4.2%/42.4% в логе).
+    private val syncInFlight = AtomicBoolean(false)
+    private val tickSeq = AtomicInteger(0)
+    @Volatile private var periodicRunning = false
 
     @Volatile private var socProp = 0; @Volatile private var socArea = 0
     @Volatile private var tmpProp = 0; @Volatile private var tmpArea = 0
@@ -173,7 +187,12 @@ object StatusIcons {
             socProp = 0
         }
         tryProp(PROP_EV_BATT_LEVEL, 0, "VHAL:0x11600309/EV_BATTERY_LEVEL")?.let { return it }
-        tryProp(PROP_ED_EV_BATT_PCT, 0, "VHAL:0x2140a6ed/ED_EV_BATTERY_PERCENTAGE", scale = 10f)?.let { return it }
+        // P-фикс: ED_EV_BATTERY_PERCENTAGE (0x2140a6ed) на этом ГУ возвращает УЖЕ ПРОЦЕНТЫ
+        // (raw=42.4 → 42.4%). Раньше здесь стоял scale=10f, деливший значение на 10
+        // (42.4→4.2) — отсюда ложные "4.2%" вместо "42.4%" в логе у владельца.
+        // Доказательство: в voiceapp3-2.log потоки с scale=1.0 всегда давали 42.4%,
+        // а с scale=10.0 — 4.2%. scale=1.0 — единственно верный вариант.
+        tryProp(PROP_ED_EV_BATT_PCT, 0, "VHAL:0x2140a6ed/ED_EV_BATTERY_PERCENTAGE")?.let { return it }
         for (p in PRECISE_COMMON) {
             for (a in intArrayOf(0, 2, 7)) {
                 tryProp(p, a, "VHAL:0x${"%08X".format(p)}[fallback]")?.let { return it }
@@ -212,54 +231,79 @@ object StatusIcons {
             } catch (e: Exception) { AppLog.d(TAG, "TEMP: $label int err=${e.message}") }
             return null
         }
+        // P-фикс: собираем ВСЕХ кандидатов и логируем единой строкой для сравнения
+        // с эталоном (Строка состояния). Раньше возвращали первый попавшийся
+        // (ENV_OUTSIDE_TEMPERATURE=25°C при реальных 7°C). Приоритет:
+        //   1) прошлый успешно-работавший источник (кеш tmpProp),
+        //   2) AC_AMBIENT_TEMP (Int norm80 — сигнал климата, используемый Строкой
+        //      состояния через GeelyProfile/AMBIENT_AIR_TEMPERATURE),
+        //   3) hvacdigital.temp_ext / .exttemp (публикует flyme-плагин после
+        //      setprop через рут; на устройстве без ру temp_ext=1 — это флаг, а не значение),
+        //   4) ENV_OUTSIDE_TEMPERATURE (Float; на этой прошивке врёт на +18°C),
+        //   5) прочие PRECISE_COMMON.
+        data class Cand(val name: String, val value: Float?)
+        val candidates = mutableListOf<Cand>()
+        fun probeOne(label: String, get: () -> Float?): Float? {
+            val v = runCatching { get() }.getOrNull()
+            candidates.add(Cand(label, v))
+            return v
+        }
+
+        // 0) кеш
         if (tmpProp != 0) {
             for (a in AREAS) {
-                tryFloatProp(tmpProp, a, tempSource)?.let { return it }
-                tryInt80Prop(tmpProp, a, tempSource)?.let { return it }
+                probeOne("$tempSource@$a(cache)") { tryFloatProp(tmpProp, a, tempSource) }?.let { return@readTempScan finalizeTemp(it, candidates) }
+                probeOne("$tempSource@$a(cache)") { tryInt80Prop(tmpProp, a, tempSource) }?.let { return@readTempScan finalizeTemp(it, candidates) }
             }
             tmpProp = 0
         }
-        // 1) основной
-        tryFloatProp(PROP_ENV_OUT_TEMP, 0, "VHAL:0x11600703/ENV_OUTSIDE_TEMPERATURE")?.let { return it }
-        // 2) из hvacdigital-свойств (публикует плагин цифрового климата). Пробуем ОБА
-        //    имени свойства (старый temp_ext = рабочий плагин на ГУ пользователя,
-        //    новый exttemp = из последней CentralEXAuto v3.3.9). Логируем оба значения
-        //    для сверки.
+
+        // 1) AC_AMBIENT_TEMP (Int, norm80 = (raw-80)/2) — primary
+        for (a in intArrayOf(0, 2, 7)) {
+            probeOne("VHAL:0x2140a377/AC_AMBIENT_TEMP@$a") { tryInt80Prop(PROP_AC_AMBIENT_TEMP, a, "VHAL:0x2140A377/AC_AMBIENT_TEMP") }
+                ?.let { return@readTempScan finalizeTemp(it, candidates) }
+        }
+        // 2) hvacdigital getprop'ы (если плагин выставил значение — не флаг)
         for (prop in SYS_HVAC_EXT_ALL) {
-            try {
-                AppLog.d(TAG, "TEMP: probing prop $prop")
+            val v = probeOne("hvacdigital/$prop") {
                 val pp = Runtime.getRuntime().exec(arrayOf("sh","-c","getprop $prop"))
                 if (!pp.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)) { pp.destroyForcibly() }
                 val sVal = pp.inputStream.bufferedReader().readText().trim()
-                val errVal = pp.errorStream.bufferedReader().readText().trim()
-                val v = sVal.toFloatOrNull()
-                AppLog.d(TAG, "TEMP: prop $prop raw=\"$sVal\" err=\"$errVal\" parsed=$v")
-                if (v != null && v in -50f..70f) {
+                pp.errorStream.bufferedReader().readText().trim()
+                val fv = sVal.toFloatOrNull()
+                AppLog.d(TAG, "TEMP: getprop $prop raw=\"$sVal\" parsed=$fv")
+                if (fv != null && fv in -50f..70f) {
                     tempSource = "hvacdigital/$prop"
-                    AppLog.i(TAG, "TEMP: norm=%.1f (src=$tempSource val=\"$sVal\")".format(v))
-                    val other = SYS_HVAC_EXT_ALL.firstOrNull { it != prop }
-                    if (other != null) {
-                        try {
-                            val pp2 = Runtime.getRuntime().exec(arrayOf("sh","-c","getprop $other"))
-                            pp2.waitFor(1, java.util.concurrent.TimeUnit.SECONDS)
-                            val v2 = pp2.inputStream.bufferedReader().readText().trim()
-                            AppLog.i(TAG, "TEMP: cross-check hvacdigital/$other=\"$v2\"")
-                        } catch (_: Exception) {}
-                    }
-                    return v
-                }
-            } catch (e: Exception) { AppLog.w(TAG, "TEMP: getprop $prop err=${e.message}") }
+                    AppLog.i(TAG, "TEMP: norm=%.1f (src=$tempSource val=\"$sVal\")".format(fv))
+                    fv
+                } else null
+            }
+            if (v != null) return@readTempScan finalizeTemp(v, candidates)
         }
-        // 3) fallback по PRECISE_COMMON (без брутфорса диапазонов!)
+        // 3) ENV_OUTSIDE_TEMPERATURE (Float) — на IHU629G замечено врёт на +18°C,
+        //    используем как fallback с явным указанием в src=, чтобы по логу было видно.
+        probeOne("VHAL:0x11600703/ENV_OUTSIDE_TEMPERATURE@0") {
+            tryFloatProp(PROP_ENV_OUT_TEMP, 0, "VHAL:0x11600703/ENV_OUTSIDE_TEMPERATURE")
+        }?.let { return@readTempScan finalizeTemp(it, candidates) }
+        // 4) PRECISE_COMMON fallback
         for (pp in PRECISE_COMMON) {
             for (a in intArrayOf(0, 2, 7)) {
-                tryInt80Prop(pp, a, "VHAL:0x${"%08X".format(pp)}[fallback]")?.let { return it }
-                tryFloatProp(pp, a, "VHAL:0x${"%08X".format(pp)}[fallback]")?.let { return it }
+                val label = "VHAL:0x${"%08X".format(pp)}@$a[fallback]"
+                probeOne(label) { tryInt80Prop(pp, a, label) }?.let { return@readTempScan finalizeTemp(it, candidates) }
+                probeOne(label) { tryFloatProp(pp, a, label) }?.let { return@readTempScan finalizeTemp(it, candidates) }
             }
         }
-        AppLog.w(TAG, "TEMP: notify ERROR: ни один источник (VHAL float/int 0x%x@0/2/7, hvacdigital.temp_ext/exttemp) не дал валидного значения".format(PROP_ENV_OUT_TEMP))
+        AppLog.w(TAG, "TEMP: candidates — " + candidates.joinToString(" | ") { "${it.name}=${it.value}" })
+        AppLog.w(TAG, "TEMP: notify ERROR: ни один источник не дал валидного значения (выводим -- )")
         tempSource = "none"
         return null
+    }
+
+    /** Логируем всех кандидатов и возвращаем выбранное значение. */
+    private fun finalizeTemp(v: Float, candidates: List<Cand>): Float {
+        AppLog.i(TAG, "TEMP: candidates — " + candidates.joinToString(" | ") { "${it.name}=${it.value}" })
+        AppLog.i(TAG, "TEMP: chosen=%.1f (src=$tempSource)".format(v))
+        return v
     }
 
     /** PendingIntent для клика по батарее/температуре → наше приложение, сразу вкладка «Телеметрия». */
@@ -436,11 +480,32 @@ object StatusIcons {
     // ─── Public API (совместимый с существующими callers) ───
     @JvmStatic fun syncAll(ctx: Context) {
         BgWorker.assertNotMain("StatusIcons.syncAll")
-        val app = ctx.applicationContext; ensureCar(app)
+        // P-фикс: если один syncAll уже работает — второй не запускаем (гонка
+        // потоков = главный источник багов "4.2% вместо 42.4%" и дублированных
+        // post notif в логе у владельца). CAS гарантирует единственность.
+        if (!syncInFlight.compareAndSet(false, true)) {
+            AppLog.d(TAG, "syncAll skipped (another sync in flight)")
+            return
+        }
+        val seq = tickSeq.incrementAndGet()
+        try {
+            syncAllImpl(ctx.applicationContext, seq)
+        } finally {
+            syncInFlight.set(false)
+        }
+    }
+
+    private fun syncAllImpl(app: Context, seq: Int) {
+        ensureCar(app)
         val showBatt = prefs(app).getBoolean(PREF_BATTERY, false)
         val showTemp = prefs(app).getBoolean(PREF_EXT_TEMP, false)
         val showWifi = prefs(app).getBoolean(PREF_WIFI, false)
-        Log.d(TAG,"syncAll batt=$showBatt temp=$showTemp wifi=$showWifi cpm=${cpm!=null}")
+        Log.d(TAG,"syncAll seq=$seq batt=$showBatt temp=$showTemp wifi=$showWifi cpm=${cpm!=null}")
+
+        var battStr: String? = null; var battPct: Float? = null; var battHas = false
+        var tempStr: String? = null; var tempVal: Float? = null; var tempHas = false
+        var wifiStr: String? = null; var wifiLvl: Int = -1; var wifiHas = false
+
         if (showBatt) {
             AppLog.d(TAG, "BATT: toggle=on read start")
             val soc = readSocScan()
@@ -448,11 +513,13 @@ object StatusIcons {
                 val socStr = if (soc == soc.toInt().toFloat()) "${soc.toInt()}" else String.format(Locale.US, "%.1f", soc)
                 val text = "$socStr% · $socSource"
                 val w = (24 * app.resources.displayMetrics.density).toInt().coerceAtLeast(24)
-                postNotif(app, NOTIF_BATT, CHANNEL_BATT, makeTextIcon(app, socStr, "%", Color.WHITE), "Батарея", text, RANK_BATT,
+                postNotif(app, NOTIF_BATT, CHANNEL_BATT, makeTextIcon(app, "%", "", Color.WHITE), "Батарея", text, RANK_BATT,
                     telemetryPi(app, NOTIF_BATT))
-                AppLog.i(TAG, "BATT: value=$socStr% iconSize=${w}x${w}px click→telemetry src=$socSource → posted")
+                AppLog.i(TAG, "BATT: value=$socStr% smallIconSize=${w}x${w}px click→telemetry src=$socSource → posted + OVERLAY")
+                battStr = "$socStr%"; battPct = soc; battHas = true
             } else { cancel(app, NOTIF_BATT); AppLog.w(TAG,"BATT: SOC null") }
         } else cancel(app, NOTIF_BATT)
+
         if (showTemp) {
             val t = readTempScan()
             if (t != null) {
@@ -460,16 +527,16 @@ object StatusIcons {
                 val sign = if (t > 0) "+" else ""
                 val text = "$sign$tStr °C · $tempSource"
                 val w = (24 * app.resources.displayMetrics.density).toInt().coerceAtLeast(24)
-                // P3: отдельный значок с глифом термометра (НЕ просто "+12°" текстом,
-                // иначе в статус-баре не видно иконки вообще).
-                postNotif(app, NOTIF_TEMP, CHANNEL_TEMP, makeTempIcon(app, "$sign$tStr", Color.WHITE), "Снаружи", text, RANK_TEMP,
+                postNotif(app, NOTIF_TEMP, CHANNEL_TEMP, makeTextIcon(app, "°", "", Color.WHITE), "Снаружи", text, RANK_TEMP,
                     telemetryPi(app, NOTIF_TEMP))
-                AppLog.i(TAG, "TEMP: notify id=$NOTIF_TEMP channel=$CHANNEL_TEMP value=$sign$tStr°C size=${w}x${w}px src=$tempSource icon=thermometer-glyph → posted")
+                AppLog.i(TAG, "TEMP: value=$sign$tStr°C smallIconSize=${w}x${w}px src=$tempSource → posted + OVERLAY")
+                tempStr = "$sign$tStr°"; tempVal = t; tempHas = true
             } else {
                 cancel(app, NOTIF_TEMP)
-                AppLog.w(TAG, "TEMP: notify ERROR: value=null (all probes failed, see TEMP: lines above for which props were tried)")
+                AppLog.w(TAG, "TEMP: notify ERROR: value=null")
             }
         } else { cancel(app, NOTIF_TEMP); AppLog.d(TAG, "TEMP: toggle=off") }
+
         if (showWifi) {
             try {
                 val wm = app.getSystemService(Context.WIFI_SERVICE) as WifiManager
@@ -485,21 +552,116 @@ object StatusIcons {
                 }
                 postNotif(app, NOTIF_WIFI, CHANNEL_WIFI, makeWifiIconWithLevel(app, level, Color.WHITE), "Wi-Fi", state, RANK_WIFI,
                     wifiSettingsPi(app))
-                AppLog.i(TAG, "WIFI: level=$level rssi=$rssi icon=arcs click→android.settings.WIFI_SETTINGS state=$state → posted")
+                wifiStr = if (!enabled) "✕" else if (connected) "$level/4" else "…"
+                wifiLvl = level
+                wifiHas = true
+                AppLog.i(TAG, "WIFI: level=$level rssi=$rssi icon=arcs click→android.settings.WIFI_SETTINGS state=$state → posted + OVERLAY")
             } catch (e: Exception) { AppLog.e(TAG,"WIFI: notify ERROR: ${e.message}", e) }
         } else cancel(app, NOTIF_WIFI)
+
+        // P-фикс раздел 0: основной рендер — в overlay-окно (читаемый размер ~12sp текст).
+        // smallIcon нотификации — заглушка ("%", "°", дуги) для системной шторки; визуально
+        // индикатор рисуется в StatusOverlay, там же и клики по PendingIntent.
+        if (battHas || tempHas || wifiHas) {
+            try {
+                val battIcon = if (battHas) makeBattGlyph(app, battPct ?: 0f) else null
+                val tempIcon = if (tempHas) makeTempOverlayIcon(app) else null
+                val wifiIcon = if (wifiHas) makeWifiOverlayIcon(app, wifiLvl) else null
+                val ovSizeDp = 32
+                StatusOverlay.update(
+                    app,
+                    battHas, battStr, battIcon, telemetryPi(app, NOTIF_BATT),
+                    tempHas, tempStr, tempIcon, telemetryPi(app, NOTIF_TEMP),
+                    wifiHas, wifiStr, wifiIcon, wifiSettingsPi(app)
+                )
+                AppLog.i(TAG, "OVERLAY: render size=${ovSizeDp}dp seg(B=$battHas T=$tempHas W=$wifiHas) seq=$seq")
+            } catch (t: Throwable) {
+                AppLog.w(app, TAG, "OVERLAY update err: ${t.message}")
+            }
+        } else {
+            StatusOverlay.hide(app)
+        }
     }
 
     @JvmStatic fun cancelAll(ctx: Context) {
         cancel(ctx, NOTIF_BATT); cancel(ctx, NOTIF_TEMP); cancel(ctx, NOTIF_WIFI)
+        StatusOverlay.hide(ctx)
+    }
+
+    // ─── Глифы для overlay (крупные, ICON_SIZE_DP=16px, белые) ───
+
+    private fun makeBattGlyph(ctx: Context, percent: Float): Icon {
+        val dp = ctx.resources.displayMetrics.density
+        val size = (16 * dp).toInt().coerceAtLeast(16)
+        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val c = Canvas(bmp)
+        val p = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE; style = Paint.Style.STROKE; strokeWidth = size*0.09f; strokeCap = Paint.Cap.ROUND }
+        val pad = size*0.12f; val h = size*0.55f; val w = size*0.65f; val topY = (size-h)/2
+        val left = size*0.20f; val right = left+w
+        c.drawRoundRect(left, topY, right, topY+h, size*0.08f, size*0.08f, p)
+        c.drawRect(right - size*0.02f, topY + h*0.25f, right+size*0.08f, topY + h*0.75f, p)
+        // Заполненность (percent 0..100)
+        p.style = Paint.Style.FILL
+        val fillH = h*0.75f * (percent/100f).coerceIn(0f,1f)
+        c.drawRect(left+size*0.09f, topY+h-fillH-size*0.05f, right-size*0.09f, topY+h-size*0.12f, p)
+        return Icon.createWithBitmap(bmp)
+    }
+
+    private fun makeTempOverlayIcon(ctx: Context): Icon {
+        // reuse existing thermometer glyph but at overlay size
+        val dp = ctx.resources.displayMetrics.density
+        val size = (16 * dp).toInt().coerceAtLeast(16)
+        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val c = Canvas(bmp)
+        val glyph = Paint(Paint.ANTI_ALIAS_FLAG).apply { color=Color.WHITE; style=Paint.Style.STROKE; strokeWidth=size*0.10f; strokeCap=Paint.Cap.ROUND }
+        val stemLeft = size*0.32f; val stemRight = size*0.52f; val topY = size*0.12f
+        val colW = stemRight - stemLeft
+        val bulbTop = size*0.48f
+        c.drawLine(stemLeft, topY+colW/2, stemLeft, bulbTop, glyph)
+        c.drawLine(stemRight, topY+colW/2, stemRight, bulbTop, glyph)
+        c.drawArc(RectF(stemLeft, topY, stemRight, topY+colW), 180f, 180f, false, glyph)
+        c.drawArc(RectF(stemLeft, bulbTop, stemRight, bulbTop+colW), 0f, 180f, false, glyph)
+        glyph.style = Paint.Style.FILL
+        val bulbR = colW*0.95f
+        val cx = (stemLeft+stemRight)/2f
+        c.drawCircle(cx, bulbTop+colW*0.45f+bulbR*0.05f, bulbR, glyph)
+        return Icon.createWithBitmap(bmp)
+    }
+
+    private fun makeWifiOverlayIcon(ctx: Context, level: Int): Icon {
+        val dp = ctx.resources.displayMetrics.density
+        val size = (16 * dp).toInt().coerceAtLeast(16)
+        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val c = Canvas(bmp)
+        val p = Paint(Paint.ANTI_ALIAS_FLAG).apply { color=Color.WHITE; style=Paint.Style.STROKE; strokeWidth=size*0.10f; strokeCap=Paint.Cap.ROUND }
+        val cx = size/2f; val dotCy = size*0.82f; val dotR = size*0.07f
+        c.drawCircle(cx, dotCy, dotR, p)
+        val active = level.coerceIn(-1,4)
+        for (k in 1..3) {
+            val r = size*(0.20f + (k-1)*0.16f)
+            val oval = RectF(cx-r, dotCy-r, cx+r, dotCy+r)
+            val isActive = (active >= k || active < 0)
+            p.alpha = if (isActive) 255 else 90
+            c.drawArc(oval, -135f, 90f, false, p)
+        }
+        p.alpha = 255
+        return Icon.createWithBitmap(bmp)
     }
 
     @JvmStatic fun startPeriodicSync(ctx: Context) {
-        h?.removeCallbacksAndMessages(null)
+        // P-фикс: если периодика уже запущена — не стартовать второй Handler/Runnable,
+        // иначе получаем N параллельных тиков (в логе у владельца "цикл 15с активен" ×4).
+        if (periodicRunning) {
+            Log.i(TAG, "startPeriodicSync: already running, skip (idempotent)")
+            return
+        }
+        stopPeriodicSync()
         val hh = Handler(Looper.getMainLooper()); h = hh
         val app = ctx.applicationContext
+        periodicRunning = true
         hh.post(object : Runnable {
             override fun run() {
+                if (!periodicRunning || h !== hh) return
                 BgWorker.post("StatusIcons.tick") {
                     try { syncAll(app) } catch (t: Throwable) { Log.e(TAG,"tick err",t) }
                 }
@@ -509,9 +671,13 @@ object StatusIcons {
         BgWorker.post("StatusIcons.firstTick") {
             try { syncAll(app) } catch (t: Throwable) { Log.e(TAG,"first tick err",t) }
         }
-        Log.i(TAG,"startPeriodicSync (15s, tick on BgWorker)")
+        Log.i(TAG,"startPeriodicSync (single instance, 15s tick on BgWorker)")
     }
-    @JvmStatic fun stopPeriodicSync() { h?.removeCallbacksAndMessages(null); h=null; Log.i(TAG,"stopPeriodicSync") }
+    @JvmStatic fun stopPeriodicSync() {
+        periodicRunning = false
+        h?.removeCallbacksAndMessages(null); h = null
+        Log.i(TAG,"stopPeriodicSync")
+    }
 
     // ─── HVAC digital (флаги persist.sys.hvacdigital.*) ───
     /**

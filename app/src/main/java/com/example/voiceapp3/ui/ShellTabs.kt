@@ -1,7 +1,14 @@
 package com.example.voiceapp3.ui
 
+import android.util.Log
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
+
+// Объект-обёртка, чтобы не тянуть tools.AppLog в ui-модуль (оставляет логи через Logcat).
+private object AppLogLike {
+    fun i(tag: String, msg: String) = Log.i(tag, msg)
+}
+private const val TAG = "CENTRAL_ShellTabs"
 
 /**
  * Вкладки шелла и правило CarPlay / Android Auto — нативно (этап 9b).
@@ -100,13 +107,35 @@ class ShellTabs(
         selected = id
     }
 
-    /** destination «carplay» / «androidAuto» из ui.destination. */
+    /** destination «carplay» / «androidAuto» / «telemetry» / «tools» / «charging» из ui.destination. */
     fun onDestination(destination: String) {
-        if (destination != "carplay" && destination != "androidAuto") return
-        val shown = resolve()
-        val id = if (destination == "carplay") "carplay" else "aa"
-        val isShown = if (id == "carplay") shown.carplay else shown.aa
-        if (isShown) select(id) else pending = destination
+        AppLogLike.i(TAG, "onDestination: requested=\"$destination\"")
+        // P-фикс: раньше switch обрабатывал ТОЛЬКО carplay/androidAuto — остальные
+        // destination игнорировались (в т.ч. "telemetry" от клика по батарее/температуре).
+        // В результате клик по иконке не переключал вкладку — владелец видел
+        // последнюю открытую (чаще «Быстродействие» = tools/perf).
+        val target = when {
+            destination == "carplay" -> "carplay"
+            destination == "androidAuto" -> "aa"
+            destination == "telemetry" -> "telemetry"
+            destination == "tools" || destination == "performance" || destination == "perf" -> "tools"
+            destination.contains("charg") -> "telemetry" // charging tab внутри telemetry
+            else -> null
+        }
+        if (target == null) {
+            // legacy carplay/aa projection — ждём появления вкладки
+            if (destination == "carplay" || destination == "androidAuto") {
+                val shown = resolve()
+                val id = if (destination == "carplay") "carplay" else "aa"
+                val isShown = if (id == "carplay") shown.carplay else shown.aa
+                if (isShown) select(id) else pending = destination
+            }
+            return
+        }
+        // Переключаемся на вкладку сразу — если вкладка есть в MENU (telemetry/tools всегда есть).
+        select(target)
+        selected = target
+        AppLogLike.i(TAG, "onDestination: selected=\"$target\" (requested=\"$destination\")")
     }
 
     /**
