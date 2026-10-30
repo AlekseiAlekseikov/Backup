@@ -2,6 +2,7 @@
 /app/build/
 /app/debug/
 *.apk
+!app/src/main/res/raw/*.apk
 local.properties
 .gradle/
 build/

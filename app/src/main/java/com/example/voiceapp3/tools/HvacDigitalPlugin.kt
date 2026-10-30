@@ -2,7 +2,6 @@ package com.example.voiceapp3.tools
 
 import android.content.Context
 import android.util.Log
-import com.example.voiceapp3.R
 import java.io.File
 import java.io.FileOutputStream
 
@@ -62,8 +61,18 @@ object HvacDigitalPlugin {
         val dst = status0.oemPkgPath
         val tmpFile = File(ctx.cacheDir, "sysui_staging.apk")
         var extracted = false; var copyErr = ""
-        try {
-            ctx.resources.openRawResource(R.raw.geely_auto_systemui_plugin_digital).use { inp ->
+        // Итерация 10 fix: ищем ресурс по имени, чтобы сборка не падала при
+        // отсутствии APK в res/raw/ (файл не попадал в репозиторий из-за *.apk
+        // в .gitignore; на машине владельца он есть локально, в CI — нет).
+        // Если ресурса нет — честно рапортуем FAILED на шаге stage_extract,
+        // сборка при этом собирается (compile-time ссылки на R.raw.* нет).
+        val resId = ctx.resources.getIdentifier(
+            "geely_auto_systemui_plugin_digital", "raw", ctx.packageName)
+        if (resId == 0) {
+            copyErr = "R.raw.geely_auto_systemui_plugin_digital отсутствует в сборке (нужен app/src/main/res/raw/geely_auto_systemui_plugin_digital.apk)"
+            AppFileLogger.e(TAG, "stage extract: $copyErr")
+        } else try {
+            ctx.resources.openRawResource(resId).use { inp ->
                 FileOutputStream(tmpFile).use { out -> inp.copyTo(out) }
             }
             extracted = tmpFile.length() > 1_000_000
@@ -71,7 +80,8 @@ object HvacDigitalPlugin {
         } catch (t: Throwable) { copyErr = "${t.javaClass.simpleName}: ${t.message}"; AppFileLogger.e(TAG, "stage extract failed", t) }
         steps += stepOf("stage_extract", "extract APK",
             if (extracted) ToolsStep.Status.OK else ToolsStep.Status.FAILED,
-            expected = ">=1MB", actual = if (extracted) "${tmpFile.length()} bytes" else copyErr,
+            expected = ">=1MB / resource present",
+            actual = if (extracted) "${tmpFile.length()} bytes" else copyErr,
             stdout = "extracted")
         if (!extracted) return ToolsResult("hvacdigital.plugin.enable", "Цифровой климат", steps)
 
