@@ -243,67 +243,82 @@ object StatusIcons {
         //   5) прочие PRECISE_COMMON.
         data class Cand(val name: String, val value: Float?)
         val candidates = mutableListOf<Cand>()
-        fun probeOne(label: String, get: () -> Float?): Float? {
-            val v = runCatching { get() }.getOrNull()
+        var chosen: Float? = null
+
+        fun pick(v: Float?, label: String): Float? {
             candidates.add(Cand(label, v))
+            if (v != null && chosen == null) chosen = v
             return v
         }
+        fun probe(label: String, get: () -> Float?): Float? {
+            val v = runCatching { get() }.getOrNull()
+            return pick(v, label)
+        }
 
-        // 0) кеш
+        // 0) кеш прошлого источника
         if (tmpProp != 0) {
             for (a in AREAS) {
-                probeOne("$tempSource@$a(cache)") { tryFloatProp(tmpProp, a, tempSource) }?.let { return@readTempScan finalizeTemp(it, candidates) }
-                probeOne("$tempSource@$a(cache)") { tryInt80Prop(tmpProp, a, tempSource) }?.let { return@readTempScan finalizeTemp(it, candidates) }
+                probe("$tempSource@$a(cache)") { tryFloatProp(tmpProp, a, tempSource) }
+                probe("$tempSource@$a(cache)") { tryInt80Prop(tmpProp, a, tempSource) }
+                if (chosen != null) break
             }
             tmpProp = 0
         }
-
-        // 1) AC_AMBIENT_TEMP (Int, norm80 = (raw-80)/2) — primary
-        for (a in intArrayOf(0, 2, 7)) {
-            probeOne("VHAL:0x2140a377/AC_AMBIENT_TEMP@$a") { tryInt80Prop(PROP_AC_AMBIENT_TEMP, a, "VHAL:0x2140A377/AC_AMBIENT_TEMP") }
-                ?.let { return@readTempScan finalizeTemp(it, candidates) }
-        }
-        // 2) hvacdigital getprop'ы (если плагин выставил значение — не флаг)
-        for (prop in SYS_HVAC_EXT_ALL) {
-            val v = probeOne("hvacdigital/$prop") {
-                val pp = Runtime.getRuntime().exec(arrayOf("sh","-c","getprop $prop"))
-                if (!pp.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)) { pp.destroyForcibly() }
-                val sVal = pp.inputStream.bufferedReader().readText().trim()
-                pp.errorStream.bufferedReader().readText().trim()
-                val fv = sVal.toFloatOrNull()
-                AppLog.d(TAG, "TEMP: getprop $prop raw=\"$sVal\" parsed=$fv")
-                if (fv != null && fv in -50f..70f) {
-                    tempSource = "hvacdigital/$prop"
-                    AppLog.i(TAG, "TEMP: norm=%.1f (src=$tempSource val=\"$sVal\")".format(fv))
-                    fv
-                } else null
-            }
-            if (v != null) return@readTempScan finalizeTemp(v, candidates)
-        }
-        // 3) ENV_OUTSIDE_TEMPERATURE (Float) — на IHU629G замечено врёт на +18°C,
-        //    используем как fallback с явным указанием в src=, чтобы по логу было видно.
-        probeOne("VHAL:0x11600703/ENV_OUTSIDE_TEMPERATURE@0") {
-            tryFloatProp(PROP_ENV_OUT_TEMP, 0, "VHAL:0x11600703/ENV_OUTSIDE_TEMPERATURE")
-        }?.let { return@readTempScan finalizeTemp(it, candidates) }
-        // 4) PRECISE_COMMON fallback
-        for (pp in PRECISE_COMMON) {
+        // 1) AC_AMBIENT_TEMP (Int norm80) — primary
+        if (chosen == null) {
             for (a in intArrayOf(0, 2, 7)) {
-                val label = "VHAL:0x${"%08X".format(pp)}@$a[fallback]"
-                probeOne(label) { tryInt80Prop(pp, a, label) }?.let { return@readTempScan finalizeTemp(it, candidates) }
-                probeOne(label) { tryFloatProp(pp, a, label) }?.let { return@readTempScan finalizeTemp(it, candidates) }
+                probe("VHAL:0x2140a377/AC_AMBIENT_TEMP@$a") { tryInt80Prop(PROP_AC_AMBIENT_TEMP, a, "VHAL:0x2140A377/AC_AMBIENT_TEMP") }
+                if (chosen != null) break
             }
+        }
+        // 2) hvacdigital getprop'ы
+        if (chosen == null) {
+            for (prop in SYS_HVAC_EXT_ALL) {
+                val v = runCatching {
+                    val pp = Runtime.getRuntime().exec(arrayOf("sh","-c","getprop $prop"))
+                    if (!pp.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)) { pp.destroyForcibly() }
+                    val sVal = pp.inputStream.bufferedReader().readText().trim()
+                    pp.errorStream.bufferedReader().readText().trim()
+                    val fv = sVal.toFloatOrNull()
+                    AppLog.d(TAG, "TEMP: getprop $prop raw=\"$sVal\" parsed=$fv")
+                    if (fv != null && fv in -50f..70f) {
+                        tempSource = "hvacdigital/$prop"
+                        AppLog.i(TAG, "TEMP: norm=%.1f (src=$tempSource val=\"$sVal\")".format(fv))
+                    }
+                    fv
+                }.getOrNull()
+                pick(v, "hvacdigital/$prop")
+                if (chosen != null) break
+            }
+        }
+        // 3) ENV_OUTSIDE_TEMPERATURE — fallback (известно что врёт на этой прошивке)
+        if (chosen == null) {
+            probe("VHAL:0x11600703/ENV_OUTSIDE_TEMPERATURE@0") {
+                tryFloatProp(PROP_ENV_OUT_TEMP, 0, "VHAL:0x11600703/ENV_OUTSIDE_TEMPERATURE")
+            }
+        }
+        // 4) PRECISE_COMMON
+        if (chosen == null) {
+            outer@ for (pp in PRECISE_COMMON) {
+                for (a in intArrayOf(0, 2, 7)) {
+                    val label = "VHAL:0x${"%08X".format(pp)}@$a[fallback]"
+                    probe(label) { tryInt80Prop(pp, a, label) }
+                    if (chosen != null) break@outer
+                    probe(label) { tryFloatProp(pp, a, label) }
+                    if (chosen != null) break@outer
+                }
+            }
+        }
+        val finalV = chosen
+        if (finalV != null) {
+            AppLog.i(TAG, "TEMP: candidates — " + candidates.joinToString(" | ") { "${it.name}=${it.value}" })
+            AppLog.i(TAG, "TEMP: chosen=%.1f (src=$tempSource)".format(finalV))
+            return finalV
         }
         AppLog.w(TAG, "TEMP: candidates — " + candidates.joinToString(" | ") { "${it.name}=${it.value}" })
-        AppLog.w(TAG, "TEMP: notify ERROR: ни один источник не дал валидного значения (выводим -- )")
+        AppLog.w(TAG, "TEMP: notify ERROR: ни один источник не дал валидного значения")
         tempSource = "none"
         return null
-    }
-
-    /** Логируем всех кандидатов и возвращаем выбранное значение. */
-    private fun finalizeTemp(v: Float, candidates: List<Cand>): Float {
-        AppLog.i(TAG, "TEMP: candidates — " + candidates.joinToString(" | ") { "${it.name}=${it.value}" })
-        AppLog.i(TAG, "TEMP: chosen=%.1f (src=$tempSource)".format(v))
-        return v
     }
 
     /** PendingIntent для клика по батарее/температуре → наше приложение, сразу вкладка «Телеметрия». */
