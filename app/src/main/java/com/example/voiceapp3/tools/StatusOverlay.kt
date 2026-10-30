@@ -2,6 +2,7 @@ package com.example.voiceapp3.tools
 
 import android.app.PendingIntent
 import android.content.Context
+import android.content.Intent
 import android.graphics.*
 import android.graphics.drawable.Icon
 import android.os.Build
@@ -176,18 +177,21 @@ object StatusOverlay {
 
             // Паттерн CentralEXAuto (TempBattPillFloaterService / WifiFloaterService /
             // QuickAccessFloaterService v3.3.9):
-            //   type = 2038 (TYPE_APPLICATION_OVERLAY),
-            //   flags = 264 (FLAG_NOT_FOCUSABLE | FLAG_NOT_TOUCH_MODAL),
-            //   format = -3 (PixelFormat.TRANSLUCENT).
-            // Повторяем точь-в-точь, чтобы не изобретать свой механизм.
+            //   new LayoutParams(-2, size, 2038, 264, -3)
+            // где 2038 = TYPE_APPLICATION_OVERLAY,
+            //     264 = 0x108 = FLAG_LAYOUT_IN_SCREEN (0x100) | FLAG_NOT_FOCUSABLE (0x8),
+            //     -3  = PixelFormat.TRANSLUCENT.
+            // ВАЖНО: FLAG_NOT_TOUCH_MODAL (0x20) в CEX НЕ используется! Окно перехватывает
+            // тапы только в своих границах; тапы за пределами пропускаются нижним окнам
+            // (NOT_FOCUSABLE это делает; NOT_TOUCH_MODAL нужен только если окно имеет
+            // собственный hit-test вне своих bounds, чего здесь нет).
             val layoutType = if (Build.VERSION.SDK_INT >= 26)
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY // 2038
             else
                 @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_SYSTEM_ALERT // 2003
-            val flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL // = 264 как в CentralEXAuto
-                // НЕ добавляем FLAG_NOT_TOUCHABLE по самим сегментам — они должны кликаться;
-                // FLAG_NOT_TOUCH_MODAL при этом НЕ ест тапы за пределами полосы.
+            // Точное значение флагов из CEX: FLAG_LAYOUT_IN_SCREEN | FLAG_NOT_FOCUSABLE = 264.
+            val flags = WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE // = 264
 
             val params = WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT,
@@ -207,10 +211,30 @@ object StatusOverlay {
             this.root = root
             showing = true
             path = "window"
-            Log.i(TAG, "StatusOverlay shown type=2038 flags=264 fmt=TRANSLUCENT path=$path sb=${sb}px y=${params.y}px (CentralEXAuto pattern)")
+            // Шторка уведомлений — системное окно слоем ВЫШЕ TYPE_APPLICATION_OVERLAY
+            // (как и у CentralEXAuto). При открытой шторке полоса временно скрывается
+            // под ней — это ожидаемое поведение, не баг; такое же у CEX.
+            Log.i(TAG, "StatusOverlay shown type=$layoutType flags=${params.flags} fmt=${params.format} path=$path sb=${sb}px y=${params.y}px (CentralEXAuto pattern; shade above overlay как в CEX)")
         } catch (t: Throwable) {
             Log.e(TAG, "StatusOverlay show FAILED path=$path (${t.javaClass.simpleName}: ${t.message})", t)
             AppLog.e(app, TAG, "OVERLAY: path=$path err=${t.javaClass.simpleName}: ${t.message}", t)
+        }
+        if (path != "window") {
+            // Fallback path=activity: запускаем OverlayActivity, которая покажет
+            // статус-плашку (если overlay permission не выдан). OverlayActivity
+            // работает только когда мы на переднем плане, поэтому это лишь подстраховка.
+            val fb = Intent(app, OverlayActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                putExtra(OverlayActivity.EXTRA_STATUS_PILL, true)
+            }
+            runCatching { app.startActivity(fb) }
+                .onSuccess {
+                    path = "activity"
+                    Log.i(TAG, "OVERLAY: started OverlayActivity as fallback (status-pill mode)")
+                }
+                .onFailure { t ->
+                    Log.e(TAG, "OVERLAY: path=activity failed: ${t.message}")
+                }
         }
         AppLog.i(app, TAG, "OVERLAY: path=$path")
     }

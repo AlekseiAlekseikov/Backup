@@ -147,10 +147,55 @@ object StatusIcons {
 
     private fun dumpKnownProps() {
         val m = cpm ?: return
-        Log.i(TAG,"=== VHAL dump start (look for BATT/TEMP raw values here) ===")
-        for (p in PRECISE_COMMON) for (a in AREAS) {
-            try { val v = m.getFloatProperty(p,a); if (!v.isNaN()) Log.i(TAG,String.format("DUMP F 0x%08X@%d = %f",p,a,v)) } catch(_:Exception){}
-            try { val v = m.getIntProperty(p,a); if (v != 0) Log.i(TAG,String.format("DUMP I 0x%08X@%d = %d",p,a,v)) } catch(_:Exception){}
+        Log.i(TAG,"=== VHAL dump start (look for TEMP/BATT in -50..70°C, 0..101%) ===")
+        // Полный перебор propertyIds по зонам: все float/int свойства с температурами
+        // (диапазоны VHAL: INFO_VEHICLE=0x11400000..0x117FFFFF, HVAC=0x15400000..0x167FFFFF,
+        //  INFO_EXT/ENV=0x1160xxxx). Чтоб не пропустить реальный источник наружной t°,
+        // сканируем все три диапазона по всем зонам.
+        val TEMP_RANGES = arrayOf(
+            0x11400000..0x117FFFFF,   // INFO_* (в т.ч. ENV_OUTSIDE_TEMPERATURE=0x11600703)
+            0x15400000..0x167FFFFF,   // HVAC_*
+            0x21400000..0x217FFFFF,   // vendor/GLOBAL HVAC MIRROR
+            0x25400000..0x267FFFFF,   // vendor MIRROR HVAC
+        )
+        val ALL_AREAS = intArrayOf(0, 1, 2, 3, 4, 5, 7, 8, 0xF, 0x10, 0x20, 0x30)
+        try {
+            val propList = m.propertyList
+            Log.i(TAG,"VHAL: propertyList size=${propList?.size ?: "null"}")
+            for (cfg in (propList ?: emptyList())) {
+                val pid = cfg.propertyId
+                val inRange = TEMP_RANGES.any { pid in it }
+                if (!inRange) continue
+                for (a in ALL_AREAS) {
+                    try {
+                        val v = m.getFloatProperty(pid, a)
+                        if (!v.isNaN() && v > -55f && v < 70f) {
+                            Log.i(TAG, String.format("DUMP F 0x%08X@0x%02X = %.2f °C", pid, a, v))
+                        }
+                    } catch (_: Exception) {}
+                    try {
+                        val iv = m.getIntProperty(pid, a)
+                        val fv = when {
+                            iv in -550..700 -> iv / 10.0f
+                            iv in -45..65 -> iv.toFloat()
+                            else -> Float.NaN
+                        }
+                        if (!fv.isNaN() && fv > -55f && fv < 70f) {
+                            Log.i(TAG, String.format("DUMP I 0x%08X@0x%02X raw=%d = %.1f °C", pid, a, iv, fv))
+                        }
+                    } catch (_: Exception) {}
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "VHAL propertyList enumeration failed, fallback to PRECISE_COMMON scan: ${e.message}")
+            for (p in PRECISE_COMMON) for (a in ALL_AREAS) {
+                try { val v = m.getFloatProperty(p,a); if (!v.isNaN() && v in -55f..70f) Log.i(TAG,String.format("DUMP F 0x%08X@0x%02X = %f",p,a,v)) } catch(_:Exception){}
+                try {
+                    val iv = m.getIntProperty(p,a)
+                    val fv = when { iv in -550..700 -> iv/10.0f; iv in -45..65 -> iv.toFloat(); else -> Float.NaN }
+                    if (!fv.isNaN()) Log.i(TAG,String.format("DUMP I 0x%08X@0x%02X raw=%d = %f",p,a,iv,fv))
+                } catch(_:Exception){}
+            }
         }
         Log.i(TAG,"=== VHAL dump end ===")
     }
@@ -292,15 +337,55 @@ object StatusIcons {
             return pick(v, label, area)
         }
 
-        tmpProp = 0
+        // Итерация 8 fix: обходим ВСЕ зоны ENV_OUTSIDE_TEMPERATURE {0,1,2,3,4,5,7,0xF},
+        // собираем все кандидаты (float / int/10 / int-as-is), логируем каждое чтение
+        // и НТ возвращаемся по первой зоне=0 (владелец показал что area=0 стабильно врёт
+        // на +25°C, а реальные 7°C, видимо, живут в другой зоне).
+        // Выбор: среди валидных значений предпочитаем то, которое != 25.0 °C; если
+        // все кандидаты 25.0 — берём из первой ненулевой зоны; если только зона 0
+        // отдала значение (и оно 25.0) — НЕ возвращаем его как «правильное»,
+        // а идём дальше по другим пропам (hvacdigital/AC_AMBIENT/PRECISE_COMMON),
+        // чтобы не залипнуть на известном дефолте.
+        data class Cand(val name: String, val value: Float?, val area: Int = 0)
+        val candidates = mutableListOf<Cand>()
 
-        // 1) PRIMARY: ENV_OUTSIDE_TEMPERATURE по зонам как в CentralEXAuto.
-        for (a in intArrayOf(0, 1, 4, 7)) {
-            probe("VHAL:0x11600703/ENV_OUTSIDE_TEMPERATURE@$a", a) {
-                tryOutsideCex(a, "VHAL:0x11600703/ENV_OUTSIDE_TEMPERATURE@$a")
-            }
-            if (chosen != null) { tempSource = "VHAL/CentralEX:ENV_OUTSIDE@$a"; tmpProp = PROP_ENV_OUT_TEMP; tmpArea = a; break }
+        fun record(label: String, v: Float?, area: Int = 0): Float? {
+            candidates.add(Cand(label, v, area))
+            return v
         }
+        // Скан всех зон ENV_OUTSIDE без раннего return.
+        val outsideHits = mutableListOf<Pair<Int, Float>>()  // (area, value)
+        val OUTSIDE_AREAS = intArrayOf(0, 1, 2, 3, 4, 5, 7, 0xF)
+        for (a in OUTSIDE_AREAS) {
+            val v = tryOutsideCex(a, "VHAL:0x11600703/ENV_OUTSIDE_TEMPERATURE@$a")
+            if (v != null) outsideHits.add(a to v)
+        }
+        // Выбираем лучшее ENV_OUTSIDE значение:
+        //  - среди всех попаданий ищем != 25.0 °C (не дефолт прошивки);
+        //  - из нескольких не-25 берём наименьшее абсолютное (ближе к реальной уличной);
+        //  - если все == 25.0 и есть хоть одна ненулевая зона, считаем это подозрительным
+        //    (все зоны дали одинаковый 25 — возможно реально 25; но если только зона 0
+        //    дала 25, а остальные NaN/err — это сбой, пропускаем).
+        var chosen: Float? = null
+        var chosenArea = 0
+        var chosenLabel = ""
+        if (outsideHits.isNotEmpty()) {
+            val non25 = outsideHits.filter { Math.abs(it.second - 25f) > 0.5f }
+            val picked = when {
+                non25.isNotEmpty() -> non25.minByOrNull { Math.abs(it.second) }!!
+                outsideHits.any { it.first != 0 } -> outsideHits.first { it.first != 0 } // доверяем хоть какой-то зоне != 0
+                else -> null // только зона 0 и все 25.0 — не доверяем, идём дальше
+            }
+            if (picked != null) {
+                chosen = picked.second; chosenArea = picked.first
+                chosenLabel = "VHAL/ENV_OUTSIDE_TEMPERATURE@${picked.first}"
+                tmpProp = PROP_ENV_OUT_TEMP; tmpArea = picked.first
+                tempSource = chosenLabel
+            }
+            // Все кандидаты записываем в лог:
+            for ((a, v) in outsideHits) record("VHAL:0x11600703/ENV_OUTSIDE@$a", v, a)
+        }
+
         // 2) hvacdigital getprop temp_ext / exttemp (кросс-проверка).
         if (chosen == null) {
             for (prop in SYS_HVAC_EXT_ALL) {
@@ -311,19 +396,25 @@ object StatusIcons {
                     pp.errorStream.bufferedReader().readText().trim()
                     val fv = sVal.toFloatOrNull()
                     AppLog.d(TAG, "TEMP: getprop $prop raw=\"$sVal\" parsed=$fv")
-                    fv?.takeIf { it in -50f..70f }?.also {
-                        AppLog.i(TAG, "TEMP: getprop $prop val=\"$sVal\" -> $it")
+                    fv?.takeIf { it in -50f..70f && Math.abs(it - 1f) > 0.1f /* не флаг */ }?.also {
+                        AppLog.i(TAG, "TEMP: getprop $prop val=\"$sVal\" -> $it °C")
                     }
                 }.getOrNull()
-                pick(v, "hvacdigital/$prop")
-                if (chosen != null) { tempSource = "hvacdigital/$prop"; break }
+                record("hvacdigital/$prop", v)
+                if (v != null && chosen == null && Math.abs(v - 1f) > 0.1f) {
+                    chosen = v; chosenLabel = "hvacdigital/$prop"; tempSource = chosenLabel
+                }
+                if (chosen != null) break
             }
         }
         // 3) AC_AMBIENT_TEMP (кабина) — fallback (norm (raw-80)/2 °C).
         if (chosen == null) {
             for (a in intArrayOf(0, 2, 7)) {
-                probe("VHAL:0x2140a377/AC_AMBIENT_TEMP@$a", a) {
-                    tryInt80Prop(PROP_AC_AMBIENT_TEMP, a, "VHAL:0x2140A377/AC_AMBIENT_TEMP@$a")
+                val v = tryInt80Prop(PROP_AC_AMBIENT_TEMP, a, "VHAL:0x2140A377/AC_AMBIENT_TEMP@$a")
+                record("VHAL:0x2140a377/AC_AMBIENT@$a", v, a)
+                if (v != null && chosen == null) {
+                    chosen = v; chosenArea = a; chosenLabel = "VHAL/AC_AMBIENT_TEMP@$a"
+                    tmpProp = PROP_AC_AMBIENT_TEMP; tmpArea = a; tempSource = chosenLabel
                 }
                 if (chosen != null) break
             }
@@ -333,17 +424,17 @@ object StatusIcons {
             outer@ for (pp in PRECISE_COMMON) {
                 for (a in intArrayOf(0, 2, 7)) {
                     val label = "VHAL:0x${"%08X".format(pp)}@$a[fallback]"
-                    probe(label, a) { tryInt80Prop(pp, a, label) }
-                    if (chosen != null) break@outer
-                    probe(label, a) { tryFloatProp(pp, a, label) }
-                    if (chosen != null) break@outer
+                    val vi = tryInt80Prop(pp, a, label); record(label + "/int80", vi, a)
+                    if (vi != null) { chosen = vi; chosenArea = a; chosenLabel = label; tmpProp = pp; tmpArea = a; tempSource = label; break@outer }
+                    val vf = tryFloatProp(pp, a, label); record(label + "/float", vf, a)
+                    if (vf != null) { chosen = vf; chosenArea = a; chosenLabel = label; tmpProp = pp; tmpArea = a; tempSource = label; break@outer }
                 }
             }
         }
         val finalV = chosen
         if (finalV != null) {
             AppLog.i(TAG, "TEMP: candidates — " + candidates.joinToString(" | ") { "${it.name}=${it.value}" })
-            AppLog.i(TAG, "TEMP: chosen=%.1f (src=$tempSource area=$chosenArea)".format(finalV))
+            AppLog.i(TAG, "TEMP: chosen=%.1f (src=$chosenLabel area=$chosenArea)".format(finalV))
             return finalV
         }
         AppLog.w(TAG, "TEMP: candidates — " + candidates.joinToString(" | ") { "${it.name}=${it.value}" })
@@ -547,6 +638,11 @@ object StatusIcons {
         val showTemp = prefs(app).getBoolean(PREF_EXT_TEMP, false)
         val showWifi = prefs(app).getBoolean(PREF_WIFI, false)
         Log.d(TAG,"syncAll seq=$seq batt=$showBatt temp=$showTemp wifi=$showWifi cpm=${cpm!=null}")
+        // Итерация 8: трассировка префа PREF_EXT_TEMP — файл + значение + поток
+        // (чтобы понять, кто пишет false между тиками).
+        val pf = prefs(app)
+        val pPath = "/data/data/${app.packageName}/shared_prefs/voiceapp3.xml"
+        Log.i(TAG, "PREF TRACE: read  file=$pPath key=$PREF_EXT_TEMP value=$showTemp seq=$seq thread=${Thread.currentThread().name}")
 
         var battStr: String? = null; var battPct: Float? = null; var battHas = false
         var tempStr: String? = null; var tempVal: Float? = null; var tempHas = false

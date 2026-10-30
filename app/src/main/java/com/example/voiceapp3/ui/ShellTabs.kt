@@ -57,7 +57,10 @@ class ShellTabs(
 
     /** Текущая вкладка (по tab.change); до первого события — стартовая «quick». */
     private var selected = "quick"
-    /** Флаг: publish был вызван хотя бы раз (шелл/док готовы к select). */
+    /** Итерация 8 fix: шелл считается готовым НЕ по refresh(), а по ПЕРВОМУ tab.change
+     * от JS (т. е. когда WebView реально загрузился и вызвал коллбэк выбора вкладки).
+     * Раньше флаг выставлялся в refresh() синхронно до handleDestination → очередь
+     * pendingSelect НИКОГДА не срабатывала на холодном старте (боевой баг). */
     private var shellEverReady = false
 
     /** Отложенная цель destination: "carplay" | "androidAuto" (как PENDING_DEST). */
@@ -109,7 +112,12 @@ class ShellTabs(
 
     /** tab.change из JS: выбранная вкладка. */
     fun onSelected(id: String) {
+        val first = !shellEverReady
         selected = id
+        if (first) {
+            // Это первый реальный ответ от JS — шелл поднялся.
+            onShellReady()
+        }
     }
 
     /** destination «carplay» / «androidAuto» / «telemetry» / «tools» / «charging» из ui.destination. */
@@ -157,6 +165,31 @@ class ShellTabs(
      * Открытая вкладка, которой больше нет, уходит на «quick»; отложенная цель
      * открывается, когда её вкладка появилась (как applyProjection в JS).
      */
+    /** Вызывается из UiBridge при ПЕРВОМ tab.change от JS (шёлл реально готов). */
+    fun onShellReady() {
+        if (shellEverReady) return
+        shellEverReady = true
+        AppLogLike.i(TAG, "shell: ready (first tab.change received from JS)")
+        // Применяем отложенную цель (холодный старт).
+        val ps = pendingSelect
+        if (ps != null) {
+            pendingSelect = null
+            val tabs = MENU.filter { t ->
+                when (t.id) {
+                    "carplay" -> resolve().carplay
+                    "aa" -> resolve().aa
+                    else -> true
+                }
+            }
+            if (tabs.any { it.id == ps }) {
+                select(ps); selected = ps
+                AppLogLike.i(TAG, "destination: applied $ps (shell ready, first tab.change)")
+            } else {
+                AppLogLike.i(TAG, "destination: queued $ps dropped (tab not in MENU)")
+            }
+        }
+    }
+
     fun refresh() {
         val s = resolve()
         val tabs = MENU.filter { t ->
@@ -166,23 +199,20 @@ class ShellTabs(
                 else -> true
             }
         }
-        // При первом refresh применяем отложенный select (холодный старт).
-        val firstTime = !shellEverReady
-        shellEverReady = true
+        // ВАЖНО: shellEverReady больше НЕ выставляется здесь — см. onShellReady().
+        // publish отсылает вкладки в native-dock синхронно, но JS их подхватит
+        // только после загрузки страницы; до первого tab.change select() в JS
+        // теряется.
         publish(tabs, selected)
         if (!s.carplay && selected == "carplay") select("quick")
         if (!s.aa && selected == "aa") select("quick")
-        // pendingSelect: применили цель, если док готов.
-        val ps = pendingSelect
-        if (ps != null) {
-            pendingSelect = null
-            val tabExists = tabs.any { it.id == ps }
-            if (tabExists) {
-                select(ps)
-                selected = ps
-                AppLogLike.i(TAG, "destination: applied $ps (shell ready, firstRefresh=$firstTime)")
-            } else {
-                AppLogLike.i(TAG, "destination: queued $ps dropped (tab not in MENU)")
+        // Если шелл уже готов (горячий сценарий) и есть pendingSelect — применяем сразу.
+        if (shellEverReady) {
+            val ps = pendingSelect
+            if (ps != null && tabs.any { it.id == ps }) {
+                pendingSelect = null
+                select(ps); selected = ps
+                AppLogLike.i(TAG, "destination: applied $ps (shell already ready)")
             }
         }
         when {

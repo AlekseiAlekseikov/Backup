@@ -203,6 +203,15 @@ enum class Choice(
             // значение — иначе «успех» мог бы опираться на кэш редактора.
             prefs().edit().putBoolean(toggle.pref, value).commit()
             val actual = prefs().getBoolean(toggle.pref, !value).toString()
+            // Итерация 8: трассировка чтения/записи префа toggle=off/on
+            // (диагностика спама 12 раз за 65 сек в логе).
+            if (toggle.pref == StatusIcons.PREF_EXT_TEMP) {
+                val f = appContext.getSharedPreferences(Prefs.FILE, Context.MODE_PRIVATE)
+                val p = try { f.javaClass.getMethod("getFilePath").invoke(f)?.toString() } catch (_: Throwable) { null }
+                    ?: "/data/data/${appContext.packageName}/shared_prefs/${Prefs.FILE}.xml"
+                Log.i("CENTRAL_ToolsBackend",
+                    "PREF TRACE: write file=$p key=${toggle.pref} value=$value actual=$actual thread=${Thread.currentThread().name}")
+            }
             (actual == value.toString()) to actual
         }
 
