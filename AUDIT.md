@@ -298,3 +298,107 @@ setHvacDigital и bootRestore пишут оба свойства; readTempScan �
 - Все root-функции продолжают рапортовать BLOCKED с честной причиной (`root unavailable`, `ADB не работает`, `uid=1000(system)`) — нет ложного SUCCESS.
 - При появлении работающего канала (порт 5555/65010) AdbClient автоматически поднимает соединение и команды начнут проходить.
 
+
+---
+
+## Обновление 2026-10-30 (итерация 7, по message_agent_iter7.md)
+
+### Компиляция (раздел 1)
+- В `StatusOverlay.kt` удалён неверный импорт `android.view.PixelFormat` (класс — `android.graphics.PixelFormat`, уже покрыт wildcard `android.graphics.*`).
+- Удалены неиспользуемые импорты: `android.content.Intent`, `android.graphics.drawable.Drawable`,
+  `android.net.wifi.WifiManager`, `android.provider.Settings`, `android.view.MotionEvent`,
+  `java.util.Locale`.
+- Сборка в песочнице невозможна (нет Android SDK, OpenJDK 11 вместо 17); CI-файл подготовлен
+  (см. `/home/user/work/build.yml.README`) — для запуска нужен PAT с scope `workflow`.
+
+### CI (раздел 2)
+- Workflow-файл `.github/workflows/build.yml` создан (ubuntu-latest, Zulu JDK 17,
+  android-actions/setup-android, `./gradlew :app:assembleRelease`, upload-artifact).
+- Запушить workflow в песочнице не удалось: PAT без scope `workflow` → "refusing to allow
+  a Personal Access Token to create or update workflow". После включения workflow-scope
+  (или ручного добавления файла) CI будет доступен по URL
+  `https://github.com/AlekseiAlekseikov/Backup/actions/runs/<RUN_ID>` — зелёный ран
+  будет добавлен в следующей итерации.
+
+### Источник температуры (раздел 3)
+- Декомпилирован `HvacDigital-platform-signed.apk` (jadx 1.4.7 → `/home/user/decompiled_hvac/`).
+  Пакет `com.swimapps.hvacdigital` — **установщик/активатор**, не сам плагин: он через ADB
+  (порты 65010/5555) скачивает `GeelyAutoSystemUIPlugin-digital.apk` с
+  `raw.githubusercontent.com/swimapps/CentralEXAuto/main/`, складывает в
+  `/data/local/hvac-digital/sysui.apk` и mount'ит поверх `com.flyme.auto.systemuiplugin`
+  (`AppConstants.TARGET_PKG = "com.flyme.auto.systemuiplugin"`).
+- Код, рисующий температуру в статус-баре, находится в `com.flyme.auto.systemuiplugin`
+  (GeelyAutoSystemUIPlugin-digital.apk), которого в репозитории нет. Верификация точного
+  propertyId + нормализации по декомпиляции flyme-плагина **не закончена** — нужен доступ
+  к самому APK (с ГУ, или pull из `/data/local/hvac-digital/sysui.apk` на устройстве).
+- Убран кеш `tmpProp` между вызовами `readTempScan()` — раньше, если AC_AMBIENT_TEMP не
+  читался (а на первой установке/после очистки так и есть), кеш на всю жизнь процесса
+  залипал на `ENV_OUTSIDE_TEMPERATURE=25°C`, и правильное значение из hvacdigital/VHAL
+  уже не подхватывалось.
+- Приоритет чтения: `AC_AMBIENT_TEMP (0x2140a377, Int norm80)` primary (совпадает с
+  `GeelyDeclarations.AcAmbientTemp`, куда смотрит `VehicleLiveAdapter.outsideTemp`);
+  затем `hvacdigital getprop temp_ext/exttemp` (кросс-проверка, не primary, т.к. без
+  рута там часто 0/1 — флаг включения); затем `ENV_OUTSIDE_TEMPERATURE@0` (Float)
+  как fallback; затем `PRECISE_COMMON` (fallback).
+
+### Overlay (раздел 4)
+- Существующий `decompiled/centralex/w0/` содержит только 8 обфусцированных файлов
+  (fh/kg/la/m/n/qd/rg/z8) — полноценного декомпила CentralEXAuto с классами
+  `QuickAccessFloaterService`/`WifiFloaterService` в текущем репозитории нет.
+  Необходимо получить сам APK CentralEXAuto для точного анализа window type/flags.
+- Исправлена обработка возвращаемого значения `OverlayPermission.ensure()`: теперь
+  вызываем как `Boolean?`, при `false` пишем `OVERLAY: path=fail` и возвращаемся
+  без `addView` (раньше игнорировали результат и получали BadTokenException).
+- Добавлен единый лог `OVERLAY: path=window|fail` в конце `showOnMain()`.
+- OverlayActivity не используется как fallback, т.к. это голосовой UI
+  ("Слушаю"/карточка ответа), а не статус-барный индикатор.
+- Флаги окна: `FLAG_NOT_FOCUSABLE | FLAG_NOT_TOUCH_MODAL | FLAG_LAYOUT_NO_LIMITS`
+  — overlay не ест тапы за пределами своей полосы. Точную высоту/смещение
+  нужно будет калибровать на ГУ.
+
+### Холодный старт destination (раздел 5)
+- В `ShellTabs` добавлен флаг `shellEverReady` и очередь `pendingSelect`.
+- `onDestination(dest)` до первого `refresh()` (когда док WebView/шелла ещё не
+  опубликовал вкладки) теперь:
+  1. Записывает `pendingSelect = target`.
+  2. Пишет лог: `destination: queued <target> (shell not ready yet)`.
+  3. Возвращается без вызова `select()` (который иначе молча падает в JS).
+- При первом `refresh()` (после `publish(tabs, selected)`) очередь размораживается:
+  - `select(target)`, лог `destination: applied <target> (shell ready, firstTime=true)`.
+- Мёртвый код `bridge.onEvent("telemetry.open")` НЕ добавлял нового Dart handler'а
+  (его нигде нет); навигация теперь работает через нативный select на Kotlin-стороне.
+
+### toggle=off ×12 (раздел 6)
+- Ключ префа и чтение, и запись: `status_icon_temp_ext` (совпадает между Flutter
+  `SharedPreferences` и Kotlin `prefs(app)` из `AppPreferences`). Рассинхрона
+  в имени ключа нет.
+- Причина массовых toggle=off при старте, вероятно:
+  1. `ToolsBackend.applyAllState()` вызывается каждый раз при показе ToolsPanel,
+     пишущий дефолты ВСЕХ тумблеров (в т.ч. `notifTemp=false`) — если преф ещё не
+     записан (первый запуск), Flutter пишет дефолт false, прежде чем Kotlin
+     прочитает.
+  2. Ранее существовавший баг «кеш tmpProp навсегда =25°C» + неработающий overlay
+     заставлял пользователя тыкать toggle несколько раз, надеясь увидеть
+     результат — отсюда ×12 в логе.
+- Вердикт: не баг в имени ключа, а (а) дефолт `false` в Kotlin ToolsCatalog
+  `addToggle("notifTemp",...,def=false)` совпадает с тем, что Flutter видит на
+  холодном старте, и (б) overlay действительно не рисовался из-за BadToken,
+  создавая впечатление «тумблер не применился». Исправлено через
+  OverlayPermission.ensure() return-check и кэш tmpProp убран.
+
+### NetworkTtl.unregisterNetworkReceiver + overlay не ест тапы (раздел 7)
+- `VoiceAssistantService.cleanup()` теперь вызывает:
+  - `NetworkTtl.unregisterNetworkReceiver(this)`
+  - `StatusOverlay.hide(this)`
+  Это убирает утечку receiver при перезапуске сервиса.
+- В cleanup() также останавливается `StatusIcons.stopPeriodicSync()` и
+  снимаются все receiver'ы (wakeWordSwitchReceiver, hubReceiver, screenWakeReceiver,
+  keyEventReceiver) — цикл один, receiver один, как и в итерации 6.
+
+### Что не сломали
+- scale=10f убран, sync guards (single-instance periodic/networkReceiver)
+  оставлены, ShellTabs dest routing расширен (не сломан), AUDIT.md §7
+  (звук блокировки bind-mount только для carlock/*.wav) не тронут.
+- «Строка состояния», lock sound, тема ГУ, windows-doors — код не изменён.
+- Wi-Fi glyph остаётся векторным (не текст), дуги и кликабельность по шторке
+  не менялись.
