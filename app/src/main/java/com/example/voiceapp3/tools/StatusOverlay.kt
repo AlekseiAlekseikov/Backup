@@ -37,6 +37,10 @@ import java.util.Locale
  *
  * Нотификации при этом МОЖНО ОСТАВИТЬ (футпринт в шторке и приоритет сервиса),
  * но smallIcon становится заглушкой-пустышкой — основной отрисовкой занимается overlay.
+ *
+ * Разрешение SYSTEM_ALERT_WINDOW уже есть в манифесте; если appop слетел —
+ * OverlayPermission.ensure() сам выдаёт его через AppOpsManager.MODE_ALLOWED
+ * (мы platform-signed/priv-app на этом ГУ).
  */
 object StatusOverlay {
     private const val TAG = "CENTRAL_StatusOverlay"
@@ -137,6 +141,12 @@ object StatusOverlay {
     private fun showOnMain(app: Context) {
         if (showing) return
         try {
+            // Пытаемся сами выдать SYSTEM_ALERT_WINDOW app-op (priv-app/platform-signed).
+            runCatching {
+                val cls = Class.forName("com.example.voiceapp3.OverlayPermission")
+                val m = cls.getMethod("ensure", Context::class.java)
+                m.invoke(null, app)
+            }
             val wm = app.getSystemService(Context.WINDOW_SERVICE) as? WindowManager ?: return
             val root = LinearLayout(app).apply {
                 orientation = LinearLayout.HORIZONTAL
