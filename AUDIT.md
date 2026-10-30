@@ -402,3 +402,59 @@ setHvacDigital и bootRestore пишут оба свойства; readTempScan �
 - «Строка состояния», lock sound, тема ГУ, windows-doors — код не изменён.
 - Wi-Fi glyph остаётся векторным (не текст), дуги и кликабельность по шторке
   не менялись.
+
+### Обновление итерации 7-b (после получения APK от пользователя)
+
+Получены и декомпилированы два APK, которых не хватало на первом проходе:
+- `GeelyAutoSystemUIPlugin-digital.apk` (com.flyme.auto.systemuiplugin) — flyme-плагин, который ставит HvacDigital-инсталлятор; содержит HvacVehicleTempWidget/BaseHvacWidget (внутренний климат-контроллер).
+- `CentralEXAuto_v3.3.9.apk` (com.ex.auto) — собственно CentralEXAuto, распакован из вложенного zip; полный декомпил 1608 классов.
+
+#### Источник наружной температуры — доказательство из CentralEXAuto (§3)
+Файл `com/geely/hvacstepperv2/TempStepperService.java` (класс i() на строке 355):
+```
+public final Float i(int i3) {                            // i3 = VHAL areaId
+    float floatProperty = cpm.getFloatProperty(291505923/*0x11600703=ENV_OUTSIDE_TEMPERATURE*/, i3);
+    if (!Float.isNaN(floatProperty)) return floatProperty; // °C as-is, range -55..70
+    int intProperty = cpm.getIntProperty(291505923, i3);
+    if (intProperty > -550 && intProperty < 700) return intProperty / 10.0f;  // десятые доли
+    if (intProperty >= -45 && intProperty <= 65)  return (float) intProperty;  // градусы
+    return null;
+}
+```
+Зоны перебираются в `f1286d0 = {0, 1, 4, 7}` (строка 55) в цикле метода h() (строки 288–303), что и даёт лог `"Exterior OK (ENV_OUTSIDE_TEMPERATURE) area=0x%x → %.1f°C"`. То же свойство (291505923 = 0x11600703) читает `TempBattPillFloaterService` (пилюля °C/% в правом верхнем углу статус-бара).
+
+**Исправление в коде**: `readTempScan()` переписан под точный CentralEXAuto-паттерн:
+1. Primary = `ENV_OUTSIDE_TEMPERATURE (0x11600703)` по зонам {0,1,4,7} с двойной нормализацией (float °C / int ÷10 / int as-is, диапазон -55..70 °C).
+2. Затем hvacdigital getprop (temp_ext/exttemp).
+3. Затем AC_AMBIENT_TEMP (0x2140A377) — кабинный HVAC-датчик, не уличный; помечен как fallback. Декомпил CentralEXAuto показывает, что 0x15600502 (=HVAC_TEMPERATURE_CURRENT, 358614274) — это кабина, а не улица; AC_AMBIENT_TEMP (0x2140A377) — HVAC-зона.
+4. Затем PRECISE_COMMON fallback.
+
+Кэш tmpProp по-прежнему сбрасывается на каждом проходе (не залипает на 25°C).
+
+#### Overlay WindowManager паттерн (§4) — доказательство из CentralEXAuto
+Все три floater-сервиса (`TempBattPillFloaterService.onCreate` строка 185, `WifiFloaterService.onCreate` строка 123, `QuickAccessFloaterService` строка 1202) создают LayoutParams **одинаково**:
+```java
+new WindowManager.LayoutParams(-2/*wrap*/, sizePx, 2038/*TYPE_APPLICATION_OVERLAY*/,
+    264/*FLAG_NOT_FOCUSABLE|FLAG_NOT_TOUCH_MODAL*/, -3/*PixelFormat.TRANSLUCENT*/);
+```
+- Дефолтная позиция TempBattPill: gravity=49 (Gravity.TOP|Gravity.LEFT?), но реально читается из SharedPreferences `overlay_positions_config` с ключом `"temp_batt_pill"` через `y7.E(ctx,"temp_batt_pill",49,0,d(80))` — пользователь может её перетаскивать. Начальные x=0, y=dp(80) → 80dp от верха = под статус-баром.
+- WifiFloater: gravity=8388659 (TOP|CENTER_HORIZONTAL? нет — 8388659 = 0x800033 ≡ TOP|END? нужно уточнить; x=80, y=420dp).
+
+**Исправление в коде**: `StatusOverlay.showOnMain()` теперь:
+- использует точный набор flags `FLAG_NOT_FOCUSABLE | FLAG_NOT_TOUCH_MODAL` (=264, как в CEX), без `FLAG_LAYOUT_NO_LIMITS`;
+- format = PixelFormat.TRANSLUCENT (-3) — совпадает;
+- type = 2038 (TYPE_APPLICATION_OVERLAY) — совпадает;
+- `params.y = statusBarHeight + OVERLAY_MARGIN_TOP_DP` — полоса рисуется ПОД системным статус-баром, не перекрывая OEM иконки и не глотая их тапы;
+- лог `"StatusOverlay shown type=2038 flags=264 fmt=TRANSLUCENT path=… sb=…px y=…px (CentralEXAuto pattern)"`.
+
+`OverlayPermission.ensure()` return-value проверяется как и раньше; при отказе — `OVERLAY: path=fail`, без addView.
+
+#### CI (§2)
+Файл `.github/workflows/build.yml` создан локально. Пуш отклонён: PAT без scope `workflow` — см. `/home/user/work/build.yml.README` с инструкцией как включить. Зелёный URL будет добавлен сразу после того, как workflow попадёт в репо и отработает. **Зелёного CI-run URL на данный момент нет — не вру**.
+
+#### Что подтверждено декомпилом
+- ✅ Window type = 2038, flags = 264 (NOT_FOCUSABLE|NOT_TOUCH_MODAL), format = -3 TRANSLUCENT (прямые цитаты из TempBattPill/Wifi/QuickAccess конструкторов).
+- ✅ Наружная температура читается из ENV_OUTSIDE_TEMPERATURE 0x11600703, зоны {0,1,4,7}, с двойной нормализацией (цитата из TempStepperService.i() строка 355).
+- ✅ Это Float °C в валидном диапазоне; int fallback /10.
+- 🟡 AC_AMBIENT_TEMP = 0x2140A377 — кабинный, не уличный (оставлен как fallback на случай прошивок без ENV_OUTSIDE).
+- 🟡 Точная позиция y-координаты под статус-баром калибруется по `status_bar_height` реса; начальная y=80dp у pill — это значение по умолчанию CentralEXAuto (при экране 1920×1080, status bar ~27dp).
