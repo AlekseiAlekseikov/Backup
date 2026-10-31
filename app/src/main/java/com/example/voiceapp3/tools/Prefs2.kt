@@ -45,10 +45,18 @@ object Prefs2 {
         return c || d
     }
 
-    fun putString(c: Context, key: String, value: String) {
+    fun putString(c: Context, key: String, value: String?) {
         val app = c.applicationContext
-        try { cps(app).edit().putString(key, value).commit() } catch (_: Throwable) {}
-        try { dps(app).edit().putString(key, value).commit() } catch (_: Throwable) {}
+        try {
+            val ed = cps(app).edit()
+            if (value == null) ed.remove(key) else ed.putString(key, value)
+            ed.commit()
+        } catch (_: Throwable) {}
+        try {
+            val ed = dps(app).edit()
+            if (value == null) ed.remove(key) else ed.putString(key, value)
+            ed.commit()
+        } catch (_: Throwable) {}
     }
 
     fun getString(c: Context, key: String, default: String? = null): String? {
