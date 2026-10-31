@@ -427,42 +427,114 @@ object ScreenBrightness {
         }
         if (persisted) Prefs2.putBoolean(ctx, PREF_KEEP_AWAKE_APPLIED, enabled)
     }
-
     /**
-     * iter19: Самое первое чтение screen_off_timeout — ДО любых записей со стороны APK.
-     * Вызывается из App.onCreate перед ensureKeepAwake и перед runBootDiag.
-     * Результат кладём в Prefs2 (durable_boot_readback, durable_boot_uptime_s,
-     * durable_boot_wrote_before_check=false). Если приложение что-то записало
-     * до этого момента — wrote_before_check=true и это видно в строке вердикта.
+     * iter20: Синхронное первое чтение screen_off_timeout — ДО любых записей.
+     *
+     * Отличия от iter19:
+     *  - Не делает вложенного BgWorker.post: чтение выполняется в вызывающем таске
+     *    последовательно, потом сразу же вердикт (устранена гонка потоков из §2).
+     *  - Идентичность загрузки через /proc/sys/kernel/random/boot_id: при новом boot_id
+     *    сбрасываются durable_boot_readback_ts и durable_after_reboot_logged,
+     *    иначе проверка после ребута никогда не срабатывала (§1).
+     *  - Ограниченный ретрай root-канала 3×3с с AdbClient.start() между попытками (§3).
+     *  - При получении `null` или пустом ответе — вердикт NO_VALUE, не FAILED.
+     *  - Возвращает data-class с результатом; checkDurableAfterReboot теперь принимает его.
      */
-    fun capturePreWriteBootReadback(ctx: Context) {
-        val app = ctx.applicationContext
-        if (Prefs2.getLong(app, "durable_boot_readback_ts", 0L) != 0L) return
-        BgWorker.post("ScreenBrightness.preBootReadback") {
-            val uptimeS = try {
-                Runtime.getRuntime().exec(arrayOf("sh","-c","cat /proc/uptime")).inputStream
-                    .bufferedReader().readText().trim().split(" ")[0].toDouble().toLong()
-            } catch (_: Throwable) { -1L }
-            val (rc, out) = AdbClient.execute(
+    data class BootReadback(
+        val actual: String,
+        val stayOn: String,
+        val uptimeS: Long,
+        val bootIdShort: String,
+        val state: String,
+        val attempt: Int,
+        val rc: Int,
+        val failed: Boolean,        // не смогли прочитать (root-канал)
+        val wroteBeforeCheck: Boolean
+    )
+
+    private fun doPreWriteBootReadback(app: Context): BootReadback {
+        // ---- boot_id guard (iter20 §1): при смене boot_id сбрасываем флаги ----
+        val bootId = try { File("/proc/sys/kernel/random/boot_id").readText().trim() } catch (_: Throwable) { "" }
+        val bootIdShort = bootId.take(8)
+        val savedBootId = Prefs2.getString(app, "durable_boot_id", "") ?: ""
+        if (savedBootId != bootId) {
+            Prefs2.putString(app, "durable_boot_id", bootId)
+            Prefs2.putLong(app, "durable_boot_readback_ts", 0L)
+            Prefs2.putBoolean(app, "durable_after_reboot_logged", false)
+        }
+        val alreadyRead = Prefs2.getLong(app, "durable_boot_readback_ts", 0L) != 0L
+        val uptimeS = try {
+            Runtime.getRuntime().exec(arrayOf("sh","-c","cat /proc/uptime")).inputStream
+                .bufferedReader().readText().trim().split(" ")[0].toDouble().toLong()
+        } catch (_: Throwable) { -1L }
+
+        if (alreadyRead) {
+            return BootReadback(actual = "", stayOn = "", uptimeS = uptimeS,
+                bootIdShort = bootIdShort, state = "already-read",
+                attempt = 0, rc = -1, failed = true, wroteBeforeCheck = true)
+        }
+
+        var actual = ""; var stayOn = ""; var rc = -1; var attempt = 0; var state = "init"
+        // ---- retry 3×3s (iter20 §3) ----
+        for (i in 1..3) {
+            attempt = i
+            state = AdbClient.currentState().toString()
+            if (state != "CONNECTED" && state != "ROOT") {
+                AdbClient.start()
+                Thread.sleep(1500)
+            }
+            state = AdbClient.currentState().toString()
+            val (rc1, out) = AdbClient.execute(
                 "settings get system screen_off_timeout 2>&1; echo ---; settings get global stay_on_while_plugged_in 2>&1",
                 5000, expectRoot = true)
+            rc = rc1
             val lines = out.lines().map { it.trim() }
-            val actual = lines.firstOrNull { it.isNotBlank() && it != "null" } ?: ""
-            val stayOn = lines.dropWhile { it != "---" }.drop(1).firstOrNull { it.isNotBlank() } ?: ""
-            Prefs2.putLong(app, "durable_boot_readback_ts", SystemClock.elapsedRealtime())
-            Prefs2.putString(app, "durable_boot_readback_val", actual)
-            Prefs2.putString(app, "durable_boot_readback_stayon", stayOn)
-            Prefs2.putLong(app, "durable_boot_uptime_s", uptimeS)
-            Prefs2.putBoolean(app, "durable_boot_wrote_before_check", false)
-            AppLog.i(TAG, "DURABLE_PREBOOT_READBACK: actual=$actual stay_on=$stayOn uptime=${uptimeS}s rc=$rc wrote_before_check=false")
+            val v = lines.firstOrNull { it.isNotBlank() && !it.startsWith("---") } ?: ""
+            if (v.isNotBlank() && v != "null" && rc1 == 0) {
+                actual = v
+                stayOn = lines.dropWhile { it != "---" }.drop(1).firstOrNull { it.isNotBlank() } ?: ""
+                state = AdbClient.currentState().toString()
+                break
+            }
+            if (i < 3) Thread.sleep(3000)
+        }
+        val failed = actual.isBlank() || rc != 0
+        if (failed) {
+            AppLog.w(TAG, "DURABLE_PREBOOT_READBACK: failed reason=root-channel actual=\"$actual\" rc=$rc uptime=${uptimeS}s boot_id=$bootIdShort state=$state attempt=$attempt")
+            // Не сохраняем прочитанное (пустое) как итоговое — оставляем ts=0,
+            // чтобы следующий вызов (из ensureKeepAwake после поднятия канала) мог попробовать ещё раз.
+            return BootReadback(actual = actual, stayOn = stayOn, uptimeS = uptimeS,
+                bootIdShort = bootIdShort, state = state, attempt = attempt, rc = rc,
+                failed = true, wroteBeforeCheck = false)
+        }
+        Prefs2.putLong(app, "durable_boot_readback_ts", SystemClock.elapsedRealtime())
+        Prefs2.putString(app, "durable_boot_readback_val", actual)
+        Prefs2.putString(app, "durable_boot_readback_stayon", stayOn)
+        Prefs2.putLong(app, "durable_boot_uptime_s", uptimeS)
+        Prefs2.putBoolean(app, "durable_boot_wrote_before_check", false)
+        AppLog.i(TAG, "DURABLE_PREBOOT_READBACK: actual=$actual stay_on=$stayOn uptime=${uptimeS}s boot_id=$bootIdShort state=$state attempt=$attempt rc=$rc wrote_before_check=false")
+        return BootReadback(actual = actual, stayOn = stayOn, uptimeS = uptimeS,
+            bootIdShort = bootIdShort, state = state, attempt = attempt, rc = rc,
+            failed = false, wroteBeforeCheck = false)
+    }
+
+    /**
+     * iter20: Единая точка входа при старте — один BgWorker пост, внутри которого
+     * сначала читаем (doPreWriteBootReadback), сразу же вердикт (checkDurableAfterReboot),
+     * и только потом ensureKeepAwake/bootDiag — больше нет гонки двух постов.
+     */
+    fun bootDurableCheckAndThen(ctx: Context, afterRead: () -> Unit) {
+        val app = ctx.applicationContext
+        BgWorker.post("ScreenBrightness.durableCheck") {
+            val rb = doPreWriteBootReadback(app)
+            checkDurableAfterReboot(app, rb)
+            afterRead()
         }
     }
 
     /**
      * Применить keep-awake если pref включен (boot-path/service-startup).
-     * На вызывающем потоке — только планирование фоновой работы.
-     * iter19: порядок — checkDurableAfterReboot (читает сохранённый pre-boot value)
-     * ДО applyKeepAwakeInternal; runBootDiag — только наблюдение, без settings put.
+     * iter19/20: вызывается ПОСЛЕ doPreWriteBootReadback+checkDurableAfterReboot.
      */
     fun ensureKeepAwake(ctx: Context) {
         val app = ctx.applicationContext
@@ -473,9 +545,7 @@ object ScreenBrightness {
             BgWorker.post("ScreenBrightness.bootDiag") { runBootDiag(app) }
         }
         BgWorker.post("ScreenBrightness.ensureKeepAwake") {
-            // iter19: сначала разметка durable-проверки (на основании pre-boot значения),
-            // потом уже применение MAX и всё остальное.
-            checkDurableAfterReboot(app)
+            // iter20: durable-чтение+вердикт уже отработали в bootDurableCheckAndThen (до вызова ensureKeepAwake).
             val expected = if (enabled) SCREEN_OFF_MAX else Prefs2.getLong(app, PREF_ORIGINAL_TIMEOUT, 600000L).toInt()
             val current = readSystem(app, Settings.System.SCREEN_OFF_TIMEOUT)
             val needReapply = enabled && (current == null || current != SCREEN_OFF_MAX)
@@ -689,32 +759,38 @@ echo '--- reverted ---'; settings get system screen_off_timeout 2>&1"""
     }
 
     /**
-     * iter19: сверка долговечности после ребута на ОСНОВАНИИ САМОГО ПЕРВОГО чтения
-     * (из capturePreWriteBootReadback, снятого ДО любых записей со стороны APK).
-     * wrote_before_check=false — гарантия честности. При позднем старте — skipped reason=late-start.
-     * Вызывается синхронно в BgWorker из ensureKeepAwake ДО applyKeepAwakeInternal.
+     * iter20: сверка долговечности после ребута — принимает результат BootReadback
+     * (снятый СРАЗУ в том же BgWorker таске, до записей), без дополнительного BgWorker-поста.
+     * wrote_before_check=false — гарантия честности. При late-start → skipped; при failed
+     * чтении (root-channel) → skipped reason=no-preboot-readback; при null/пустом actual → NO_VALUE.
      */
-    private fun checkDurableAfterReboot(ctx: Context) {
-        val readbackTs = Prefs2.getLong(ctx, "durable_boot_readback_ts", 0L)
+    private fun checkDurableAfterReboot(ctx: Context, rb: BootReadback) {
         val expected = Prefs2.getString(ctx, "durable_expected_timeout", "2147483647") ?: "2147483647"
-        if (readbackTs == 0L) {
-            AppLog.i(TAG, "DURABLE_AFTER_REBOOT: skipped reason=no-preboot-readback")
+        if (Prefs2.getBoolean(ctx, "durable_after_reboot_logged", false)) return
+
+        // already-read не должно доходить сюда из bootDurableCheckAndThen (он переустановил флаги
+        // при новом boot_id), но страхуемся.
+        val uptimeMin = if (rb.uptimeS > 0) (rb.uptimeS / 60).toInt() else -1
+
+        if (rb.failed) {
+            AppLog.i(TAG, "DURABLE_AFTER_REBOOT: skipped reason=no-preboot-readback uptime=${uptimeMin}m state=${rb.state} attempt=${rb.attempt}")
+            // НЕ ставим durable_after_reboot_logged — дадим шанс на следующем ensureKeepAwake
+            // прочитать ещё раз, если root-канал поднимется позже.
             return
         }
-        if (Prefs2.getBoolean(ctx, "durable_after_reboot_logged", false)) return
-        val uptimeS = Prefs2.getLong(ctx, "durable_boot_uptime_s", -1L)
-        val uptimeMin = if (uptimeS > 0) (uptimeS / 60).toInt() else -1
-        val wroteBeforeCheck = Prefs2.getBoolean(ctx, "durable_boot_wrote_before_check", true)
-        val actual = (Prefs2.getString(ctx, "durable_boot_readback_val", "") ?: "").trim()
-        val stayOn = (Prefs2.getString(ctx, "durable_boot_readback_stayon", "") ?: "").trim()
-
         if (uptimeMin < 0 || uptimeMin > 10) {
-            AppLog.i(TAG, "DURABLE_AFTER_REBOOT: skipped reason=late-start uptime=${uptimeMin}m wrote_before_check=$wroteBeforeCheck")
+            AppLog.i(TAG, "DURABLE_AFTER_REBOOT: skipped reason=late-start uptime=${uptimeMin}m wrote_before_check=${rb.wroteBeforeCheck}")
             Prefs2.putBoolean(ctx, "durable_after_reboot_logged", true)
             return
         }
-        val ok = actual == expected
-        AppLog.i(TAG, "DURABLE_AFTER_REBOOT: expected=$expected actual=${actual.ifEmpty { "(empty)" }} stay_on=$stayOn uptime=${uptimeMin}m wrote_before_check=$wroteBeforeCheck → ${if (ok) "OK" else "FAILED"}")
+        val actual = rb.actual.trim()
+        val stayOn = rb.stayOn.trim()
+        val verdict = when {
+            actual.isEmpty() || actual == "null" -> "NO_VALUE"
+            actual == expected -> "OK"
+            else -> "FAILED"
+        }
+        AppLog.i(TAG, "DURABLE_AFTER_REBOOT: expected=$expected actual=${actual.ifEmpty { "(empty)" }} stay_on=$stayOn uptime=${uptimeMin}m wrote_before_check=${rb.wroteBeforeCheck} → $verdict")
         Prefs2.putBoolean(ctx, "durable_after_reboot_logged", true)
     }
 

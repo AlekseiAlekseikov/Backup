@@ -30,15 +30,10 @@ class App : Application() {
             "${Prefs2.diag(this, NetworkTtl.PREF_TTL_65_ACTIVE)} " +
             "${Prefs2.diag(this, ScreenBrightness.PREF_KEEP_AWAKE)} " +
             "${Prefs2.diag(this, ScreenBrightness.PREF_REMEMBER)}")
-        // iter19: САМОЕ ПЕРВОЕ чтение screen_off_timeout ДО любых записей со стороны APK
-        // (для честной проверки DURABLE_AFTER_REBOOT). Это должно случиться раньше
-        // ensureKeepAwake и раньше runBootDiag — они обе имеют право писать settings.
-        BgWorker.post("App.durablePreRead") { ScreenBrightness.capturePreWriteBootReadback(this) }
-        // Итерация 12: ensureKeepAwake при старте процесса (чтобы при ребуте
-        // или прибитии процесса системой фича «Не гасить экран» применилась
-        // автоматически — не дожидаясь входа в UI).
-        // iter16: ensureKeepAwake — на BgWorker, не на main.
-        BgWorker.post("App.ensureKeepAwake") { ScreenBrightness.ensureKeepAwake(this) }
+        // iter20: ОДИН BgWorker-пост — чтение screen_off_timeout ДО любых записей (с ретраем root-канала),
+        // сразу же вердикт DURABLE_AFTER_REBOOT, и только потом ensureKeepAwake/runBootDiag.
+        // Устранена гонка потоков из iter19 (два независимых поста на 4-поточном пуле).
+        ScreenBrightness.bootDurableCheckAndThen(this) { ScreenBrightness.ensureKeepAwake(this) }
         // iter16: инициализируем наблюдателя дверей (для механизма "стекло при
         // открытии двери") ВНЕ зависимости от EXTRA_BOOT_RESTORE — раньше он
         // вызывался только из boot-ветки, поэтому при обычном запуске не работал.
