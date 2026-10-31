@@ -126,27 +126,54 @@ object AppPerformance {
     fun setKeepAliveApps(context: Context, packages: List<String>): ToolsResult {
         val joined = packages.joinToString(",")
         getKeepAlivePrefs(context).edit().putString(PREF_PACKAGES, joined).apply()
-        
-        // Применяем защиту в adb / system (deviceidle whitelist + oom_score_adj)
+        BgWorker.assertNotMain("AppPerformance.setKeepAliveApps")
+        val steps = mutableListOf<ToolsStep>()
+        // Применяем защиту в adb / system (deviceidle whitelist + oom_score_adj),
+        // затем ЧИТАЕМ обратно и ставим OK только при подтверждении (iter16 fix).
         for (pkg in packages) {
-            AdbClient.execute("dumpsys deviceidle whitelist +$pkg 2>/dev/null")
-            AdbClient.execute("for pid in " + "$" + "(pidof $pkg); do echo -900 > /proc/" + "$" + "pid/oom_score_adj 2>/dev/null; done")
+            try { AdbClient.execute("dumpsys deviceidle whitelist +$pkg 2>/dev/null", 5000) } catch (_: Throwable) {}
+            try { AdbClient.execute("for pid in \$(pidof $pkg); do echo -900 > /proc/\$pid/oom_score_adj 2>/dev/null; done", 5000) } catch (_: Throwable) {}
+            val verify = verifyKeepAlive(pkg)
+            val ok = verify.first
+            val msg = "KEEP_ALIVE: pkg=$pkg whitelisted=${verify.second} oom=${verify.third}"
+            AppLog.i("CENTRAL_AppPerformance", msg)
+            steps.add(ToolsStep(
+                step = "keep_alive_$pkg",
+                command = "deviceidle whitelist + oom_score_adj -900; verify",
+                startedAtMs = System.currentTimeMillis(), finishedAtMs = System.currentTimeMillis(),
+                exitCode = if (ok) 0 else 1, stdout = msg, stderr = "",
+                expected = "whitelisted=true oom=-900", actual = msg,
+                status = if (ok) ToolsStep.Status.OK else ToolsStep.Status.PARTIAL
+            ))
         }
-
-        val step = ToolsStep(
-            step = "keep_alive_save",
-            command = "whitelist + oom_score_adj (-900)",
-            startedAtMs = System.currentTimeMillis(),
-            finishedAtMs = System.currentTimeMillis(),
-            exitCode = 0,
-            stdout = "Сохранено активных приложений: ${packages.size}",
-            status = ToolsStep.Status.OK
-        )
         return ToolsResult(
             action = "perf.saveKeepAlive",
             title = "Всегда активные приложения",
-            steps = listOf(step)
+            steps = steps
         )
+    }
+
+    /** iter16: ПРОВЕРКА применения whitelist и oom_score_adj. */
+    private fun verifyKeepAlive(pkg: String): Triple<Boolean, Boolean, String> {
+        return try {
+            val (_, wlOut) = AdbClient.execute("dumpsys deviceidle whitelist | grep -F $pkg", 3000)
+            val whitelisted = wlOut.contains(pkg)
+            val (_, oomOut) = AdbClient.execute("for p in \$(pidof $pkg); do printf \"%s:\" \$p; cat /proc/\$p/oom_score_adj 2>/dev/null; echo; done", 3000)
+            val oom = oomOut.replace('\n', ' ').trim().take(80)
+            val ok = whitelisted && (oom.contains("-900") || oom.isEmpty())
+            Triple(ok, whitelisted, oom.ifEmpty { "(process not running)" })
+        } catch (t: Throwable) {
+            Triple(false, false, "err: ${t.message}")
+        }
+    }
+
+    /** iter16: Применить keep-alive на буте (чтобы whitelist не терялся после рестарта). */
+    fun applyKeepAliveOnBoot(context: Context) {
+        BgWorker.post("AppPerformance.keepAliveBoot") {
+            val pkgs = getKeepAliveApps(context)
+            if (pkgs.isEmpty()) return@post
+            setKeepAliveApps(context, pkgs)
+        }
     }
 
     fun getKeepAliveAppsJson(context: Context): JsonArray {

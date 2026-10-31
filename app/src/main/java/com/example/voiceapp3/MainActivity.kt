@@ -18,6 +18,7 @@ import com.example.voiceapp3.ui.UiBridge
 import com.example.voiceapp3.tools.AppLog
 import android.os.Process
 import android.os.SystemClock
+import android.view.Choreographer
 
 /**
  * Оболочка нового интерфейса (фаза 1 — только UI).
@@ -73,6 +74,14 @@ class MainActivity : AppCompatActivity() {
         AppTheme.applyToWindow(this)
         if (android.os.Build.VERSION.SDK_INT >= 29) {
             window.decorView.isForceDarkAllowed = false
+        }
+        // iter16: замер первого кадра (Choreographer postAtFrontOfQueue).
+        // Это единственная цифра "время до первого кадра" — без неё жалоба
+        // на "белый экран" не диагностируема.
+        window.decorView.viewTreeObserver.addOnWindowFocusChangeListener { /*placeholder*/ }
+        android.view.Choreographer.getInstance().postFrameCallback {
+            val dt = SystemClock.uptimeMillis() - t0
+            AppLog.i("CENTRAL_MainActivity", "MainActivity FIRST_FRAME dt=${dt}ms (onCreate→first frame)")
         }
 
         setContentView(R.layout.activity_main)

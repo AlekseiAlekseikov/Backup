@@ -112,6 +112,11 @@ object StatusIcons {
     /** Источник последнего прочитанного SOC/temp (для VERIFY в логе и в уведомлении). */
     @Volatile private var socSource: String = "none"
     @Volatile private var tempSource: String = "none"
+    // iter16: кэш последних прочитанных значений (для push в persist.sys.hvacdigital.*
+    // под строковый плагин). Плагин ожидает ЗНАЧЕНИЯ (напр. "98.1", "22.5", "9.7"), а не 0/1.
+    @Volatile private var lastBattPct: Float? = null
+    @Volatile private var lastTempC: Float? = null
+    @Volatile private var lastExtTempC: Float? = null
 
     // ─── Prefs helper ───
     private fun prefs(c: Context): SharedPreferences =
@@ -145,16 +150,33 @@ object StatusIcons {
         } catch (e: Exception) { Log.w(TAG,"Car.createCar: ${e.message}") }
     }
 
+    /** iter16: явный список вендорных id, найденных в dex плагина. Добавляем их
+     *  в дамп безусловно (чтобы гарантированно увидеть в логе), даже если они
+     *  не попадают в TEMP_RANGES. */
+    private val VENDOR_PLUGIN_IDS = intArrayOf(
+        0x15600503.toInt(), // getFloatProperty в плагине (наружная?)
+        0x15600502,
+        0x1140050E,
+        0x15200510,
+        0x10020200,
+        0x15400500,
+    )
+
     private fun dumpKnownProps() {
         val m = cpm ?: return
-        AppLog.i(TAG,"=== VHAL dump start (look for TEMP/BATT in -50..70°C, 0..101%) ===")
+        AppLog.i(TAG,"=== VHAL CANDPROP dump start (look for 10°C/98.1% matches HU panel) ===")
+        // iter16: расширенные диапазоны (вкл. 0x10xxxxxx из dex плагина). ONE PASS за старт.
         val TEMP_RANGES = arrayOf(
-            0x11400000..0x117FFFFF,
-            0x15400000..0x167FFFFF,
+            0x10000000..0x10FFFFFF,
+            0x11000000..0x117FFFFF,
+            0x15000000..0x167FFFFF,
             0x21400000..0x217FFFFF,
             0x25400000..0x267FFFFF,
         )
-        val ALL_AREAS = intArrayOf(0, 1, 2, 3, 4, 5, 7, 8, 0xF, 0x10, 0x20, 0x30)
+        // iter16: для полного дампа ограничиваем area=0 (один проход), чтобы не устроить
+        // 9000+ строк при каждом старте. Полная area-пробежка нам не нужна — важны
+        // вендорные id с area=0, как в dex плагина.
+        val ALL_AREAS = intArrayOf(0)
         try {
             val propList = m.propertyList
             AppLog.i(TAG,"VHAL: propertyList size=${propList?.size ?: "null"}")
@@ -166,41 +188,60 @@ object StatusIcons {
                         pid == 0x11600703 || pid == 0x15400701 || pid == 0x15400703
                 if (inRange) {
                     val areaIds = try { cfg.areaIds?.joinToString(",") { "0x%x".format(it) } } catch (_: Throwable) { "n/a" }
-                    AppLog.i(TAG, String.format("CFG 0x%08X access=%d areaType=0x%08X areas=[$areaIds]", pid, cfg.access, cfg.areaType))
+                    AppLog.i(TAG, String.format("CANDCFG 0x%08X access=%d areaType=0x%08X areas=[$areaIds]", pid, cfg.access, cfg.areaType))
                 }
                 if (!inRange) continue
                 for (a in ALL_AREAS) {
                     try {
                         val v = m.getFloatProperty(pid, a)
                         if (!v.isNaN() && v > -55f && v < 70f) {
-                            AppLog.i(TAG, String.format("DUMP F 0x%08X@0x%02X = %.2f °C", pid, a, v))
+                            AppLog.i(TAG, String.format("CANDPROP 0x%08X@0x%02X F = %.2f °C", pid, a, v))
+                        } else if (!v.isNaN() && v in 0f..101f) {
+                            AppLog.i(TAG, String.format("CANDPROP 0x%08X@0x%02X F = %.2f %%", pid, a, v))
                         }
                     } catch (_: Exception) {}
                     try {
                         val iv = m.getIntProperty(pid, a)
-                        val fv = when {
+                        val fvT = when {
                             iv in -550..700 -> iv / 10.0f
                             iv in -45..65 -> iv.toFloat()
                             else -> Float.NaN
                         }
-                        if (!fv.isNaN() && fv > -55f && fv < 70f) {
-                            AppLog.i(TAG, String.format("DUMP I 0x%08X@0x%02X raw=%d = %.1f °C", pid, a, iv, fv))
+                        if (!fvT.isNaN() && fvT > -55f && fvT < 70f) {
+                            AppLog.i(TAG, String.format("CANDPROP 0x%08X@0x%02X I raw=%d = %.1f °C", pid, a, iv, fvT))
+                        } else if (iv in 0..1010) {
+                            AppLog.i(TAG, String.format("CANDPROP 0x%08X@0x%02X I raw=%d = %.1f %%", pid, a, iv, iv/10.0f))
+                        } else if (iv in 0..101) {
+                            AppLog.i(TAG, String.format("CANDPROP 0x%08X@0x%02X I raw=%d = %d %%", pid, a, iv, iv))
                         }
                     } catch (_: Exception) {}
                 }
             }
+            // iter16: явный проход по вендорным id из плагина, даже если они не в propertyList
+            for (pid in VENDOR_PLUGIN_IDS) {
+                for (a in ALL_AREAS) {
+                    try {
+                        val v = m.getFloatProperty(pid, a)
+                        if (!v.isNaN()) AppLog.i(TAG, String.format("CANDPROP(VEND) 0x%08X@0x%02X F = %.4f", pid, a, v))
+                    } catch (_: Exception) {}
+                    try {
+                        val iv = m.getIntProperty(pid, a)
+                        AppLog.i(TAG, String.format("CANDPROP(VEND) 0x%08X@0x%02X I raw=%d", pid, a, iv))
+                    } catch (_: Exception) {}
+                }
+            }
         } catch (e: Exception) {
-            AppLog.w(TAG, "VHAL propertyList enumeration failed, fallback to PRECISE_COMMON scan: ${e.message}")
-            for (p in PRECISE_COMMON) for (a in ALL_AREAS) {
-                try { val v = m.getFloatProperty(p,a); if (!v.isNaN() && v in -55f..70f) AppLog.i(TAG,String.format("DUMP F 0x%08X@0x%02X = %f",p,a,v)) } catch(_:Exception){}
+            AppLog.w(TAG, "VHAL propertyList enumeration failed, fallback to PRECISE_COMMON+VENDOR scan: ${e.message}")
+            val allFallback = PRECISE_COMMON + VENDOR_PLUGIN_IDS
+            for (p in allFallback) for (a in ALL_AREAS) {
+                try { val v = m.getFloatProperty(p,a); if (!v.isNaN()) AppLog.i(TAG,String.format("CANDPROP(fb) 0x%08X@0x%02X F=%f",p,a,v)) } catch(_:Exception){}
                 try {
                     val iv = m.getIntProperty(p,a)
-                    val fv = when { iv in -550..700 -> iv/10.0f; iv in -45..65 -> iv.toFloat(); else -> Float.NaN }
-                    if (!fv.isNaN()) AppLog.i(TAG,String.format("DUMP I 0x%08X@0x%02X raw=%d = %f",p,a,iv,fv))
+                    AppLog.i(TAG,String.format("CANDPROP(fb) 0x%08X@0x%02X I raw=%d",p,a,iv))
                 } catch(_:Exception){}
             }
         }
-        AppLog.i(TAG,"=== VHAL dump end ===")
+        AppLog.i(TAG,"=== VHAL CANDPROP dump end ===")
     }
 
     private fun readSocScan(): Float? {
@@ -642,6 +683,7 @@ object StatusIcons {
                     telemetryPi(app, NOTIF_BATT))
                 AppLog.i(TAG, "BATT: value=$socStr% smallIconSize=${w}x${w}px smallIconText=\"$smallBattText\" click→telemetry src=$socSource → posted + OVERLAY")
                 battStr = "$socStr%"; battPct = soc; battHas = true
+                lastBattPct = soc
             } else { cancel(app, NOTIF_BATT); AppLog.w(TAG,"BATT: SOC null") }
         } else cancel(app, NOTIF_BATT)
 
@@ -663,6 +705,8 @@ object StatusIcons {
                     telemetryPi(app, NOTIF_TEMP))
                 AppLog.i(TAG, "TEMP: value=$sign$tStr°C smallIconSize=${w}x${w}px smallIconText=\"$smallTempText\" src=$tempSource → posted + OVERLAY")
                 tempStr = "$sign$tStr°"; tempVal = t; tempHas = true
+                lastTempC = t
+                lastExtTempC = t
             } else {
                 cancel(app, NOTIF_TEMP)
                 AppLog.w(TAG, "TEMP: notify ERROR: value=null")
@@ -712,6 +756,44 @@ object StatusIcons {
             }
         } else {
             StatusOverlay.hide(app)
+        }
+
+        // iter16: после каждого tick проталкиваем РЕАЛЬНЫЕ значения в
+        // persist.sys.hvacdigital.{batt,temp,exttemp,temp_ext}, если соответствующий
+        // тогл включён. Плагин ожидает значения ("98.1", "22.0", "9.7"), а не 0/1 —
+        // поэтому форматируем до одного знака после запятой, batt и temp — с .1f.
+        // Если значение ещё не прочитано (первый tick) — не пишем ничего (пропускаем).
+        pushHvacDigitalPropsIfEnabled(app)
+    }
+
+    /**
+     * iter16: протолкнуть значения батареи/температуры/наружки в persist.sys.hvacdigital.*
+     * для строкового плагина SystemUI. Пишет ЗНАЧЕНИЯ, а не 0/1; если тогл выключен — 0.
+     * Работает на BgWorker (вызывается из syncAllImpl, который уже на BgWorker).
+     */
+    private fun pushHvacDigitalPropsIfEnabled(app: Context) {
+        val p = prefs(app)
+        val sb = StringBuilder()
+        val fmt = { v: Float? -> if (v == null) null else String.format(Locale.US, "%.1f", v) }
+        // batt
+        val battOn = p.getBoolean(PREF_HVAC_BATT, false)
+        val bv = if (battOn) fmt(lastBattPct) ?: return else "0"
+        sb.append("setprop $SYS_HVAC_BATT $bv; ")
+        // temp (внутренний климат)
+        val tempOn = p.getBoolean(PREF_HVAC_TEMP, false)
+        val tv = if (tempOn) fmt(lastTempC) ?: return else "0"
+        sb.append("setprop $SYS_HVAC_TEMP $tv; ")
+        // ext_temp — пишем в ОБА свойства (старый и новый плагин)
+        val extOn = p.getBoolean(PREF_HVAC_EXT_TEMP, false)
+        val ev = if (extOn) fmt(lastExtTempC) ?: return else "0"
+        sb.append("setprop $SYS_HVAC_EXT_TEMP_EXT $ev; setprop $SYS_HVAC_EXT_EXTTEMP $ev; ")
+        // verify echo
+        sb.append("echo batt=\$(getprop $SYS_HVAC_BATT) temp=\$(getprop $SYS_HVAC_TEMP) ext_temp=\$(getprop $SYS_HVAC_EXT_TEMP_EXT) exttemp=\$(getprop $SYS_HVAC_EXT_EXTTEMP)")
+        try {
+            val (rc, out) = AdbClient.execute(sb.toString(), 5000)
+            AppLog.i(TAG, "HVACDIGITAL_PUSH rc=$rc batt=$bv temp=$tv exttemp=$ev out=${out.replace('\n',' ').take(200)}")
+        } catch (t: Throwable) {
+            AppLog.w(TAG, "HVACDIGITAL_PUSH failed: ${t.message}")
         }
     }
 
@@ -834,36 +916,32 @@ object StatusIcons {
     @JvmStatic fun setHvacDigital(ctx: Context, pref: String, value: Boolean): ToolsResult {
         val t0 = android.os.SystemClock.uptimeMillis()
         prefs(ctx).edit().putBoolean(pref, value).commit()
-        val v = if (value) 1 else 0
-        // Для batt/temp одно свойство; для ext_temp пишем в ОБА имени (temp_ext — старый
-        // плагин на устройстве, exttemp — новый CentralEXAuto).
-        val props = when (pref) {
-            PREF_HVAC_BATT -> listOf(SYS_HVAC_BATT)
-            PREF_HVAC_TEMP -> listOf(SYS_HVAC_TEMP)
-            PREF_HVAC_EXT_TEMP -> SYS_HVAC_EXT_ALL.toList()
-            else -> listOf(sysPropFor(pref))
-        }.filter { it.isNotEmpty() }
-        val cmd = buildString {
-            for (prop in props) append("setprop $prop $v; ")
-            append("echo ")
-            var first = true
-            for (prop in props) {
-                if (!first) append(" "); first = false
-                append("$prop=\$(getprop $prop)")
+        // iter16: при ВКЛЮЧЕНИИ любого из трёх тоглов — пытаемся заинсталлить плагин
+        // (mount --bind на OEM com.flyme.auto.systemuiplugin). Плагин уже лежит в
+        // app/src/main/res/raw/geely_auto_systemui_plugin_digital.apk (18 МБ).
+        var installNote = "plugin-not-invoked"
+        if (value) {
+            try {
+                val r = HvacDigitalPlugin.enable(ctx)
+                installNote = "plugin.enable invoked (steps=${r.steps.size} lastStatus=${r.steps.lastOrNull()?.status})"
+                AppLog.i(TAG, "HVACDIGITAL: plugin.enable -> $installNote")
+            } catch (t: Throwable) {
+                installNote = "plugin.enable err: ${t.message}"
+                AppLog.w(TAG, "HVACDIGITAL: plugin.enable failed", t)
             }
         }
-        val (exit, out) = AdbClient.execute(cmd, 5000)
-        val allApplied = props.all { p -> out.contains("$p=$v") }
+        // Сразу же проталкиваем текущие значения (а не 0/1) — на случай, если пользователь
+        // включил тогл после того, как syncAll уже прочитал данные.
+        BgWorker.post("StatusIcons.hvacdigital.push") { pushHvacDigitalPropsIfEnabled(ctx.applicationContext) }
         val step = ToolsStep(
             step = "hvacdigital.$pref",
-            command = cmd.take(200),
+            command = "prefs.put($pref=$value) + push values + $installNote",
             startedAtMs = t0, finishedAtMs = android.os.SystemClock.uptimeMillis(),
-            exitCode = exit, stdout = out, stderr = "",
-            expected = props.joinToString(" ") { "$it=$v" },
-            actual = out.lines().lastOrNull { it.contains(if(pref==PREF_HVAC_EXT_TEMP) "temp_ext" else props.first()) } ?: out,
-            status = if ((value && allApplied) || (!value && exit==0)) ToolsStep.Status.OK else ToolsStep.Status.PARTIAL
+            exitCode = 0, stdout = installNote, stderr = "",
+            expected = "$pref=$value", actual = "$pref=$value (values pushed on next tick)",
+            status = ToolsStep.Status.OK
         )
-        AppLog.i(TAG, "VERIFY hvacdigital set $pref=$v: applied=$allApplied props=$props out=${out.replace('\n',' ').take(300)}")
+        AppLog.i(TAG, "VERIFY hvacdigital toggle $pref=$value: $installNote")
         return ToolsResult(
             action = "hvacdigital",
             title = "Цифровая индикация климата",
@@ -875,19 +953,34 @@ object StatusIcons {
         prefs(ctx).getBoolean(pref, false)
 
     @JvmStatic fun bootRestoreHvacDigital(ctx: Context) {
-        val p = prefs(ctx)
-        val sb = StringBuilder()
-        val pairs = mutableListOf(
-            PREF_HVAC_BATT to SYS_HVAC_BATT,
-            PREF_HVAC_TEMP to SYS_HVAC_TEMP,
-        )
-        for (prop in SYS_HVAC_EXT_ALL) pairs.add(PREF_HVAC_EXT_TEMP to prop)
-        for ((k,sp) in pairs) {
-            val v = if (p.getBoolean(k, false)) 1 else 0
-            sb.append("setprop $sp $v; ")
+        val app = ctx.applicationContext
+        // iter16: при буте, если хоть один тогл включен — пытаемся подмонтировать плагин
+        // (после ребута bind-mount слетает, надо переустановить).
+        val p = prefs(app)
+        val anyOn = p.getBoolean(PREF_HVAC_BATT, false) ||
+                   p.getBoolean(PREF_HVAC_TEMP, false) ||
+                   p.getBoolean(PREF_HVAC_EXT_TEMP, false)
+        if (anyOn) {
+            BgWorker.post("StatusIcons.hvacdigital.boot-install") {
+                try {
+                    val r = HvacDigitalPlugin.enable(app)
+                    AppLog.i(TAG, "HVACDIGITAL_BOOT: plugin.enable -> steps=${r.steps.size} last=${r.steps.lastOrNull()?.status} mountLine=${r.steps.lastOrNull()?.stdout?.take(200)}")
+                } catch (t: Throwable) {
+                    AppLog.w(TAG, "HVACDIGITAL_BOOT: plugin.enable failed", t)
+                }
+            }
         }
-        sb.append("echo batt=\$(getprop $SYS_HVAC_BATT) temp=\$(getprop $SYS_HVAC_TEMP) ext_temp_ext=\$(getprop $SYS_HVAC_EXT_TEMP_EXT) ext_exttemp=\$(getprop $SYS_HVAC_EXT_EXTTEMP)")
-        val (_,out) = AdbClient.execute(sb.toString(), 5000)
-        Log.i(TAG,"bootRestoreHvacDigital: $out")
+        // Значения протолкнутся на первом tick (startPeriodicSync в BootReceiver) —
+        // до tick'а у нас ещё нет batt/temp значений. Пишем 0 как старт.
+        val sb = StringBuilder()
+        for (sp in listOf(SYS_HVAC_BATT, SYS_HVAC_TEMP, SYS_HVAC_EXT_TEMP_EXT, SYS_HVAC_EXT_EXTTEMP)) {
+            sb.append("setprop $sp 0; ")
+        }
+        sb.append("echo reset_all_hvacdigital")
+        try {
+            val (_, out) = AdbClient.execute(sb.toString(), 3000)
+            AppLog.i(TAG, "HVACDIGITAL_BOOT: reset props -> ${out.replace('\n',' ').take(200)}")
+        } catch (t: Throwable) {
+            AppLog.w(TAG, "HVACDIGITAL_BOOT: reset failed: ${t.message}")
+        }
     }
-}

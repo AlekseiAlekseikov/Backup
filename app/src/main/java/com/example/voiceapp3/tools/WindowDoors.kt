@@ -117,6 +117,7 @@ object WindowDoors {
 
     fun registerWakeReceiver(context: Context) {
         if (screenWakeReceiver != null) return
+        val appCtx = appContext ?: context.applicationContext
         val filter = android.content.IntentFilter().apply {
             addAction(android.content.Intent.ACTION_SCREEN_ON)
             addAction(android.content.Intent.ACTION_USER_PRESENT)
@@ -135,50 +136,52 @@ object WindowDoors {
         try {
             context.applicationContext.registerReceiver(screenWakeReceiver, filter)
         } catch (e: Throwable) {
-            Log.w(TAG, "registerWakeReceiver failed", e)
+            AppLog.w(appCtx, TAG, "registerWakeReceiver failed", e)
         }
     }
 
     private val carCallback = object : CarPropertyManager.CarPropertyEventCallback {
         override fun onChangeEvent(value: CarPropertyValue<*>) {
+            val ctx = appContext ?: return
             val propId = value.propertyId
             when (propId) {
                 PROP_DOOR_POS -> {
                     val areaId = value.areaId
                     val rawVal = (value.value as? Number)?.toInt() ?: return
-                    // rawVal == 1: открыта, rawVal == 2: закрыта
                     val isOpen = (rawVal == 1)
-                    AppLog.i(appContext ?: return, TAG,
+                    AppLog.i(ctx, TAG,
                         "DOOR_POS area=0x${Integer.toHexString(areaId)} raw=$rawVal open=$isOpen")
                     onDoorChanged(areaId, isOpen)
                 }
                 PROP_DOOR_UNLOCK_STATE -> {
-                    // Реальное событие РАЗБЛОКИРОВКИ замка (RKE unlock, или кнопка на двери).
-                    // СЮДА — а не на дверь или окно — привязан unlock-звук приветствия.
                     val rawVal = (value.value as? Number)?.toInt() ?: -1
                     val areaId = value.areaId
-                    AppLog.i(appContext ?: return, TAG,
+                    AppLog.i(ctx, TAG,
                         "DOOR_UNLOCK_STATE area=0x${Integer.toHexString(areaId)} raw=$rawVal")
-                    val ctx = appContext ?: return
                     fireUnlockSound(ctx, "PROP_DOOR_UNLOCK_STATE(0x214020bd) raw=$rawVal area=0x${Integer.toHexString(areaId)}")
                 }
                 PROP_DOOR_LOCK_STATE -> {
-                    // Только логируем; звук ЗАКРЫТИЯ играется фреймворком Geely через
-                    // Settings.System lock_car_audio_path — не дублируем.
                     val rawVal = (value.value as? Number)?.toInt() ?: -1
-                    AppLog.i(appContext ?: return, TAG,
+                    AppLog.i(ctx, TAG,
                         "DOOR_LOCK_STATE area=0x${Integer.toHexString(value.areaId)} raw=$rawVal (lock sound via Geely FW, not us)")
                 }
             }
         }
 
         override fun onErrorEvent(propId: Int, zone: Int) {
-            Log.w(TAG, "onErrorEvent prop=0x${Integer.toHexString(propId)} area=0x${Integer.toHexString(zone)}")
+            AppLog.w(appCtx, TAG, "onErrorEvent prop=0x${Integer.toHexString(propId)} area=0x${Integer.toHexString(zone)}")
         }
     }
 
     private fun getPrefs(context: Context): SharedPreferences {
-        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        // iter16: при буте N direct-boot используем device-protected storage —
+        // туда же пишутся переключатели через Settings.
+        return try {
+            context.createDeviceProtectedStorageContext()
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        } catch (_: Throwable) {
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        }
     }
 
     fun isWindowDriverOnDoor(context: Context): Boolean {
@@ -189,10 +192,28 @@ object WindowDoors {
         return getPrefs(context).getBoolean(PREF_WINDOW_OPPOSITE_ON_DOOR, false)
     }
 
+    /** iter16: вызывать из App.onCreate/VoiceAssistantService.onCreate ВНЕ
+     *  boot-ветки — раньше initCarService вызывался только при EXTRA_BOOT_RESTORE,
+     *  из-за чего при обычном запуске слушатель дверей не регистрировался. */
+    @JvmStatic fun maybeInit(context: Context) {
+        val appCtx = context.applicationContext
+        appContext = appCtx
+        val driverOn = isWindowDriverOnDoor(appCtx)
+        val oppOn = isWindowOppositeOnDoor(appCtx)
+        val unlockOn = LockSound.isUnlockSoundEnabled(appCtx)
+        AppLog.i(appCtx, TAG, "maybeInit driverOn=$driverOn oppOn=$oppOn unlockOn=$unlockOn isRegistered=$isRegistered")
+        if (driverOn || oppOn || unlockOn) {
+            initCarService(appCtx)
+        }
+    }
+
     fun initCarService(context: Context) {
         val appCtx = context.applicationContext
         appContext = appCtx
-        if (carPropertyManager != null || isRegistered) return
+        if (carPropertyManager != null || isRegistered) {
+            AppLog.i(appCtx, TAG, "initCarService: already registered, skip")
+            return
+        }
 
         try {
             car = Car.createCar(appCtx, null, 0L) { carObj, ready ->
@@ -205,7 +226,7 @@ object WindowDoors {
                             registerWakeReceiver(context)
                         }
                     } catch (e: Throwable) {
-                        Log.w(TAG, "Ошибка получения CarPropertyManager", e)
+                        AppLog.w(appCtx, TAG, "Ошибка получения CarPropertyManager", e)
                     }
                 } else {
                     carPropertyManager = null
@@ -213,37 +234,36 @@ object WindowDoors {
                 }
             }
         } catch (e: Throwable) {
-            Log.w(TAG, "Car.createCar failed", e)
+            AppLog.w(appCtx, TAG, "Car.createCar failed", e)
         }
     }
 
     private fun registerDoorListener() {
         val cpm = carPropertyManager ?: return
         if (isRegistered) return
+        val appCtx = appContext ?: return
         // Подписка на позицию двери (для режима «опустить стекло при открытии двери»).
         try {
             cpm.registerCallback(carCallback, PROP_DOOR_POS, 0.0f)
-            Log.i(TAG, "Подписка на DOOR_POS (0x16400b00) активна")
+            AppLog.i(appCtx, TAG, "registerCallback DOOR_POS=0x16400b00 OK")
         } catch (e: Throwable) {
-            Log.w(TAG, "registerCallback DOOR_POS failed", e)
+            AppLog.w(appCtx, TAG, "registerCallback DOOR_POS failed: ${e.message}")
         }
-        // Подписка на СОБЫТИЯ ЗАМКА (P4): звук открытия привязан к unlock-state,
-        // а не к факту открытия двери (дверь можно открыть и изнутри при снятом замке,
-        // и тем более не к позиции стекла — у того другое свойство PROP_WINDOW_POS).
+        // Подписка на СОБЫТИЯ ЗАМКА (P4): звук открытия привязан к unlock-state.
         try {
             cpm.registerCallback(carCallback, PROP_DOOR_UNLOCK_STATE, 0.0f)
-            Log.i(TAG, "Подписка на DOOR_UNLOCK_STATE (0x214020bd) активна → сюда привязан unlock-звук")
+            AppLog.i(appCtx, TAG, "registerCallback DOOR_UNLOCK_STATE=0x214020bd OK → unlock sound bound here")
         } catch (e: Throwable) {
-            Log.w(TAG, "registerCallback DOOR_UNLOCK_STATE failed: ${e.message}")
-            appContext?.let { AppLog.w(it, TAG, "registerCallback DOOR_UNLOCK_STATE failed: ${e.message}") }
+            AppLog.w(appCtx, TAG, "registerCallback DOOR_UNLOCK_STATE failed: ${e.message}")
         }
         try {
             cpm.registerCallback(carCallback, PROP_DOOR_LOCK_STATE, 0.0f)
-            Log.i(TAG, "Подписка на DOOR_LOCK_STATE (0x214020bc) активна (логируем, звук закрытия играет FW Geely)")
+            AppLog.i(appCtx, TAG, "registerCallback DOOR_LOCK_STATE=0x214020bc OK (logging only, OEM plays close sound)")
         } catch (e: Throwable) {
-            Log.w(TAG, "registerCallback DOOR_LOCK_STATE failed: ${e.message}")
+            AppLog.w(appCtx, TAG, "registerCallback DOOR_LOCK_STATE failed: ${e.message}")
         }
         isRegistered = true
+        AppLog.i(appCtx, TAG, "WindowDoors listener registered — DOOR_TO_WINDOW=$DOOR_TO_WINDOW OPPOSITE=$OPPOSITE_WINDOW")
     }
 
     /**
@@ -306,44 +326,45 @@ object WindowDoors {
         doorOpened: Boolean,
         oposta: Boolean
     ): Boolean {
+        val appCtx = appContext ?: return false
         val tag = if (oposta) "oposta " else ""
         val curPos = readWindowPos(cpm, windowAreaId)
         if (curPos == null) {
-            Log.w(TAG, "windowDriver чтение ${tag}0x${Integer.toHexString(windowAreaId)}: таймаут/ошибка VHAL")
+            AppLog.w(appCtx, TAG, "windowDriver чтение ${tag}0x${Integer.toHexString(windowAreaId)}: таймаут/ошибка VHAL")
             return false
         }
 
         if (doorOpened) {
             // k0(z2=true): приоткрываем только если окно фактически закрыто (pos ≤ 7).
             if (curPos > WINDOW_OPEN_THRESHOLD) {
-                Log.i(TAG, "janela ${tag}0x${Integer.toHexString(windowAreaId)} не закрыта (pos=$curPos) — дверь 0x${Integer.toHexString(doorAreaId)} открылась, не мешаю")
+                AppLog.i(appCtx, TAG, "janela ${tag}0x${Integer.toHexString(windowAreaId)} не закрыта (pos=$curPos) — дверь 0x${Integer.toHexString(doorAreaId)} открылась, не мешаю")
                 return false
             }
             val ok = writeWindowPos(cpm, windowAreaId, WINDOW_OPEN_POS)
             if (ok) {
                 activeVentWindows.add(windowAreaId)
-                Log.i(TAG, "janela ${tag}0x${Integer.toHexString(windowAreaId)} → POS $WINDOW_OPEN_POS (дверь 0x${Integer.toHexString(doorAreaId)} открыта); activeSet=$activeVentWindows")
+                AppLog.i(appCtx, TAG, "janela ${tag}0x${Integer.toHexString(windowAreaId)} → POS $WINDOW_OPEN_POS (дверь 0x${Integer.toHexString(doorAreaId)} открыта); activeSet=$activeVentWindows")
             } else {
-                Log.w(TAG, "windowDriver set ${tag}0x${Integer.toHexString(windowAreaId)} не удался")
+                AppLog.w(appCtx, TAG, "windowDriver set ${tag}0x${Integer.toHexString(windowAreaId)} не удался")
             }
             return ok
         } else {
             // k0(z2=false): закрываем только если окно всё ещё около POS 10.
             if (kotlin.math.abs(curPos - WINDOW_OPEN_POS) > WINDOW_CLOSE_TOLERANCE) {
-                Log.i(TAG, "janela ${tag}0x${Integer.toHexString(windowAreaId)} не около POS $WINDOW_OPEN_POS (pos=$curPos) — дверь 0x${Integer.toHexString(doorAreaId)} закрылась, не мешаю")
+                AppLog.i(appCtx, TAG, "janela ${tag}0x${Integer.toHexString(windowAreaId)} не около POS $WINDOW_OPEN_POS (pos=$curPos) — дверь 0x${Integer.toHexString(doorAreaId)} закрылась, не мешаю")
                 activeVentWindows.remove(windowAreaId)
                 return false
             }
             if (windowAreaId !in activeVentWindows) {
-                Log.i(TAG, "janela ${tag}0x${Integer.toHexString(windowAreaId)} не была открыта нами в этом цикле — не закрываю")
+                AppLog.i(appCtx, TAG, "janela ${tag}0x${Integer.toHexString(windowAreaId)} не была открыта нами в этом цикле — не закрываю")
                 return false
             }
             val ok = writeWindowPos(cpm, windowAreaId, WINDOW_CLOSED_POS)
             if (ok) {
                 activeVentWindows.remove(windowAreaId)
-                Log.i(TAG, "janela ${tag}0x${Integer.toHexString(windowAreaId)} → POS $WINDOW_CLOSED_POS (дверь 0x${Integer.toHexString(doorAreaId)} закрыта); activeSet=$activeVentWindows")
+                AppLog.i(appCtx, TAG, "janela ${tag}0x${Integer.toHexString(windowAreaId)} → POS $WINDOW_CLOSED_POS (дверь 0x${Integer.toHexString(doorAreaId)} закрыта); activeSet=$activeVentWindows")
             } else {
-                Log.w(TAG, "windowDriver set ${tag}0x${Integer.toHexString(windowAreaId)} не удался")
+                AppLog.w(appCtx, TAG, "windowDriver set ${tag}0x${Integer.toHexString(windowAreaId)} не удался")
             }
             return ok
         }
