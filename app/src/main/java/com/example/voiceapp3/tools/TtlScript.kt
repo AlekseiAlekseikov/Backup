@@ -117,8 +117,8 @@ elif [ -z "${D}TTL_REAL" ] && [ "${D}DELTA_V4" -gt 0 ] 2>/dev/null; then
 else
   REAL_SHOW=UNKNOWN; METHOD=none; VERDICT=UNVERIFIED; REASON="tcpdump ran but no ttl found and counters did not increment (delta=${D}DELTA_V4)"
 fi
-echo "TTL_CHECK: real=${D}REAL_SHOW expected=${D}EXPECTED src=${D}{SRC_IP:-unknown} dst=1.1.1.1 iface=${D}{OUT_IFACE:-any} method=${D}METHOD reason=${D}REASON ${'->'} ${D}VERDICT"
+echo "TTL_CHECK: real=${D}REAL_SHOW expected=${D}EXPECTED src=${D}{SRC_IP:-unknown} dst=1.1.1.1 iface=${D}{OUT_IFACE:-any} method=${D}METHOD reason=${D}REASON ARROW ${D}VERDICT"
 echo '=== TTL_SCRIPT end ==='
-""".trimIndent().replace("${'->'}", "\u2192")
+""".trimIndent().replace("ARROW", "\u2192")
     }
 }

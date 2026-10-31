@@ -3,6 +3,7 @@ package com.example.voiceapp3.tools
 import com.example.voiceapp3.tools.Prefs2
 
 import android.content.Context
+import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.os.Build
@@ -152,14 +153,14 @@ object ScreenBrightness {
     } catch (t: Throwable) { WriteResult(false, null, t.message) }
 
     fun captureLevel(ctx: Context) {
-        val p = prefs(ctx); if (!p.getBoolean(PREF_REMEMBER, false)) return
+        if (!Prefs2.getBoolean(ctx, PREF_REMEMBER, false)) return
         val lvl = currentLevel(ctx)
         if (lvl > 0) { Prefs2.putInt(ctx, bucketPref(ctx), lvl); AppLog.d(TAG, "captureLevel saved $lvl to ${bucketPref(ctx)}") }
     }
 
     fun restoreIfEnabled(ctx: Context) {
-        val p = prefs(ctx); if (!p.getBoolean(PREF_REMEMBER, false)) return
-        val lvl = p.getInt(bucketPref(ctx), -1)
+        if (!Prefs2.getBoolean(ctx, PREF_REMEMBER, false)) return
+        val lvl = Prefs2.cps(ctx).getInt(bucketPref(ctx), -1)
         if (lvl in MIN_LEVEL..MAX_LEVEL) {
             writeSystemInt(ctx, SETTINGS_KEY, lvl); writeSysfs(lvl); writeProp(lvl)
             AppLog.d(TAG, "restoreIfEnabled: $lvl for ${bucketPref(ctx)}")
@@ -176,7 +177,7 @@ object ScreenBrightness {
         }
     }
 
-    fun restSeconds(ctx: Context): Int = prefs(ctx).getInt(PREF_REST_SEC, 0)
+    fun restSeconds(ctx: Context): Int = Prefs2.getInt(ctx, PREF_REST_SEC, 0)
 
     data class RestOutcome(val ok: Boolean, val appliedMs: Long?, val readbackMs: Long?, val error: String?, val note: String?)
 
@@ -217,11 +218,10 @@ object ScreenBrightness {
 
     private fun cachedSerialFresh(ctx: Context): SerialInfo? {
         val c = cachedSerial
-        if (c != null && System.currentTimeMillis() - (prefs(ctx).getLong(PREF_CACHED_SERIAL_TS,0)) < SERIAL_CACHE_TTL_MS && c.serial.isNotEmpty()) return c
-        val sp = prefs(ctx)
-        val sv = sp.getString(PREF_CACHED_SERIAL,"") ?: ""
-        val src = sp.getString(PREF_CACHED_SERIAL_SRC,"") ?: ""
-        if (sv.isNotEmpty() && System.currentTimeMillis() - sp.getLong(PREF_CACHED_SERIAL_TS,0) < SERIAL_CACHE_TTL_MS) {
+        if (c != null && System.currentTimeMillis() - Prefs2.getLong(ctx, PREF_CACHED_SERIAL_TS, 0L) < SERIAL_CACHE_TTL_MS && c.serial.isNotEmpty()) return c
+        val sv = Prefs2.getString(ctx, PREF_CACHED_SERIAL, "") ?: ""
+        val src = Prefs2.getString(ctx, PREF_CACHED_SERIAL_SRC, "") ?: ""
+        if (sv.isNotEmpty() && System.currentTimeMillis() - Prefs2.getLong(ctx, PREF_CACHED_SERIAL_TS, 0L) < SERIAL_CACHE_TTL_MS) {
             val ci = SerialInfo(sv, "cache:$src", 0); cachedSerial = ci; return ci
         }
         return null
@@ -299,11 +299,9 @@ object ScreenBrightness {
 
     private fun persistSerialCache(ctx: Context, info: SerialInfo) {
         cachedSerial = info
-        prefs(ctx).edit()
-            .putString(PREF_CACHED_SERIAL, info.serial)
-            .putString(PREF_CACHED_SERIAL_SRC, info.source)
-            .putLong(PREF_CACHED_SERIAL_TS, System.currentTimeMillis())
-            .apply()
+        Prefs2.putString(ctx, PREF_CACHED_SERIAL, info.serial)
+        Prefs2.putString(ctx, PREF_CACHED_SERIAL_SRC, info.source)
+        Prefs2.putLong(ctx, PREF_CACHED_SERIAL_TS, System.currentTimeMillis())
     }
 
     /** Асинхронно (на BgWorker) запускает детекцию серийника если кэш не свежий. */
@@ -346,7 +344,7 @@ object ScreenBrightness {
 
     /** Текущее состояние фичи «Не гасить экран» — для UI-среза. */
     fun isKeepAwake(ctx: Context): Boolean =
-        prefs(ctx.applicationContext).getBoolean(PREF_KEEP_AWAKE, true)
+        Prefs2.getBoolean(ctx.applicationContext, PREF_KEEP_AWAKE, true)
 
     /**
      * Применить keep-awake ON/OFF. НА ВЫЗЫВАЮЩЕМ ПОТОКЕ — только запись pref и
@@ -376,14 +374,13 @@ object ScreenBrightness {
         AppLog.i(TAG, "SCREEN_TIMEOUT: serial match (src=${serial.source} dt=${serial.dtMs}ms) → applicable, applying enabled=$enabled")
 
         // Сохраняем оригинальное значение перед первой записью.
-        val p = prefs(ctx)
         val before = readSystem(ctx, Settings.System.SCREEN_OFF_TIMEOUT)
-        if (before != null && before != SCREEN_OFF_MAX && !p.contains(PREF_ORIGINAL_TIMEOUT)) {
+        if (before != null && before != SCREEN_OFF_MAX && !Prefs2.cps(ctx).contains(PREF_ORIGINAL_TIMEOUT)) {
             Prefs2.putLong(ctx, PREF_ORIGINAL_TIMEOUT, before.toLong())
             AppLog.i(TAG, "SCREEN_TIMEOUT: сохранили оригинальное значение = $before")
         }
         val target = if (enabled) SCREEN_OFF_MAX else {
-            val restored = p.getLong(PREF_ORIGINAL_TIMEOUT, 0L).toInt()
+            val restored = Prefs2.getLong(ctx, PREF_ORIGINAL_TIMEOUT, 0L).toInt()
             if (restored > 0 && restored != SCREEN_OFF_MAX) restored else 600000
         }
 

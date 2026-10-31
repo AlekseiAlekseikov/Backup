@@ -463,11 +463,9 @@ object LockSound {
         val nameKey = if (isLock) PREF_LOCK_SOUND_NAME else PREF_UNLOCK_SOUND_NAME
         val enableKey = if (isLock) PREF_LOCK_SOUND_ENABLED else PREF_UNLOCK_SOUND_ENABLED
 
-        prefs.edit()
-            .putString(pathKey, targetFile.absolutePath)
-            .putString(nameKey, fileName)
-            .putBoolean(enableKey, true)
-            .commit()
+        Prefs2.putString(ctx, pathKey, targetFile.absolutePath)
+        Prefs2.putString(ctx, nameKey, fileName)
+        Prefs2.putBoolean(ctx, enableKey, true)
 
         if (isLock) {
             // Выбор кастомного файла → пишем путь и enable=1.
@@ -654,11 +652,9 @@ object LockSound {
         val nameKey = if (isLock) PREF_LOCK_SOUND_NAME else PREF_UNLOCK_SOUND_NAME
         val enableKey = if (isLock) PREF_LOCK_SOUND_ENABLED else PREF_UNLOCK_SOUND_ENABLED
 
-        prefs.edit()
-            .remove(pathKey)
-            .remove(nameKey)
-            .putBoolean(enableKey, false)
-            .commit()
+        Prefs2.putString(ctx, pathKey, null)
+        Prefs2.putString(ctx, nameKey, null)
+        Prefs2.putBoolean(ctx, enableKey, false)
 
         if (isLock) {
             try {
