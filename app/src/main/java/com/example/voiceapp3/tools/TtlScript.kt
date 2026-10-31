@@ -124,16 +124,16 @@ run_v4_capture() {
     ${D}TCPDUMP_BIN -l -ni ${D}IFACE_ARG -c 2 -v -s 0 'ip and dst host 1.1.1.1' >"${D}TD_ERR" 2>&1 &
   fi
   _pid=${D}!
-  echo "TCPDUMP_PID=${_pid}"
+  echo "TCPDUMP_PID=${D}{_pid}"
   sleep 1
   ping -c 2 -W 2 1.1.1.1 >/dev/null 2>&1 || true
   sleep 1
   # iter19/20: kill ПЕРВЫМ (не ждать wait бесконечно); после kill пауза на сброс буфера.
-  kill ${D}_pid 2>/dev/null || true
+  kill ${D}{_pid} 2>/dev/null || true
   sleep 0.3
-  if kill -0 ${D}_pid 2>/dev/null; then _alive=yes; else _alive=no; fi
-  echo "TCPDUMP_ALIVE=${_alive} (after kill -0)"
-  wait ${D}_pid 2>/dev/null || true
+  if kill -0 ${D}{_pid} 2>/dev/null; then _alive=yes; else _alive=no; fi
+  echo "TCPDUMP_ALIVE=${D}{_alive} (after kill -0)"
+  wait ${D}{_pid} 2>/dev/null || true
 }
 run_v6_capture() {
   local _pid _alive
@@ -143,15 +143,15 @@ run_v6_capture() {
     ${D}TCPDUMP_BIN -l -ni ${D}IFACE_ARG -c 2 -v -s 0 'ip6 and dst host 2606:4700:4700::1111' >"${D}TD_ERR6" 2>&1 &
   fi
   _pid=${D}!
-  echo "TCPDUMP_V6_PID=${_pid}"
+  echo "TCPDUMP_V6_PID=${D}{_pid}"
   sleep 1
   ping6 -c 2 -W 2 2606:4700:4700::1111 >/dev/null 2>&1 || true
   sleep 1
-  kill ${D}_pid 2>/dev/null || true
+  kill ${D}{_pid} 2>/dev/null || true
   sleep 0.3
-  if kill -0 ${D}_pid 2>/dev/null; then _alive=yes; else _alive=no; fi
-  echo "TCPDUMP_V6_ALIVE=${_alive} (after kill -0)"
-  wait ${D}_pid 2>/dev/null || true
+  if kill -0 ${D}{_pid} 2>/dev/null; then _alive=yes; else _alive=no; fi
+  echo "TCPDUMP_V6_ALIVE=${D}{_alive} (after kill -0)"
+  wait ${D}{_pid} 2>/dev/null || true
 }
 if [ -n "${D}TCPDUMP_BIN" ]; then
   run_v4_capture
