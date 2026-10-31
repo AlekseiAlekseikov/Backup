@@ -4,6 +4,7 @@ import android.app.Application
 import com.example.voiceapp3.tools.AppLog
 import com.example.voiceapp3.tools.BgWorker
 import com.example.voiceapp3.tools.LockSound
+import com.example.voiceapp3.tools.NetworkTtl
 import com.example.voiceapp3.tools.Prefs2
 import com.example.voiceapp3.tools.ScreenBrightness
 import com.example.voiceapp3.tools.WindowDoors
@@ -24,7 +25,11 @@ class App : Application() {
         AppLog.i("App", "PREFSTORE: " +
             "${Prefs2.diag(this, WindowDoors.PREF_WINDOW_DRIVER_ON_DOOR)} " +
             "${Prefs2.diag(this, WindowDoors.PREF_WINDOW_OPPOSITE_ON_DOOR)} " +
-            "${Prefs2.diag(this, LockSound.PREF_UNLOCK_SOUND_ENABLED)}")
+            "${Prefs2.diag(this, LockSound.PREF_LOCK_SOUND_ENABLED)} " +
+            "${Prefs2.diag(this, LockSound.PREF_UNLOCK_SOUND_ENABLED)} " +
+            "${Prefs2.diag(this, NetworkTtl.PREF_TTL_65_ACTIVE)} " +
+            "${Prefs2.diag(this, ScreenBrightness.PREF_KEEP_AWAKE)} " +
+            "${Prefs2.diag(this, ScreenBrightness.PREF_REMEMBER)}")
         // Итерация 12: ensureKeepAwake при старте процесса (чтобы при ребуте
         // или прибитии процесса системой фича «Не гасить экран» применилась
         // автоматически — не дожидаясь входа в UI).

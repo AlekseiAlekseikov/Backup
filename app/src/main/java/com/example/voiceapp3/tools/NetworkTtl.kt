@@ -80,6 +80,7 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
         val ttlVerdict = when {
             "→ VERIFIED" in ttlCheckLine -> "VERIFIED"
             "→ MISMATCH" in ttlCheckLine -> "MISMATCH"
+            "→ INDIRECT" in ttlCheckLine -> "INDIRECT"
             "→ UNVERIFIED" in ttlCheckLine -> "UNVERIFIED"
             else -> ""
         }
@@ -109,6 +110,7 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
             hasLock   -> "xtables lock (iptables занят, попробуйте снова)"
             noTarget  -> "iptables target 'TTL' не поддерживается ядром (модуль отсутствует)"
             expected && ttlVerdict == "MISMATCH" -> "wire TTL mismatch (real=$ttlReal, expected=65)"
+            expected && ttlVerdict == "INDIRECT" -> "wire TTL не снят с провода (счётчики подросли, но ttl N в tcpdump не попал) → непрямое подтверждение"
             expected && ttlVerdict == "UNVERIFIED" -> "wire TTL не измерен (real=UNKNOWN): tcpdump не дал ttl N и счётчики не растут"
             !v4Ok     -> "TTL_V4 mismatch (expected=${if (expected) 1 else 0}, got=$v4 verify=$v4Verify)"
             !v6Ok     -> "TTL_V6 mismatch (expected=${if (expected) 1 else 0}, got=$v6 verify=$v6Verify)"
@@ -119,6 +121,7 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
             hasNoRoot -> ToolsStep.Status.BLOCKED
             hasPerm || noTarget -> ToolsStep.Status.FAILED
             expected && ttlVerdict == "MISMATCH" -> ToolsStep.Status.FAILED
+            expected && ttlVerdict == "INDIRECT" -> ToolsStep.Status.PARTIAL
             else -> ToolsStep.Status.PARTIAL
         }
         return stepStatus to (reason ?: "TTL_V4=$v4 TTL_V6=$v6 VERIFY=$v4Verify/$v6Verify wire=$ttlVerdict(real=$ttlReal)")
@@ -153,6 +156,7 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
         val ttlReason = Regex("reason=([^ ]+)").find(ttlCheckLine)?.groupValues?.get(1) ?: ""
         val ttlArrow  = if ("→ VERIFIED" in ttlCheckLine) "VERIFIED"
                         else if ("→ MISMATCH" in ttlCheckLine) "MISMATCH"
+                        else if ("→ INDIRECT" in ttlCheckLine) "INDIRECT"
                         else if ("→ UNVERIFIED" in ttlCheckLine) "UNVERIFIED"
                         else "UNKNOWN"
         val kv = parseKv(output)

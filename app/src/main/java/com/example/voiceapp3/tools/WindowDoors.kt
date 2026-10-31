@@ -179,11 +179,11 @@ object WindowDoors {
     private fun getPrefs(context: Context): SharedPreferences = Prefs2.cps(context)
 
     fun isWindowDriverOnDoor(context: Context): Boolean {
-        return getPrefs(context).getBoolean(PREF_WINDOW_DRIVER_ON_DOOR, false)
+        return Prefs2.getBoolean(context, PREF_WINDOW_DRIVER_ON_DOOR, false)
     }
 
     fun isWindowOppositeOnDoor(context: Context): Boolean {
-        return getPrefs(context).getBoolean(PREF_WINDOW_OPPOSITE_ON_DOOR, false)
+        return Prefs2.getBoolean(context, PREF_WINDOW_OPPOSITE_ON_DOOR, false)
     }
 
     /** iter16: вызывать из App.onCreate/VoiceAssistantService.onCreate ВНЕ
@@ -279,8 +279,8 @@ object WindowDoors {
         // режимы работают НЕЗАВИСИМО: если включены ОБА — вентилируются оба
         // окна (своё + противоположное). Это соответствует k0()-семантике,
         // где z3=true помечает вторую подряд итерацию для oposta.
-        val prefOwn = getPrefs(ctx).getBoolean(PREF_WINDOW_DRIVER_ON_DOOR, false)
-        val prefOpp = getPrefs(ctx).getBoolean(PREF_WINDOW_OPPOSITE_ON_DOOR, false)
+        val prefOwn = Prefs2.getBoolean(ctx, PREF_WINDOW_DRIVER_ON_DOOR, false)
+        val prefOpp = Prefs2.getBoolean(ctx, PREF_WINDOW_OPPOSITE_ON_DOOR, false)
 
         // P4: unlock-звук здесь БОЛЬШЕ НЕ ИГРАЕТ. Он привязан к событию
         // PROP_DOOR_UNLOCK_STATE (VHAL-ивент разблокировки замка), а не к факту

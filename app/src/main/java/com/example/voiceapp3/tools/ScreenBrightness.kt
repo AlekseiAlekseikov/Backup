@@ -449,6 +449,7 @@ object ScreenBrightness {
             AppLog.i(TAG, "SCREEN_TIMEOUT: boot readback=$current expected=$expected enabled=$enabled → reapply=${if(needReapply) "yes" else "no"}")
             if (needReapply) applyKeepAwakeInternal(app, true)
             scheduleRestWatchdog(app)
+            checkDurableAfterReboot(app)
         }
     }
 
@@ -547,63 +548,137 @@ echo "=== END ==="
      * Если ничего не получилось — честно логируем "НЕВЫПОЛНИМО БЕЗ ИЗМЕНЕНИЯ ПРОШИВКИ"
      * и перечисляем что было проверено.
      */
+    /**
+     * iter18: честный probe долговечного механизма screen_off_timeout.
+     *
+     *  1) Пишем одноразовый (не while-true) сервис в /data/adb/service.d/ через ROOT AdbClient
+     *     (не через execShort uid=1000 — там никогда не было прав записи). chmod 755.
+     *     Верифицируем: ls -l + md5sum + sh -n. Если файл появился и валиден → installed=magisk-service.d.
+     *  2) persist.sys.prop: делаем СВЯЗНЫЙ тест — пишем заведомо фейк (1800000), ждём 3с, читаем
+     *     через root settings get; если значение реально ИЗМЕНИЛОСЬ с baseline — механизм работает.
+     *     Тогда откатываемся на MAX 2147483647 и ставим installed=persist.sys.
+     *     Если не изменилось — persist-путь мёртв, честно пишем DURABLE_PROBE: binding=dead.
+     *  3) init.d: только ls + mount-инфо (system r/o). Никогда не считаем installed.
+     *  4) Сохраняем timestamp пробы в Prefs2, чтобы после следующей загрузки вывести
+     *     DURABLE_AFTER_REBOOT: ожидание/факт.
+     * Ни при каких обстоятельствах не выставляется INSTALLED по тому факту, что settings
+     * уже показывает 2147483647 — это делал и сам APK на предыдущем шаге.
+     */
     private fun installDurableScreenOffIfPossible(ctx: Context) {
-        val verdict = StringBuilder("DURABLE_SCREEN_OFF: verdict=")
         var installed: String? = null
-        val probeMark = "/data/local/tmp/hook_test_${SystemClock.elapsedRealtime()}"
-        // probe 1: Magisk service.d (пользовательская зона /data — чаще всего writable)
+        var magiskProbe: String = "not-run"
+        var persistProbe: String = "not-run"
+        var initdProbe: String = "not-run"
+        val bootTs = SystemClock.elapsedRealtime()
+        Prefs2.putLong(ctx, "durable_probe_ts", bootTs)
+        Prefs2.putString(ctx, "durable_expected_timeout", "2147483647")
+
+        // ---- probe 1: Magisk service.d (all via root AdbClient) ----
         try {
-            val t = execShort("ls -ld /data/adb/service.d 2>&1; id")
-            AppLog.i(TAG, "DURABLE: probe Magisk service.d: $t")
-            if ("/data/adb/service.d".let {
-                    val p = Runtime.getRuntime().exec(arrayOf("sh","-c","test -d $it && test -w $it && echo W"))
-                    p.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)
-                    p.inputStream.bufferedReader().readText().trim() == "W"
-                }) {
-                val script = "#!/system/bin/sh\n# voiceapp3 durable screen_off_timeout (installed by APK, survives APK delete)\nwhile true; do\n  settings put system screen_off_timeout 2147483647 2>/dev/null\n  settings put global stay_on_while_plugged_in 7 2>/dev/null\n  sleep 60\ndone\n"
-                val marker = execShort("echo -n \"${script.replace("$","\\$")}\" > /data/adb/service.d/99voiceapp3_screenoff.sh 2>&1; chmod 755 /data/adb/service.d/99voiceapp3_screenoff.sh 2>&1; ls -l /data/adb/service.d/99voiceapp3_screenoff.sh; echo ---; cat /data/adb/service.d/99voiceapp3_screenoff.sh")
-                AppLog.i(TAG, "DURABLE: wrote magisk service.d script → $marker")
-                val (rc, chk) = AdbClient.execute("ls -l /data/adb/service.d/99voiceapp3_screenoff.sh; sh -n /data/adb/service.d/99voiceapp3_screenoff.sh && echo SYNTAX_OK", 5000, expectRoot = true)
-                AppLog.i(TAG, "DURABLE: magisk root verify rc=$rc: $chk")
-                installed = "magisk-service.d:/data/adb/service.d/99voiceapp3_screenoff.sh"
+            val (rcLs, outLs) = AdbClient.execute("ls -ld /data/adb/service.d 2>&1; id", 5000, expectRoot = true)
+            AppLog.i(TAG, "DURABLE: Magisk service.d root-ls rc=$rcLs: $outLs")
+            // Пробуем написать (одноразовый скрипт, без вечного цикла, как просили в iter18).
+            val oneShotScript = "#!/system/bin/sh\n# voiceapp3 one-shot durable screen_off_timeout (iter18)\n# Survives APK delete. Runs at boot by Magisk service.d.\nsettings put system screen_off_timeout 2147483647\nsettings put global stay_on_while_plugged_in 7\nexit 0\n"
+            val writeCmd = """SCRIPT_PATH=/data/adb/service.d/99voiceapp3_screenoff.sh
+cat > ${'$'}SCRIPT_PATH <<'VOICEEOF'
+$oneShotScript
+VOICEEOF
+chmod 755 ${'$'}SCRIPT_PATH
+echo '--- ls -l ---'
+ls -l ${'$'}SCRIPT_PATH 2>&1
+echo '--- sh -n ---'
+sh -n ${'$'}SCRIPT_PATH && echo SYNTAX_OK
+echo '--- md5 ---'
+md5sum ${'$'}SCRIPT_PATH 2>&1
+echo '--- first 3 lines ---'
+head -3 ${'$'}SCRIPT_PATH"""
+            val (rcW, outW) = AdbClient.execute(writeCmd, 8000, expectRoot = true)
+            AppLog.i(TAG, "DURABLE: writing Magisk service.d script rc=$rcW:\n${outW.takeLast(1200)}")
+            val present = outW.contains("SYNTAX_OK") && outW.contains("99voiceapp3_screenoff.sh") && rcW == 0
+            if (present) {
+                installed = "magisk-service.d:/data/adb/service.d/99voiceapp3_screenoff.sh(one-shot)"
+                magiskProbe = "writable-script-installed"
+            } else {
+                magiskProbe = "present-but-not-writable-or-script-failed"
             }
-        } catch (t: Throwable) { AppLog.w(TAG, "DURABLE magisk probe err: ${t.message}") }
+        } catch (t: Throwable) {
+            magiskProbe = "error:${t.message}"
+            AppLog.w(TAG, "DURABLE magisk probe err: ${t.message}")
+        }
 
+        // ---- probe 2: persist.sys prop (with bogus value test via root) ----
         if (installed == null) {
-            // probe 2: persist.sys prop
             try {
-                val hasProp = execShort("getprop persist.sys.screen_off_timeout_force; echo ---; getprop persist.sys.screen_off_timeout")
-                AppLog.i(TAG, "DURABLE: probe persist.sys props: $hasProp")
-                // Пишем persist prop через AdbClient (root). Если вендор читает его при загрузке — он применит MAX.
-                val (rc3, out3) = AdbClient.execute("setprop persist.sys.screen_off_timeout 2147483647; setprop persist.sys.stay_on_while_plugged_in 7; echo ---; getprop persist.sys.screen_off_timeout", 5000, expectRoot = true)
-                AppLog.i(TAG, "DURABLE: persist.sys set rc=$rc3: $out3")
-                // Проверим, применилось ли в settings после setprop
-                val verify = execShort("sleep 2; settings get system screen_off_timeout 2>&1")
-                AppLog.i(TAG, "DURABLE: after setprop readback: $verify")
-                if (verify.trim() == "2147483647") {
-                    installed = "persist.sys.screen_off_timeout=2147483647"
+                val baselineScript = "echo '--- baseline ---'; settings get system screen_off_timeout 2>&1; echo '--- set bogus 1800000 ---'; settings put system screen_off_timeout 1800000 2>&1; echo rc=${'$'}?; sleep 3; echo '--- after-bogus ---'; settings get system screen_off_timeout 2>&1; echo '--- revert MAX ---'; settings put system screen_off_timeout 2147483647 2>&1; sleep 1; echo '--- reverted ---'; settings get system screen_off_timeout 2>&1"
+                val (rcB, outB) = AdbClient.execute(baselineScript, 12000, expectRoot = true)
+                AppLog.i(TAG, "DURABLE_PROBE baseline/bogus/revert rc=$rcB:\n$outB")
+                // parse baseline, after_bogus, reverted
+                val lines = outB.lines()
+                var baseline = ""; var afterBogus = ""; var reverted = ""
+                for ((idx, l) in lines.withIndex()) {
+                    when (l.trim()) {
+                        "--- baseline ---" -> if (idx + 1 < lines.size) baseline = lines[idx + 1].trim()
+                        "--- after-bogus ---" -> if (idx + 1 < lines.size) afterBogus = lines[idx + 1].trim()
+                        "--- reverted ---" -> if (idx + 1 < lines.size) reverted = lines[idx + 1].trim()
+                    }
                 }
-            } catch (t: Throwable) { AppLog.w(TAG, "DURABLE persist prop err: ${t.message}") }
+                val bogusApplied = afterBogus == "1800000" && afterBogus != baseline
+                val revertedOk = reverted == "2147483647"
+                AppLog.i(TAG, "DURABLE_PROBE: baseline=$baseline after_bogus=$afterBogus reverted=$reverted binding=${if (bogusApplied) "works" else "dead"}")
+                if (bogusApplied && revertedOk) {
+                    // Дополнительно ставим persist.sys prop — может жить даже при отвале APK
+                    val (rcP, outP) = AdbClient.execute("setprop persist.sys.screen_off_timeout 2147483647; setprop persist.sys.stay_on_while_plugged_in 7; getprop persist.sys.screen_off_timeout", 5000, expectRoot = true)
+                    AppLog.i(TAG, "DURABLE: persist.sys set rc=$rcP: $outP")
+                    installed = "settings-root-binding(persist.sys written)"
+                    persistProbe = "binding-works-via-root-settings"
+                } else {
+                    persistProbe = "dead(baseline=$baseline after_bogus=$afterBogus reverted=$reverted)"
+                }
+            } catch (t: Throwable) {
+                persistProbe = "error:${t.message}"
+                AppLog.w(TAG, "DURABLE persist probe err: ${t.message}")
+            }
         }
 
-        if (installed == null) {
-            // probe 3: init.d /system/etc/init.d — почти всегда read-only без ремаунта
-            try {
-                val t = execShort("ls -ld /system/etc/init.d 2>&1; mount | grep ' /system ' | head")
-                AppLog.i(TAG, "DURABLE: probe /system/etc/init.d: $t")
-            } catch (_: Throwable) {}
-            verdict.append("IMPOSSIBLE_WITHOUT_FIRMWARE_MOD")
-                .append("\n  checked: /data/adb/service.d (absent/unwritable)")
-                .append("\n  checked: persist.sys.screen_off_timeout (setprop did not reflect in settings)")
-                .append("\n  checked: /system/etc/init.d (read-only system partition)")
-                .append("\n  rejected: watchdog-in-apk (dies with APK delete)")
-                .append("\n  rejected: /data/local/tmp script (not auto-started at boot)")
-                .append("\n  Решение: применение MAX через работающий сервис APK + один setprop на persist.sys." +
-                        " Если удалить APK — механизм исчезнет; для живучести нужна поддержка прошивки.")
-        } else {
-            verdict.append("INSTALLED source=$installed")
+        // ---- probe 3: init.d (read-only info only; never "installed") ----
+        try {
+            val (rcI, outI) = AdbClient.execute("ls -ld /system/etc/init.d 2>&1; echo '--- mount /system ---'; mount | grep ' /system ' | head", 5000, expectRoot = true)
+            initdProbe = outI.replace('\n', ' ').take(300)
+            AppLog.i(TAG, "DURABLE: /system/etc/init.d probe rc=$rcI: $outI")
+        } catch (t: Throwable) {
+            initdProbe = "error:${t.message}"
         }
-        AppLog.i(TAG, verdict.toString())
+
+        val verdict = if (installed != null) "INSTALLED source=$installed"
+        else "IMPOSSIBLE_WITHOUT_FIRMWARE_MOD"
+        AppLog.i(TAG, "DURABLE_SCREEN_OFF: verdict=$verdict magisk=$magiskProbe persist=$persistProbe initd=$initdProbe\n" +
+                "  rejected: watchdog-in-apk (dies with APK delete)\n" +
+                "  rejected: /data/local/tmp script (not auto-started at boot)\n" +
+                "  Если удалить APK и перезагрузить — проверьте в следующем логе DURABLE_AFTER_REBOOT строку.")
+    }
+
+    /**
+     * iter18: сверка ДОЛГОВЕЧНОСТИ после ребута. Вызывается из ensureKeepAwake при старте,
+     * если уже был запущен installDurableScreenOffIfPossible в одном из предыдущих запусков.
+     * Пишет строку DURABLE_AFTER_REBOOT: expected=2147483647 actual=… → OK/FAILED.
+     */
+    private fun checkDurableAfterReboot(ctx: Context) {
+        val probeTs = Prefs2.getLong(ctx, "durable_probe_ts", 0L)
+        val expected = Prefs2.getString(ctx, "durable_expected_timeout", "2147483647") ?: "2147483647"
+        if (probeTs == 0L) return
+        val uptimeMin = try {
+            val u = Runtime.getRuntime().exec(arrayOf("sh","-c","cat /proc/uptime")).inputStream.bufferedReader().readText().trim().split(" ")[0].toDouble()
+            (u / 60.0).toInt()
+        } catch (_: Throwable) { -1 }
+        // Если это наш первый запуск после пробы (т.е. после ребута uptime < 10 мин)
+        if (uptimeMin in 0..10) {
+            BgWorker.post("ScreenBrightness.durableAfterReboot") {
+                val (rc, out) = AdbClient.execute("settings get system screen_off_timeout 2>&1; echo ---; settings get global stay_on_while_plugged_in 2>&1", 5000, expectRoot = true)
+                val actual = out.lineSequence().firstOrNull { it.isNotBlank() && !it.startsWith("---") }?.trim() ?: ""
+                val ok = actual == expected
+                AppLog.i(TAG, "DURABLE_AFTER_REBOOT: expected=$expected actual=$actual stay_on=${out.lineSequence().lastOrNull { it.isNotBlank() }} rc=$rc → ${if (ok) "OK" else "FAILED"}")
+            }
+        }
     }
 
     private fun scheduleRestWatchdog(ctx: Context) {
