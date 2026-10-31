@@ -1,5 +1,7 @@
 package com.example.voiceapp3.tools
 
+import com.example.voiceapp3.tools.Prefs2
+
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -119,8 +121,7 @@ object StatusIcons {
     @Volatile private var lastExtTempC: Float? = null
 
     // ─── Prefs helper ───
-    private fun prefs(c: Context): SharedPreferences =
-        c.getSharedPreferences("voiceapp3", Context.MODE_PRIVATE)
+    private fun prefs(c: Context): SharedPreferences = Prefs2.cps(c)
 
     // ─── Normalization (w0.y7.N Float; Int halves+80 w0.y7.P) ───
     private fun normFloat(raw: Float?, lo: Float, hi: Float): Float? {
@@ -142,9 +143,24 @@ object StatusIcons {
             carObj = Car.createCar(app, null, 0L) { c: Car, ready: Boolean ->
                 if (ready) try {
                     cpm = c.getCarManager(Car.PROPERTY_SERVICE) as? android.car.hardware.property.CarPropertyManager
-                    Log.i(TAG,"CarPropertyManager ready=${cpm != null}")
-                    if (!dumpLogged && cpm != null) { dumpLogged = true; dumpKnownProps() }
-                } catch (e: Exception) { Log.w(TAG,"getCarManager err",e) }
+                    AppLog.i(TAG, "CarPropertyManager ready=${cpm != null}")
+                    // iter17: дамп VHAL тяжёлый (1000+ binder-вызовов), нельзя
+                    // выполнять на main looper при старте (он и был причиной
+                    // белого окна). Откладываем на 8с на BgWorker — чтобы не
+                    // конкурировать с первым кадром.
+                    if (!dumpLogged && cpm != null) {
+                        dumpLogged = true
+                        android.os.Handler(Looper.getMainLooper()).postDelayed({
+                            BgWorker.post("StatusIcons.vhalDump") {
+                                val t0 = android.os.SystemClock.uptimeMillis()
+                                val propsBefore = dumpKnownPropsCount(cpm)
+                                dumpKnownProps()
+                                val dt = android.os.SystemClock.uptimeMillis() - t0
+                                AppLog.i(TAG, "VHAL_DUMP: end dt=${dt}ms props≈$propsBefore")
+                            }
+                        }, 8000L)
+                    }
+                } catch (e: Exception) { AppLog.w(TAG, "getCarManager err", e) }
             }
             carObj?.connect()
         } catch (e: Exception) { Log.w(TAG,"Car.createCar: ${e.message}") }
@@ -162,8 +178,14 @@ object StatusIcons {
         0x15400500,
     )
 
+    // iter17: подсчёт числа пропертей перед дампом (для VHAL_DUMP метрики).
+    private fun dumpKnownPropsCount(m: android.car.hardware.property.CarPropertyManager?): Int {
+        return try { m?.propertyList?.size ?: -1 } catch (_: Throwable) { -1 }
+    }
+
     private fun dumpKnownProps() {
         val m = cpm ?: return
+        AppLog.i(TAG, "VHAL_DUMP: start (bg thread=${Thread.currentThread().name})")
         AppLog.i(TAG,"=== VHAL CANDPROP dump start (look for 10°C/98.1% matches HU panel) ===")
         // iter16: расширенные диапазоны (вкл. 0x10xxxxxx из dex плагина). ONE PASS за старт.
         val TEMP_RANGES = arrayOf(
@@ -915,7 +937,7 @@ object StatusIcons {
 
     @JvmStatic fun setHvacDigital(ctx: Context, pref: String, value: Boolean): ToolsResult {
         val t0 = android.os.SystemClock.uptimeMillis()
-        prefs(ctx).edit().putBoolean(pref, value).commit()
+        Prefs2.putBoolean(ctx, pref, value)
         // iter16: при ВКЛЮЧЕНИИ любого из трёх тоглов — пытаемся заинсталлить плагин
         // (mount --bind на OEM com.flyme.auto.systemuiplugin). Плагин уже лежит в
         // app/src/main/res/raw/geely_auto_systemui_plugin_digital.apk (18 МБ).

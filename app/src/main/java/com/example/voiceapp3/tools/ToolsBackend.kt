@@ -136,7 +136,7 @@ enum class Choice(
     }
 }
 
-    private fun prefs() = appContext.getSharedPreferences(Prefs.FILE, Context.MODE_PRIVATE)
+    private fun prefs() = Prefs2.cps(appContext)
 
     /**
      * Снимок состояния для инициализации страницы и для пуша после каждого
@@ -205,7 +205,7 @@ enum class Choice(
         ) {
             // commit(), а не apply(): readback должен видеть уже записанное
             // значение — иначе «успех» мог бы опираться на кэш редактора.
-            prefs().edit().putBoolean(toggle.pref, value).commit()
+            Prefs2.putBoolean(appContext, toggle.pref, value)
             val actual = prefs().getBoolean(toggle.pref, !value).toString()
             // Итерация 8: трассировка чтения/записи префа toggle=off/on
             // (диагностика спама 12 раз за 65 сек в логе).
@@ -389,7 +389,7 @@ enum class Choice(
             command = "SharedPreferences[${Prefs.FILE}].putString(${choice.pref})",
             expected = value
         ) {
-            prefs().edit().putString(choice.pref, value).commit()
+            Prefs2.putString(appContext, choice.pref, value)
             val actual = prefs().getString(choice.pref, "") ?: ""
             (actual == value) to actual
         }
@@ -551,7 +551,7 @@ enum class Choice(
             command = "SharedPreferences[${Prefs.FILE}].putInt(${ScreenBrightness.PREF_REST_SEC})",
             expected = seconds.toString()
         ) {
-            prefs().edit().putInt(ScreenBrightness.PREF_REST_SEC, seconds).commit()
+            Prefs2.putInt(appContext, ScreenBrightness.PREF_REST_SEC, seconds)
             val actual = prefs().getInt(ScreenBrightness.PREF_REST_SEC, -1).toString()
             (actual == seconds.toString()) to actual
         }
@@ -613,7 +613,7 @@ enum class Choice(
             command = "SharedPreferences[${Prefs.FILE}].putBoolean(${ScreenBrightness.PREF_KEEP_AWAKE})",
             expected = enabled.toString()
         ) {
-            prefs().edit().putBoolean(ScreenBrightness.PREF_KEEP_AWAKE, enabled).commit()
+            Prefs2.putBoolean(appContext, ScreenBrightness.PREF_KEEP_AWAKE, enabled)
             val actual = prefs().getBoolean(ScreenBrightness.PREF_KEEP_AWAKE, !enabled).toString()
             (actual == enabled.toString()) to actual
         }

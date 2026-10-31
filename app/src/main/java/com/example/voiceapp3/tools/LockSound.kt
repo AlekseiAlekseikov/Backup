@@ -1,5 +1,7 @@
 package com.example.voiceapp3.tools
 
+import com.example.voiceapp3.tools.Prefs2
+
 import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioManager
@@ -74,39 +76,38 @@ object LockSound {
     // ──────────────────────────────────────────────────────────────
 
     fun isEnabled(ctx: Context): Boolean {
-        val prefs = ctx.getSharedPreferences("voiceapp3", Context.MODE_PRIVATE)
-        return prefs.getBoolean(PREF_LOCK_SOUND_ENABLED, false)
+        // iter17: prefs via Prefs2
+        return Prefs2.getBoolean(ctx, PREF_LOCK_SOUND_ENABLED, false)
     }
 
     fun getSelectedPath(ctx: Context): String {
-        val prefs = ctx.getSharedPreferences("voiceapp3", Context.MODE_PRIVATE)
-        val path = prefs.getString(PREF_LOCK_SOUND_PATH, "") ?: ""
+        // iter17: prefs via Prefs2
+        val path = Prefs2.getString(ctx, PREF_LOCK_SOUND_PATH, "") ?: ""
         if (path.isNotEmpty() && File(path).exists()) return path
         return ""
     }
 
     fun getDisplayName(ctx: Context): String {
-        val prefs = ctx.getSharedPreferences("voiceapp3", Context.MODE_PRIVATE)
-        val name = prefs.getString(PREF_LOCK_SOUND_NAME, "") ?: ""
+        // iter17: prefs via Prefs2
+        val name = Prefs2.getString(ctx, PREF_LOCK_SOUND_NAME, "") ?: ""
         if (name.isNotEmpty()) return name
         val path = getSelectedPath(ctx)
         return if (path.isNotEmpty()) File(path).name else "Заводской (Geely OEM)"
     }
 
     fun getVolume(ctx: Context): Int {
-        val prefs = ctx.getSharedPreferences("voiceapp3", Context.MODE_PRIVATE)
-        return prefs.getInt(PREF_LOCK_SOUND_VOLUME, DEFAULT_VOLUME)
+        // iter17: prefs via Prefs2
+        return Prefs2.cps(ctx).getInt(PREF_LOCK_SOUND_VOLUME, DEFAULT_VOLUME)
     }
 
     fun getDelayMs(ctx: Context): Int {
-        val prefs = ctx.getSharedPreferences("voiceapp3", Context.MODE_PRIVATE)
-        return prefs.getInt(PREF_LOCK_SOUND_DELAY, DEFAULT_DELAY_MS)
+        // iter17: prefs via Prefs2
+        return Prefs2.cps(ctx).getInt(PREF_LOCK_SOUND_DELAY, DEFAULT_DELAY_MS)
     }
 
     fun setVolume(ctx: Context, volume: Int): ToolsResult {
         val clamped = volume.coerceIn(5, 100)
-        ctx.getSharedPreferences("voiceapp3", Context.MODE_PRIVATE)
-            .edit().putInt(PREF_LOCK_SOUND_VOLUME, clamped).commit()
+        Prefs2.putInt(ctx, PREF_LOCK_SOUND_VOLUME, clamped)
         return ToolsResult(
             action = "settings.lockSoundVol",
             title = "Громкость звука замка",
@@ -126,8 +127,7 @@ object LockSound {
 
     fun setDelay(ctx: Context, delayMs: Int): ToolsResult {
         val validDelay = if (delayMs.toString() in DELAY_CHOICES) delayMs else DEFAULT_DELAY_MS
-        ctx.getSharedPreferences("voiceapp3", Context.MODE_PRIVATE)
-            .edit().putInt(PREF_LOCK_SOUND_DELAY, validDelay).commit()
+        Prefs2.putInt(ctx, PREF_LOCK_SOUND_DELAY, validDelay)
         return ToolsResult(
             action = "settings.lockSoundDelay",
             title = "Задержка звука замка",
@@ -148,10 +148,10 @@ object LockSound {
     fun setEnabled(ctx: Context, enabled: Boolean): ToolsResult {
         val t0 = SystemClock.elapsedRealtime()
         val steps = ArrayList<ToolsStep>(3)
-        val prefs = ctx.getSharedPreferences("voiceapp3", Context.MODE_PRIVATE)
+        // iter17: prefs via Prefs2
 
-        prefs.edit().putBoolean(PREF_LOCK_SOUND_ENABLED, enabled).commit()
-        val prefReadback = prefs.getBoolean(PREF_LOCK_SOUND_ENABLED, false)
+        Prefs2.putBoolean(ctx, PREF_LOCK_SOUND_ENABLED, enabled)
+        val prefReadback = Prefs2.getBoolean(ctx, PREF_LOCK_SOUND_ENABLED, false)
         steps += ToolsStep(
             step = "persist_pref",
             command = "prefs.putBoolean($PREF_LOCK_SOUND_ENABLED, $enabled)",
@@ -272,20 +272,20 @@ object LockSound {
     // ──────────────────────────────────────────────────────────────
 
     fun isUnlockSoundEnabled(ctx: Context): Boolean {
-        val prefs = ctx.getSharedPreferences("voiceapp3", Context.MODE_PRIVATE)
-        return prefs.getBoolean(PREF_UNLOCK_SOUND_ENABLED, false)
+        // iter17: prefs via Prefs2
+        return Prefs2.getBoolean(ctx, PREF_UNLOCK_SOUND_ENABLED, false)
     }
 
     fun getUnlockSelectedPath(ctx: Context): String {
-        val prefs = ctx.getSharedPreferences("voiceapp3", Context.MODE_PRIVATE)
-        val path = prefs.getString(PREF_UNLOCK_SOUND_PATH, "") ?: ""
+        // iter17: prefs via Prefs2
+        val path = Prefs2.getString(ctx, PREF_UNLOCK_SOUND_PATH, "") ?: ""
         if (path.isNotEmpty() && File(path).exists()) return path
         return ""
     }
 
     fun getUnlockDisplayName(ctx: Context): String {
-        val prefs = ctx.getSharedPreferences("voiceapp3", Context.MODE_PRIVATE)
-        val name = prefs.getString(PREF_UNLOCK_SOUND_NAME, "") ?: ""
+        // iter17: prefs via Prefs2
+        val name = Prefs2.getString(ctx, PREF_UNLOCK_SOUND_NAME, "") ?: ""
         if (name.isNotEmpty()) return name
         val path = getUnlockSelectedPath(ctx)
         return if (path.isNotEmpty()) File(path).name else "Не выбран (отключен)"
@@ -293,10 +293,10 @@ object LockSound {
 
     fun setUnlockSoundEnabled(ctx: Context, enabled: Boolean): ToolsResult {
         val t0 = SystemClock.elapsedRealtime()
-        val prefs = ctx.getSharedPreferences("voiceapp3", Context.MODE_PRIVATE)
-        prefs.edit().putBoolean(PREF_UNLOCK_SOUND_ENABLED, enabled).commit()
+        // iter17: prefs via Prefs2
+        Prefs2.putBoolean(ctx, PREF_UNLOCK_SOUND_ENABLED, enabled)
 
-        val readback = prefs.getBoolean(PREF_UNLOCK_SOUND_ENABLED, false)
+        val readback = Prefs2.getBoolean(ctx, PREF_UNLOCK_SOUND_ENABLED, false)
         val path = getUnlockSelectedPath(ctx)
         val hasFile = path.isNotEmpty() && File(path).exists()
 
@@ -458,7 +458,7 @@ object LockSound {
             return errRes
         }
 
-        val prefs = ctx.getSharedPreferences("voiceapp3", Context.MODE_PRIVATE)
+        // iter17: prefs via Prefs2
         val pathKey = if (isLock) PREF_LOCK_SOUND_PATH else PREF_UNLOCK_SOUND_PATH
         val nameKey = if (isLock) PREF_LOCK_SOUND_NAME else PREF_UNLOCK_SOUND_NAME
         val enableKey = if (isLock) PREF_LOCK_SOUND_ENABLED else PREF_UNLOCK_SOUND_ENABLED
@@ -649,7 +649,7 @@ object LockSound {
     }
 
     fun restoreFactorySound(ctx: Context, isLock: Boolean): ToolsResult {
-        val prefs = ctx.getSharedPreferences("voiceapp3", Context.MODE_PRIVATE)
+        // iter17: prefs via Prefs2
         val pathKey = if (isLock) PREF_LOCK_SOUND_PATH else PREF_UNLOCK_SOUND_PATH
         val nameKey = if (isLock) PREF_LOCK_SOUND_NAME else PREF_UNLOCK_SOUND_NAME
         val enableKey = if (isLock) PREF_LOCK_SOUND_ENABLED else PREF_UNLOCK_SOUND_ENABLED
@@ -929,8 +929,7 @@ object LockSound {
         bindDisabledUntilBoot = true
         AppLog.e(ctx, TAG, "lockSound отключён до следующей загрузки: $reason")
         try {
-            ctx.getSharedPreferences("voiceapp3", Context.MODE_PRIVATE)
-                .edit().putBoolean(PREF_LOCK_SOUND_ENABLED, false).apply()
+            Prefs2.putBoolean(ctx, PREF_LOCK_SOUND_ENABLED, false)
         } catch (_: Throwable) {}
         // TODO: показать нотификацию/Toast пользователю с причиной (след. итерация)
     }

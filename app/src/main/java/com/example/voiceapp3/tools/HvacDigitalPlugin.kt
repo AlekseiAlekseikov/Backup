@@ -8,7 +8,7 @@ import java.io.FileOutputStream
 /**
  * Установщик цифрового оверлея SystemUI (hvac_digital).
  * Команды через AdbClient (su-fallback с SELinux sandboxing).
- * Все ключевые шаги пишутся в AppFileLogger.
+ * Все ключевые шаги пишутся в AppLog (единый файл лога приложения).
  */
 object HvacDigitalPlugin {
     private const val TAG = "CENTRAL_HvacDigitalPlugin"
@@ -27,12 +27,12 @@ object HvacDigitalPlugin {
         var oemPath: String? = null; var mounted = false; var mountLine = ""
         try {
             val (rc, out) = AdbClient.execute("pm path $OEM_PKG", 4000)
-            AppFileLogger.d(TAG, "checkStatus pm path rc=$rc out=${out.take(200)}")
+            AppLog.d(TAG, "checkStatus pm path rc=$rc out=${out.take(200)}")
             if (rc == 0) {
                 val m = Regex("package:(\\S+)").find(out.trim())
                 if (m != null) oemPath = m.groupValues[1]
             }
-        } catch (t: Throwable) { AppFileLogger.e(TAG, "checkStatus pm path failed", t) }
+        } catch (t: Throwable) { AppLog.e(TAG, "checkStatus pm path failed", t) }
         try {
             val (_, out2) = AdbClient.execute("grep -F GeelyAutoSystemUIPlugin /proc/mounts || echo NOMOUNT", 4000)
             val t = out2.trim()
@@ -40,14 +40,14 @@ object HvacDigitalPlugin {
                 mounted = true
                 mountLine = t.lineSequence().firstOrNull { it.isNotBlank() } ?: ""
             }
-            AppFileLogger.d(TAG, "checkStatus mounts mounted=$mounted line=${mountLine.take(200)}")
-        } catch (t: Throwable) { AppFileLogger.e(TAG, "checkStatus mounts failed", t) }
+            AppLog.d(TAG, "checkStatus mounts mounted=$mounted line=${mountLine.take(200)}")
+        } catch (t: Throwable) { AppLog.e(TAG, "checkStatus mounts failed", t) }
         val oemInstalled = try { ctx.packageManager.getPackageInfo(OEM_PKG, 0); true } catch (_: Exception) { false }
         return Status(oemInstalled, mounted, mountLine, oemPath)
     }
 
     fun enable(ctx: Context): ToolsResult {
-        AppFileLogger.i(TAG, "enable called")
+        AppLog.i(TAG, "enable called")
         val steps = ArrayList<ToolsStep>()
         val status0 = checkStatus(ctx)
         steps += stepOf("check", "pm path", if (status0.oemPluginInstalled) ToolsStep.Status.OK else ToolsStep.Status.FAILED,
@@ -55,7 +55,7 @@ object HvacDigitalPlugin {
             actual = "oem=${status0.oemPluginInstalled} path=${status0.oemPkgPath} mounted=${status0.overlayMounted}",
             stdout = status0.mountLine)
         if (!status0.oemPluginInstalled || status0.oemPkgPath == null) {
-            AppFileLogger.e(TAG, "enable aborted: OEM pkg not found")
+            AppLog.e(TAG, "enable aborted: OEM pkg not found")
             return ToolsResult("hvacdigital.plugin.enable", "Цифровой климат", steps)
         }
         val dst = status0.oemPkgPath
@@ -70,14 +70,14 @@ object HvacDigitalPlugin {
             "geely_auto_systemui_plugin_digital", "raw", ctx.packageName)
         if (resId == 0) {
             copyErr = "R.raw.geely_auto_systemui_plugin_digital отсутствует в сборке (нужен app/src/main/res/raw/geely_auto_systemui_plugin_digital.apk)"
-            AppFileLogger.e(TAG, "stage extract: $copyErr")
+            AppLog.e(TAG, "stage extract: $copyErr")
         } else try {
             ctx.resources.openRawResource(resId).use { inp ->
                 FileOutputStream(tmpFile).use { out -> inp.copyTo(out) }
             }
             extracted = tmpFile.length() > 1_000_000
-            AppFileLogger.i(TAG, "stage APK extracted: ${tmpFile.length()} bytes")
-        } catch (t: Throwable) { copyErr = "${t.javaClass.simpleName}: ${t.message}"; AppFileLogger.e(TAG, "stage extract failed", t) }
+            AppLog.i(TAG, "stage APK extracted: ${tmpFile.length()} bytes")
+        } catch (t: Throwable) { copyErr = "${t.javaClass.simpleName}: ${t.message}"; AppLog.e(TAG, "stage extract failed", t) }
         steps += stepOf("stage_extract", "extract APK",
             if (extracted) ToolsStep.Status.OK else ToolsStep.Status.FAILED,
             expected = ">=1MB / resource present",
@@ -114,7 +114,7 @@ object HvacDigitalPlugin {
             if grep -F " $STAGE_APK " /proc/mounts >/dev/null 2>&1 || grep -F GeelyAutoSystemUIPlugin /proc/mounts >/dev/null 2>&1; then echo HVAC_DIGITAL_OK; else echo HVAC_DIGITAL_FALHOU; fi
         """.trimIndent()
         val (rc, out) = AdbClient.execute(script, 40000)
-        AppFileLogger.i(TAG, "enable script rc=$rc out=${out.take(1000)}")
+        AppLog.i(TAG, "enable script rc=$rc out=${out.take(1000)}")
         val mountOk = out.contains("HVAC_DIGITAL_OK") && !out.contains("MOUNT_FAIL")
         val inodeMatch = Regex("SRC_INODE=(\\d+) TGT_INODE=(\\d+)").find(out)?.let {
             it.groupValues[1] == it.groupValues[2] && it.groupValues[1].isNotEmpty() && it.groupValues[1] != "0"
@@ -137,7 +137,7 @@ object HvacDigitalPlugin {
     }
 
     fun disable(ctx: Context): ToolsResult {
-        AppFileLogger.i(TAG, "disable called")
+        AppLog.i(TAG, "disable called")
         val steps = ArrayList<ToolsStep>()
         val status0 = checkStatus(ctx)
         steps += stepOf("pre_check", "grep mounts", if (status0.overlayMounted) ToolsStep.Status.OK else ToolsStep.Status.PARTIAL,
@@ -158,7 +158,7 @@ object HvacDigitalPlugin {
             if grep -F GeelyAutoSystemUIPlugin /proc/mounts >/dev/null 2>&1; then echo REVERTED_FAIL; else echo REVERTED_OK; fi
         """.trimIndent()
         val (rc, out) = AdbClient.execute(script, 25000)
-        AppFileLogger.i(TAG, "disable script rc=$rc out=${out.take(500)}")
+        AppLog.i(TAG, "disable script rc=$rc out=${out.take(500)}")
         val ok = rc == 0 && out.contains("REVERTED_OK")
         AppLog.i(TAG, "VERIFY hvacdigital.disable: expected REVERTED_OK got rc=$rc → ${if(ok)"SUCCESS"else"FAILED"}")
         steps += stepOf("revert", "umount", if (ok) ToolsStep.Status.OK else ToolsStep.Status.PARTIAL,

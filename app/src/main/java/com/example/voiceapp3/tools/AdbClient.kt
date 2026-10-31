@@ -375,9 +375,14 @@ object AdbClient {
         val verdict = if (finalRc == 0) "SUCCESS" else "FAILED (${failReason ?: "rc=$rc"})"
         val portLabel = if (port == 0) "sh" else port.toString()
         AppLog.i(TAG, "VERIFY EXEC port=$portLabel rc=$finalRc expectRoot=$expectRoot cmd=${shortCmd} → $verdict")
+        // iter17: для TTL_CHECK/TTL_VERIFY и прочих скриптов полезен ХВОСТ вывода,
+        // а не начало (take 300 откусывал 2/3 лога). Логируем takeLast(600) всегда,
+        // а при неудаче — ещё и расширенный takeLast(2000).
+        val tail600 = out.replace('\n', ' ').takeLast(600)
+        AppLog.i(TAG, "VERIFY EXEC tail: $tail600")
         if (finalRc != 0) {
-            val tail = out.replace('\n', ' ').take(300)
-            AppLog.w(TAG, "VERIFY EXEC tail: $tail")
+            val tail2000 = out.replace('\n', ' ').takeLast(2000)
+            AppLog.w(TAG, "VERIFY EXEC FAIL tail2000: $tail2000")
         }
         return Pair(finalRc, out)
     }

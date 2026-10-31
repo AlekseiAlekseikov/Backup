@@ -75,16 +75,23 @@ class MainActivity : AppCompatActivity() {
         if (android.os.Build.VERSION.SDK_INT >= 29) {
             window.decorView.isForceDarkAllowed = false
         }
-        // iter16: замер первого кадра (Choreographer postAtFrontOfQueue).
-        // Это единственная цифра "время до первого кадра" — без неё жалоба
-        // на "белый экран" не диагностируема.
-        window.decorView.viewTreeObserver.addOnWindowFocusChangeListener { /*placeholder*/ }
-        android.view.Choreographer.getInstance().postFrameCallback {
-            val dt = SystemClock.uptimeMillis() - t0
-            AppLog.i("CENTRAL_MainActivity", "MainActivity FIRST_FRAME dt=${dt}ms (onCreate→first frame)")
-        }
-
+        // iter17: замер ПЕРВОГО РЕАЛЬНОГО КАДРА после setContentView через
+        // OnDrawListener у decorView. PostFrameCallback приходит до того, как
+        // контент размещён, а focus listener — мёртвый placeholder (ничего
+        // не измеряет). Навешиваем один раз и снимаемся в первом же вызове,
+        // чтобы не тикать на каждый кадр.
         setContentView(R.layout.activity_main)
+        var fired = false
+        val drawListener = object : android.view.ViewTreeObserver.OnDrawListener {
+            override fun onDraw() {
+                if (fired) return
+                fired = true
+                val dt = SystemClock.uptimeMillis() - t0
+                AppLog.i("CENTRAL_MainActivity", "MainActivity FIRST_FRAME dt=${dt}ms (onCreate→first draw of decorView after setContentView)")
+                runCatching { window.decorView.viewTreeObserver.removeOnDrawListener(this) }
+            }
+        }
+        window.decorView.viewTreeObserver.addOnDrawListener(drawListener)
 
         shellRoot = findViewById(R.id.shellRoot)
         // Фон корня до первой темы (прежний фон WebView, чтобы не мигал белый экран).

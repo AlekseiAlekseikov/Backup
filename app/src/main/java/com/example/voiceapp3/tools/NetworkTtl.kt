@@ -1,5 +1,7 @@
 package com.example.voiceapp3.tools
 
+import com.example.voiceapp3.tools.Prefs2
+
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -41,94 +43,141 @@ object NetworkTtl {
     private const val IPT6 = "ip6tables"
     private const val W    = "-w 5"  // ждём xtables lock до 5 секунд
 
-    /** Сброс с VERIFY (-C) и подсчётом до/после.
-     *  iter16: (1) не трогаем правила, если они уже стоят (`grep -c ttl-set 65` == 1)
-     *  — без этого при каждом network-change мы дёргали -D/-A и обнуляли счётчики;
-     *  (2) tcpdump stderr → /dev/null (на ГУ нет /tmp), парсим ttl из stdout (-v пишет в stderr,
-     *  поэтому redirect 2>&1); (3) TTL_V4 == expected ⇒ OK, а не PARTIAL. */
-    private fun buildScript(enable: Boolean): String {
-        val v4Expect = if (enable) "1" else "0"
-        val v6Expect = if (enable) "1" else "0"
-        val TD_ERR = "/data/local/tmp/ttl_tcpdump.out" // iter16: /tmp отсутствует на ГУ
-        return """
-            V4_EXIST=${'$'}($IPT -t mangle -S POSTROUTING 2>/dev/null | grep -c 'ttl-set 65')
-            V6_EXIST=${'$'}($IPT6 -t mangle -S POSTROUTING 2>/dev/null | grep -c 'hl-set 65')
-            echo TTL_BEFORE_V4=${'$'}V4_EXIST
-            echo TTL_BEFORE_V6=${'$'}V6_EXIST
-            echo TTL_CNTR_BEFORE_V4=${'$'}($IPT -t mangle -L POSTROUTING -v -n 2>/dev/null | grep -F 'TTL' | awk '{print ${'$'}1}' | head -1)
-            echo TTL_CNTR_BEFORE_V6=${'$'}($IPT6 -t mangle -L POSTROUTING -v -n 2>/dev/null | grep -F 'HL' | awk '{print ${'$'}1}' | head -1)
-            NEED_APPLY_V4=0; NEED_APPLY_V6=0
-            if [ "$enable" = "1" ]; then
-              [ "${'$'}V4_EXIST" -lt 1 ] 2>/dev/null && NEED_APPLY_V4=1
-              [ "${'$'}V6_EXIST" -lt 1 ] 2>/dev/null && NEED_APPLY_V6=1
-            else
-              [ "${'$'}V4_EXIST" -gt 0 ] 2>/dev/null && NEED_APPLY_V4=1
-              [ "${'$'}V6_EXIST" -gt 0 ] 2>/dev/null && NEED_APPLY_V6=1
-              # При выключении аккуратно сносим все правила TTL
-              if [ "${'$'}NEED_APPLY_V4" = "1" ]; then
-                for i in 1 2 3 4 5; do $IPT $W -t mangle -D POSTROUTING -j TTL --ttl-set 65 2>/dev/null || break; done
-              fi
-              if [ "${'$'}NEED_APPLY_V6" = "1" ]; then
-                for i in 1 2 3 4 5; do $IPT6 $W -t mangle -D POSTROUTING -j HL  --hl-set  65 2>/dev/null || break; done
-              fi
-            fi
-            echo NEED_APPLY_V4=${'$'}NEED_APPLY_V4 NEED_APPLY_V6=${'$'}NEED_APPLY_V6
-        """.trimIndent() + "\n" + """
-            if [ "${'$'}NEED_APPLY_V4" = "1" ] && [ "$enable" = "1" ]; then
-              $IPT $W -t mangle -A POSTROUTING -j TTL --ttl-set 65 2>&1 || echo IPTV4_FAIL
-            fi
-            if [ "${'$'}NEED_APPLY_V6" = "1" ] && [ "$enable" = "1" ]; then
-              $IPT6 $W -t mangle -A POSTROUTING -j HL  --hl-set  65 2>&1 || echo IPTV6_FAIL
-            fi
-        """.trimIndent() + """
-            echo VERIFY_V4=${'$'}($IPT $W -t mangle -C POSTROUTING -j TTL --ttl-set 65 >/dev/null 2>&1 && echo OK || echo FAIL)
-            echo VERIFY_V6=${'$'}($IPT6 $W -t mangle -C POSTROUTING -j HL  --hl-set  65 >/dev/null 2>&1 && echo OK || echo FAIL)
-            echo TTL_V4=${'$'}($IPT -t mangle -S POSTROUTING 2>/dev/null | grep -c 'ttl-set 65')
-            echo TTL_V6=${'$'}($IPT6 -t mangle -S POSTROUTING 2>/dev/null | grep -c 'hl-set 65')
-            echo TTL_CNTR_AFTER_V4=${'$'}($IPT -t mangle -L POSTROUTING -v -n 2>/dev/null | grep -F 'TTL' | awk '{print ${'$'}1}' | head -1)
-            echo TTL_CNTR_AFTER_V6=${'$'}($IPT6 -t mangle -L POSTROUTING -v -n 2>/dev/null | grep -F 'HL' | awk '{print ${'$'}1}' | head -1)
-            # === Попытка РЕАЛЬНО измерить исходящий TTL ===
-            # tcpdump stderr -> /data/local/tmp (на ГУ нет /tmp); -v пишет ttl в stderr,
-            # поэтому мержим 2>&1 и оттуда парсим.
-            TTL_MEASURED=""
-            TTL_METHOD=""
-            TD_DIR="/data/local/tmp"
-            mkdir -p ${'$'}TD_DIR 2>/dev/null || true
-            TD_ERR="${'$'}TD_DIR/ttl_tcpdump.err"
-            rm -f ${'$'}TD_ERR
-            for TCPDUMP in tcpdump toybox-tcpdump busybox-tcpdump /system/bin/tcpdump /system/xbin/tcpdump; do
-              if command -v ${'$'}TCPDUMP >/dev/null 2>&1; then
-                ${'$'}TCPDUMP -ni any -c 3 -v -s 0 'ip and dst host 1.1.1.1' >/dev/null 2>${'$'}TD_ERR &
-                TD_PID=$!
-                sleep 1
-                ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1 || true
-                wait ${'$'}TD_PID 2>/dev/null || true
-                TTL_MEASURED=${'$'}(grep -oE 'ttl [0-9]+' ${'$'}TD_ERR | head -1 | awk '{print ${'$'}2}')
-                if [ -n "${'$'}TTL_MEASURED" ]; then TTL_METHOD="tcpdump(${'$'}TCPDUMP)"; break; fi
-              fi
-            done
-            # Fallback: счётчики правил TTL ДО и ПОСЛЕ ping — если растут, правило работает.
-            if [ -z "${'$'}TTL_MEASURED" ]; then
-              CNTR_BEFORE=${'$'}($IPT -t mangle -L POSTROUTING -v -n 2>/dev/null | grep -F 'TTL' | awk '{print ${'$'}1}' | head -1)
-              ping -c 3 -W 2 1.1.1.1 >/dev/null 2>&1 || true
-              sleep 1
-              CNTR_AFTER=${'$'}($IPT -t mangle -L POSTROUTING -v -n 2>/dev/null | grep -F 'TTL' | awk '{print ${'$'}1}' | head -1)
-              echo TTL_CNTR_PING_BEFORE=${'$'}CNTR_BEFORE TTL_CNTR_PING_AFTER=${'$'}CNTR_AFTER
-              if [ -n "${'$'}CNTR_BEFORE" ] && [ -n "${'$'}CNTR_AFTER" ] && [ "${'$'}CNTR_AFTER" -gt "${'$'}CNTR_BEFORE" ] 2>/dev/null; then
-                TTL_MEASURED="counters_incremented(${'$'}CNTR_BEFORE->${'$'}CNTR_AFTER)"
-                TTL_METHOD="iptables-counters-after-ping"
-              else
-                TTL_MEASURED=unavailable
-                TTL_METHOD="no-tcpdump-and-counters-not-incremented"
-              fi
-            fi
-            echo "TTL_CHECK: method=${'$'}TTL_METHOD ttl=${'$'}TTL_MEASURED"
-            rm -f ${'$'}TD_ERR
-        """.trimIndent()
-    }
+    /**
+ * iter17: строим shell-скрипт с РЕАЛЬНЫМ замером TTL на проводе.
+ * Ключевые требования iter17 §6a:
+ *  — НИКОГДА не печатать "65" из константы; TTL приходит ИЗ tcpdump или ИЗ iptables -S.
+ *  — Формат TTL_CHECK: real=<n> expected=<n> src=... dst=1.1.1.1 iface=... method=tcpdump → VERIFIED
+ *    или real=UNKNOWN method=none reason=... → UNVERIFIED
+ *  — iptables -C НЕ ВСЕГДА поддерживает TTL target (на некоторых ядрах выдаёт "No chain/target/match")
+ *    → используем grep -c по iptables -S как надёжный fallback.
+ *  — Замер ДО и ПОСЛЕ ping для счётчиков: TTL_COUNTERS: before=... after=... delta=...
+ *  — IPv6: ищем hlim N в tcpdump и hl-set в ip6tables.
+ *  — Замер производится на iface текущего дефолтного маршрута.
+ */
+private fun buildScript(enable: Boolean): String {
+    val enableBit = if (enable) "1" else "0"
+    return """
+set +e
+echo '=== TTL_SCRIPT start enable=$enableBit ==='
+# --- 0) определяем outgoing iface и src-ip для 1.1.1.1 ---
+OUT_IFACE=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
+SRC_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')
+[ -z "$OUT_IFACE" ] && OUT_IFACE=$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' | head -1)
+echo OUT_IFACE=$OUT_IFACE SRC_IP=$SRC_IP
+# --- 1) извлекаем РЕАЛЬНОЕ значение --ttl-set из существующего правила (если есть) ---
+RULE_TTL=$(iptables -t mangle -S POSTROUTING 2>/dev/null | grep -oE -- '--ttl-set[[:space:]]+[0-9]+' | head -1 | awk '{print $2}')
+RULE_HL=$(ip6tables -t mangle -S POSTROUTING 2>/dev/null | grep -oE -- '--hl-set[[:space:]]+[0-9]+' | head -1 | awk '{print $2}')
+echo RULE_V4_TTL=$RULE_TTL RULE_V6_HL=$RULE_HL
+# --- 2) счётчики ДО ---
+CNTR_BEFORE_V4=$(iptables -t mangle -L POSTROUTING -v -n -x 2>/dev/null | awk '/TTL/ && /ttl-set/ {print $2; exit}')
+CNTR_BEFORE_V6=$(ip6tables -t mangle -L POSTROUTING -v -n -x 2>/dev/null | awk '/HL/ && /hl-set/ {print $2; exit}')
+echo TTL_COUNTERS_BEFORE_V4=$CNTR_BEFORE_V4 V6=$CNTR_BEFORE_V6
+# --- 3) применение правил (если нужно) ---
+V4_EXIST=$(iptables -t mangle -S POSTROUTING 2>/dev/null | grep -c -- '--ttl-set')
+V6_EXIST=$(ip6tables -t mangle -S POSTROUTING 2>/dev/null | grep -c -- '--hl-set')
+echo TTL_V4_EXIST=$V4_EXIST TTL_V6_EXIST=$V6_EXIST
+if [ "$enableBit" = "1" ]; then
+  if [ "$V4_EXIST" -lt 1 ] 2>/dev/null; then
+    echo "APPENDING iptables TTL --ttl-set 65"
+    iptables -w 5 -t mangle -A POSTROUTING -j TTL --ttl-set 65 2>&1 || echo IPTV4_FAIL=$?
+  else
+    echo "V4 rule already present (ttl-set=$RULE_TTL)"
+  fi
+  if [ "$V6_EXIST" -lt 1 ] 2>/dev/null; then
+    echo "APPENDING ip6tables HL --hl-set 65"
+    ip6tables -w 5 -t mangle -A POSTROUTING -j HL --hl-set 65 2>&1 || echo IPTV6_FAIL=$?
+  else
+    echo "V6 rule already present (hl-set=$RULE_HL)"
+  fi
+else
+  # выключение: сносим все TTL/HL правила в POSTROUTING
+  for i in 1 2 3 4 5 6; do
+    iptables -w 5 -t mangle -D POSTROUTING -j TTL --ttl-set 65 2>/dev/null || break
+  done
+  for i in 1 2 3 4 5 6; do
+    ip6tables -w 5 -t mangle -D POSTROUTING -j HL --hl-set 65 2>/dev/null || break
+  done
+fi
+# --- 4) повторно читаем --ttl-set/--hl-set (после possible apply) ---
+RULE_TTL_AFTER=$(iptables -t mangle -S POSTROUTING 2>/dev/null | grep -oE -- '--ttl-set[[:space:]]+[0-9]+' | head -1 | awk '{print $2}')
+RULE_HL_AFTER=$(ip6tables -t mangle -S POSTROUTING 2>/dev/null | grep -oE -- '--hl-set[[:space:]]+[0-9]+' | head -1 | awk '{print $2}')
+echo RULE_V4_TTL_AFTER=$RULE_TTL_AFTER RULE_V6_HL_AFTER=$RULE_HL_AFTER
+# --- 5) VERIFY через grep -c (fallback для ядер где iptables -C не знает TTL target) ---
+V4_AFTER=$(iptables -t mangle -S POSTROUTING 2>/dev/null | grep -c -- '--ttl-set')
+V6_AFTER=$(ip6tables -t mangle -S POSTROUTING 2>/dev/null | grep -c -- '--hl-set')
+echo TTL_V4=$V4_AFTER TTL_V6=$V6_AFTER
+# пробуем -C; если он не поддерживает target — пишем VERIFY_V4=UNSUPPORTED
+VC4_OUT=$(iptables -w 5 -t mangle -C POSTROUTING -j TTL --ttl-set 65 >/dev/null 2>&1; echo rc=$?)
+VC6_OUT=$(ip6tables -w 5 -t mangle -C POSTROUTING -j HL --hl-set 65 >/dev/null 2>&1; echo rc=$?)
+echo VERIFY_V4_C_RC=$VC4_OUT VERIFY_V6_C_RC=$VC6_OUT
+if echo "$VC4_OUT" | grep -q 'rc=0'; then VERIFY_V4=OK
+elif [ "$V4_AFTER" -ge 1 ] 2>/dev/null; then VERIFY_V4=OK-grepc
+else VERIFY_V4=FAIL; fi
+if echo "$VC6_OUT" | grep -q 'rc=0'; then VERIFY_V6=OK
+elif [ "$V6_AFTER" -ge 1 ] 2>/dev/null; then VERIFY_V6=OK-grepc
+else VERIFY_V6=FAIL; fi
+echo VERIFY_V4=$VERIFY_V4 VERIFY_V6=$VERIFY_V6
+# --- 6) РЕАЛЬНЫЙ замер через tcpdump + ping 1.1.1.1 ---
+TD_DIR=/data/local/tmp
+mkdir -p $TD_DIR 2>/dev/null || true
+TD_ERR="$TD_DIR/ttl_tcpdump_$$.err"
+rm -f "$TD_ERR"
+TTL_REAL=""
+TCPDUMP_BIN=""
+# определяем tcpdump
+for cand in tcpdump toybox-tcpdump busybox-tcpdump /system/bin/tcpdump /system/xbin/tcpdump; do
+  if command -v $cand >/dev/null 2>&1; then TCPDUMP_BIN=$cand; break; fi
+done
+echo TCPDUMP_BIN=$TCPDUMP_BIN
+if [ -n "$TCPDUMP_BIN" ]; then
+  IFACE_ARG="${OUT_IFACE:-any}"
+  # запускаем tcpdump на iface, 3 пакета, verbose; ttl в stderr у обычного tcpdump, в stdout у toybox — мержим 2>&1
+  $TCPDUMP_BIN -ni $IFACE_ARG -c 3 -v -s 0 'ip and dst host 1.1.1.1' >"$TD_ERR" 2>&1 &
+  TD_PID=$!
+  sleep 1
+  ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1 || true
+  # ipv6 ping (может не быть маршрута, это ок)
+  ping6 -c 1 -W 2 2606:4700:4700::1111 >/dev/null 2>&1 || true
+  wait $TD_PID 2>/dev/null || true
+  sleep 1
+  TTL_REAL=$(grep -oE 'ttl[[:space:]]+[0-9]+' "$TD_ERR" | head -1 | awk '{print $2}')
+  HL_REAL=$(grep -oE 'hlim[[:space:]]+[0-9]+' "$TD_ERR" | head -1 | awk '{print $2}')
+  echo TCPDUMP_TAIL=$(tail -5 "$TD_ERR" 2>/dev/null | tr '\n' ' ')
+  echo TTL_REAL_FROM_WIRE=$TTL_REAL HLIM_REAL_FROM_WIRE=$HL_REAL
+else
+  echo "TCPDUMP absent — cannot measure real TTL from wire"
+fi
+# --- 7) счётчики ПОСЛЕ ping ---
+CNTR_AFTER_V4=$(iptables -t mangle -L POSTROUTING -v -n -x 2>/dev/null | awk '/TTL/ && /ttl-set/ {print $2; exit}')
+CNTR_AFTER_V6=$(ip6tables -t mangle -L POSTROUTING -v -n -x 2>/dev/null | awk '/HL/ && /hl-set/ {print $2; exit}')
+DELTA_V4=$(( ${CNTR_AFTER_V4:-0} - ${CNTR_BEFORE_V4:-0} )) 2>/dev/null
+DELTA_V6=$(( ${CNTR_AFTER_V6:-0} - ${CNTR_BEFORE_V6:-0} )) 2>/dev/null
+echo TTL_COUNTERS: before_v4=$CNTR_BEFORE_V4 after_v4=$CNTR_AFTER_V4 delta_v4=$DELTA_V4 before_v6=$CNTR_BEFORE_V6 after_v6=$CNTR_AFTER_V6 delta_v6=$DELTA_V6
+rm -f "$TD_ERR"
+# --- 8) ИТОГОВАЯ строка TTL_CHECK: формат строго по iter17 §6a ---
+EXPECTED=65
+VERDICT="UNVERIFIED"
+REASON=""
+METHOD="none"
+REAL_SHOW="UNKNOWN"
+if [ -n "$TTL_REAL" ] && [ "$TTL_REAL" = "$EXPECTED" ]; then
+  REAL_SHOW=$TTL_REAL; METHOD=tcpdump; VERDICT=VERIFIED; REASON="wire ttl matches expected"
+elif [ -n "$TTL_REAL" ] && [ "$TTL_REAL" != "$EXPECTED" ]; then
+  REAL_SHOW=$TTL_REAL; METHOD=tcpdump; VERDICT=MISMATCH; REASON="wire ttl=$TTL_REAL != expected=$EXPECTED"
+elif [ -z "$TCPDUMP_BIN" ]; then
+  REAL_SHOW=UNKNOWN; METHOD=none; VERDICT=UNVERIFIED; REASON="tcpdump-absent"
+elif [ -z "$TTL_REAL" ] && [ "$DELTA_V4" -gt 0 ] 2>/dev/null; then
+  REAL_SHOW=$RULE_TTL_AFTER; METHOD=iptables-counters; VERDICT=VERIFIED; REASON="counters delta=$DELTA_V4 after ping (wire capture unavailable)"
+else
+  REAL_SHOW=UNKNOWN; METHOD=none; VERDICT=UNVERIFIED; REASON="tcpdump ran but no ttl found and counters did not increment (delta=$DELTA_V4)"
+fi
+echo "TTL_CHECK: real=$REAL_SHOW expected=$EXPECTED src=${SRC_IP:-unknown} dst=1.1.1.1 iface=${OUT_IFACE:-any} method=$METHOD reason=$REASON → $VERDICT"
+echo '=== TTL_SCRIPT end ==='
+""".trimIndent()
+}
 
-    private fun getPrefs(context: Context): SharedPreferences =
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private fun getPrefs(context: Context): SharedPreferences = Prefs2.cps(context)
 
     fun isTtl65Active(context: Context): Boolean =
         getPrefs(context).getBoolean(PREF_TTL_65_ACTIVE, false)
@@ -147,19 +196,40 @@ object NetworkTtl {
         val v6 = kv["TTL_V6"]?.trim()
         val v4Verify = kv["VERIFY_V4"]
         val v6Verify = kv["VERIFY_V6"]
+        val ttlCheckLine = out.lineSequence().firstOrNull { it.startsWith("TTL_CHECK:") } ?: ""
+        val ttlVerdict = when {
+            "→ VERIFIED" in ttlCheckLine -> "VERIFIED"
+            "→ MISMATCH" in ttlCheckLine -> "MISMATCH"
+            "→ UNVERIFIED" in ttlCheckLine -> "UNVERIFIED"
+            else -> ""
+        }
+        val ttlReal = Regex("real=([^ ]+)").find(ttlCheckLine)?.groupValues?.get(1) ?: "UNKNOWN"
         val hasLock = out.lowercase().contains("xtables lock")
         val hasPerm = out.lowercase().contains("permission denied") || out.lowercase().contains("avc: denied")
         val hasNoRoot = out.contains("ERR_ROOT_CHANNEL_UNAVAILABLE")
         val noTarget = out.lowercase().contains("no chain/target/match")
 
-        val v4Ok = if (expected) v4 == "1" && v4Verify == "OK" else (v4 == "0" || v4 == null) && v4Verify == "FAIL"
-        val v6Ok = if (expected) v6 == "1" && v6Verify == "OK" else (v6 == "0" || v6 == null) && v6Verify == "FAIL"
+        // iter17: VERIFY допускает "OK-grepc" (когда iptables -C не знает TTL target,
+        // но grep -c по -S видит правило). Это нормальный верифицированный вариант.
+        val v4Ok: Boolean
+        val v6Ok: Boolean
+        if (expected) {
+            val v4Count = v4?.toIntOrNull() ?: 0
+            val v6Count = v6?.toIntOrNull() ?: 0
+            v4Ok = v4Count >= 1 && (v4Verify == "OK" || v4Verify == "OK-grepc")
+            v6Ok = v6Count >= 1 && (v6Verify == "OK" || v6Verify == "OK-grepc")
+        } else {
+            v4Ok = (v4 == null || v4 == "0") && v4Verify != "OK" && v4Verify != "OK-grepc"
+            v6Ok = (v6 == null || v6 == "0") && v6Verify != "OK" && v6Verify != "OK-grepc"
+        }
 
         val reason = when {
             hasNoRoot -> "требуется root-канал (порт 65010 не поднят). Проверьте в dev.checkRoot."
             hasPerm   -> "Permission denied (нужен root-шелл uid=0)"
             hasLock   -> "xtables lock (iptables занят, попробуйте снова)"
             noTarget  -> "iptables target 'TTL' не поддерживается ядром (модуль отсутствует)"
+            expected && ttlVerdict == "MISMATCH" -> "wire TTL mismatch (real=$ttlReal, expected=65)"
+            expected && ttlVerdict == "UNVERIFIED" -> "wire TTL не измерен (real=UNKNOWN): tcpdump не дал ttl N и счётчики не растут"
             !v4Ok     -> "TTL_V4 mismatch (expected=${if (expected) 1 else 0}, got=$v4 verify=$v4Verify)"
             !v6Ok     -> "TTL_V6 mismatch (expected=${if (expected) 1 else 0}, got=$v6 verify=$v6Verify)"
             else      -> null
@@ -168,15 +238,16 @@ object NetworkTtl {
             reason == null -> ToolsStep.Status.OK
             hasNoRoot -> ToolsStep.Status.BLOCKED
             hasPerm || noTarget -> ToolsStep.Status.FAILED
+            expected && ttlVerdict == "MISMATCH" -> ToolsStep.Status.FAILED
             else -> ToolsStep.Status.PARTIAL
         }
-        return stepStatus to (reason ?: "TTL_V4=$v4 TTL_V6=$v6 VERIFY=$v4Verify/$v6Verify")
+        return stepStatus to (reason ?: "TTL_V4=$v4 TTL_V6=$v6 VERIFY=$v4Verify/$v6Verify wire=$ttlVerdict(real=$ttlReal)")
     }
 
     fun setTtl65Active(context: Context, enabled: Boolean): ToolsResult {
         BgWorker.assertNotMain("NetworkTtl.setTtl65Active")
         val t0 = SystemClock.uptimeMillis()
-        getPrefs(context).edit().putBoolean(PREF_TTL_65_ACTIVE, enabled).apply()
+        Prefs2.putBoolean(context, PREF_TTL_65_ACTIVE, enabled)
 
         val script = buildScript(enabled)
         val (exitCode, output) = AdbClient.execute(script, 25000)
@@ -186,27 +257,32 @@ object NetworkTtl {
         // P8: toggle back OFF if failed and we were trying to turn ON (PARTIAL/BLOCKED оставляем как есть — пользователь должен видеть не-идеал)
         if (enabled && status == ToolsStep.Status.FAILED) {
             AppLog.w(TAG, "TTL: toggle FAILED ($reason) — turning pref OFF to reflect reality")
-            getPrefs(context).edit().putBoolean(PREF_TTL_65_ACTIVE, false).apply()
+            Prefs2.putBoolean(context, PREF_TTL_65_ACTIVE, false)
         }
         if (status == ToolsStep.Status.BLOCKED) {
             AppLog.w(TAG, "TTL: toggle BLOCKED ($reason). rootChannel state=${AdbClient.currentState()} port=${AdbClient.currentPort()}")
         }
 
-        val expectedStr = if (enabled) "TTL_V4=1 TTL_V6=1 VERIFY=OK/OK" else "TTL_V4=0 TTL_V6=0 VERIFY=FAIL/FAIL"
-        // Парсим строку TTL_CHECK: метод=... ttl=...
+        val expectedStr = if (enabled) "TTL_V4=1 TTL_V6=1 VERIFY=OK/OK wire-real=65" else "TTL_V4=0 TTL_V6=0 VERIFY=FAIL/FAIL"
+        // iter17: парсим НОВЫЙ формат TTL_CHECK: real=... expected=... src=... dst=1.1.1.1 iface=... method=... reason=... → VERDICT
         val ttlCheckLine = output.lineSequence().firstOrNull { it.startsWith("TTL_CHECK:") } ?: ""
-        val ttlMethod = Regex("метод=([^ ]+)").find(ttlCheckLine)?.groupValues?.get(1) ?: "none"
-        val ttlValue  = Regex("ttl=([^ ]+)").find(ttlCheckLine)?.groupValues?.get(1) ?: "unavailable"
-        val actualLines = output.lineSequence().filter {
-            it.startsWith("TTL_") || it.startsWith("VERIFY_") || it.startsWith("TTL_CHECK:")
-        }.joinToString(" | ")
-        val ttlExpected = if (enabled) "65" else "default"
+        val ttlReal   = Regex("real=([^ ]+)").find(ttlCheckLine)?.groupValues?.get(1) ?: "UNKNOWN"
+        val ttlMethod = Regex("method=([^ ]+)").find(ttlCheckLine)?.groupValues?.get(1) ?: "none"
+        val ttlIface  = Regex("iface=([^ ]+)").find(ttlCheckLine)?.groupValues?.get(1) ?: "unknown"
+        val ttlSrc    = Regex("src=([^ ]+)").find(ttlCheckLine)?.groupValues?.get(1) ?: "unknown"
+        val ttlReason = Regex("reason=([^ ]+)").find(ttlCheckLine)?.groupValues?.get(1) ?: ""
+        val ttlArrow  = if ("→ VERIFIED" in ttlCheckLine) "VERIFIED"
+                        else if ("→ MISMATCH" in ttlCheckLine) "MISMATCH"
+                        else if ("→ UNVERIFIED" in ttlCheckLine) "UNVERIFIED"
+                        else "UNKNOWN"
         val kv = parseKv(output)
-        Log.i(TAG, "TTL_BEFORE_V4=${kv["TTL_BEFORE_V4"]} TTL_BEFORE_V6=${kv["TTL_BEFORE_V6"]}")
-        Log.i(TAG, "TTL_AFTER_V4=${kv["TTL_V4"]} TTL_AFTER_V6=${kv["TTL_V6"]} VERIFY=${kv["VERIFY_V4"]}/${kv["VERIFY_V6"]}")
-        Log.i(TAG, "TTL_CHECK: фактический TTL = $ttlValue (метод=$ttlMethod)")
-        Log.i(TAG, "TTL_CHECK: ИТОГ = $ttlValue (ожидали $ttlExpected) → $status ($reason)")
-        Log.i(TAG, "VERIFY TTL: expected enabled=$enabled ($expectedStr) → got $actualLines rc=$exitCode → $status ($reason)")
+        val actualLines = output.lineSequence().filter {
+            it.startsWith("TTL_") || it.startsWith("VERIFY_") || it.startsWith("RULE_") || it.startsWith("TCPDUMP_") || it.startsWith("OUT_IFACE") || it.startsWith("TTL_CHECK:") || it.startsWith("TTL_COUNTERS:")
+        }.joinToString(" | ")
+        AppLog.i(TAG, "TTL_CHECK: real=$ttlReal expected=65 src=$ttlSrc dst=1.1.1.1 iface=$ttlIface method=$ttlMethod reason=$ttlReason → $ttlArrow")
+        AppLog.i(TAG, "TTL_RULE: v4_rule_ttl=${kv["RULE_V4_TTL"]}→${kv["RULE_V4_TTL_AFTER"]} v6_hl=${kv["RULE_V6_HL"]}→${kv["RULE_V6_HL_AFTER"]}")
+        AppLog.i(TAG, "TTL_COUNTERS line: ${output.lineSequence().firstOrNull { it.startsWith("TTL_COUNTERS:") } ?: "(none)"}")
+        AppLog.i(TAG, "VERIFY TTL: enabled=$enabled v4=${kv["TTL_V4"]}/v6=${kv["TTL_V6"]} vfy=${kv["VERIFY_V4"]}/${kv["VERIFY_V6"]} rc=$exitCode → $status ($reason)")
 
         val step = ToolsStep(
             step = "settings.ttl65",
@@ -270,7 +346,7 @@ object NetworkTtl {
                     AppLog.i(TAG, "VERIFY TTL networkChange: rc=$rc → $status ($reason)")
                     if (status == ToolsStep.Status.FAILED) {
                         AppLog.w(TAG, "TTL networkChange: failed to re-apply — turning toggle off")
-                        getPrefs(rcvCtx).edit().putBoolean(PREF_TTL_65_ACTIVE, false).apply()
+                        Prefs2.putBoolean(rcvCtx, PREF_TTL_65_ACTIVE, false)
                     }
                 }
             }

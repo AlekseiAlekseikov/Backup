@@ -1,5 +1,7 @@
 package com.example.voiceapp3
 
+import com.example.voiceapp3.tools.Prefs2
+
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.NotificationChannel
@@ -347,15 +349,10 @@ class VoiceAssistantService : Service() {
                 runCatching { NetworkTtl.bootRestore(app) }
                 runCatching { LockSound.onBootOrWatchdog(app) }
                 runCatching {
-                    val prefs = try {
-                        app.createDeviceProtectedStorageContext()
-                            .getSharedPreferences("voiceapp3", Context.MODE_PRIVATE)
-                    } catch (_: Throwable) {
-                        app.getSharedPreferences("voiceapp3", Context.MODE_PRIVATE)
-                    }
-                    val driverOn = prefs.getBoolean(WindowDoors.PREF_WINDOW_DRIVER_ON_DOOR, false)
-                    val oppOn = prefs.getBoolean(WindowDoors.PREF_WINDOW_OPPOSITE_ON_DOOR, false)
-                    val unlockOn = prefs.getBoolean(LockSound.PREF_UNLOCK_SOUND_ENABLED, false)
+                    val driverOn = Prefs2.getBoolean(app, WindowDoors.PREF_WINDOW_DRIVER_ON_DOOR, false)
+                    val oppOn = Prefs2.getBoolean(app, WindowDoors.PREF_WINDOW_OPPOSITE_ON_DOOR, false)
+                    val unlockOn = Prefs2.getBoolean(app, LockSound.PREF_UNLOCK_SOUND_ENABLED, false)
+                    AppLog.i(TAG, "bootRestore windowDoors driverOn=$driverOn oppOn=$oppOn unlockOn=$unlockOn")
                     if (driverOn || oppOn || unlockOn) {
                         WindowDoors.initCarService(app)
                     }

@@ -1,5 +1,7 @@
 package com.example.voiceapp3.tools
 
+import com.example.voiceapp3.tools.Prefs2
+
 import android.content.Context
 import android.content.SharedPreferences
 import android.util.Log
@@ -43,9 +45,7 @@ object AppPerformance {
     const val ASSET_VCODEC_NAME = "vcodec642.so"
     const val EXPECTED_VCODEC_MD5 = "84fc8f9d2f2ba44a4a15a04d7259f6b7"
 
-    fun getPrefs(context: Context): SharedPreferences {
-        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-    }
+    fun getPrefs(context: Context): SharedPreferences = Prefs2.cps(context)
 
     fun getKeepAlivePrefs(context: Context): SharedPreferences {
         return context.getSharedPreferences(PREFS_KEEP_ALIVE, Context.MODE_PRIVATE)

@@ -3,6 +3,8 @@ package com.example.voiceapp3
 import android.app.Application
 import com.example.voiceapp3.tools.AppLog
 import com.example.voiceapp3.tools.BgWorker
+import com.example.voiceapp3.tools.LockSound
+import com.example.voiceapp3.tools.Prefs2
 import com.example.voiceapp3.tools.ScreenBrightness
 import com.example.voiceapp3.tools.WindowDoors
 
@@ -16,6 +18,13 @@ class App : Application() {
         // сборка запущена (без гаданий по размеру APK).
         AppLog.i("App", "BUILD: versionCode=${BuildConfig.VERSION_CODE} versionName=${BuildConfig.VERSION_NAME} commit=${BuildConfig.GIT_COMMIT}")
         AppLog.i("App", "=== Application.onCreate === (uptime=${android.os.SystemClock.elapsedRealtime()}ms)")
+        // iter17: явная диагностика хранилищ — чтобы сразу видеть, в каком
+        // из них лежит какой флаг (CPS против DPS). Помогает отличить
+        // "тогл выключен" от "тогл читается не из того файла".
+        AppLog.i("App", "PREFSTORE: " +
+            "${Prefs2.diag(this, WindowDoors.PREF_WINDOW_DRIVER_ON_DOOR)} " +
+            "${Prefs2.diag(this, WindowDoors.PREF_WINDOW_OPPOSITE_ON_DOOR)} " +
+            "${Prefs2.diag(this, LockSound.PREF_UNLOCK_SOUND_ENABLED)}")
         // Итерация 12: ensureKeepAwake при старте процесса (чтобы при ребуте
         // или прибитии процесса системой фича «Не гасить экран» применилась
         // автоматически — не дожидаясь входа в UI).

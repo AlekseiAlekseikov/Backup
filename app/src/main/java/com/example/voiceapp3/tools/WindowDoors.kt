@@ -1,5 +1,7 @@
 package com.example.voiceapp3.tools
 
+import com.example.voiceapp3.tools.Prefs2
+
 import android.car.Car
 import android.car.hardware.CarPropertyValue
 import android.car.hardware.property.CarPropertyManager
@@ -174,16 +176,7 @@ object WindowDoors {
         }
     }
 
-    private fun getPrefs(context: Context): SharedPreferences {
-        // iter16: при буте N direct-boot используем device-protected storage —
-        // туда же пишутся переключатели через Settings.
-        return try {
-            context.createDeviceProtectedStorageContext()
-                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        } catch (_: Throwable) {
-            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        }
-    }
+    private fun getPrefs(context: Context): SharedPreferences = Prefs2.cps(context)
 
     fun isWindowDriverOnDoor(context: Context): Boolean {
         return getPrefs(context).getBoolean(PREF_WINDOW_DRIVER_ON_DOOR, false)
@@ -387,7 +380,7 @@ object WindowDoors {
 
     fun setWindowDriverOnDoor(context: Context, enabled: Boolean): ToolsResult {
         val t0 = SystemClock.uptimeMillis()
-        getPrefs(context).edit().putBoolean(PREF_WINDOW_DRIVER_ON_DOOR, enabled).commit()
+        Prefs2.putBoolean(context, PREF_WINDOW_DRIVER_ON_DOOR, enabled)
         if (enabled) {
             initCarService(context)
         }
@@ -413,7 +406,7 @@ object WindowDoors {
 
     fun setWindowOppositeOnDoor(context: Context, enabled: Boolean): ToolsResult {
         val t0 = SystemClock.uptimeMillis()
-        getPrefs(context).edit().putBoolean(PREF_WINDOW_OPPOSITE_ON_DOOR, enabled).commit()
+        Prefs2.putBoolean(context, PREF_WINDOW_OPPOSITE_ON_DOOR, enabled)
         if (enabled) {
             initCarService(context)
         }
