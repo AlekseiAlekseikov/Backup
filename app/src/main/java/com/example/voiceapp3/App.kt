@@ -30,6 +30,10 @@ class App : Application() {
             "${Prefs2.diag(this, NetworkTtl.PREF_TTL_65_ACTIVE)} " +
             "${Prefs2.diag(this, ScreenBrightness.PREF_KEEP_AWAKE)} " +
             "${Prefs2.diag(this, ScreenBrightness.PREF_REMEMBER)}")
+        // iter19: САМОЕ ПЕРВОЕ чтение screen_off_timeout ДО любых записей со стороны APK
+        // (для честной проверки DURABLE_AFTER_REBOOT). Это должно случиться раньше
+        // ensureKeepAwake и раньше runBootDiag — они обе имеют право писать settings.
+        BgWorker.post("App.durablePreRead") { ScreenBrightness.capturePreWriteBootReadback(this) }
         // Итерация 12: ensureKeepAwake при старте процесса (чтобы при ребуте
         // или прибитии процесса системой фича «Не гасить экран» применилась
         // автоматически — не дожидаясь входа в UI).

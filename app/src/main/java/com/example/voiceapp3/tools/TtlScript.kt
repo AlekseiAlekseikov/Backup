@@ -1,19 +1,19 @@
 package com.example.voiceapp3.tools
 
 /**
- * Shell-скрипт для измерения/установки TTL (iter18).
+ * Shell-скрипт для измерения/установки TTL (iter19).
  *
- * iter18 fixes:
- *  - tcpdump под timeout 6, -c 2, kill после wait — не виснет, даже если ответов нет.
- *  - Отдельные tcpdump-блоки для IPv4 (ttl N -> 1.1.1.1) и IPv6 (hlim N -> 2606:4700:4700::1111).
- *  - verdict-матрица: VERIFIED только при реальном ttl/hlim с провода; если счётчики
- *    выросли, а пакета нет — real=UNKNOWN method=iptables-counters → INDIRECT;
- *    есть правило, но нет измерения — real=UNKNOWN method=rule-text → UNVERIFIED;
- *    число из правила выносится в отдельное поле rule_ttl=/rule_hl=, НЕ в real=.
- *  - DELTA_V4/V6 всегда число (по умолч. 0) — нет 'unary operator expected'.
- *
- * Все $ в этом triple-quoted шаблоне относятся к shell. Kotlin $ нужный, мы
- * экранируем через константу ${D} (D="$").
+ * Ключевые гарантии (iter19):
+ *  1. ФИНАЛЬНАЯ СТРОКА `TTL_CHECK:` ВСЕГДА печатается — даже при падении tcpdump/iptables,
+ *     при отсутствии timeout, при ошибке ping. Строка вынесена из всех if и в конце — это
+ *     твёрдая гарантия завершения.
+ *  2. `kill $TD_PID` вызывается ДО `wait $TD_PID` — мы не висим, ожидая второго пакета,
+ *     которого может не быть. `timeout 6` — только как второй эшелон, не как
+ *     единственная защита от зависания.
+ *  3. `toybox-timeout` удалён из кандидатов (такой команды нет; есть `toybox timeout`).
+ *     Пробуем `timeout` и `/system/bin/timeout`.
+ *  4. Строка `PROBE: timeout=<bin|none> tcpdump=<bin|none>` в начале — сразу видно
+ *     в логе, какая ветка сработала.
  */
 internal object TtlScript {
     private const val D = "$"
@@ -35,21 +35,28 @@ TIMEOUT_BIN=""
 for cand in tcpdump toybox-tcpdump busybox-tcpdump /system/bin/tcpdump /system/xbin/tcpdump; do
   if command -v ${D}cand >/dev/null 2>&1; then TCPDUMP_BIN=${D}cand; break; fi
 done
-for cand in timeout toybox-timeout; do
+for cand in timeout /system/bin/timeout; do
   if command -v ${D}cand >/dev/null 2>&1; then TIMEOUT_BIN=${D}cand; break; fi
 done
-echo TCPDUMP_BIN=${D}TCPDUMP_BIN TIMEOUT_BIN=${D}TIMEOUT_BIN
-# --- read current rule TTL/HL from iptables -S ---
+# iter19: проба выводится в начале — чтобы видно было в логе, каким путём пошло
+echo "PROBE: timeout=${D}{TIMEOUT_BIN:-none} tcpdump=${D}{TCPDUMP_BIN:-none}"
+# --- read current rule TTL/HL from iptables -S (safely, don't fail the script) ---
+RULE_TTL=""
+RULE_HL=""
 RULE_TTL=${D}(iptables -t mangle -S POSTROUTING 2>/dev/null | grep -oE -- '--ttl-set[[:space:]]+[0-9]+' | head -1 | awk '{print ${D}2}')
 RULE_HL=${D}(ip6tables -t mangle -S POSTROUTING 2>/dev/null | grep -oE -- '--hl-set[[:space:]]+[0-9]+' | head -1 | awk '{print ${D}2}')
 echo RULE_V4_TTL=${D}RULE_TTL RULE_V6_HL=${D}RULE_HL
 # --- counters BEFORE ---
+CNTR_BEFORE_V4=0
+CNTR_BEFORE_V6=0
 CNTR_BEFORE_V4=${D}(iptables -t mangle -L POSTROUTING -v -n -x 2>/dev/null | awk '/TTL/ && /ttl-set/ {print ${D}2; exit}')
 CNTR_BEFORE_V6=${D}(ip6tables -t mangle -L POSTROUTING -v -n -x 2>/dev/null | awk '/HL/ && /hl-set/ {print ${D}2; exit}')
 [ -z "${D}CNTR_BEFORE_V4" ] && CNTR_BEFORE_V4=0
 [ -z "${D}CNTR_BEFORE_V6" ] && CNTR_BEFORE_V6=0
 echo TTL_COUNTERS_BEFORE_V4=${D}CNTR_BEFORE_V4 V6=${D}CNTR_BEFORE_V6
-# --- apply rules if needed ---
+# --- apply rules if needed (best-effort, do not abort on error) ---
+V4_EXIST=0
+V6_EXIST=0
 V4_EXIST=${D}(iptables -t mangle -S POSTROUTING 2>/dev/null | grep -c -- '--ttl-set')
 V6_EXIST=${D}(ip6tables -t mangle -S POSTROUTING 2>/dev/null | grep -c -- '--hl-set')
 echo TTL_V4_EXIST=${D}V4_EXIST TTL_V6_EXIST=${D}V6_EXIST
@@ -74,10 +81,18 @@ else
     ip6tables -w 5 -t mangle -D POSTROUTING -j HL --hl-set 65 2>/dev/null || break
   done
 fi
+RULE_TTL_AFTER=""
+RULE_HL_AFTER=""
 RULE_TTL_AFTER=${D}(iptables -t mangle -S POSTROUTING 2>/dev/null | grep -oE -- '--ttl-set[[:space:]]+[0-9]+' | head -1 | awk '{print ${D}2}')
 RULE_HL_AFTER=${D}(ip6tables -t mangle -S POSTROUTING 2>/dev/null | grep -oE -- '--hl-set[[:space:]]+[0-9]+' | head -1 | awk '{print ${D}2}')
 echo RULE_V4_TTL_AFTER=${D}RULE_TTL_AFTER RULE_V6_HL_AFTER=${D}RULE_HL_AFTER
 # --- verify via -C with grep -c fallback ---
+V4_AFTER=0
+V6_AFTER=0
+VC4=1
+VC6=1
+VERIFY_V4="FAIL"
+VERIFY_V6="FAIL"
 V4_AFTER=${D}(iptables -t mangle -S POSTROUTING 2>/dev/null | grep -c -- '--ttl-set')
 V6_AFTER=${D}(ip6tables -t mangle -S POSTROUTING 2>/dev/null | grep -c -- '--hl-set')
 iptables -w 5 -t mangle -C POSTROUTING -j TTL --ttl-set 65 >/dev/null 2>&1; VC4=${D}?
@@ -89,7 +104,7 @@ if [ "${D}VC6" -eq 0 ] 2>/dev/null; then VERIFY_V6=OK
 elif [ "${D}V6_AFTER" -ge 1 ] 2>/dev/null; then VERIFY_V6=OK-grepc
 else VERIFY_V6=FAIL; fi
 echo TTL_V4=${D}V4_AFTER TTL_V6=${D}V6_AFTER VERIFY_V4=${D}VERIFY_V4 VERIFY_V6=${D}VERIFY_V6
-# --- real TTL via tcpdump (IPv4) ---
+# --- real TTL via tcpdump (IPv4 + IPv6). Kill BEFORE wait to avoid hanging. ---
 TD_DIR=/data/local/tmp
 mkdir -p ${D}TD_DIR 2>/dev/null || true
 TD_ERR="${D}TD_DIR/ttl_tcpdump_${D}${D}.err"
@@ -97,51 +112,67 @@ TD_ERR6="${D}TD_DIR/ttl_tcpdump6_${D}${D}.err"
 rm -f ${D}TD_ERR ${D}TD_ERR6
 TTL_REAL=""
 HL_REAL=""
-WIRE_TTL_METHOD="none"
-if [ -n "${D}TCPDUMP_BIN" ]; then
-  # IPv4 capture: timeout 6, -c 2 (one for ping request + retrans), under timeout so we never hang
+TCPDUMP_ERRMSG=""
+run_v4_capture() {
+  # iter19: kill -> wait (kill ПЕРЕД wait — не ждём бесконечно второй пакет).
+  # timeout можно использовать как второй эшелон, но он не обязательный.
+  local _pid _rc
   if [ -n "${D}TIMEOUT_BIN" ]; then
     ${D}TIMEOUT_BIN 6 ${D}TCPDUMP_BIN -ni ${D}IFACE_ARG -c 2 -v -s 0 'ip and dst host 1.1.1.1' >"${D}TD_ERR" 2>&1 &
   else
     ${D}TCPDUMP_BIN -ni ${D}IFACE_ARG -c 2 -v -s 0 'ip and dst host 1.1.1.1' >"${D}TD_ERR" 2>&1 &
   fi
-  TD_PID=${D}!
+  _pid=${D}!
   sleep 1
   ping -c 2 -W 2 1.1.1.1 >/dev/null 2>&1 || true
-  wait ${D}TD_PID 2>/dev/null || true
-  kill ${D}TD_PID 2>/dev/null || true
-  TTL_REAL=${D}(grep -oE 'ttl[[:space:]]+[0-9]+' "${D}TD_ERR" | head -1 | awk '{print ${D}2}')
-  echo TCPDUMP_V4_TAIL=${D}(tail -5 "${D}TD_ERR" 2>/dev/null | tr '\n' ' ')
-  echo TTL_V4_WIRE=${D}TTL_REAL
-  # IPv6 capture (separate filter for hlim)
+  sleep 1
+  # ВАЖНО iter19: сначала kill, потом wait (wait НИКОГДА не должен висеть).
+  kill ${D}_pid 2>/dev/null || true
+  wait ${D}_pid 2>/dev/null || true
+}
+run_v6_capture() {
+  local _pid
   if [ -n "${D}TIMEOUT_BIN" ]; then
     ${D}TIMEOUT_BIN 6 ${D}TCPDUMP_BIN -ni ${D}IFACE_ARG -c 2 -v -s 0 'ip6 and dst host 2606:4700:4700::1111' >"${D}TD_ERR6" 2>&1 &
   else
     ${D}TCPDUMP_BIN -ni ${D}IFACE_ARG -c 2 -v -s 0 'ip6 and dst host 2606:4700:4700::1111' >"${D}TD_ERR6" 2>&1 &
   fi
-  TD_PID6=${D}!
+  _pid=${D}!
   sleep 1
   ping6 -c 2 -W 2 2606:4700:4700::1111 >/dev/null 2>&1 || true
-  wait ${D}TD_PID6 2>/dev/null || true
-  kill ${D}TD_PID6 2>/dev/null || true
+  sleep 1
+  kill ${D}_pid 2>/dev/null || true
+  wait ${D}_pid 2>/dev/null || true
+}
+if [ -n "${D}TCPDUMP_BIN" ]; then
+  run_v4_capture
+  TTL_REAL=${D}(grep -oE 'ttl[[:space:]]+[0-9]+' "${D}TD_ERR" | head -1 | awk '{print ${D}2}')
+  echo TCPDUMP_V4_TAIL=${D}(tail -3 "${D}TD_ERR" 2>/dev/null | tr '\n' ' ')
+  echo TTL_V4_WIRE=${D}TTL_REAL
+  run_v6_capture
   HL_REAL=${D}(grep -oE 'hlim[[:space:]]+[0-9]+' "${D}TD_ERR6" | head -1 | awk '{print ${D}2}')
-  echo TCPDUMP_V6_TAIL=${D}(tail -5 "${D}TD_ERR6" 2>/dev/null | tr '\n' ' ')
+  echo TCPDUMP_V6_TAIL=${D}(tail -3 "${D}TD_ERR6" 2>/dev/null | tr '\n' ' ')
   echo HLIM_V6_WIRE=${D}HL_REAL
 else
+  TCPDUMP_ERRMSG="tcpdump-absent"
   echo "TCPDUMP absent - cannot measure real TTL from wire"
 fi
 # --- counters AFTER ping ---
+CNTR_AFTER_V4=0
+CNTR_AFTER_V6=0
 CNTR_AFTER_V4=${D}(iptables -t mangle -L POSTROUTING -v -n -x 2>/dev/null | awk '/TTL/ && /ttl-set/ {print ${D}2; exit}')
 CNTR_AFTER_V6=${D}(ip6tables -t mangle -L POSTROUTING -v -n -x 2>/dev/null | awk '/HL/ && /hl-set/ {print ${D}2; exit}')
 [ -z "${D}CNTR_AFTER_V4" ] && CNTR_AFTER_V4=0
 [ -z "${D}CNTR_AFTER_V6" ] && CNTR_AFTER_V6=0
+DELTA_V4=0
+DELTA_V6=0
 DELTA_V4=$(( ${D}{CNTR_AFTER_V4:-0} - ${D}{CNTR_BEFORE_V4:-0} )) 2>/dev/null || DELTA_V4=0
 DELTA_V6=$(( ${D}{CNTR_AFTER_V6:-0} - ${D}{CNTR_BEFORE_V6:-0} )) 2>/dev/null || DELTA_V6=0
 case ${D}DELTA_V4 in ''|*[!0-9-]*) DELTA_V4=0 ;; esac
 case ${D}DELTA_V6 in ''|*[!0-9-]*) DELTA_V6=0 ;; esac
 echo TTL_COUNTERS: before_v4=${D}CNTR_BEFORE_V4 after_v4=${D}CNTR_AFTER_V4 delta_v4=${D}DELTA_V4 before_v6=${D}CNTR_BEFORE_V6 after_v6=${D}CNTR_AFTER_V6 delta_v6=${D}DELTA_V6
 rm -f ${D}TD_ERR ${D}TD_ERR6
-# --- verdict per iter18 matrix ---
+# --- verdict matrix (iter19 сохраняет iter18 матрицу) ---
 EXPECTED=65
 VERDICT="UNVERIFIED"
 REASON=""
@@ -154,15 +185,15 @@ if [ -n "${D}TTL_REAL" ] && [ "${D}TTL_REAL" = "${D}EXPECTED" ]; then
 elif [ -n "${D}TTL_REAL" ] && [ "${D}TTL_REAL" != "${D}EXPECTED" ]; then
   REAL_SHOW=${D}TTL_REAL; METHOD=tcpdump; VERDICT=MISMATCH; REASON="wire ttl=${D}TTL_REAL != expected=${D}EXPECTED"
 elif [ -z "${D}TCPDUMP_BIN" ]; then
-  REAL_SHOW=UNKNOWN; METHOD=none; VERDICT=UNVERIFIED; REASON="tcpdump-absent"
+  REAL_SHOW=UNKNOWN; METHOD=none; VERDICT=UNVERIFIED; REASON=${D}TCPDUMP_ERRMSG
 elif [ "${D}DELTA_V4" -gt 0 ] 2>/dev/null; then
-  # iter18: число из правила НЕ подставляется в real=; real=UNKNOWN, verdict=INDIRECT
   REAL_SHOW=UNKNOWN; METHOD=iptables-counters; VERDICT=INDIRECT; REASON="counters delta=${D}DELTA_V4 after ping, but no captured wire packet"
 elif [ -n "${D}RULE_TTL_AFTER" ]; then
   REAL_SHOW=UNKNOWN; METHOD=rule-text; VERDICT=UNVERIFIED; REASON="rule present but no wire measurement and counters did not increment (delta=${D}DELTA_V4)"
 else
   REAL_SHOW=UNKNOWN; METHOD=none; VERDICT=UNVERIFIED; REASON="no rule, no tcpdump, no counters - nothing to verify"
 fi
+# --- ФИНАЛЬНАЯ СТРОКА ГАРАНТИРОВАННО печатается ВСЕГДА ---
 echo "TTL_CHECK: real=${D}REAL_SHOW expected=${D}EXPECTED src=${D}{SRC_IP:-unknown} dst=1.1.1.1 iface=${D}IFACE_ARG method=${D}METHOD reason=${D}REASON rule_ttl=${D}RULE_SHOW hl_wire=${D}HL_REAL ARROW ${D}VERDICT"
 echo '=== TTL_SCRIPT end ==='
 """.trimIndent().replace("ARROW", "\u2192")

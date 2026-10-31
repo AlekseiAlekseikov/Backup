@@ -176,8 +176,6 @@ object WindowDoors {
         }
     }
 
-    private fun getPrefs(context: Context): SharedPreferences = Prefs2.cps(context)
-
     fun isWindowDriverOnDoor(context: Context): Boolean {
         return Prefs2.getBoolean(context, PREF_WINDOW_DRIVER_ON_DOOR, false)
     }

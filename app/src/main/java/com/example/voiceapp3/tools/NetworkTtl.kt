@@ -85,6 +85,8 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
             else -> ""
         }
         val ttlReal = Regex("real=([^ ]+)").find(ttlCheckLine)?.groupValues?.get(1) ?: "UNKNOWN"
+        // iter19 §4.3: при real=UNKNOWN показываем rule_ttl (например "не измерен, правило 65").
+        val ttlRuleEarly = Regex("rule_ttl=([^ ]+)").find(ttlCheckLine)?.groupValues?.get(1) ?: ""
         val hasLock = out.lowercase().contains("xtables lock")
         val hasPerm = out.lowercase().contains("permission denied") || out.lowercase().contains("avc: denied")
         val hasNoRoot = out.contains("ERR_ROOT_CHANNEL_UNAVAILABLE")
@@ -111,7 +113,7 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
             noTarget  -> "iptables target 'TTL' не поддерживается ядром (модуль отсутствует)"
             expected && ttlVerdict == "MISMATCH" -> "wire TTL mismatch (real=$ttlReal, expected=65)"
             expected && ttlVerdict == "INDIRECT" -> "wire TTL не снят с провода (счётчики подросли, но ttl N в tcpdump не попал) → непрямое подтверждение"
-            expected && ttlVerdict == "UNVERIFIED" -> "wire TTL не измерен (real=UNKNOWN): tcpdump не дал ttl N и счётчики не растут"
+            expected && ttlVerdict == "UNVERIFIED" -> "wire TTL не измерен (real=UNKNOWN${if (ttlRuleEarly.isNotBlank()) ", правило $ttlRuleEarly" else ""}): tcpdump не дал ttl N и счётчики не растут"
             !v4Ok     -> "TTL_V4 mismatch (expected=${if (expected) 1 else 0}, got=$v4 verify=$v4Verify)"
             !v6Ok     -> "TTL_V6 mismatch (expected=${if (expected) 1 else 0}, got=$v6 verify=$v6Verify)"
             else      -> null
@@ -133,7 +135,7 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
         Prefs2.putBoolean(context, PREF_TTL_65_ACTIVE, enabled)
 
         val script = buildScript(enabled)
-        val (exitCode, output) = AdbClient.execute(script, 25000)
+        val (exitCode, output) = AdbClient.execute(script, 40000)
 
         val (status, reason) = parseVerifyResult(enabled, output)
 
@@ -147,26 +149,36 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
         }
 
         val expectedStr = if (enabled) "TTL_V4=1 TTL_V6=1 VERIFY=OK/OK wire-real=65" else "TTL_V4=0 TTL_V6=0 VERIFY=FAIL/FAIL"
-        // iter17: парсим НОВЫЙ формат TTL_CHECK: real=... expected=... src=... dst=1.1.1.1 iface=... method=... reason=... → VERDICT
+        // iter19: печатаем ВСЮ строку TTL_CHECK как есть (не режем reason пробелом),
+        // а отдельно достаём поля для структурированного лога. reason между "reason=" и "rule_ttl=" — всё, что внутри.
         val ttlCheckLine = output.lineSequence().firstOrNull { it.startsWith("TTL_CHECK:") } ?: ""
         val ttlReal   = Regex("real=([^ ]+)").find(ttlCheckLine)?.groupValues?.get(1) ?: "UNKNOWN"
         val ttlMethod = Regex("method=([^ ]+)").find(ttlCheckLine)?.groupValues?.get(1) ?: "none"
         val ttlIface  = Regex("iface=([^ ]+)").find(ttlCheckLine)?.groupValues?.get(1) ?: "unknown"
         val ttlSrc    = Regex("src=([^ ]+)").find(ttlCheckLine)?.groupValues?.get(1) ?: "unknown"
-        val ttlReason = Regex("reason=([^ ]+)").find(ttlCheckLine)?.groupValues?.get(1) ?: ""
-        val ttlArrow  = if ("→ VERIFIED" in ttlCheckLine) "VERIFIED"
-                        else if ("→ MISMATCH" in ttlCheckLine) "MISMATCH"
-                        else if ("→ INDIRECT" in ttlCheckLine) "INDIRECT"
-                        else if ("→ UNVERIFIED" in ttlCheckLine) "UNVERIFIED"
-                        else "UNKNOWN"
+        val ttlRule   = Regex("rule_ttl=([^ ]+)").find(ttlCheckLine)?.groupValues?.get(1) ?: "none"
+        val ttlHl     = Regex("hl_wire=([^ ]+)").find(ttlCheckLine)?.groupValues?.get(1) ?: ""
+        // reason между "reason=" и " rule_ttl=" (может содержать пробелы)
+        val ttlReason = run {
+            val m = Regex("reason=(.*?) rule_ttl=").find(ttlCheckLine) ?: return@run ""
+            m.groupValues[1]
+        }
+        val ttlArrow  = when {
+            "→ VERIFIED" in ttlCheckLine -> "VERIFIED"
+            "→ MISMATCH" in ttlCheckLine -> "MISMATCH"
+            "→ INDIRECT" in ttlCheckLine -> "INDIRECT"
+            "→ UNVERIFIED" in ttlCheckLine -> "UNVERIFIED"
+            else -> "UNKNOWN"
+        }
         val kv = parseKv(output)
         val actualLines = output.lineSequence().filter {
-            it.startsWith("TTL_") || it.startsWith("VERIFY_") || it.startsWith("RULE_") || it.startsWith("TCPDUMP_") || it.startsWith("OUT_IFACE") || it.startsWith("TTL_CHECK:") || it.startsWith("TTL_COUNTERS:")
-        }.joinToString(" | ")
-        AppLog.i(TAG, "TTL_CHECK: real=$ttlReal expected=65 src=$ttlSrc dst=1.1.1.1 iface=$ttlIface method=$ttlMethod reason=$ttlReason → $ttlArrow")
-        AppLog.i(TAG, "TTL_RULE: v4_rule_ttl=${kv["RULE_V4_TTL"]}→${kv["RULE_V4_TTL_AFTER"]} v6_hl=${kv["RULE_V6_HL"]}→${kv["RULE_V6_HL_AFTER"]}")
-        AppLog.i(TAG, "TTL_COUNTERS line: ${output.lineSequence().firstOrNull { it.startsWith("TTL_COUNTERS:") } ?: "(none)"}")
-        AppLog.i(TAG, "VERIFY TTL: enabled=$enabled v4=${kv["TTL_V4"]}/v6=${kv["TTL_V6"]} vfy=${kv["VERIFY_V4"]}/${kv["VERIFY_V6"]} rc=$exitCode → $status ($reason)")
+            it.startsWith("TTL_") || it.startsWith("VERIFY_") || it.startsWith("RULE_") || it.startsWith("TCPDUMP_") || it.startsWith("OUT_IFACE") || it.startsWith("PROBE:") || it.startsWith("TTL_CHECK:") || it.startsWith("TTL_COUNTERS:")
+        }.joinToString(" | \n  ")
+        // iter19 §4.3: при real=UNKNOWN показать rule_ttl в UI — передаём в step.expected/actual.
+        AppLog.i(TAG, "TTL_CHECK (raw line from shell): $ttlCheckLine")
+        AppLog.i(TAG, "TTL_COUNTERS: ${output.lineSequence().firstOrNull { it.startsWith("TTL_COUNTERS:") } ?: "(none)"}")
+        AppLog.i(TAG, "TTL_RULE: v4_rule=${kv["RULE_V4_TTL_AFTER"] ?: ttlRule} v6_hl=${kv["RULE_V6_HL_AFTER"]} vfy=${kv["VERIFY_V4"]}/${kv["VERIFY_V6"]}")
+        AppLog.i(TAG, "VERIFY TTL: enabled=$enabled rc=$exitCode → $status ($reason)")
 
         val step = ToolsStep(
             step = "settings.ttl65",
@@ -189,7 +201,7 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
         AppLog.i(TAG, "TTL bootRestore: active=$active")
         if (!active) return
         val script = buildScript(true)
-        val (rc, out) = AdbClient.execute(script, 25000)
+        val (rc, out) = AdbClient.execute(script, 40000)
         val (status, reason) = parseVerifyResult(true, out)
         AppLog.i(TAG, "VERIFY TTL bootRestore: rc=$rc → $status ($reason)")
     }
@@ -225,7 +237,7 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
                         @Suppress("DEPRECATION") cm?.activeNetworkInfo?.type == ConnectivityManager.TYPE_WIFI
                     }
                     AppLog.i(TAG, "TTL network change (wifi=$isWifi) — re-applying rules")
-                    val (rc, out) = AdbClient.execute(buildScript(true), 25000)
+                    val (rc, out) = AdbClient.execute(buildScript(true), 40000)
                     val (status, reason) = parseVerifyResult(true, out)
                     AppLog.i(TAG, "VERIFY TTL networkChange: rc=$rc → $status ($reason)")
                     if (status == ToolsStep.Status.FAILED) {
