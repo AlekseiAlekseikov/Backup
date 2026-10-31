@@ -238,7 +238,9 @@ class ToolsPanel(
             opts = listOf("0" to "Выкл", "10" to "10 с", "30" to "30 с", "60" to "1 мин", "120" to "2 мин"),
         )
         addDiv()
-        addToggle("keepawake", "Не гасить экран", "desc.keepawake", def = false)
+        // iter16: тогл «Не гасить экран» убран по требованию владельца — keep-awake
+        // теперь применяется автоматически при первом старте и на каждом буте.
+        // addToggle("keepawake", "Не гасить экран", "desc.keepawake", def = false)
         addDiv()
         addSect("page.sectionTheme")
         addSeg("gu", ToolsCatalog.TEXT["page.themeHu"].orEmpty(), def = "light", width = 260,

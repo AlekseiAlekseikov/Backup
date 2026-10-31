@@ -366,6 +366,7 @@ class VoiceAssistantService : Service() {
                         AppPerformance.setVideo60Fps(app, true)
                     }
                 }
+                runCatching { AppPerformance.applyKeepAliveOnBoot(app) }
                 runCatching { NetworkTtl.registerNetworkReceiver(app) }
                 AppLog.i(TAG, "bootRestore complete (BgWorker)")
             }

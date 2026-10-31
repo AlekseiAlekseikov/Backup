@@ -344,7 +344,7 @@ object ScreenBrightness {
 
     /** Текущее состояние фичи «Не гасить экран» — для UI-среза. */
     fun isKeepAwake(ctx: Context): Boolean =
-        prefs(ctx.applicationContext).getBoolean(PREF_KEEP_AWAKE, false)
+        prefs(ctx.applicationContext).getBoolean(PREF_KEEP_AWAKE, true)
 
     /**
      * Применить keep-awake ON/OFF. НА ВЫЗЫВАЮЩЕМ ПОТОКЕ — только запись pref и
@@ -437,7 +437,7 @@ object ScreenBrightness {
         val app = ctx.applicationContext
         // Если кэш не свежий — запускаем асинхронную детекцию заранее (для UI).
         ensureSerialProbeAsync(app)
-        val enabled = prefs(app).getBoolean(PREF_KEEP_AWAKE, false)
+        val enabled = prefs(app).getBoolean(PREF_KEEP_AWAKE, true)
         // Однократная boot-диагностика (кто гаснет экран) — один раз после запуска
         // процесса, даже если keep-awake выключен (нам важно понять СОСТОЯНИЕ).
         if (prefs(app).getBoolean(BOOT_DIAG_DONE_KEY, false).not()) {

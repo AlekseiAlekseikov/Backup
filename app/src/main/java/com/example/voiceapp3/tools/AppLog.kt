@@ -46,6 +46,12 @@ object AppLog {
     @Volatile private var primaryPath: String = "(not initialised yet)"
     @Volatile private var processStartUptimeMs: Long = 0L
 
+    /** iter16: шапка, которая ДОЛЖНА быть в начале любого лога — даже после
+     *  ротации (когда лог-файл создаётся заново). В шапку попадают BUILD-строка
+     *  и CENTRAL_Init из App.onCreate — так после ротации не теряется версия. */
+    private val headerLines = ArrayDeque<String>(8)
+    @Volatile private var headerWritten = false
+
     /** Кольцевой буфер сообщений до init(). */
     private val early = ArrayDeque<String>(EARLY_CAP)
 
@@ -235,6 +241,14 @@ object AppLog {
         val c = ctx ?: return
         var thrown: Throwable? = null
         val line = formatLine(lvl, tag, msg, null)
+        // iter16: собираем "шапку" (BUILD/App INIT) — пишем её в начало каждого
+        // нового/повёрнутого файла, чтобы после ротации версия не терялась.
+        if (isHeaderLine(tag, msg)) {
+            synchronized(lock) {
+                if (headerLines.size >= 8) headerLines.removeFirst()
+                headerLines.addLast(line)
+            }
+        }
         synchronized(lock) {
             var out: PrintWriter? = null
             var target: File? = null
@@ -331,10 +345,40 @@ object AppLog {
     private fun intFile(c: Context): File =
         File(c.filesDir, "logs").apply { runCatching { if(!exists()) mkdirs() } }.let { File(it, LOG_NAME) }
 
+    /** Маркеры строк-шапки — их мы сохраняем в headerLines и пишем в начало
+     *  каждого нового (после ротации) файла, чтобы шапка с версией не терялась. */
+    private fun isHeaderLine(tag: String, msg: String): Boolean {
+        if (tag == "App" && msg.startsWith("BUILD:")) return true
+        if (tag == "App" && msg.startsWith("=== Application.onCreate")) return true
+        if (tag == "CENTRAL_Init") return true
+        if (msg.startsWith("Application.onCreate done")) return true
+        return false
+    }
+
+    private fun writeHeaderToFile(f: File) {
+        if (headerLines.isEmpty()) return
+        try {
+            FileWriter(f, true).use { fw ->
+                // помечаем "шапка после ротации"
+                fw.write(formatLine("INFO", TAG_BASE, "──── rotated log header (${headerLines.size} lines) ────", null))
+                fw.write("\n")
+                for (line in headerLines) { fw.write(line); fw.write("\n") }
+                fw.flush()
+            }
+        } catch (_: Throwable) {}
+    }
+
     private fun rotateIfNeeded(f: File) {
         if (f.exists() && f.length() > MAX) {
             val bak = File(f.parentFile, "${f.name}.bak")
             runCatching { if (bak.exists()) bak.delete(); f.renameTo(bak) }
+            // Новый файл: пишем шапку в начало, чтобы после ротации версия не
+            // терялась (iter16: жалоба владельца на потерянный BUILD после
+            // ротации в логе, начинающемся с +34376мс).
+            writeHeaderToFile(f)
+        } else if (!f.exists() && headerLines.isNotEmpty()) {
+            // Свежесозданный файл — тоже со шапкой.
+            writeHeaderToFile(f)
         }
     }
 

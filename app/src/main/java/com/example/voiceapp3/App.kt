@@ -2,23 +2,32 @@ package com.example.voiceapp3
 
 import android.app.Application
 import com.example.voiceapp3.tools.AppLog
+import com.example.voiceapp3.tools.BgWorker
 import com.example.voiceapp3.tools.ScreenBrightness
+import com.example.voiceapp3.tools.WindowDoors
 
 class App : Application() {
     override fun onCreate() {
         super.onCreate()
+        val tAppOnCreate = android.os.SystemClock.uptimeMillis()
         // Инициализируем логгер ПЕРВЫМ делом — до любых других модулей.
         AppLog.init(this)
         // Явная строка версии — чтобы владелец мгновенно видел в логе, какая
         // сборка запущена (без гаданий по размеру APK).
         AppLog.i("App", "BUILD: versionCode=${BuildConfig.VERSION_CODE} versionName=${BuildConfig.VERSION_NAME} commit=${BuildConfig.GIT_COMMIT}")
-        AppLog.i("App", "=== Application.onCreate ===")
+        AppLog.i("App", "=== Application.onCreate === (uptime=${android.os.SystemClock.elapsedRealtime()}ms)")
         // Итерация 12: ensureKeepAwake при старте процесса (чтобы при ребуте
         // или прибитии процесса системой фича «Не гасить экран» применилась
         // автоматически — не дожидаясь входа в UI).
-        ScreenBrightness.ensureKeepAwake(this)
+        // iter16: ensureKeepAwake — на BgWorker, не на main.
+        BgWorker.post("App.ensureKeepAwake") { ScreenBrightness.ensureKeepAwake(this) }
+        // iter16: инициализируем наблюдателя дверей (для механизма "стекло при
+        // открытии двери") ВНЕ зависимости от EXTRA_BOOT_RESTORE — раньше он
+        // вызывался только из boot-ветки, поэтому при обычном запуске не работал.
+        BgWorker.post("App.windowDoors") { WindowDoors.maybeInit(this) }
         // Фоновая диагностика при старте: uid/SELinux/su-бинарники/sysfs battery/temperature props
         Thread { rootDiagnostic() }.start()
+        AppLog.i("App", "Application.onCreate done in ${android.os.SystemClock.uptimeMillis() - tAppOnCreate}ms")
     }
 
     private fun rootDiagnostic() {

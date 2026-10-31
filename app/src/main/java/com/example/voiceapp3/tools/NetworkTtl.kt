@@ -41,22 +41,46 @@ object NetworkTtl {
     private const val IPT6 = "ip6tables"
     private const val W    = "-w 5"  // ждём xtables lock до 5 секунд
 
-    /** Сброс с VERIFY (-C) и подсчётом до/после. */
+    /** Сброс с VERIFY (-C) и подсчётом до/после.
+     *  iter16: (1) не трогаем правила, если они уже стоят (`grep -c ttl-set 65` == 1)
+     *  — без этого при каждом network-change мы дёргали -D/-A и обнуляли счётчики;
+     *  (2) tcpdump stderr → /dev/null (на ГУ нет /tmp), парсим ttl из stdout (-v пишет в stderr,
+     *  поэтому redirect 2>&1); (3) TTL_V4 == expected ⇒ OK, а не PARTIAL. */
     private fun buildScript(enable: Boolean): String {
-        val action = if (enable) "-A" else "-D"
         val v4Expect = if (enable) "1" else "0"
         val v6Expect = if (enable) "1" else "0"
+        val TD_ERR = "/data/local/tmp/ttl_tcpdump.out" // iter16: /tmp отсутствует на ГУ
         return """
-            echo TTL_BEFORE_V4=${'$'}($IPT -t mangle -S POSTROUTING 2>/dev/null | grep -c 'ttl-set 65')
-            echo TTL_BEFORE_V6=${'$'}($IPT6 -t mangle -S POSTROUTING 2>/dev/null | grep -c 'hl-set 65')
+            V4_EXIST=${'$'}($IPT -t mangle -S POSTROUTING 2>/dev/null | grep -c 'ttl-set 65')
+            V6_EXIST=${'$'}($IPT6 -t mangle -S POSTROUTING 2>/dev/null | grep -c 'hl-set 65')
+            echo TTL_BEFORE_V4=${'$'}V4_EXIST
+            echo TTL_BEFORE_V6=${'$'}V6_EXIST
             echo TTL_CNTR_BEFORE_V4=${'$'}($IPT -t mangle -L POSTROUTING -v -n 2>/dev/null | grep -F 'TTL' | awk '{print ${'$'}1}' | head -1)
             echo TTL_CNTR_BEFORE_V6=${'$'}($IPT6 -t mangle -L POSTROUTING -v -n 2>/dev/null | grep -F 'HL' | awk '{print ${'$'}1}' | head -1)
-            for i in 1 2 3 4 5; do $IPT $W -t mangle -D POSTROUTING -j TTL --ttl-set 65 2>/dev/null || break; done
-            for i in 1 2 3 4 5; do $IPT6 $W -t mangle -D POSTROUTING -j HL  --hl-set  65 2>/dev/null || break; done
-        """.trimIndent() + "\n" + (if (enable) """
-            $IPT  $W -t mangle -A POSTROUTING -j TTL --ttl-set 65 2>&1 || echo IPTV4_FAIL
-            $IPT6 $W -t mangle -A POSTROUTING -j HL  --hl-set  65 2>&1 || echo IPTV6_FAIL
-        """.trimIndent() else "") + """
+            NEED_APPLY_V4=0; NEED_APPLY_V6=0
+            if [ "$enable" = "1" ]; then
+              [ "${'$'}V4_EXIST" -lt 1 ] 2>/dev/null && NEED_APPLY_V4=1
+              [ "${'$'}V6_EXIST" -lt 1 ] 2>/dev/null && NEED_APPLY_V6=1
+            else
+              [ "${'$'}V4_EXIST" -gt 0 ] 2>/dev/null && NEED_APPLY_V4=1
+              [ "${'$'}V6_EXIST" -gt 0 ] 2>/dev/null && NEED_APPLY_V6=1
+              # При выключении аккуратно сносим все правила TTL
+              if [ "${'$'}NEED_APPLY_V4" = "1" ]; then
+                for i in 1 2 3 4 5; do $IPT $W -t mangle -D POSTROUTING -j TTL --ttl-set 65 2>/dev/null || break; done
+              fi
+              if [ "${'$'}NEED_APPLY_V6" = "1" ]; then
+                for i in 1 2 3 4 5; do $IPT6 $W -t mangle -D POSTROUTING -j HL  --hl-set  65 2>/dev/null || break; done
+              fi
+            fi
+            echo NEED_APPLY_V4=${'$'}NEED_APPLY_V4 NEED_APPLY_V6=${'$'}NEED_APPLY_V6
+        """.trimIndent() + "\n" + """
+            if [ "${'$'}NEED_APPLY_V4" = "1" ] && [ "$enable" = "1" ]; then
+              $IPT $W -t mangle -A POSTROUTING -j TTL --ttl-set 65 2>&1 || echo IPTV4_FAIL
+            fi
+            if [ "${'$'}NEED_APPLY_V6" = "1" ] && [ "$enable" = "1" ]; then
+              $IPT6 $W -t mangle -A POSTROUTING -j HL  --hl-set  65 2>&1 || echo IPTV6_FAIL
+            fi
+        """.trimIndent() + """
             echo VERIFY_V4=${'$'}($IPT $W -t mangle -C POSTROUTING -j TTL --ttl-set 65 >/dev/null 2>&1 && echo OK || echo FAIL)
             echo VERIFY_V6=${'$'}($IPT6 $W -t mangle -C POSTROUTING -j HL  --hl-set  65 >/dev/null 2>&1 && echo OK || echo FAIL)
             echo TTL_V4=${'$'}($IPT -t mangle -S POSTROUTING 2>/dev/null | grep -c 'ttl-set 65')
@@ -64,26 +88,26 @@ object NetworkTtl {
             echo TTL_CNTR_AFTER_V4=${'$'}($IPT -t mangle -L POSTROUTING -v -n 2>/dev/null | grep -F 'TTL' | awk '{print ${'$'}1}' | head -1)
             echo TTL_CNTR_AFTER_V6=${'$'}($IPT6 -t mangle -L POSTROUTING -v -n 2>/dev/null | grep -F 'HL' | awk '{print ${'$'}1}' | head -1)
             # === Попытка РЕАЛЬНО измерить исходящий TTL ===
-            # Метод 1 (предпочтительный): tcpdump. Пробуем все известные пути (system, toybox, busybox).
-            # tcpdump -ni any -c 5 -v 'ip' — снимает 5 IP-пакетов и печатает ttl N в каждом.
+            # tcpdump stderr -> /data/local/tmp (на ГУ нет /tmp); -v пишет ttl в stderr,
+            # поэтому мержим 2>&1 и оттуда парсим.
             TTL_MEASURED=""
             TTL_METHOD=""
+            TD_DIR="/data/local/tmp"
+            mkdir -p ${'$'}TD_DIR 2>/dev/null || true
+            TD_ERR="${'$'}TD_DIR/ttl_tcpdump.err"
+            rm -f ${'$'}TD_ERR
             for TCPDUMP in tcpdump toybox-tcpdump busybox-tcpdump /system/bin/tcpdump /system/xbin/tcpdump; do
               if command -v ${'$'}TCPDUMP >/dev/null 2>&1; then
-                # Запускаем tcpdump в фоне и инициируем один ICMP пакет ping-ом (без -t!
-                # он использует системный TTL, который и должно переписать mangle-правило).
-                ${'$'}TCPDUMP -ni any -c 3 -v -s 0 'ip and dst host 1.1.1.1' -w /dev/null 2>/tmp/ttl_tcpdump.out &
+                ${'$'}TCPDUMP -ni any -c 3 -v -s 0 'ip and dst host 1.1.1.1' >/dev/null 2>${'$'}TD_ERR &
                 TD_PID=$!
                 sleep 1
                 ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1 || true
                 wait ${'$'}TD_PID 2>/dev/null || true
-                TTL_MEASURED=${'$'}(grep -oE 'ttl [0-9]+' /tmp/ttl_tcpdump.out | head -1 | awk '{print $2}')
+                TTL_MEASURED=${'$'}(grep -oE 'ttl [0-9]+' ${'$'}TD_ERR | head -1 | awk '{print ${'$'}2}')
                 if [ -n "${'$'}TTL_MEASURED" ]; then TTL_METHOD="tcpdump(${'$'}TCPDUMP)"; break; fi
               fi
             done
-            # Метод 2 (fallback): сравниваем счётчики правил TTL/HL ДО и ПОСЛЕ порции трафика.
-            # Если счётчик увеличился — значит правило реально сработало на пакетах и TTL
-            # переписан. Это не даёт числа TTL, но доказывает, что правило применяется.
+            # Fallback: счётчики правил TTL ДО и ПОСЛЕ ping — если растут, правило работает.
             if [ -z "${'$'}TTL_MEASURED" ]; then
               CNTR_BEFORE=${'$'}($IPT -t mangle -L POSTROUTING -v -n 2>/dev/null | grep -F 'TTL' | awk '{print ${'$'}1}' | head -1)
               ping -c 3 -W 2 1.1.1.1 >/dev/null 2>&1 || true
@@ -98,8 +122,8 @@ object NetworkTtl {
                 TTL_METHOD="no-tcpdump-and-counters-not-incremented"
               fi
             fi
-            echo "TTL_CHECK: метод=${'$'}TTL_METHOD ttl=${'$'}TTL_MEASURED"
-            rm -f /tmp/ttl_tcpdump.out
+            echo "TTL_CHECK: method=${'$'}TTL_METHOD ttl=${'$'}TTL_MEASURED"
+            rm -f ${'$'}TD_ERR
         """.trimIndent()
     }
 
