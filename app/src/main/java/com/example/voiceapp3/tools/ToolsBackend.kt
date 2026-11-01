@@ -674,9 +674,6 @@ enum class Choice(
         return res
     }
 
-    /**
-     * Шаг с явным статусом — для случаев «шаг выполнен не полностью»
-     * (prop/sysfs недоступны, заставка уже выключена): статус виден в
     /** iter21 §3: кнопка «Не гасить ГУ» — одноразовое действие через ScreenBrightness. */
     private fun pressKeepAwakeButton(): ToolsResult {
         BgWorker.assertNotMain("ToolsBackend.pressKeepAwakeButton")
