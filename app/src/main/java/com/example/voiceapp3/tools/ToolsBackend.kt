@@ -677,6 +677,23 @@ enum class Choice(
     /**
      * Шаг с явным статусом — для случаев «шаг выполнен не полностью»
      * (prop/sysfs недоступны, заставка уже выключена): статус виден в
+    /** iter21 §3: кнопка «Не гасить ГУ» — одноразовое действие через ScreenBrightness. */
+    private fun pressKeepAwakeButton(): ToolsResult {
+        BgWorker.assertNotMain("ToolsBackend.pressKeepAwakeButton")
+        val res = ScreenBrightness.pressKeepAwakeButton(appContext)
+        AppLog.logAction(appContext, "settings.keepawake_btn=true", res)
+        return res
+    }
+
+    /** iter21 §2: восстановление панели SystemUI (умонтировать битый плагин + перезапустить sysui). */
+    private fun restoreHvac(): ToolsResult {
+        BgWorker.assertNotMain("ToolsBackend.restoreHvac")
+        val res = HvacDigitalPlugin.restoreSystemUi(appContext)
+        AppLog.logAction(appContext, "hvacdigital.restore", res)
+        return res
+    }
+
+    /**
      * cxNote и diagnostics, но не превращает всё действие в FAILED.
      */
     private fun stepOf(
@@ -885,6 +902,14 @@ enum class Choice(
                     else -> null
                 } ?: return parseFailed(key, "true|false", value)
                 return setKeepAwake(b)
+            }
+            // iter21 §3: кнопка «Не гасить ГУ» — одноразовое действие, НЕ тумблер, НЕ запоминается.
+            "keepawake_btn" -> {
+                return pressKeepAwakeButton()
+            }
+            // iter21 §2: RESTORE шторки SystemUI (umount кривого плагина + kill systemui).
+            "hvac_restore_btn" -> {
+                return restoreHvac()
             }
             "lockSoundVol" -> {
                 val v = intValue(value)

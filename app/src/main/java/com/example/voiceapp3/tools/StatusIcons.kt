@@ -80,23 +80,21 @@ object StatusIcons {
 
     private val AREAS = intArrayOf(0, 1, 2, 3, 4, 7, 0x10, 0x20, 0x30)
     private val RANGES = arrayOf(0x0..0x4FF, 0x11400000..0x117FFFFF, 0x15400000..0x167FFFFF)
+    // iter21 §5: 0x11600703 УДАЛЁН (всегда возвращал константу 25.0 — не реальный датчик).
     private val PRECISE_COMMON = intArrayOf(0x157, 0x11600005, 0x11600207, 0x11600208,
-        0x16400017, 0x21600017, 0x16400001, 0x15500703, 0x11500703, 0x11600703,
+        0x16400017, 0x21600017, 0x16400001, 0x15500703, 0x11500703,
         0x16400703, 0x21600703, 0x11600502, 0x11600204, 0x11400204)
 
-    // Подтверждённые ID VHAL по дампу geely_dump/car_service_dump.txt
+    // Подтверждённые ID VHAL.
     // EV_BATTERY_LEVEL=0x11600309 (Float %, 0..100)
     // ED_EV_BATTERY_PERCENTAGE=0x2140a6ed (Int, x10 — делим на 10)
-    // ENV_OUTSIDE_TEMPERATURE=0x11600703 (Float °C)
     private const val PROP_EV_BATT_LEVEL = 0x11600309
     private const val PROP_ED_EV_BATT_PCT = 0x2140a6ed
-    private const val PROP_ENV_OUT_TEMP = 0x11600703
+    // iter21 §5: 5 НОВЫХ ID для пробы наружной температуры (логгируем ВСЕ raw, "--" до верификации).
+    private val TEMP_PROBE_IDS = intArrayOf(
+        0x2140A863.toInt(), 0x2140B009, 0x2140B00D, 0x2140A6DC.toInt(), 0x21402063
+    )
     // AC_AMBIENT_TEMP (0x2140a377) — Int со смещением 80, половина градуса (norm: (raw-80)/2 °C).
-    // Это КАБИННЫЙ ambient-датчик HVAC, а не уличная температура.
-    // ПОСЛЕ декомпила CentralEXAuto v3.3.9 (com.geely.hvacstepperv2.TempStepperService.i()):
-    // наружка читается из ENV_OUTSIDE_TEMPERATURE (0x11600703) с двойной нормализацией
-    // (float °C, либо int/10, либо int как-есть); zones {0,1,4,7}. AC_AMBIENT_TEMP
-    // оставлен как fallback на случай, если на конкретной ГУ ENV_OUTSIDE_TEMPERATURE не отдаётся.
     private const val PROP_AC_AMBIENT_TEMP = 0x2140A377
 
     @Volatile private var cpm: android.car.hardware.property.CarPropertyManager? = null
@@ -316,155 +314,79 @@ object StatusIcons {
 
     private fun readTempScan(): Float? {
         val m = cpm ?: return null
-        AppLog.i(TAG, "TEMP: toggle=on read start")
+        AppLog.i(TAG, "TEMP (iter21 §5): probing, will show \"--\" until source is verified by human")
 
-        // CentralEXAuto pattern (com.geely.hvacstepperv2.TempStepperService.i()):
-        // PRIMARY = ENV_OUTSIDE_TEMPERATURE (0x11600703) по зонам {0,1,4,7},
-        // с двойной нормализацией:
-        //   1) getFloatProperty(p, area) — напрямую °C; валидный диапазон -55..70 °C
-        //   2) если float не дал, getIntProperty(p, area):
-        //        - если raw в [-550..700] → raw / 10.0f   (десятые доли градуса)
-        //        - иначе если raw в [-45..65] → raw.toFloat() (уже градусы)
-        // Декомпилировано из TempBattPillFloaterService/TempStepperService CentralEXAuto v3.3.9.
-        fun tryOutsideCex(area: Int, label: String): Float? {
-            // Float first
-            try {
-                val raw = m.getFloatProperty(PROP_ENV_OUT_TEMP, area)
-                if (!raw.isNaN() && raw > -55f && raw < 70f) {
-                    AppLog.i(TAG, "TEMP: ENV_OUTSIDE@$area float raw=$raw -> $raw °C (CentralEX)")
-                    return raw
-                }
-            } catch (e: Exception) { AppLog.d(TAG, "TEMP: $label float err=${e.message}") }
-            // Int fallback (two ranges, как у CentralEXAuto TempStepperService.i())
-            try {
-                val raw = m.getIntProperty(PROP_ENV_OUT_TEMP, area)
-                val v: Float? = when {
-                    raw in -550..700 -> raw / 10.0f
-                    raw in -45..65   -> raw.toFloat()
-                    else -> null
-                }
-                if (v != null && v > -55f && v < 70f) {
-                    AppLog.i(TAG, "TEMP: ENV_OUTSIDE@$area int raw=$raw -> $v °C (CentralEX /10 norm)")
-                    return v
-                }
-            } catch (e: Exception) { AppLog.d(TAG, "TEMP: $label int err=${e.message}") }
-            return null
-        }
-
-        fun tryFloatProp(p: Int, a: Int, label: String): Float? {
+        fun tryFloatProp(p: Int, a: Int): Pair<Float?, Any?> {
             try {
                 val raw = m.getFloatProperty(p, a)
-                if (!raw.isNaN() && raw != 0f) {
-                    val v = raw.coerceIn(-50f, 70f)
-                    if (v in -50f..70f) {
-                        tmpProp = p; tmpArea = a; tempSource = label
-                        AppLog.i(TAG, "TEMP: read raw=$raw v=%.1f src=$tempSource area=$a".format(v))
-                        return v
-                    } else { AppLog.d(TAG, "TEMP: $label raw=$raw out of range") }
-                }
-            } catch (e: Exception) { AppLog.d(TAG, "TEMP: $label float err=${e.message}") }
-            return null
+                if (!raw.isNaN()) return (if (raw in -55f..70f && raw != 25.0f) raw else null) to raw
+            } catch (e: Exception) { return null to ("ERR:" + e.message) }
+            return null to null
         }
-        fun tryInt80Prop(p: Int, a: Int, label: String): Float? {
+        fun tryIntProp(p: Int, a: Int): Pair<Float?, Any?> {
             try {
                 val raw = m.getIntProperty(p, a)
-                if (raw != 0) normInt80(raw)?.let { v ->
-                    tmpProp = p; tmpArea = a; tempSource = label
-                    AppLog.i(TAG, "TEMP: read raw=$raw v=$v (norm=($raw-80)/2) src=$tempSource")
-                    return v.toFloat()
+                val v: Float? = when {
+                    raw in -550..700 -> raw / 10.0f
+                    raw in -55..70   -> raw.toFloat()
+                    else -> null
                 }
-            } catch (e: Exception) { AppLog.d(TAG, "TEMP: $label int err=${e.message}") }
-            return null
+                return (if (v != null && v != 25.0f && v in -55f..70f) v else null) to raw
+            } catch (e: Exception) { return null to ("ERR:" + e.message) }
+            return null to null
         }
-        // Итерация 9 fix: удалены дубли объявлений Cand/candidates/chosen (compile error).
-        // Пока источник температуры не верифицирован логом с ГУ:
-        //   - читаем ENV_OUTSIDE_TEMPERATURE@0 КАК ЕСТЬ (как в прошлой рабочей сборке)
-        //     и показываем значение на экране (владелец просил: пусть даже неверное,
-        //     значок должен быть живой);
-        //   - РЯДОМ в лог пишем полный дамп всех температурных VHAL propertyId по всем
-        //     зонам — по нему определим реальный источник после прогона на ГУ;
-        //   - в tempSource пишем префикс UNVERIFIED, чтобы в логах видно было,
-        //     что это ещё не подтверждённое соответствие OEM-строке.
-        data class Cand(val name: String, val value: Float?, val area: Int = 0)
-        val candidates = mutableListOf<Cand>()
-        var chosen: Float? = null
-        var chosenArea = 0
-        var chosenLabel = ""
-        fun record(label: String, v: Float?, area: Int = 0): Float? {
-            candidates.add(Cand(label, v, area))
-            return v
+        fun tryInt80Prop(p: Int, a: Int): Pair<Float?, Any?> {
+            try {
+                val raw = m.getIntProperty(p, a)
+                val v = normInt80(raw)?.toFloat()
+                return (if (v != null && v in -50f..70f && v != 25.0f) v else null) to raw
+            } catch (e: Exception) { return null to ("ERR:" + e.message) }
         }
 
-        // 1) PRIMARY (UNVERIFIED): ENV_OUTSIDE_TEMPERATURE@0 как есть.
-        //    Это то же самое, что читала прошлая сборка, дававшая 25 °C. Значение
-        //    показывается на экране (не прячем), а рядом — полный дамп для анализа.
-        val v0 = tryOutsideCex(0, "VHAL:0x11600703/ENV_OUTSIDE_TEMPERATURE@0")
-        record("VHAL:0x11600703/ENV_OUTSIDE@0", v0, 0)
-        if (v0 != null) {
-            chosen = v0; chosenArea = 0
-            chosenLabel = "VHAL/UNVERIFIED:ENV_OUTSIDE@0"
-            tmpProp = PROP_ENV_OUT_TEMP; tmpArea = 0; tempSource = chosenLabel
+        data class Cand(val name: String, val value: Float?, val raw: Any?)
+        val candidates = ArrayList<Cand>()
+        fun rec(name: String, v: Float?, raw: Any?) { candidates.add(Cand(name, v, raw)) }
+
+        // iter21 §5: 0x11600703 ОТКЛЮЧЁН — не используем и не выбираем (всегда 25.0 — не датчик).
+        // Пробуем 5 НОВЫХ ID по трём зонам; все raw логируем, но НЕ ВЫБИРАЕМ автоматически
+        // (нельзя угадать без верификации на ГУ).
+        for (pid in TEMP_PROBE_IDS) {
+            for (area in intArrayOf(0, 2, 7)) {
+                val name = "0x${"%08X".format(pid)}@$area"
+                val (vf, rawf) = tryFloatProp(pid, area)
+                rec("$name/float", vf, rawf)
+                val (vi, rawi) = tryIntProp(pid, area)
+                rec("$name/int", vi, rawi)
+            }
         }
 
-        // 2) Сканируем ОСТАЛЬНЫЕ зоны ENV_OUTSIDE в диагностических целях (в лог)
-        //    — но не перезаписываем chosen автоматически (не угадываем).
-        for (a in intArrayOf(1, 2, 3, 4, 5, 7, 0xF)) {
-            val v = tryOutsideCex(a, "VHAL:0x11600703/ENV_OUTSIDE_TEMPERATURE@$a")
-            record("VHAL:0x11600703/ENV_OUTSIDE@$a", v, a)
-        }
-
-        // 3) hvacdigital getprop temp_ext / exttemp (кросс-проверка, не primary,
-        //    т.к. без рута там может быть флаг 0/1).
+        // getprop fallback (всё так же логируем, но тоже не auto-choose).
         for (prop in SYS_HVAC_EXT_ALL) {
-            val v = runCatching {
+            runCatching {
                 val pp = Runtime.getRuntime().exec(arrayOf("sh","-c","getprop $prop"))
                 if (!pp.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)) { pp.destroyForcibly() }
                 val sVal = pp.inputStream.bufferedReader().readText().trim()
                 pp.errorStream.bufferedReader().readText().trim()
                 val fv = sVal.toFloatOrNull()
-                AppLog.d(TAG, "TEMP: getprop $prop raw=\"$sVal\" parsed=$fv")
-                fv?.takeIf { it in -50f..70f && Math.abs(it - 1f) > 0.1f }?.also {
-                    AppLog.i(TAG, "TEMP: getprop $prop val=\"$sVal\" -> $it °C")
-                }
-            }.getOrNull()
-            record("hvacdigital/$prop", v)
-            if (v != null && chosen == null && Math.abs(v - 1f) > 0.1f) {
-                chosen = v; chosenLabel = "hvacdigital/$prop"; tempSource = chosenLabel
+                val v = fv?.takeIf { it in -50f..70f && Math.abs(it - 1f) > 0.1f && it != 25.0f }
+                rec("getprop/$prop", v, sVal)
             }
         }
-        // 4) AC_AMBIENT_TEMP (кабина) — fallback (norm (raw-80)/2 °C).
-        if (chosen == null) {
-            for (a in intArrayOf(0, 2, 7)) {
-                val v = tryInt80Prop(PROP_AC_AMBIENT_TEMP, a, "VHAL:0x2140A377/AC_AMBIENT_TEMP@$a")
-                record("VHAL:0x2140a377/AC_AMBIENT@$a", v, a)
-                if (v != null && chosen == null) {
-                    chosen = v; chosenArea = a; chosenLabel = "VHAL/UNVERIFIED:AC_AMBIENT@$a"
-                    tmpProp = PROP_AC_AMBIENT_TEMP; tmpArea = a; tempSource = chosenLabel
-                }
-                if (chosen != null) break
-            }
+
+        // AC_AMBIENT_TEMP (кабина, не наружка) — тоже только лог, не auto-choose.
+        for (a in intArrayOf(0, 2, 7)) {
+            val (vi, rawi) = tryInt80Prop(PROP_AC_AMBIENT_TEMP, a)
+            rec("0x2140A377@$a/int80(cabin)", vi, rawi)
         }
-        // 5) PRECISE_COMMON fallback
-        if (chosen == null) {
-            outer@ for (pp in PRECISE_COMMON) {
-                for (a in intArrayOf(0, 2, 7)) {
-                    val label = "VHAL:0x${"%08X".format(pp)}@$a[fallback]"
-                    val vi = tryInt80Prop(pp, a, label); record(label + "/int80", vi, a)
-                    if (vi != null) { chosen = vi; chosenArea = a; chosenLabel = label; tmpProp = pp; tmpArea = a; tempSource = label; break@outer }
-                    val vf = tryFloatProp(pp, a, label); record(label + "/float", vf, a)
-                    if (vf != null) { chosen = vf; chosenArea = a; chosenLabel = label; tmpProp = pp; tmpArea = a; tempSource = label; break@outer }
-                }
-            }
-        }
-        val finalV = chosen
-        if (finalV != null) {
-            AppLog.i(TAG, "TEMP status=UNVERIFIED candidates — " + candidates.joinToString(" | ") { "${it.name}=${it.value}" })
-            AppLog.i(TAG, "TEMP: chosen=%.1f (src=$chosenLabel area=$chosenArea)".format(finalV))
-            return finalV
-        }
-        AppLog.w(TAG, "TEMP: candidates — " + candidates.joinToString(" | ") { "${it.name}=${it.value}" })
-        AppLog.w(TAG, "TEMP: notify ERROR: ни один источник не дал валидного значения")
-        tempSource = "none"
+
+        // Логгируем ВСЕ значения в строку (чтобы по логу определить реальный ID с ГУ).
+        val lines = candidates.map { "${it.name}=${it.raw}->${it.value}" }
+        AppLog.i(TAG, "TEMP_PROBE (iter21 §5):\n" + lines.joinToString("\n  ", prefix = "  "))
+
+        // iter21 §5: ПОКА НИЧЕГО НЕ ВЫБИРАЕМ — показываем "--" до верификации.
+        // Как только по логам определим реальный ID — вернём его в PRECISE_COMMON/primary.
+        tempSource = "unverified (-- shown)"
+        AppLog.w(TAG, "TEMP: no source verified yet — returning null (UI shows \"--\")")
         return null
     }
 
@@ -514,6 +436,32 @@ object StatusIcons {
         n.extras.putInt("flag_status_icon_specific_width", 0)
         try { nm.notify(id, n); AppLog.d(TAG,"post notif id=$id rank=$rank text=\"$text\"") }
         catch (t: Throwable) { AppLog.e(TAG,"notify $id err", t) }
+    }
+
+    // iter21 §4: TempBattPill — постоянная нотификация, канал "temp_batt_pill_floater" (РЕФЕРЕНС CEX
+    // com.ex.auto.TempBattPillFloaterService#onCreate: startForeground(109, k1.G(...,"temp_batt_pill_floater",...))
+    // с smallIcon=17301561 (android.R.drawable.ic_menu_compass/ic_dialog_info — системная иконка).
+    private const val CHANNEL_PILL = "temp_batt_pill_floater"
+    private const val NOTIF_PILL = 109
+    private fun postTempBattPill(ctx: Context, battStr: String?, tempStr: String?, wifiStr: String?) {
+        val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        nm.createNotificationChannel(NotificationChannel(CHANNEL_PILL, "Temp/Batt Pill", NotificationManager.IMPORTANCE_LOW).apply {
+            setShowBadge(false)
+        })
+        val parts = ArrayList<String>(3)
+        if (!tempStr.isNullOrEmpty()) parts.add(tempStr)
+        if (!battStr.isNullOrEmpty()) parts.add(battStr)
+        if (!wifiStr.isNullOrEmpty()) parts.add(wifiStr)
+        val title = if (parts.isEmpty()) "—" else parts.joinToString("   ")
+        val n = Notification.Builder(ctx, CHANNEL_PILL)
+            .setSmallIcon(android.R.drawable.ic_menu_compass)
+            .setContentTitle(title)
+            .setContentText("CentralEXAuto pill")
+            .setOngoing(true).setShowWhen(false)
+            .setContentIntent(telemetryPi(ctx, NOTIF_PILL))
+            .build()
+        try { nm.notify(NOTIF_PILL, n); AppLog.i(TAG, "PILL_NOTIF: posted title=\"$title\"") }
+        catch (t: Throwable) { AppLog.e(TAG, "PILL_NOTIF err", t) }
     }
 
     // DO NOT replace with a text placeholder. Use arc-based draw for wifi; keep text-draw for batt/temp.
@@ -730,8 +678,13 @@ object StatusIcons {
                 lastTempC = t
                 lastExtTempC = t
             } else {
-                cancel(app, NOTIF_TEMP)
-                AppLog.w(TAG, "TEMP: notify ERROR: value=null")
+                // iter21 §5: "--" пока не верифицирован источник (вместо константы 25.0 и вместо отмены нотификации).
+                postNotif(app, NOTIF_TEMP, CHANNEL_TEMP,
+                    makeTextIcon(app, "--", "", Color.WHITE),
+                    "Снаружи --°C", "источник не верифицирован (iter21 §5)", RANK_TEMP,
+                    telemetryPi(app, NOTIF_TEMP))
+                tempStr = "--°"; tempHas = true
+                AppLog.w(TAG, "TEMP: value=unverified → show \"--\" (no more 25.0 constant)")
             }
         } else { cancel(app, NOTIF_TEMP); AppLog.d(TAG, "TEMP: toggle=off") }
 
@@ -757,28 +710,12 @@ object StatusIcons {
             } catch (e: Exception) { AppLog.e(TAG,"WIFI: notify ERROR: ${e.message}", e) }
         } else cancel(app, NOTIF_WIFI)
 
-        // P-фикс раздел 0: основной рендер — в overlay-окно (читаемый размер ~12sp текст).
-        // smallIcon нотификации — заглушка ("%", "°", дуги) для системной шторки; визуально
-        // индикатор рисуется в StatusOverlay, там же и клики по PendingIntent.
-        if (battHas || tempHas || wifiHas) {
-            try {
-                val battIcon = if (battHas) makeBattGlyph(app, battPct ?: 0f) else null
-                val tempIcon = if (tempHas) makeTempOverlayIcon(app) else null
-                val wifiIcon = if (wifiHas) makeWifiOverlayIcon(app, wifiLvl) else null
-                val ovSizeDp = 32
-                StatusOverlay.update(
-                    app,
-                    battHas, battStr, battIcon, telemetryPi(app, NOTIF_BATT),
-                    tempHas, tempStr, tempIcon, telemetryPi(app, NOTIF_TEMP),
-                    wifiHas, wifiStr, wifiIcon, wifiSettingsPi(app)
-                )
-                AppLog.i(TAG, "OVERLAY: render size=${ovSizeDp}dp seg(B=$battHas T=$tempHas W=$wifiHas) seq=$seq")
-            } catch (t: Throwable) {
-                AppLog.w(app, TAG, "OVERLAY update err: ${t.message}")
-            }
-        } else {
-            StatusOverlay.hide(app)
-        }
+        // iter21 §4: OVERLAY ОТКЛЮЧЁН (TYPE_APPLICATION_OVERLAY убран).
+        // Индикаторы температуры/батареи — в СТРОКЕ СОСТОЯНИЯ через постоянную
+        // нотификацию TempBattPill (аналогично CEX com.ex.auto.TempBattPillFloaterService,
+        // но БЕЗ WindowManager.addView — только Notification).
+        runCatching { StatusOverlay.hide(app) }
+        postTempBattPill(app, battStr, tempStr, wifiStr)
 
         // iter16: после каждого tick проталкиваем РЕАЛЬНЫЕ значения в
         // persist.sys.hvacdigital.{batt,temp,exttemp,temp_ext}, если соответствующий
@@ -820,7 +757,7 @@ object StatusIcons {
     }
 
     @JvmStatic fun cancelAll(ctx: Context) {
-        cancel(ctx, NOTIF_BATT); cancel(ctx, NOTIF_TEMP); cancel(ctx, NOTIF_WIFI)
+        cancel(ctx, NOTIF_BATT); cancel(ctx, NOTIF_TEMP); cancel(ctx, NOTIF_WIFI); cancel(ctx, NOTIF_PILL)
         StatusOverlay.hide(ctx)
     }
 

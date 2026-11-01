@@ -347,6 +347,44 @@ object ScreenBrightness {
         Prefs2.getBoolean(ctx.applicationContext, PREF_KEEP_AWAKE, true)
 
     /**
+     * iter21 §3: КНОПКА «Не гасить ГУ» — одноразовое действие, НЕ тумблер, НЕ запоминает pref.
+     * Через root-канал ставит screen_off_timeout=2147483647 и stay_on_while_plugged_in=7,
+     * сразу читает обратно для честного вердикта. Никаких watchdog-циклов, никаких while-true.
+     */
+    fun pressKeepAwakeButton(ctx: Context): ToolsResult {
+        val t0 = SystemClock.uptimeMillis()
+        val script = """
+echo '=== KEEPAWAKE_BUTTON (one-shot) ==='
+_BEFORE=\$(settings get system screen_off_timeout 2>&1)
+_STAY_BEFORE=\$(settings get global stay_on_while_plugged_in 2>&1)
+settings put system screen_off_timeout 2147483647 2>&1
+settings put global stay_on_while_plugged_in 7 2>&1
+_RC=\$?
+_AFTER=\$(settings get system screen_off_timeout 2>&1)
+_STAY_AFTER=\$(settings get global stay_on_while_plugged_in 2>&1)
+echo "before=\$_BEFORE stay_before=\$_STAY_BEFORE"
+echo "after=\$_AFTER stay_after=\$_STAY_AFTER rc=\$_RC"
+""".trimIndent()
+        val (rc, out) = AdbClient.execute("echo '$script' | sh", 10000, expectRoot = true)
+        val mBefore = Regex("before=([^\\n]+)").find(out)?.groupValues?.get(1)?.trim() ?: ""
+        val mAfter  = Regex("after=([^\\n]+)").find(out)?.groupValues?.get(1)?.trim() ?: ""
+        val mStayB  = Regex("stay_before=([^\\n]+)").find(out)?.groupValues?.get(1)?.trim() ?: ""
+        val mStayA  = Regex("stay_after=([^\\n]+)").find(out)?.groupValues?.get(1)?.trim() ?: ""
+        val mRc     = Regex("rc=([0-9-]+)").find(out)?.groupValues?.get(1) ?: rc.toString()
+        val ok = (mAfter == "2147483647")
+        AppLog.i(TAG, "KEEPAWAKE_BUTTON: before=$mBefore set=2147483647 after=$mAfter stay_on=$mStayB→$mStayA rc=$mRc → ${if (ok) "OK" else "FAILED"}")
+        val step = ToolsStep(step = "keepawake.btn",
+            command = "settings put system screen_off_timeout 2147483647; settings put global stay_on_while_plugged_in 7",
+            startedAtMs = t0, finishedAtMs = SystemClock.uptimeMillis(),
+            exitCode = if (ok) 0 else 1,
+            stdout = out, stderr = if (ok) "" else "ожидалось after=2147483647, получили=$mAfter",
+            expected = "after=2147483647 stay_on=7",
+            actual = "after=$mAfter stay_on=$mStayA",
+            status = if (ok) ToolsStep.Status.OK else ToolsStep.Status.FAILED)
+        return ToolsResult("settings.keepawake_btn", "Не гасить ГУ", listOf(step))
+    }
+
+    /**
      * Применить keep-awake ON/OFF. НА ВЫЗЫВАЮЩЕМ ПОТОКЕ — только запись pref и
      * запуск фоновой работы. Никакого getprop/Runtime.exec здесь быть не должно
      * (prompt_four_fixes §3: главный поток <16 мс).
@@ -463,10 +501,10 @@ object ScreenBrightness {
             Prefs2.putBoolean(app, "durable_after_reboot_logged", false)
         }
         val alreadyRead = Prefs2.getLong(app, "durable_boot_readback_ts", 0L) != 0L
-        val uptimeS = try {
-            Runtime.getRuntime().exec(arrayOf("sh","-c","cat /proc/uptime")).inputStream
-                .bufferedReader().readText().trim().split(" ")[0].toDouble().toLong()
-        } catch (_: Throwable) { -1L }
+        // iter21 §6: uptime читаем через SystemClock.elapsedRealtime (это монотонное время с boot,
+        // в миллисекундах; /1000 = секунды). Runtime.exec("sh -c cat /proc/uptime") на устройстве
+        // возвращал -1 из-за неверного массива argv, из-за чего любая загрузка считалась late-start.
+        val uptimeS = android.os.SystemClock.elapsedRealtime() / 1000L
 
         if (alreadyRead) {
             return BootReadback(actual = "", stayOn = "", uptimeS = uptimeS,

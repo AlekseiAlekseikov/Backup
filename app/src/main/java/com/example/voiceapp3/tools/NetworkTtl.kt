@@ -129,13 +129,43 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
         return stepStatus to (reason ?: "TTL_V4=$v4 TTL_V6=$v6 VERIFY=$v4Verify/$v6Verify wire=$ttlVerdict(real=$ttlReal)")
     }
 
+    @Volatile private var ttlInFlight = false
+    @Volatile private var ttlLastRunAtMs: Long = 0L
+
     fun setTtl65Active(context: Context, enabled: Boolean): ToolsResult {
         BgWorker.assertNotMain("NetworkTtl.setTtl65Active")
         val t0 = SystemClock.uptimeMillis()
-        Prefs2.putBoolean(context, PREF_TTL_65_ACTIVE, enabled)
+        // iter21 §7: debounce 30s + single-flight — не давать шторму вызовов (в iter19 логе было 22 запуска за 7 с).
+        if (ttlInFlight) {
+            AppLog.w(TAG, "TTL: setTtl65Active SKIPPED (in-flight enabled=$enabled)")
+            val skipStep = ToolsStep(step="settings.ttl65", command="iptables ttl-set", startedAtMs=t0,
+                finishedAtMs=SystemClock.uptimeMillis(), exitCode=1, stdout="",
+                stderr="skipped: single-flight in-flight", expected="", actual="", status=ToolsStep.Status.BLOCKED)
+            return ToolsResult("settings.ttl65", "Фиксация TTL 65", listOf(skipStep))
+        }
+        val sinceLast = t0 - ttlLastRunAtMs
+        if (sinceLast in 0 until 30_000L) {
+            AppLog.w(TAG, "TTL: setTtl65Active DEBOUNCE lastRan=${sinceLast}ms ago (<30s)")
+            val skipStep = ToolsStep(step="settings.ttl65", command="iptables ttl-set", startedAtMs=t0,
+                finishedAtMs=SystemClock.uptimeMillis(), exitCode=1, stdout="",
+                stderr="skipped: debounce ${sinceLast}ms", expected="", actual="", status=ToolsStep.Status.BLOCKED)
+            return ToolsResult("settings.ttl65", "Фиксация TTL 65", listOf(skipStep))
+        }
+        synchronized(this) {
+            if (ttlInFlight) {
+                val skipStep = ToolsStep(step="settings.ttl65", command="iptables ttl-set", startedAtMs=t0,
+                    finishedAtMs=SystemClock.uptimeMillis(), exitCode=1, stdout="",
+                    stderr="skipped: in-flight", expected="", actual="", status=ToolsStep.Status.BLOCKED)
+                return ToolsResult("settings.ttl65", "Фиксация TTL 65", listOf(skipStep))
+            }
+            ttlInFlight = true
+        }
+        try {
+            ttlLastRunAtMs = SystemClock.uptimeMillis()
+            Prefs2.putBoolean(context, PREF_TTL_65_ACTIVE, enabled)
 
-        val script = buildScript(enabled)
-        val (exitCode, output) = AdbClient.execute(script, 40000)
+            val script = buildScript(enabled)
+            val (exitCode, output) = AdbClient.executeScript("ttl_script", script, 40000)
 
         val (status, reason) = parseVerifyResult(enabled, output)
 
@@ -192,7 +222,10 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
             actual = actualLines,
             status = status
         )
-        return ToolsResult("settings.ttl65", "Фиксация TTL 65", listOf(step))
+            return ToolsResult("settings.ttl65", "Фиксация TTL 65", listOf(step))
+        } finally {
+            ttlInFlight = false
+        }
     }
 
     fun bootRestore(context: Context) {
@@ -201,7 +234,7 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
         AppLog.i(TAG, "TTL bootRestore: active=$active")
         if (!active) return
         val script = buildScript(true)
-        val (rc, out) = AdbClient.execute(script, 40000)
+        val (rc, out) = AdbClient.executeScript("ttl_script", script, 40000)
         val (status, reason) = parseVerifyResult(true, out)
         AppLog.i(TAG, "VERIFY TTL bootRestore: rc=$rc → $status ($reason)")
     }
@@ -237,7 +270,7 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
                         @Suppress("DEPRECATION") cm?.activeNetworkInfo?.type == ConnectivityManager.TYPE_WIFI
                     }
                     AppLog.i(TAG, "TTL network change (wifi=$isWifi) — re-applying rules")
-                    val (rc, out) = AdbClient.execute(buildScript(true), 40000)
+                    val (rc, out) = AdbClient.executeScript("ttl_script", buildScript(true), 40000)
                     val (status, reason) = parseVerifyResult(true, out)
                     AppLog.i(TAG, "VERIFY TTL networkChange: rc=$rc → $status ($reason)")
                     if (status == ToolsStep.Status.FAILED) {

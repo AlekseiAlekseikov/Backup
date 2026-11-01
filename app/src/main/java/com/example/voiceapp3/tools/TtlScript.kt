@@ -128,11 +128,14 @@ run_v4_capture() {
   sleep 1
   ping -c 2 -W 2 1.1.1.1 >/dev/null 2>&1 || true
   sleep 1
-  # iter19/20: kill ПЕРВЫМ (не ждать wait бесконечно); после kill пауза на сброс буфера.
-  kill ${D}{_pid} 2>/dev/null || true
+  # iter19/20/21: kill ПЕРВЫМ; пауза на сброс буфера (-l line-buffered).
+  # Печатаем TCPDUMP_KILL_RC (0 = процесс был жив и получил сигнал).
+  kill ${D}{_pid} 2>/dev/null
+  _krc=${D}?
   sleep 0.3
   if kill -0 ${D}{_pid} 2>/dev/null; then _alive=yes; else _alive=no; fi
   echo "TCPDUMP_ALIVE=${D}{_alive} (after kill -0)"
+  echo "TCPDUMP_KILL_RC=${D}{_krc}"
   wait ${D}{_pid} 2>/dev/null || true
 }
 run_v6_capture() {
@@ -147,10 +150,12 @@ run_v6_capture() {
   sleep 1
   ping6 -c 2 -W 2 2606:4700:4700::1111 >/dev/null 2>&1 || true
   sleep 1
-  kill ${D}{_pid} 2>/dev/null || true
+  kill ${D}{_pid} 2>/dev/null
+  _krc=${D}?
   sleep 0.3
   if kill -0 ${D}{_pid} 2>/dev/null; then _alive=yes; else _alive=no; fi
   echo "TCPDUMP_V6_ALIVE=${D}{_alive} (after kill -0)"
+  echo "TCPDUMP_V6_KILL_RC=${D}{_krc}"
   wait ${D}{_pid} 2>/dev/null || true
 }
 if [ -n "${D}TCPDUMP_BIN" ]; then

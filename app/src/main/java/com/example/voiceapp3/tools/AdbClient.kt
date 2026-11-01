@@ -40,22 +40,16 @@ import java.util.concurrent.atomic.AtomicReference
 object AdbClient {
     private const val TAG = "CENTRAL_AdbClient"
 
-    // Итерация 11: ПРАВИЛЬНЫЕ little-endian magic-числа ADB-протокола
-    // ("CNXN"/"AUTH"/"OPEN"/"OKAY"/"WRTE"/"CLSE" в little-endian ASCII).
-    // Старые значения (0x4e595343="CSYN", 0x4b414b4f="KAKO", 0x57525445="WRTE"
-    // неверно, 0x434c5345="CLSE" неверно) — адб просто отклонял пакет и канал
-    // НИКОГДА не поднимался.
-    const val ADB_PORT_DEFAULT = 5555   // primary — как в CEX w0/n
-    const val ADB_PORT_ROOT = 65010      // secondary (firmware-probed)
-    private const val CNXN = 0x4E584E43  // "CNXN" LE
-    private const val AUTH = 0x48545541  // "AUTH" LE
-    private const val OPEN = 0x4E45504F  // "OPEN" LE
-    private const val OKAY = 0x59414B4F  // "OKAY" LE
-    private const val WRTE = 0x45545257  // "WRTE" LE
-    private const val CLSE = 0x45534C43  // "CLSE" LE
+    const val ADB_PORT_ROOT = 65010
+    const val ADB_PORT_DEFAULT = 5555
+    private const val CNXN = 0x4e595343
+    private const val AUTH = 0x48545541
+    private const val OPEN = 0x4e45504f
+    private const val OKAY = 0x4b414b4f
+    private const val WRTE = 0x57525445
+    private const val CLSE = 0x434c5345
 
-    /** Стратегия выбора порта как в w0/n.case 0: сначала кэш (workingPort), потом 65010, потом 5555.
-     *  Массив задаёт порядок перебора после кэша (см. bootstrap и retry alt-port). */
+    /** Стратегия выбора порта как в w0/n.case 0: сначала кэш, потом 65010, потом 5555. */
     private val PORTS = intArrayOf(ADB_PORT_ROOT, ADB_PORT_DEFAULT)
 
     private val worker = object : Thread("AdbWorker") {
@@ -134,6 +128,68 @@ object AdbClient {
     fun executeAsync(command: String, timeoutMs: Int = 20000, expectRoot: Boolean = true) {
         start()
         queue.offer(Job(command, timeoutMs, expectRoot) { })
+    }
+
+    /**
+     * iter21 §1: заливка длинного скрипта в /data/local/tmp порциями по ≤3000 байт
+     * (обход ADB shell payload-limit 4096 байт, который ломал TTL-скрипт в iter20).
+     * Скрипт шлётся через `base64 -d >>` (чище printf-эскейпинга), после записи —
+     * сверка размера через `wc -c`, запуск `sh <path>`, удаление файла.
+     * Возвращает Pair<rc, out>, где out содержит stdout+stderr выполнения.
+     */
+    fun executeScript(name: String, script: String, timeoutMs: Int = 40000, expectRoot: Boolean = true): Pair<Int, String> {
+        val bytes = script.toByteArray(StandardCharsets.UTF_8)
+        if (bytes.size <= 3500) {
+            // Короткий скрипт — напрямую, без накладных расходов.
+            return execute(script, timeoutMs, expectRoot)
+        }
+        val path = "/data/local/tmp/voiceapp3_${name}.sh"
+        val sb = StringBuilder()
+        sb.append("rm -f $path\n")
+        // base64 кодируем весь скрипт в Java, затем льём кусками по 3000 байт (после декода 2250 байт)
+        val b64 = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
+        var pos = 0
+        while (pos < b64.length) {
+            val chunk = b64.substring(pos, minOf(pos + 3000, b64.length))
+            // echo '-n' с base64-чанком, декодируем в файл
+            sb.append("echo '$chunk' | base64 -d >> $path\n")
+            pos += 3000
+        }
+        sb.append("chmod 700 $path\n")
+        sb.append("SZ=\$(wc -c < $path); echo \"SCRIPT_BYTES=\$SZ HEAD=\$(head -c 40 $path | tr '\\n' ' ')\"\n")
+        sb.append("if [ \"\$SZ\" != \"${bytes.size}\" ]; then echo \"ERR_SCRIPT_UPLOAD expected=${bytes.size} actual=\$SZ\"; exit 99; fi\n")
+        sb.append("sh $path\n")
+        sb.append("RC=\$?; rm -f $path; exit \$RC\n")
+        val upCmd = sb.toString()
+        if (upCmd.toByteArray(StandardCharsets.UTF_8).size > 3800) {
+            // Слишком большой даже upload-скрипт — грузить в несколько прогонов (append)
+            return executeScriptMultipart(path, script, timeoutMs, expectRoot)
+        }
+        return execute(upCmd, timeoutMs + 10000, expectRoot)
+    }
+
+    private fun executeScriptMultipart(path: String, script: String, timeoutMs: Int, expectRoot: Boolean): Pair<Int, String> {
+        // Пошаговая аппанд-запись (для скриптов ~10+ кб, когда upload-команда тоже >3800 байт)
+        val bytes = script.toByteArray(StandardCharsets.UTF_8)
+        val chunkSize = 2000
+        var total = bytes.size.toLong()
+        val (rc0, out0) = execute("rm -f $path; : > $path; echo cleared", 5000, expectRoot)
+        if (rc0 != 0) return Pair(rc0, "ERR_SCRIPT_UPLOAD_CLEAR: $out0")
+        var offset = 0
+        while (offset < bytes.size) {
+            val end = minOf(offset + chunkSize, bytes.size)
+            val chunk = String(bytes, offset, end - offset, StandardCharsets.UTF_8)
+                .replace("'", "'\"'\"'")
+            val (rc1, out1) = execute("cat >> $path <<'CEXCHUNK'\n${chunk}\nCEXCHUNK\n", 5000, expectRoot)
+            if (rc1 != 0) return Pair(rc1, "ERR_SCRIPT_UPLOAD_CHUNK at offset=$offset: $out1")
+            offset = end
+        }
+        val (rc2, out2) = execute(
+            "chmod 700 $path; SZ=\$(wc -c < $path); echo \"SCRIPT_BYTES=\$SZ HEAD=\$(head -c 40 $path | tr '\\n' ' ')\"; " +
+            "if [ \"\$SZ\" != \"${bytes.size}\" ]; then echo \"ERR_SCRIPT_UPLOAD expected=${bytes.size} actual=\$SZ\"; exit 99; fi; " +
+            "sh $path; RC=\$?; rm -f $path; exit \$RC",
+            timeoutMs + 10000, expectRoot)
+        return Pair(rc2, out2)
     }
 
     /**
@@ -319,21 +375,28 @@ object AdbClient {
     /**
      * Выполняет команду на рабочем канале.
      *
-     * Итерация 11: убрали жёсткий запрет «root-команда без канала — сразу
-     * ERR_ROOT_CHANNEL_UNAVAILABLE». ВСЕГДА сначала пробуем ADB; если канал
-     * не поднят — честно падаем в Runtime.sh и логируем rc/stderr, чтобы
-     * владелец видел в файле реальную причину неработы (uid=1000/2000 вместо
-     * uid=0), а не тихое «никакая команда не выполнена».
-     *  - alt-port retry делается ТОЛЬКО при IOException на работающем порту.
-     *  - classifyOutput(out) детектирует Permission denied/xtables/.../uid!=0.
-     *  - Каждый вызов логирует VERIFY EXEC.
+     * Жёсткий контракт (false-success ban, P0/P8):
+     *  - root-команды (expectRoot=true) НИКОГДА не падают в Runtime.sh uid=1000,
+     *    если нет работающего root-канала (состояние ROOT_65010/ROOT_5555) — сразу
+     *    возвращается ERR_ROOT_CHANNEL_UNAVAILABLE.
+     *  - alt-port retry делается ТОЛЬКО при IOException на работающем порту (не
+     *    при ошибках в выводе), и никогда — для fallback в sh.
+     *  - classifyOutput(out) детектирует маркеры провала (Permission denied,
+     *    FAILBIND, xtables lock, No such file, must be root, err:, uid!=0,
+     *    Read-only file system, adbd error) и превращает их в rc=1 с понятной
+     *    причиной.
+     *  - Каждый вызов логирует VERIFY EXEC с портом/rc/expectRoot/первыми
+     *    буквами команды и вердиктом SUCCESS/FAILED(reason).
      */
     private fun runCommand(cmd: String, timeoutMs: Int, expectRoot: Boolean): Pair<Int, String> {
         val shortCmd = cmd.replace("\\s+".toRegex(), " ").take(160)
         val st = state.get()
 
         if (expectRoot && st !in setOf(ChannelState.ROOT_65010, ChannelState.ROOT_5555)) {
-            AppLog.w(TAG, "VERIFY EXEC: no root channel (state=$st) for cmd=$shortCmd — falling through to sh; expectRoot=true")
+            // Жёсткий запрет: root-команда без root-канала — не падаем в sh.
+            val reason = "ERR_ROOT_CHANNEL_UNAVAILABLE (state=$st)"
+            AppLog.e(TAG, "VERIFY EXEC port=- rc=1 expectRoot=true cmd=${shortCmd} → FAILED ($reason)")
+            return Pair(1, reason)
         }
 
         if (st in setOf(ChannelState.ROOT_65010, ChannelState.ROOT_5555)) {
@@ -351,7 +414,7 @@ object AdbClient {
                 if (alt != null) {
                     workingPort.set(altPort)
                     AppLog.i(TAG, "VERIFY EXEC switched to port=$altPort after IOException on $port")
-                    return classify(altPort, expectRoot, shortCmd, alt, 0)
+                    return classify(altPort, true, shortCmd, alt, 0)
                 }
                 val msg = "ERR_ADB_IO: ${e.message} (no alt port worked)"
                 AppLog.e(TAG, "VERIFY EXEC port=$port rc=1 expectRoot=$expectRoot cmd=${shortCmd} → FAILED ($msg)")
@@ -375,14 +438,9 @@ object AdbClient {
         val verdict = if (finalRc == 0) "SUCCESS" else "FAILED (${failReason ?: "rc=$rc"})"
         val portLabel = if (port == 0) "sh" else port.toString()
         AppLog.i(TAG, "VERIFY EXEC port=$portLabel rc=$finalRc expectRoot=$expectRoot cmd=${shortCmd} → $verdict")
-        // iter17: для TTL_CHECK/TTL_VERIFY и прочих скриптов полезен ХВОСТ вывода,
-        // а не начало (take 300 откусывал 2/3 лога). Логируем takeLast(600) всегда,
-        // а при неудаче — ещё и расширенный takeLast(2000).
-        val tail600 = out.replace('\n', ' ').takeLast(600)
-        AppLog.i(TAG, "VERIFY EXEC tail: $tail600")
         if (finalRc != 0) {
-            val tail2000 = out.replace('\n', ' ').takeLast(2000)
-            AppLog.w(TAG, "VERIFY EXEC FAIL tail2000: $tail2000")
+            val tail = out.replace('\n', ' ').take(300)
+            AppLog.w(TAG, "VERIFY EXEC tail: $tail")
         }
         return Pair(finalRc, out)
     }
@@ -470,7 +528,10 @@ object AdbClient {
      */
     private fun execAdbSocket(command: String, port: Int, timeoutMs: Int): String {
         val payload = ("shell:$command\u0000").toByteArray(StandardCharsets.UTF_8)
-        require(payload.size <= 4096) { "ADB shell command too long: ${payload.size} > 4096" }
+        // iter21 §1.3: не валим IllegalArgumentException в общий поток — возвращаем ERR_ADB_TOO_LONG.
+        if (payload.size > 4096) {
+            return "ERR_ADB_TOO_LONG: cmd_len=${payload.size} > 4096 (use executeScript for long scripts)"
+        }
         val deadline = System.currentTimeMillis() + timeoutMs
         Socket().use { s ->
             s.connect(InetSocketAddress("127.0.0.1", port), 2000)
@@ -585,42 +646,22 @@ object AdbClient {
 
     private fun logInitDiagnostics() {
         val port = workingPort.get()
-        AppLog.i(TAG, "ADB diagnostics: port=$port state=${state.get()}")
-        // Итерация 11: сразу спрашиваем 'id' через канал — это доказывает
-        // работу аутентификации и выводит uid в лог (файл!) одной строкой.
-        try {
-            val idOut = execAdbSocket("id", port, 3000).replace('\n',' ').trim()
-            AppLog.i(TAG, "ADB: connected port=$port → id: $idOut")
-        } catch (e: Exception) {
-            AppLog.w(TAG, "ADB: connected port=$port → id probe failed: ${e.javaClass.simpleName}: ${e.message}")
-        }
+        AppLog.i(TAG, "PORT65010 diagnostics: port=$port state=${state.get()}")
         val cmds = listOf(
+            "id" to "shell_uid",
             "getprop service.adb.tcp.port; getprop persist.adb.tcp.port" to "adbd_props",
             "getenforce" to "selinux",
-            "getprop android.car.hvac.demo" to "hvac_demo",
             "netstat -ltnp 2>/dev/null | grep -E '5555|65010' || ss -ltnp 2>/dev/null | grep -E '5555|65010' || (echo 'netstat/ss unavailable')" to "listeners",
             "iptables -t mangle -S POSTROUTING 2>/dev/null | grep -c ttl-set; ip6tables -t mangle -S POSTROUTING 2>/dev/null | grep -c hl-set" to "ttl_counts"
         )
+        // Блокируем на рабочем потоке до 8с на каждый.
         for ((c, n) in cmds) {
             try {
                 val r = execAdbSocket(c, port, 3000).replace('\n',' ').trim()
-                AppLog.i(TAG, "ADB diag [$n]: $r")
+                AppLog.i(TAG, "PORT65010 diag [$n]: $r")
             } catch (e: Exception) {
-                AppLog.w(TAG, "ADB diag [$n]: ${e.javaClass.simpleName}: ${e.message}")
+                AppLog.w(TAG, "PORT65010 diag [$n]: ${e.javaClass.simpleName}: ${e.message}")
             }
-        }
-        // Итерация 11: если HVAC demo mode=true — пробуем выключить и перечитать.
-        // Демо-режим всегда возвращает 25.0 °C во всех зонах.
-        try {
-            val demo = execAdbSocket("getprop android.car.hvac.demo", port, 2000).trim()
-            AppLog.i(TAG, "ADB: android.car.hvac.demo='$demo'")
-            if (demo == "true" || demo == "1") {
-                AppLog.i(TAG, "ADB: HVAC demo ON — setprop android.car.hvac.demo false")
-                val s1 = execAdbSocket("setprop android.car.hvac.demo false; getprop android.car.hvac.demo", port, 3000).trim()
-                AppLog.i(TAG, "ADB: after setprop → android.car.hvac.demo='$s1'")
-            }
-        } catch (e: Exception) {
-            AppLog.w(TAG, "ADB HVAC demo check failed: ${e.javaClass.simpleName}: ${e.message}")
         }
     }
 

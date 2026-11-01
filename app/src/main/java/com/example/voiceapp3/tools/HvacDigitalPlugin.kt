@@ -87,31 +87,43 @@ object HvacDigitalPlugin {
 
         val tmp = tmpFile.absolutePath.replace("'", "'\\''")
         BgWorker.assertNotMain("HvacDigitalPlugin.enable")
+        // iter21 §2: idempotent enable — если уже смонтировано и inode совпадает — пропускаем mount/kill.
         val script = """
             id
             SELINUX_BEFORE=${'$'}(getenforce 2>/dev/null)
-            # P5: setenforce 0 удалён — на user-билде отклоняется и маскирует ошибку mount.
             mkdir -p $STAGE_DIR
             cp -f '$tmp' $STAGE_APK
             chown root:root $STAGE_APK 2>/dev/null || echo CHOWN_FAIL
             chmod 644 $STAGE_APK
             chcon u:object_r:system_app_file:s0 $STAGE_APK 2>/dev/null || chcon u:object_r:vendor_file:s0 $STAGE_APK 2>/dev/null || true
             DST="$dst"
-            umount ${'$'}DST 2>/dev/null || true
-            SYSUI_PID_BEFORE=${'$'}(pidof com.android.systemui)
-            mount --bind $STAGE_APK ${'$'}DST 2>&1 || echo MOUNT_FAIL
+            NEED_RESTART=0
+            SRC_INODE_PRE=${'$'}(stat -c '%i' $STAGE_APK 2>/dev/null)
+            TGT_INODE_PRE=${'$'}(stat -c '%i' ${'$'}DST 2>/dev/null)
+            echo "pre-check: DST=\$DST SRC_INODE=\$SRC_INODE_PRE TGT_INODE=\$TGT_INODE_PRE"
+            if [ "\$SRC_INODE_PRE" != "\$TGT_INODE_PRE" ] || ! grep -F " \$DST " /proc/mounts >/dev/null 2>&1; then
+              umount ${'$'}DST 2>/dev/null || true
+              mount --bind $STAGE_APK ${'$'}DST 2>&1 || echo MOUNT_FAIL
+              NEED_RESTART=1
+            else
+              echo "ALREADY_MOUNTED (idempotent)"
+            fi
             restorecon -v ${'$'}DST 2>/dev/null || true
             rm -rf /data/dalvik-cache/*/*GeelyAutoSystemUIPlugin* 2>/dev/null || true
             rm -rf /data/dalvik-cache/*/*systemuiplugin* 2>/dev/null || true
-            kill ${'$'}SYSUI_PID_BEFORE 2>/dev/null || true
-            sleep 3
+            SYSUI_PID_BEFORE=${'$'}(pidof com.android.systemui)
+            if [ "\$NEED_RESTART" = "1" ]; then
+              kill ${'$'}SYSUI_PID_BEFORE 2>/dev/null || true
+              sleep 3
+            fi
             SYSUI_PID_AFTER=${'$'}(pidof com.android.systemui)
             SELINUX_AFTER=${'$'}(getenforce 2>/dev/null)
-            echo SELINUX_BEFORE=${'$'}SELINUX_BEFORE SELINUX_AFTER=${'$'}SELINUX_AFTER SYSUI_PID_BEFORE=${'$'}SYSUI_PID_BEFORE SYSUI_PID_AFTER=${'$'}SYSUI_PID_AFTER
+            echo SELINUX_BEFORE=${'$'}SELINUX_BEFORE SELINUX_AFTER=${'$'}SELINUX_AFTER SYSUI_PID_BEFORE=${'$'}SYSUI_PID_BEFORE SYSUI_PID_AFTER=${'$'}SYSUI_PID_AFTER NEED_RESTART=${'$'}NEED_RESTART
             SRC_INODE=${'$'}(stat -c '%i' $STAGE_APK 2>/dev/null)
             TGT_INODE=${'$'}(stat -c '%i' ${'$'}DST 2>/dev/null)
             echo SRC_INODE=${'$'}SRC_INODE TGT_INODE=${'$'}TGT_INODE
-            if grep -F " $STAGE_APK " /proc/mounts >/dev/null 2>&1 || grep -F GeelyAutoSystemUIPlugin /proc/mounts >/dev/null 2>&1; then echo HVAC_DIGITAL_OK; else echo HVAC_DIGITAL_FALHOU; fi
+            # iter21 §2: проверка монтирования ТОЧНО по grep -F " \$DST " /proc/mounts
+            if grep -F " \$DST " /proc/mounts >/dev/null 2>&1; then echo HVAC_DIGITAL_OK; else echo HVAC_DIGITAL_FALHOU; fi
         """.trimIndent()
         val (rc, out) = AdbClient.execute(script, 40000)
         AppLog.i(TAG, "enable script rc=$rc out=${out.take(1000)}")
@@ -167,6 +179,58 @@ object HvacDigitalPlugin {
         steps += stepOf("post_check", "grep mounts", if (!post.overlayMounted) ToolsStep.Status.OK else ToolsStep.Status.FAILED,
             expected = "unmounted", actual = "mounted=${post.overlayMounted}", stdout = post.mountLine)
         return ToolsResult("hvacdigital.plugin.disable", "Откат к OEM", steps)
+    }
+
+    /**
+     * iter21 §2: RESTORE панели SystemUI — umount любого кривого bind-mount
+     * плагина, перезапуск SystemUI и проверка, что mount НЕ висит.
+     * Нужен на случай, если сломанный/неполный mount оставил шторку чёрной.
+     * Команды не зависят от OEM-пути (umount по имени плагина в /proc/mounts).
+     */
+    fun restoreSystemUi(ctx: Context): ToolsResult {
+        AppLog.i(TAG, "restoreSystemUi called (iter21 §2)")
+        val steps = ArrayList<ToolsStep>()
+        val pre = checkStatus(ctx)
+        steps += stepOf("pre_check", "grep mounts",
+            if (pre.overlayMounted) ToolsStep.Status.PARTIAL else ToolsStep.Status.OK,
+            expected = "no stale mount",
+            actual = "mounted=${pre.overlayMounted} line=${pre.mountLine.take(120)}",
+            stdout = pre.mountLine)
+        BgWorker.assertNotMain("HvacDigitalPlugin.restoreSystemUi")
+        // iter21 §2: проверка монтирования ТОЧНО по grep -F " \$DST " /proc/mounts
+        val script = """
+echo '=== HVAC_DIGITAL_RESTORE ==='
+id
+# Найдём все bind-mount, указывающие на GeelyAutoSystemUIPlugin, и отмонтируем
+for MNT in \$(grep -F GeelyAutoSystemUIPlugin /proc/mounts | awk '{print \$2}'); do
+  echo "UMOUNT stale: \$MNT"
+  umount "\$MNT" 2>&1 || echo "UMOUNT_FAIL \$MNT"
+done
+SYSUI_PID_BEFORE=\$(pidof com.android.systemui)
+echo "SYSUI_PID_BEFORE=\$SYSUI_PID_BEFORE"
+kill \$SYSUI_PID_BEFORE 2>/dev/null || true
+sleep 4
+SYSUI_PID_AFTER=\$(pidof com.android.systemui)
+echo "SYSUI_PID_AFTER=\$SYSUI_PID_AFTER"
+if grep -F GeelyAutoSystemUIPlugin /proc/mounts >/dev/null 2>&1; then
+  echo RESTORE_STALE_MOUNT
+else
+  echo RESTORE_OK
+fi
+""".trimIndent()
+        val (rc, out) = AdbClient.execute(script, 25000)
+        AppLog.i(TAG, "restoreSystemUi script rc=$rc out=${out.take(800)}")
+        val ok = rc == 0 && out.contains("RESTORE_OK") && !out.contains("UMOUNT_FAIL") && !out.contains("RESTORE_STALE_MOUNT")
+        steps += stepOf("restore", "umount+kill systemui",
+            if (ok) ToolsStep.Status.OK else ToolsStep.Status.FAILED,
+            expected = "RESTORE_OK", actual = "rc=$rc out_last=${out.lineSequence().lastOrNull()}", stdout = out)
+        val post = checkStatus(ctx)
+        steps += stepOf("post_check", "grep mounts + sysui pid",
+            if (!post.overlayMounted) ToolsStep.Status.OK else ToolsStep.Status.FAILED,
+            expected = "unmounted, sysui alive",
+            actual = "mounted=${post.overlayMounted}", stdout = post.mountLine)
+        AppLog.i(TAG, "VERIFY hvacdigital.restore: ${if (ok) "OK" else "FAILED"}")
+        return ToolsResult("hvacdigital.plugin.restore", "Восстановить шторку", steps)
     }
 
     private fun stepOf(step: String, command: String, status: ToolsStep.Status,
