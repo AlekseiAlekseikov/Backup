@@ -86,11 +86,12 @@ object HvacDigitalPlugin {
         if (!extracted) return ToolsResult("hvacdigital.plugin.enable", "Цифровой климат", steps)
 
         val tmp = tmpFile.absolutePath.replace("'", "'\\''")
+        val D = "$" // shell dollar escape (${D}NAME → $NAME)
         BgWorker.assertNotMain("HvacDigitalPlugin.enable")
         // iter21 §2: idempotent enable — если уже смонтировано и inode совпадает — пропускаем mount/kill.
         val script = """
             id
-            SELINUX_BEFORE=${'$'}(getenforce 2>/dev/null)
+            SELINUX_BEFORE=${D}(getenforce 2>/dev/null)
             mkdir -p $STAGE_DIR
             cp -f '$tmp' $STAGE_APK
             chown root:root $STAGE_APK 2>/dev/null || echo CHOWN_FAIL
@@ -98,32 +99,32 @@ object HvacDigitalPlugin {
             chcon u:object_r:system_app_file:s0 $STAGE_APK 2>/dev/null || chcon u:object_r:vendor_file:s0 $STAGE_APK 2>/dev/null || true
             DST="$dst"
             NEED_RESTART=0
-            SRC_INODE_PRE=${'$'}(stat -c '%i' $STAGE_APK 2>/dev/null)
-            TGT_INODE_PRE=${'$'}(stat -c '%i' ${'$'}DST 2>/dev/null)
-            echo "pre-check: DST=\$DST SRC_INODE=\$SRC_INODE_PRE TGT_INODE=\$TGT_INODE_PRE"
-            if [ "\$SRC_INODE_PRE" != "\$TGT_INODE_PRE" ] || ! grep -F " \$DST " /proc/mounts >/dev/null 2>&1; then
-              umount ${'$'}DST 2>/dev/null || true
-              mount --bind $STAGE_APK ${'$'}DST 2>&1 || echo MOUNT_FAIL
+            SRC_INODE_PRE=${D}(stat -c '%i' $STAGE_APK 2>/dev/null)
+            TGT_INODE_PRE=${D}(stat -c '%i' ${D}DST 2>/dev/null)
+            echo "pre-check: DST=${D}DST SRC_INODE=${D}SRC_INODE_PRE TGT_INODE=${D}TGT_INODE_PRE"
+            if [ "${D}SRC_INODE_PRE" != "${D}TGT_INODE_PRE" ] || ! grep -F " ${D}DST " /proc/mounts >/dev/null 2>&1; then
+              umount ${D}DST 2>/dev/null || true
+              mount --bind $STAGE_APK ${D}DST 2>&1 || echo MOUNT_FAIL
               NEED_RESTART=1
             else
               echo "ALREADY_MOUNTED (idempotent)"
             fi
-            restorecon -v ${'$'}DST 2>/dev/null || true
+            restorecon -v ${D}DST 2>/dev/null || true
             rm -rf /data/dalvik-cache/*/*GeelyAutoSystemUIPlugin* 2>/dev/null || true
             rm -rf /data/dalvik-cache/*/*systemuiplugin* 2>/dev/null || true
-            SYSUI_PID_BEFORE=${'$'}(pidof com.android.systemui)
-            if [ "\$NEED_RESTART" = "1" ]; then
-              kill ${'$'}SYSUI_PID_BEFORE 2>/dev/null || true
+            SYSUI_PID_BEFORE=${D}(pidof com.android.systemui)
+            if [ "${D}NEED_RESTART" = "1" ]; then
+              kill ${D}SYSUI_PID_BEFORE 2>/dev/null || true
               sleep 3
             fi
-            SYSUI_PID_AFTER=${'$'}(pidof com.android.systemui)
-            SELINUX_AFTER=${'$'}(getenforce 2>/dev/null)
-            echo SELINUX_BEFORE=${'$'}SELINUX_BEFORE SELINUX_AFTER=${'$'}SELINUX_AFTER SYSUI_PID_BEFORE=${'$'}SYSUI_PID_BEFORE SYSUI_PID_AFTER=${'$'}SYSUI_PID_AFTER NEED_RESTART=${'$'}NEED_RESTART
-            SRC_INODE=${'$'}(stat -c '%i' $STAGE_APK 2>/dev/null)
-            TGT_INODE=${'$'}(stat -c '%i' ${'$'}DST 2>/dev/null)
-            echo SRC_INODE=${'$'}SRC_INODE TGT_INODE=${'$'}TGT_INODE
-            # iter21 §2: проверка монтирования ТОЧНО по grep -F " \$DST " /proc/mounts
-            if grep -F " \$DST " /proc/mounts >/dev/null 2>&1; then echo HVAC_DIGITAL_OK; else echo HVAC_DIGITAL_FALHOU; fi
+            SYSUI_PID_AFTER=${D}(pidof com.android.systemui)
+            SELINUX_AFTER=${D}(getenforce 2>/dev/null)
+            echo SELINUX_BEFORE=${D}SELINUX_BEFORE SELINUX_AFTER=${D}SELINUX_AFTER SYSUI_PID_BEFORE=${D}SYSUI_PID_BEFORE SYSUI_PID_AFTER=${D}SYSUI_PID_AFTER NEED_RESTART=${D}NEED_RESTART
+            SRC_INODE=${D}(stat -c '%i' $STAGE_APK 2>/dev/null)
+            TGT_INODE=${D}(stat -c '%i' ${D}DST 2>/dev/null)
+            echo SRC_INODE=${D}SRC_INODE TGT_INODE=${D}TGT_INODE
+            # iter21 §2: проверка монтирования ТОЧНО по grep -F " ${D}DST " /proc/mounts
+            if grep -F " ${D}DST " /proc/mounts >/dev/null 2>&1; then echo HVAC_DIGITAL_OK; else echo HVAC_DIGITAL_FALHOU; fi
         """.trimIndent()
         val (rc, out) = AdbClient.execute(script, 40000)
         AppLog.i(TAG, "enable script rc=$rc out=${out.take(1000)}")
@@ -197,21 +198,21 @@ object HvacDigitalPlugin {
             actual = "mounted=${pre.overlayMounted} line=${pre.mountLine.take(120)}",
             stdout = pre.mountLine)
         BgWorker.assertNotMain("HvacDigitalPlugin.restoreSystemUi")
-        // iter21 §2: проверка монтирования ТОЧНО по grep -F " \$DST " /proc/mounts
+        val D = "$"
         val script = """
 echo '=== HVAC_DIGITAL_RESTORE ==='
 id
 # Найдём все bind-mount, указывающие на GeelyAutoSystemUIPlugin, и отмонтируем
-for MNT in \$(grep -F GeelyAutoSystemUIPlugin /proc/mounts | awk '{print \$2}'); do
-  echo "UMOUNT stale: \$MNT"
-  umount "\$MNT" 2>&1 || echo "UMOUNT_FAIL \$MNT"
+for MNT in ${D}(grep -F GeelyAutoSystemUIPlugin /proc/mounts | awk '{print ${D}2}'); do
+  echo "UMOUNT stale: ${D}MNT"
+  umount "${D}MNT" 2>&1 || echo "UMOUNT_FAIL ${D}MNT"
 done
-SYSUI_PID_BEFORE=\$(pidof com.android.systemui)
-echo "SYSUI_PID_BEFORE=\$SYSUI_PID_BEFORE"
-kill \$SYSUI_PID_BEFORE 2>/dev/null || true
+SYSUI_PID_BEFORE=${D}(pidof com.android.systemui)
+echo "SYSUI_PID_BEFORE=${D}SYSUI_PID_BEFORE"
+kill ${D}SYSUI_PID_BEFORE 2>/dev/null || true
 sleep 4
-SYSUI_PID_AFTER=\$(pidof com.android.systemui)
-echo "SYSUI_PID_AFTER=\$SYSUI_PID_AFTER"
+SYSUI_PID_AFTER=${D}(pidof com.android.systemui)
+echo "SYSUI_PID_AFTER=${D}SYSUI_PID_AFTER"
 if grep -F GeelyAutoSystemUIPlugin /proc/mounts >/dev/null 2>&1; then
   echo RESTORE_STALE_MOUNT
 else

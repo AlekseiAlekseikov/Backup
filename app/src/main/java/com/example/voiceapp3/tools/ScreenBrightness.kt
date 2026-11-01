@@ -353,17 +353,18 @@ object ScreenBrightness {
      */
     fun pressKeepAwakeButton(ctx: Context): ToolsResult {
         val t0 = SystemClock.uptimeMillis()
+        val D = "$"
         val script = """
 echo '=== KEEPAWAKE_BUTTON (one-shot) ==='
-_BEFORE=\$(settings get system screen_off_timeout 2>&1)
-_STAY_BEFORE=\$(settings get global stay_on_while_plugged_in 2>&1)
+_BEFORE=${D}(settings get system screen_off_timeout 2>&1)
+_STAY_BEFORE=${D}(settings get global stay_on_while_plugged_in 2>&1)
 settings put system screen_off_timeout 2147483647 2>&1
 settings put global stay_on_while_plugged_in 7 2>&1
-_RC=\$?
-_AFTER=\$(settings get system screen_off_timeout 2>&1)
-_STAY_AFTER=\$(settings get global stay_on_while_plugged_in 2>&1)
-echo "before=\$_BEFORE stay_before=\$_STAY_BEFORE"
-echo "after=\$_AFTER stay_after=\$_STAY_AFTER rc=\$_RC"
+_RC=${D}?
+_AFTER=${D}(settings get system screen_off_timeout 2>&1)
+_STAY_AFTER=${D}(settings get global stay_on_while_plugged_in 2>&1)
+echo "before=${D}_BEFORE stay_before=${D}_STAY_BEFORE"
+echo "after=${D}_AFTER stay_after=${D}_STAY_AFTER rc=${D}_RC"
 """.trimIndent()
         val (rc, out) = AdbClient.execute("echo '$script' | sh", 10000, expectRoot = true)
         val mBefore = Regex("before=([^\\n]+)").find(out)?.groupValues?.get(1)?.trim() ?: ""
