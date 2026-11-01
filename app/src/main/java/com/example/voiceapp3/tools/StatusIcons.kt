@@ -541,7 +541,7 @@ object StatusIcons {
         val dens = ctx.resources.displayMetrics.density
         AppLog.i(TAG, "ICON_GEOM: kind=${kind.ifEmpty { main + suffix }} w=${bmpW}px h=${bmpH}px " +
                 "(w=${"%.1f".format(bmpW / dens)}dp h=${"%.1f".format(bmpH / dens)}dp) " +
-                "textSize=${"%.1f".format(mainSize)} suffix=$suffix padH=${padHDp}dp gap=$GAP_DPdp keepNum=$keepNum")
+                "textSize=${"%.1f".format(mainSize)} suffix=$suffix padH=${padHDp}dp gap=${GAP_DP}dp keepNum=$keepNum")
         return Icon.createWithBitmap(bmp)
     }
 
@@ -735,6 +735,37 @@ object StatusIcons {
 
     @JvmStatic fun cancelAll(ctx: Context) {
         cancel(ctx, NOTIF_BATT); cancel(ctx, NOTIF_TEMP); cancel(ctx, NOTIF_WIFI)
+    }
+
+    @JvmStatic fun startPeriodicSync(ctx: Context) {
+        // P-фикс: если периодика уже запущена — не стартовать второй Handler/Runnable,
+        // иначе получаем N параллельных тиков (в логе у владельца "цикл 15с активен" ×4).
+        if (periodicRunning) {
+            Log.i(TAG, "startPeriodicSync: already running, skip (idempotent)")
+            return
+        }
+        stopPeriodicSync()
+        val hh = Handler(Looper.getMainLooper()); h = hh
+        val app = ctx.applicationContext
+        periodicRunning = true
+        hh.post(object : Runnable {
+            override fun run() {
+                if (!periodicRunning || h !== hh) return
+                BgWorker.post("StatusIcons.tick") {
+                    try { syncAll(app) } catch (t: Throwable) { Log.e(TAG,"tick err",t) }
+                }
+                hh.postDelayed(this, 15000L)
+            }
+        })
+        BgWorker.post("StatusIcons.firstTick") {
+            try { syncAll(app) } catch (t: Throwable) { Log.e(TAG,"first tick err",t) }
+        }
+        Log.i(TAG,"startPeriodicSync (single instance, 15s tick on BgWorker)")
+    }
+    @JvmStatic fun stopPeriodicSync() {
+        periodicRunning = false
+        h?.removeCallbacksAndMessages(null); h = null
+        Log.i(TAG,"stopPeriodicSync")
     }
 
     // ─── HVAC digital (флаги persist.sys.hvacdigital.*) ───
