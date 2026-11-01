@@ -208,7 +208,11 @@ else
   REAL_SHOW=UNKNOWN; METHOD=none; VERDICT=UNVERIFIED; REASON="no rule, no tcpdump, no counters - nothing to verify"
 fi
 # --- ФИНАЛЬНАЯ СТРОКА ГАРАНТИРОВАННО печатается ВСЕГДА ---
-echo "TTL_CHECK: real=${D}REAL_SHOW expected=${D}EXPECTED src=${D}{SRC_IP:-unknown} dst=1.1.1.1 iface=${D}IFACE_ARG method=${D}METHOD reason=${D}REASON rule_ttl=${D}RULE_SHOW hl_wire=${D}HL_REAL ARROW ${D}VERDICT"
+# iter22 §5.2: число в лог — before=<n> after=<n> rc=<n> rule_ttl=<n>, где n — ЗНАЧЕНИЕ
+# из `iptables -t mangle -S POSTROUTING` по правилу --ttl-set (НЕ число строк).
+BEFORE_N=${D}RULE_TTL; [ -z "${D}BEFORE_N" ] && BEFORE_N=none
+AFTER_N=${D}RULE_TTL_AFTER; [ -z "${D}AFTER_N" ] && AFTER_N=none
+echo "TTL_CHECK: before=${D}BEFORE_N after=${D}AFTER_N rc=${D}VC4 rule_ttl=${D}RULE_SHOW real=${D}REAL_SHOW expected=${D}EXPECTED src=${D}{SRC_IP:-unknown} dst=1.1.1.1 iface=${D}IFACE_ARG method=${D}METHOD reason=${D}REASON hl_wire=${D}HL_REAL ARROW ${D}VERDICT"
 echo '=== TTL_SCRIPT end ==='
 """.trimIndent().replace("ARROW", "\u2192")
     }

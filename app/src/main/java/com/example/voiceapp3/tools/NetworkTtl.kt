@@ -206,6 +206,12 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
         }.joinToString(" | \n  ")
         // iter19 §4.3: при real=UNKNOWN показать rule_ttl в UI — передаём в step.expected/actual.
         AppLog.i(TAG, "TTL_CHECK (raw line from shell): $ttlCheckLine")
+        // iter22 §5.2: числа отдельной строкой — before/after/rc/rule_ttl (значения правила, не строки).
+        val numBefore = Regex("before=([^ ]+)").find(ttlCheckLine)?.groupValues?.get(1) ?: "?"
+        val numAfter  = Regex("after=([^ ]+)").find(ttlCheckLine)?.groupValues?.get(1) ?: "?"
+        val numRc     = Regex(" rc=([^ ]+)").find(ttlCheckLine)?.groupValues?.get(1) ?: "?"
+        val numRule   = Regex("rule_ttl=([^ ]+)").find(ttlCheckLine)?.groupValues?.get(1) ?: "?"
+        AppLog.i(TAG, "TTL_CHECK: before=$numBefore after=$numAfter rc=$numRc rule_ttl=$numRule")
         AppLog.i(TAG, "TTL_COUNTERS: ${output.lineSequence().firstOrNull { it.startsWith("TTL_COUNTERS:") } ?: "(none)"}")
         AppLog.i(TAG, "TTL_RULE: v4_rule=${kv["RULE_V4_TTL_AFTER"] ?: ttlRule} v6_hl=${kv["RULE_V6_HL_AFTER"]} vfy=${kv["VERIFY_V4"]}/${kv["VERIFY_V6"]}")
         AppLog.i(TAG, "VERIFY TTL: enabled=$enabled rc=$exitCode → $status ($reason)")
@@ -269,8 +275,29 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
                     } else {
                         @Suppress("DEPRECATION") cm?.activeNetworkInfo?.type == ConnectivityManager.TYPE_WIFI
                     }
-                    AppLog.i(TAG, "TTL network change (wifi=$isWifi) — re-applying rules")
-                    val (rc, out) = AdbClient.executeScript("ttl_script", buildScript(true), 40000)
+                    // iter22 §5.1: приёмник сети идёт через ТОТ ЖЕ single-flight + окно 30 000 мс,
+                    // иначе storm перезапусков (в iter19 — 22 запуска за 7 с).
+                    val now = SystemClock.uptimeMillis()
+                    synchronized(this@NetworkTtl) {
+                        if (ttlInFlight) {
+                            AppLog.w(TAG, "TTL_RECEIVER: skipped reason=in_flight (wifi=$isWifi)")
+                            return@post
+                        }
+                        val since = now - ttlLastRunAtMs
+                        if (since in 0 until 30_000L) {
+                            AppLog.w(TAG, "TTL_RECEIVER: skipped reason=debounce ${since}ms (wifi=$isWifi)")
+                            return@post
+                        }
+                        ttlInFlight = true
+                        ttlLastRunAtMs = now
+                    }
+                    val res = try {
+                        AdbClient.executeScript("ttl_script", buildScript(true), 40000)
+                    } finally {
+                        ttlInFlight = false
+                    }
+                    val rc = res.first
+                    val out = res.second
                     val (status, reason) = parseVerifyResult(true, out)
                     AppLog.i(TAG, "VERIFY TTL networkChange: rc=$rc → $status ($reason)")
                     if (status == ToolsStep.Status.FAILED) {

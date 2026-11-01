@@ -49,8 +49,12 @@ object AdbClient {
     private const val WRTE = 0x57525445
     private const val CLSE = 0x434c5345
 
-    /** Стратегия выбора порта как в w0/n.case 0: сначала кэш, потом 65010, потом 5555. */
-    private val PORTS = intArrayOf(ADB_PORT_ROOT, ADB_PORT_DEFAULT)
+    /**
+     * Стратегия выбора порта.
+     * iter22 §5.3: ОСНОВНОЙ канал — 5555 (adbd отдаёт uid=0 на 127.0.0.1:5555),
+     * 65010 — вторичная попытка (миграция adbd, нужна не всегда).
+     */
+    private val PORTS = intArrayOf(ADB_PORT_DEFAULT, ADB_PORT_ROOT)
 
     private val worker = object : Thread("AdbWorker") {
         init { isDaemon = true }

@@ -68,15 +68,20 @@ object StatusIcons {
     @Deprecated("Use SYS_HVAC_EXT_TEMP_EXT/SYS_HVAC_EXT_EXTTEMP explicitly; kept for sysPropFor mapping")
     private const val SYS_HVAC_EXT = SYS_HVAC_EXT_TEMP_EXT
 
-    private const val CHANNEL_BATT = "central_ex_status_batt"
-    private const val CHANNEL_TEMP = "central_ex_status_temp"
+    // iter22 §1: канал и ранги ОДИН-В-ОДИН как в CEX w0/kg#j: единый канал
+    // "central_ex_status_temp", IMPORTANCE_LOW, setShowBadge(false);
+    // notifId 15020 (batt) iconId=97 rank=32; notifId 15021 (temp) iconId=15 rank=22;
+    // Wi-Fi остаётся на том же канале с собственным notifId.
+    private const val CHANNEL_STATUS = "central_ex_status_temp"
     private const val CHANNEL_WIFI = "central_ex_status_wifi"
     private const val NOTIF_BATT = 15020
     private const val NOTIF_TEMP = 15021
     private const val NOTIF_WIFI = 15024
-    private const val RANK_BATT = 10
-    private const val RANK_TEMP = 20
-    private const val RANK_WIFI = 31
+    private const val ICON_ID_BATT = 97
+    private const val ICON_ID_TEMP = 15
+    private const val RANK_BATT = 32
+    private const val RANK_TEMP = 22
+    private const val RANK_WIFI = 42
 
     private val AREAS = intArrayOf(0, 1, 2, 3, 4, 7, 0x10, 0x20, 0x30)
     private val RANGES = arrayOf(0x0..0x4FF, 0x11400000..0x117FFFFF, 0x15400000..0x167FFFFF)
@@ -112,6 +117,9 @@ object StatusIcons {
     /** Источник последнего прочитанного SOC/temp (для VERIFY в логе и в уведомлении). */
     @Volatile private var socSource: String = "none"
     @Volatile private var tempSource: String = "none"
+    // iter22 §2: детектор «залипшего» значения (25.0) — только ЛОГ, значение не скрываем.
+    @Volatile private var tempSameCount: Int = 0
+    @Volatile private var tempPrev: Float? = null
     // iter16: кэш последних прочитанных значений (для push в persist.sys.hvacdigital.*
     // под строковый плагин). Плагин ожидает ЗНАЧЕНИЯ (напр. "98.1", "22.5", "9.7"), а не 0/1.
     @Volatile private var lastBattPct: Float? = null
@@ -205,7 +213,7 @@ object StatusIcons {
                 // Итерация 11: dump конфига свойства (доступ/areaType/supportedAreas)
                 // — по этому можно понять, какое свойство реально поддерживается ГУ.
                 val inRange = TEMP_RANGES.any { pid in it } ||
-                        pid == 0x11600703 || pid == 0x15400701 || pid == 0x15400703
+                        pid == 0x15400701 || pid == 0x15400703
                 if (inRange) {
                     val areaIds = try { cfg.areaIds?.joinToString(",") { "0x%x".format(it) } } catch (_: Throwable) { "n/a" }
                     AppLog.i(TAG, String.format("CANDCFG 0x%08X access=%d areaType=0x%08X areas=[$areaIds]", pid, cfg.access, cfg.areaType))
@@ -312,81 +320,82 @@ object StatusIcons {
         return null
     }
 
+    // РЕФЕРЕНС: com.geely.hvacstepperv2.TempStepperService#i(int area) — getFloatProperty(291505923, area),
+    // при NaN — getIntProperty(291505923, area): -550..700 → /10.0f, -45..65 → as-is.
+    // РЕФЕРЕНС: #g() — перебор зон f1286d0 = {0,1,4,7}, первый валидный в (-55, 70) — «Exterior OK».
+    // 291505923 == 0x11600703 == ENV_OUTSIDE_TEMPERATURE. Именно этот ID эталон и использует
+    // для наружной температуры; прошлая «константа 25.0» — следствие чтения только area=0
+    // без проверки диапазона и без int-ветки. Отсюда: число возвращаем всегда, «--» — только
+    // если ни одна зона/ветка не дала значения за всё время жизни сервиса (см. syncAll).
+    private const val PROP_ENV_OUTSIDE_TEMP = 291505923 // 0x11600703
+    private val CEX_OUTSIDE_AREAS = intArrayOf(0, 1, 4, 7) // f1286d0
+
+    /** РЕФЕРЕНС: CarPropertyManager#getCarPropertyConfig (в CEX — через рефлексию, API разнится). */
+    private fun propConfigAccessAreaType(m: android.car.hardware.property.CarPropertyManager, propId: Int): Pair<Int, Int>? {
+        return try {
+            val meth = m.javaClass.getMethod("getCarPropertyConfig", Int::class.javaPrimitiveType!!)
+            val cfg = meth.invoke(m, propId) ?: return null
+            val access = runCatching { cfg.javaClass.getMethod("getAccess").invoke(cfg) as Int }.getOrNull() ?: -1
+            val areaType = runCatching { cfg.javaClass.getMethod("getAreaType").invoke(cfg) as Int }.getOrNull() ?: -1
+            access to areaType
+        } catch (t: Throwable) { null }
+    }
+
     private fun readTempScan(): Float? {
-        val m = cpm ?: return null
-        AppLog.i(TAG, "TEMP (iter21 §5): probing, will show \"--\" until source is verified by human")
-
-        fun tryFloatProp(p: Int, a: Int): Pair<Float?, Any?> {
-            try {
-                val raw = m.getFloatProperty(p, a)
-                if (!raw.isNaN()) return (if (raw in -55f..70f && raw != 25.0f) raw else null) to raw
-            } catch (e: Exception) { return null to ("ERR:" + e.message) }
-            return null to null
+        val m = cpm ?: run { AppLog.w(TAG, "TEMP: no CarPropertyManager"); return null }
+        val cfg = propConfigAccessAreaType(m, PROP_ENV_OUTSIDE_TEMP)
+        AppLog.i(TAG, "TEMP PROBE_CFG 0x11600703 access=${cfg?.first ?: "n/a"} areaType=${cfg?.second ?: "n/a"} " +
+                "(access 1=READ 3=READ_WRITE)")
+        // access: 1 = READ_ONLY, 3 = READ_WRITE; если свойство не читаемое — не тратим binder-вызовы.
+        if (cfg != null && cfg.first != 1 && cfg.first != 3) {
+            AppLog.w(TAG, "TEMP: 0x11600703 not readable (access=${cfg.first}) → skip")
+            return null
         }
-        fun tryIntProp(p: Int, a: Int): Pair<Float?, Any?> {
+        for (area in CEX_OUTSIDE_AREAS) {
+            // float-ветка CEX#i
             try {
-                val raw = m.getIntProperty(p, a)
-                val v: Float? = when {
-                    raw in -550..700 -> raw / 10.0f
-                    raw in -55..70   -> raw.toFloat()
-                    else -> null
+                val f = m.getFloatProperty(PROP_ENV_OUTSIDE_TEMP, area)
+                AppLog.i(TAG, String.format("TEMP_PROBE 0x11600703@%d float=%.3f", area, f))
+                if (!f.isNaN() && f > -55f && f < 70f) {
+                    tempSource = "HAL 0x11600703@$area"
+                    AppLog.i(TAG, String.format("Temp HAL=%.1f → UI=%.1f (area=0x%x)", f, f, area))
+                    return f
                 }
-                return (if (v != null && v != 25.0f && v in -55f..70f) v else null) to raw
-            } catch (e: Exception) { return null to ("ERR:" + e.message) }
-            return null to null
-        }
-        fun tryInt80Prop(p: Int, a: Int): Pair<Float?, Any?> {
+            } catch (e: Exception) {
+                AppLog.d(TAG, String.format("TEMP_PROBE 0x11600703@%d float ERR %s", area, e.message))
+            }
+            // int-ветка CEX#i
             try {
-                val raw = m.getIntProperty(p, a)
-                val v = normInt80(raw)?.toFloat()
-                return (if (v != null && v in -50f..70f && v != 25.0f) v else null) to raw
-            } catch (e: Exception) { return null to ("ERR:" + e.message) }
-        }
-
-        data class Cand(val name: String, val value: Float?, val raw: Any?)
-        val candidates = ArrayList<Cand>()
-        fun rec(name: String, v: Float?, raw: Any?) { candidates.add(Cand(name, v, raw)) }
-
-        // iter21 §5: 0x11600703 ОТКЛЮЧЁН — не используем и не выбираем (всегда 25.0 — не датчик).
-        // Пробуем 5 НОВЫХ ID по трём зонам; все raw логируем, но НЕ ВЫБИРАЕМ автоматически
-        // (нельзя угадать без верификации на ГУ).
-        for (pid in TEMP_PROBE_IDS) {
-            for (area in intArrayOf(0, 2, 7)) {
-                val name = "0x${"%08X".format(pid)}@$area"
-                val (vf, rawf) = tryFloatProp(pid, area)
-                rec("$name/float", vf, rawf)
-                val (vi, rawi) = tryIntProp(pid, area)
-                rec("$name/int", vi, rawi)
+                val iv = m.getIntProperty(PROP_ENV_OUTSIDE_TEMP, area)
+                AppLog.i(TAG, String.format("TEMP_PROBE 0x11600703@%d int=%d", area, iv))
+                if (iv > -550 && iv < 700) {
+                    val v = iv / 10.0f
+                    if (v > -55f && v < 70f) {
+                        tempSource = "HAL 0x11600703@$area (int/10)"
+                        AppLog.i(TAG, String.format("Temp HAL=%.1f → UI=%.1f (area=0x%x int)", v, v, area))
+                        return v
+                    }
+                }
+                if (iv in -45..65) {
+                    tempSource = "HAL 0x11600703@$area (int)"
+                    AppLog.i(TAG, String.format("Temp HAL=%.1f → UI=%.1f (area=0x%x int raw)", iv.toFloat(), iv.toFloat(), area))
+                    return iv.toFloat()
+                }
+            } catch (e: Exception) {
+                AppLog.d(TAG, String.format("TEMP_PROBE 0x11600703@%d int ERR %s", area, e.message))
             }
         }
+        AppLog.w(TAG, "TEMP: 0x11600703 unavailable in all CEX areas {0,1,4,7}")
 
-        // getprop fallback (всё так же логируем, но тоже не auto-choose).
-        for (prop in SYS_HVAC_EXT_ALL) {
-            runCatching {
-                val pp = Runtime.getRuntime().exec(arrayOf("sh","-c","getprop $prop"))
-                if (!pp.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)) { pp.destroyForcibly() }
-                val sVal = pp.inputStream.bufferedReader().readText().trim()
-                pp.errorStream.bufferedReader().readText().trim()
-                val fv = sVal.toFloatOrNull()
-                val v = fv?.takeIf { it in -50f..70f && Math.abs(it - 1f) > 0.1f && it != 25.0f }
-                rec("getprop/$prop", v, sVal)
-            }
+        // ДИАГНОСТИКА (не источник): перебор альтернативных ID — ТОЛЬКО лог, значения
+        // никогда не выбираются автоматически (мандат iter22 §2.4: TEMP_PROBE = дамп).
+        val diag = StringBuilder()
+        for (pid in TEMP_PROBE_IDS) for (a in intArrayOf(0, 2, 7)) {
+            val f = runCatching { m.getFloatProperty(pid, a) }.getOrElse { Float.NaN }
+            val i = runCatching { m.getIntProperty(pid, a) }.getOrElse { Int.MIN_VALUE }
+            diag.append(String.format("\n  0x%08X@%d float=%s int=%d", pid, a, f.toString(), i))
         }
-
-        // AC_AMBIENT_TEMP (кабина, не наружка) — тоже только лог, не auto-choose.
-        for (a in intArrayOf(0, 2, 7)) {
-            val (vi, rawi) = tryInt80Prop(PROP_AC_AMBIENT_TEMP, a)
-            rec("0x2140A377@$a/int80(cabin)", vi, rawi)
-        }
-
-        // Логгируем ВСЕ значения в строку (чтобы по логу определить реальный ID с ГУ).
-        val lines = candidates.map { "${it.name}=${it.raw}->${it.value}" }
-        AppLog.i(TAG, "TEMP_PROBE (iter21 §5):\n" + lines.joinToString("\n  ", prefix = "  "))
-
-        // iter21 §5: ПОКА НИЧЕГО НЕ ВЫБИРАЕМ — показываем "--" до верификации.
-        // Как только по логам определим реальный ID — вернём его в PRECISE_COMMON/primary.
-        tempSource = "unverified (-- shown)"
-        AppLog.w(TAG, "TEMP: no source verified yet — returning null (UI shows \"--\")")
+        AppLog.i(TAG, "TEMP_PROBE (diagnostics only, not a source):$diag")
         return null
     }
 
@@ -416,17 +425,25 @@ object StatusIcons {
         return PendingIntent.getActivity(ctx, 15099, intent, flags)
     }
 
-    private fun postNotif(ctx: Context, id: Int, channelId: String, icon: Icon, title: String, text: String, rank: Int,
-                          contentIntent: PendingIntent) {
+    /**
+     * РЕФЕРЕНС: w0/kg#j(ctx, notifId, iconId, rank, title, text, icon, pi)
+     * Канал "central_ex_status_temp" IMPORTANCE_LOW (2), setShowBadge(false),
+     * setSmallIcon(icon: Icon), setContentTitle/Text/Intent, setOngoing/ShowWhen,
+     * extras flag_status_icon_* ровно как в CEX.
+     */
+    private fun postNotif(ctx: Context, notifId: Int, iconId: Int, rank: Int,
+                          title: String, text: String, describe: String,
+                          icon: Icon, contentIntent: PendingIntent,
+                          channelId: String = CHANNEL_STATUS) {
         val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        nm.createNotificationChannel(NotificationChannel(channelId, title, NotificationManager.IMPORTANCE_LOW).apply { setShowBadge(false) })
+        nm.createNotificationChannel(NotificationChannel(channelId, "CentralEX status icons", NotificationManager.IMPORTANCE_LOW).apply { setShowBadge(false) })
         val n = Notification.Builder(ctx, channelId)
             .setSmallIcon(icon)
             .setContentTitle(title).setContentText(text).setContentIntent(contentIntent)
             .setOngoing(true).setShowWhen(false).build()
         n.extras.putBoolean("flag_status_icon_notification", true)
-        n.extras.putInt("flag_status_icon_id", id)
-        n.extras.putString("flag_status_icon_describe", "centralex_$id")
+        n.extras.putInt("flag_status_icon_id", iconId)
+        n.extras.putString("flag_status_icon_describe", describe)
         n.extras.putParcelable("flag_status_icon_icon", icon)
         n.extras.putParcelable("flag_status_icon_pressed_icon", icon)
         n.extras.putBoolean("flag_status_icon_hide", false)
@@ -434,96 +451,97 @@ object StatusIcons {
         n.extras.putInt("flag_status_icon_space_x", 1)
         n.extras.putBoolean("flag_status_icon_is_pick_on", false)
         n.extras.putInt("flag_status_icon_specific_width", 0)
-        try { nm.notify(id, n); AppLog.d(TAG,"post notif id=$id rank=$rank text=\"$text\"") }
-        catch (t: Throwable) { AppLog.e(TAG,"notify $id err", t) }
+        try {
+            nm.notify(notifId, n)
+            AppLog.i(TAG, "KmIconProbe: postStatusIcon $describe notifId=$notifId iconId=$iconId rank=$rank text=\"$text\"")
+        } catch (t: Throwable) { AppLog.e(TAG, "notify $notifId err", t) }
     }
 
-    // iter21 §4: TempBattPill — постоянная нотификация, канал "temp_batt_pill_floater" (РЕФЕРЕНС CEX
-    // com.ex.auto.TempBattPillFloaterService#onCreate: startForeground(109, k1.G(...,"temp_batt_pill_floater",...))
-    // с smallIcon=17301561 (android.R.drawable.ic_menu_compass/ic_dialog_info — системная иконка).
-    private const val CHANNEL_PILL = "temp_batt_pill_floater"
-    private const val NOTIF_PILL = 109
-    private fun postTempBattPill(ctx: Context, battStr: String?, tempStr: String?, wifiStr: String?) {
-        val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        nm.createNotificationChannel(NotificationChannel(CHANNEL_PILL, "Temp/Batt Pill", NotificationManager.IMPORTANCE_LOW).apply {
-            setShowBadge(false)
-        })
-        val parts = ArrayList<String>(3)
-        if (!tempStr.isNullOrEmpty()) parts.add(tempStr)
-        if (!battStr.isNullOrEmpty()) parts.add(battStr)
-        if (!wifiStr.isNullOrEmpty()) parts.add(wifiStr)
-        val title = if (parts.isEmpty()) "—" else parts.joinToString("   ")
-        val n = Notification.Builder(ctx, CHANNEL_PILL)
-            .setSmallIcon(android.R.drawable.ic_menu_compass)
-            .setContentTitle(title)
-            .setContentText("CentralEXAuto pill")
-            .setOngoing(true).setShowWhen(false)
-            .setContentIntent(telemetryPi(ctx, NOTIF_PILL))
-            .build()
-        try { nm.notify(NOTIF_PILL, n); AppLog.i(TAG, "PILL_NOTIF: posted title=\"$title\"") }
-        catch (t: Throwable) { AppLog.e(TAG, "PILL_NOTIF err", t) }
+    // iter22 §1 pill-нотификация УДАЛЕНА: вместо неё — две отдельные иконки (batt/temp)
+    // с битмапами по геометрии CEX w0/kg#a, как того требует мандат.
+
+    /** h(dp) — CEX w0/kg#h */
+    private fun h(ctx: Context, dp: Int): Int =
+        (dp * ctx.resources.displayMetrics.density + 0.5f).toInt()
+
+    /** i(x) — CEX w0/kg#i: Math.round(x*10)/10 → "%.1f" или целое */
+    fun fmtOneDecimal(x: Float): String {
+        val r = Math.round(x * 10f) / 10f
+        return if (r == r.toInt().toFloat()) r.toInt().toString() else String.format(Locale.US, "%.1f", r)
     }
 
-    // DO NOT replace with a text placeholder. Use arc-based draw for wifi; keep text-draw for batt/temp.
-    private fun makeTextIcon(ctx: Context, main: String, suffix: String, color: Int): Icon {
-        val dp = ctx.resources.displayMetrics.density
-        val size = (24 * dp).toInt().coerceAtLeast(24)
-        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(bmp)
-        val p = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            this.color = color; typeface = Typeface.DEFAULT_BOLD
-            textAlign = Paint.Align.CENTER
-            style = Paint.Style.FILL
+    /**
+     * РЕФЕРЕНС: w0/kg#a(ctx, main, suffix, color, padH=22, keepNum=true, modeKm=false, scale=0.61f).
+     * Рисует битмап под intrinsic-размер: TEXT_DP=56, суффикс 0.61×, padH=22dp,
+     * высота = max(1, (int)((descent-ascent)/0.61f)),
+     * ширина = 2*padH + measureText(main) + gap + measureText(suffix).
+     */
+    private fun makeTextIconCex(ctx: Context, main: String, suffix: String, color: Int): Icon {
+        val TEXT_DP = 56
+        val SUFFIX_SCALE = 0.61f
+        val PAD_H_DP = 22
+        val GAP_DP = 0   // в CEX gap=0 между main и suffix (suffix стартует сразу после main)
+        val p = Paint(Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG).apply {
+            this.color = color; typeface = Typeface.DEFAULT; isAntiAlias = true
         }
-        // Итерация 12: авто-fit размера шрифта по measureText. НИКОГДА не
-        // обрезаем число — уменьшаем шрифт от 0.55*size до 0.28*size, пока
-        // ширина не влезет в 0.94*size (1 знак после запятой влезает всегда).
-        val pSfx = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            this.color = color; typeface = Typeface.DEFAULT
-            textAlign = Paint.Align.LEFT
-        }
-        // Подбираем textSize для main и суффикса синхронно.
-        var mainSize = size * 0.55f
-        val maxW = size * 0.94f
-        while (mainSize > size * 0.28f) {
-            p.textSize = mainSize
-            pSfx.textSize = mainSize * 0.65f
-            val mw = p.measureText(main)
-            val sw = if (suffix.isNotEmpty()) pSfx.measureText(suffix) else 0f
-            if (mw + sw <= maxW) break
-            mainSize -= size * 0.02f
-        }
+        val mainSize = h(ctx, TEXT_DP).toFloat()
         p.textSize = mainSize
-        pSfx.textSize = mainSize * 0.65f
-        if (main == "wifi") {
-            // Значок Wi-Fi: маленькая точка внизу + 3 дуги (уровни сигнала) над ней.
-            // Все дуги рисуем одним цветом (нет инфы об уровне в small icon-е; детали в contentText).
-            val cx = size/2f
-            val dotR = size * 0.06f
-            val dotCy = size * 0.82f
-            canvas.drawCircle(cx, dotCy, dotR, p)
-            p.style = Paint.Style.STROKE
-            p.strokeWidth = size * 0.08f
-            p.strokeCap = Paint.Cap.ROUND
-            // 3 дуги: radii 0.22/0.38/0.54 размера
-            for (k in 1..3) {
-                val r = size * (0.22f + (k-1)*0.16f)
-                val oval = RectF(cx - r, dotCy - r, cx + r, dotCy + r)
-                canvas.drawArc(oval, -135f, 90f, false, p)
-            }
-            p.style = Paint.Style.FILL
-        } else {
-            val mainW = p.measureText(main)
-            val sfxW = if (suffix.isNotEmpty()) pSfx.measureText(suffix) else 0f
-            val totalW = mainW + sfxW
-            val startX = (size - totalW) / 2f
-            canvas.drawText(main, startX + mainW/2f, size*0.72f, p)
-            if (suffix.isNotEmpty()) {
-                canvas.drawText(suffix, startX + mainW, size*0.72f, pSfx)
-            }
+        val mainW = p.measureText(main)
+        val fm = p.fontMetrics
+        val textH = fm.descent - fm.ascent
+        val bmpH = (textH / SUFFIX_SCALE).toInt().coerceAtLeast(1)
+        var sfxW = 0f; val gapPx = h(ctx, GAP_DP)
+        val sfxPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG).apply {
+            this.color = color; typeface = Typeface.DEFAULT; isAntiAlias = true
+            textSize = SUFFIX_SCALE * mainSize
+        }
+        if (suffix.isNotEmpty()) sfxW = sfxPaint.measureText(suffix)
+        val padH = h(ctx, PAD_H_DP)
+        var bmpW = padH*2 + (mainW + gapPx + sfxW).toInt()
+        if (bmpW < 1) bmpW = 1
+        val bmp = Bitmap.createBitmap(bmpW, bmpH, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bmp)
+        val y = ((bmpH - textH) / 2f) - fm.ascent
+        canvas.drawText(main, padH.toFloat(), y, p)
+        if (suffix.isNotEmpty()) canvas.drawText(suffix, padH + mainW + gapPx, y, sfxPaint)
+        return Icon.createWithBitmap(bmp)
+    }
+
+    /**
+     * Иконка Wi-Fi: 3 дуги + точка, РАЗМЕР по той же геометрии (рисуется в том же
+     * TEXT_DP масштабе, чтобы высота иконки совпадала с batt/temp в статус-баре).
+     */
+    private fun makeWifiIconCex(ctx: Context, level: Int, color: Int): Icon {
+        val TEXT_DP = 56
+        val p = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            this.color = color; typeface = Typeface.DEFAULT; isAntiAlias = true; style = Paint.Style.FILL
+        }
+        val size = h(ctx, TEXT_DP)
+        val padH = h(ctx, 22)
+        val bmpW = (padH*2 + size*0.55f).toInt().coerceAtLeast(1)
+        val bmpH = size.coerceAtLeast(1)
+        val bmp = Bitmap.createBitmap(bmpW, bmpH, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bmp)
+        val cx = bmpW/2f
+        val dotR = size * 0.05f
+        val dotCy = bmpH * 0.82f
+        canvas.drawCircle(cx, dotCy, dotR, p)
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = size * 0.06f
+        p.strokeCap = Paint.Cap.ROUND
+        for (k in 1..3) {
+            if (k > level + 1) p.alpha = 0x55  // неактивные дуги — сероватые
+            val r = bmpH * (0.20f + (k-1)*0.14f)
+            val oval = RectF(cx - r, dotCy - r, cx + r, dotCy + r)
+            canvas.drawArc(oval, -135f, 90f, false, p)
+            p.alpha = 0xFF
         }
         return Icon.createWithBitmap(bmp)
     }
+
+    // DO NOT replace with a text placeholder — синоним для обратной совместимости.
+    private fun makeTextIcon(ctx: Context, main: String, suffix: String, color: Int): Icon =
+        makeTextIconCex(ctx, main, suffix, color)
 
     /**
      * Иконка температуры «снаружи»: компактный термометр (глиф, НЕ текст-заглушка)
@@ -641,17 +659,14 @@ object StatusIcons {
             AppLog.d(TAG, "BATT: toggle=on read start")
             val soc = readSocScan()
             if (soc != null) {
-                // Итерация 12: батарея — всегда ОДИН знак после запятой
-                // (42.4, 100.0, 7.0), без toInt() обрезания в "32".
-                val socStr = String.format(Locale.US, "%.1f", soc)
-                val smallBattText = socStr
+                // iter22 §1: одна цифра после запятой (42.4, 100.0, 7.0) — как w0/kg#i("%.1f").
+                val socStr = fmtOneDecimal(soc)
+                val icon = makeTextIconCex(app, socStr, "%", Color.WHITE)
                 val text = "$socStr% · $socSource"
-                val w = (24 * app.resources.displayMetrics.density).toInt().coerceAtLeast(24)
-                postNotif(app, NOTIF_BATT, CHANNEL_BATT,
-                    makeTextIcon(app, smallBattText, "", Color.WHITE),
-                    "Батарея $socStr%", text, RANK_BATT,
+                postNotif(app, NOTIF_BATT, ICON_ID_BATT, RANK_BATT,
+                    "Батарея $socStr%", text, "StatusIcon_BatteryPercent", icon,
                     telemetryPi(app, NOTIF_BATT))
-                AppLog.i(TAG, "BATT: value=$socStr% smallIconSize=${w}x${w}px smallIconText=\"$smallBattText\" click→telemetry src=$socSource → posted + OVERLAY")
+                AppLog.i(TAG, "BATT: value=$socStr% src=$socSource → posted (CEX geom 56dp/0.61)")
                 battStr = "$socStr%"; battPct = soc; battHas = true
                 lastBattPct = soc
             } else { cancel(app, NOTIF_BATT); AppLog.w(TAG,"BATT: SOC null") }
@@ -659,32 +674,33 @@ object StatusIcons {
 
         if (showTemp) {
             val t = readTempScan()
-            if (t != null) {
-                // Итерация 12: температура — один знак после запятой если
-                // дробная часть не нулевая, иначе целое (7.2/-3.5 → "7.2"/"-3.5";
-                // 7/-3 → "7"/"-3").
-                val tStr = if (kotlin.math.abs(t - t.toInt().toFloat()) < 0.05f)
-                    "${t.toInt()}" else String.format(Locale.US, "%.1f", t)
-                val sign = if (t > 0) "+" else ""
-                val smallTempText = tStr  // с дробной частью, без обрезания
+            // iter22 §2: число показываем ВСЕГДА, если хоть раз его прочитали
+            // (аналогично OEM-панели "10°C"). "--" только при полном отсутствии данных.
+            val display: Float? = t ?: lastTempC
+            if (display != null) {
+                val tStr = fmtOneDecimal(display)
+                val sign = if (display > 0f) "+" else ""
+                val icon = makeTextIconCex(app, tStr, "°C", Color.WHITE)
                 val text = "$sign$tStr °C · $tempSource"
-                val w = (24 * app.resources.displayMetrics.density).toInt().coerceAtLeast(24)
-                postNotif(app, NOTIF_TEMP, CHANNEL_TEMP,
-                    makeTextIcon(app, smallTempText, "", Color.WHITE),
-                    "Снаружи $sign$tStr°C", text, RANK_TEMP,
+                postNotif(app, NOTIF_TEMP, ICON_ID_TEMP, RANK_TEMP,
+                    "Снаружи $sign$tStr°C", text, "StatusIcon_OutsideTemperature", icon,
                     telemetryPi(app, NOTIF_TEMP))
-                AppLog.i(TAG, "TEMP: value=$sign$tStr°C smallIconSize=${w}x${w}px smallIconText=\"$smallTempText\" src=$tempSource → posted + OVERLAY")
-                tempStr = "$sign$tStr°"; tempVal = t; tempHas = true
-                lastTempC = t
-                lastExtTempC = t
+                AppLog.i(TAG, "Temp HAL=%.1f → UI=%s°C (src=%s)".format(display, tStr, tempSource))
+                // iter22 §2: если число не меняется много тиков — это, вероятно, дефолт VHAL.
+                // Значение НЕ скрываем (владелец: показывать всегда), только предупреждаем в логе.
+                if (display == tempPrev) tempSameCount++ else { tempSameCount = 0; tempPrev = display }
+                if (tempSameCount == 5) {
+                    AppLog.w(TAG, "TEMP: value pinned at ${tStr}°C for 5+ ticks (src=$tempSource) — possibly VHAL default, compare with GU panel")
+                }
+                tempStr = "$sign$tStr°"; tempVal = display; tempHas = true
+                lastTempC = display; lastExtTempC = display
             } else {
-                // iter21 §5: "--" пока не верифицирован источник (вместо константы 25.0 и вместо отмены нотификации).
-                postNotif(app, NOTIF_TEMP, CHANNEL_TEMP,
-                    makeTextIcon(app, "--", "", Color.WHITE),
-                    "Снаружи --°C", "источник не верифицирован (iter21 §5)", RANK_TEMP,
+                val icon = makeTextIconCex(app, "--", "", Color.WHITE)
+                postNotif(app, NOTIF_TEMP, ICON_ID_TEMP, RANK_TEMP,
+                    "Снаружи --°C", "нет данных от VHAL", "StatusIcon_OutsideTemperature", icon,
                     telemetryPi(app, NOTIF_TEMP))
                 tempStr = "--°"; tempHas = true
-                AppLog.w(TAG, "TEMP: value=unverified → show \"--\" (no more 25.0 constant)")
+                AppLog.w(TAG, "TEMP: no data yet → \"--\" shown")
             }
         } else { cancel(app, NOTIF_TEMP); AppLog.d(TAG, "TEMP: toggle=off") }
 
@@ -701,21 +717,17 @@ object StatusIcons {
                     connected -> "on (${level}/4 rssi=$rssi)"
                     else -> "disc"
                 }
-                postNotif(app, NOTIF_WIFI, CHANNEL_WIFI, makeWifiIconWithLevel(app, level, Color.WHITE), "Wi-Fi", state, RANK_WIFI,
-                    wifiSettingsPi(app))
+                // РЕГРЕСС-ЗОНА: Wi-Fi остаётся на своём notifId/канале и тех же кликах
+                // (android.settings.WIFI_SETTINGS); меняется ТОЛЬКО размер иконки.
+                val icon = makeWifiIconCex(app, level, Color.WHITE)
+                postNotif(app, NOTIF_WIFI, NOTIF_WIFI, RANK_WIFI, "Wi-Fi", state, "StatusIcon_Wifi",
+                    icon, wifiSettingsPi(app), CHANNEL_WIFI)
                 wifiStr = if (!enabled) "✕" else if (connected) "$level/4" else "…"
-                wifiLvl = level
-                wifiHas = true
-                AppLog.i(TAG, "WIFI: level=$level rssi=$rssi icon=arcs click→android.settings.WIFI_SETTINGS state=$state → posted + OVERLAY")
+                wifiLvl = level; wifiHas = true
+                AppLog.i(TAG, "WIFI: level=$level rssi=$rssi state=$state → posted")
             } catch (e: Exception) { AppLog.e(TAG,"WIFI: notify ERROR: ${e.message}", e) }
         } else cancel(app, NOTIF_WIFI)
 
-        // iter21 §4: OVERLAY ОТКЛЮЧЁН (TYPE_APPLICATION_OVERLAY убран).
-        // Индикаторы температуры/батареи — в СТРОКЕ СОСТОЯНИЯ через постоянную
-        // нотификацию TempBattPill (аналогично CEX com.ex.auto.TempBattPillFloaterService,
-        // но БЕЗ WindowManager.addView — только Notification).
-        runCatching { StatusOverlay.hide(app) }
-        postTempBattPill(app, battStr, tempStr, wifiStr)
 
         // iter16: после каждого tick проталкиваем РЕАЛЬНЫЕ значения в
         // persist.sys.hvacdigital.{batt,temp,exttemp,temp_ext}, если соответствующий
@@ -757,8 +769,7 @@ object StatusIcons {
     }
 
     @JvmStatic fun cancelAll(ctx: Context) {
-        cancel(ctx, NOTIF_BATT); cancel(ctx, NOTIF_TEMP); cancel(ctx, NOTIF_WIFI); cancel(ctx, NOTIF_PILL)
-        StatusOverlay.hide(ctx)
+        cancel(ctx, NOTIF_BATT); cancel(ctx, NOTIF_TEMP); cancel(ctx, NOTIF_WIFI)
     }
 
     // ─── Глифы для overlay (крупные, ICON_SIZE_DP=16px, белые) ───

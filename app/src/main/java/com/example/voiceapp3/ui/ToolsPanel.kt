@@ -238,9 +238,12 @@ class ToolsPanel(
             opts = listOf("0" to "Выкл", "10" to "10 с", "30" to "30 с", "60" to "1 мин", "120" to "2 мин"),
         )
         addDiv()
-        // iter16: тогл «Не гасить экран» убран по требованию владельца — keep-awake
-        // теперь применяется автоматически при первом старте и на каждом буте.
-        // addToggle("keepawake", "Не гасить экран", "desc.keepawake", def = false)
+        // iter16: тогл «Не гасить экран» убран по требованию владельца.
+        // iter22 §3: вместо тумблера — ОДНОРАЗОВАЯ кнопка (settings put, без pref,
+        // не переживает перезагрузку; РЕФЕРЕНС: экран не гасится до reboot).
+        addOneShot("keepawake_btn", "Не гасить ГУ (до перезагрузки)",
+            "Одноразово выставит screen_off_timeout=2147483647 и stay_on=7. После перезагрузки ГУ настройка сбросится — нажмите снова.",
+            "settings.keepawake_btn")
         addDiv()
         addSect("page.sectionTheme")
         addSeg("gu", ToolsCatalog.TEXT["page.themeHu"].orEmpty(), def = "light", width = 260,
@@ -272,6 +275,12 @@ class ToolsPanel(
         addToggle("hvacTemp", "Цифровой климат-контроль", "desc.hvacTemp", def = false)
         addDiv()
         addToggle("hvacExtTemp", "Цифровая наружная температура", "desc.hvacExtTemp", def = false)
+        addDiv()
+        // iter22 §3 + §4: страховка на случай VIA=nenhum — снять битый bind-mount
+        // плагина и перезапустить SystemUI. РЕФЕРЕНС: w0/o#c (umount в цикле + kill sysui).
+        addOneShot("hvac_restore_btn", "Вернуть панель SystemUI",
+            "Снимет зависший bind-mount плагина, перезапустит SystemUI и проверит /proc/mounts. Нажимайте, если шторка Системы чёрная или не открывается.",
+            "hvacdigital.plugin.restore")
         addDiv()
         addText(ToolsCatalog.TEXT["page.statusHelpTitle"].orEmpty(), ToolsCatalog.TEXT["page.statusHelpText"].orEmpty())
     }
@@ -834,6 +843,56 @@ class ToolsPanel(
     }
 
     private fun addDiv() = page.addView(divider(), matchWrap(dp(1f)))
+
+    /**
+     * iter22 §3: одноразовая кнопка (не тумблер, состояния не хранит).
+     * Отправляет `settings.change` с key=<route>, value=true; результат приходит в
+     * tools.state.last с action = "settings.<route>" (keepawake) или "hvacdigital.restore".
+     */
+    private fun addOneShot(key: String, title: String, desc: String, actionPrefix: String) {
+        val row = LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(10f), 0, dp(10f))
+        }
+        val info = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
+        info.addView(text(title, 14.5f, palette.ink, bold = true))
+        info.addView(text(desc, 12f, palette.muted, bold = false))
+        oneShotNote(info, actionPrefix)
+        row.addView(info, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        row.addView(okButton("ВЫПОЛНИТЬ") {
+            send("settings.change", JsonObject().apply {
+                addProperty("key", key)
+                addProperty("value", true)
+            }.toString())
+            toast("$title · выполнено")
+        }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        page.addView(row, matchWrap())
+    }
+
+    /** Хвост readback под кнопкой: "after=… stay_on=… rc=…" / "RESTORE_OK" — как пришло из shell. */
+    private fun oneShotNote(parent: LinearLayout, actionPrefix: String) {
+        val r = last ?: return
+        val action = r.get("action")?.takeIf { it.isJsonPrimitive }?.asString ?: return
+        if (!action.startsWith(actionPrefix)) return
+        val ok = r.get("ok")?.takeIf { it.isJsonPrimitive }?.asBoolean ?: true
+        val summary = r.get("summary")?.takeIf { it.isJsonPrimitive }?.asString.orEmpty()
+        // Хвост readback — из последнего шага (stdout/actual), как он пришёл из shell.
+        val steps = r.get("steps")?.takeIf { it.isJsonArray }?.asJsonArray
+        val tail = steps?.lastOrNull()?.takeIf { it.isJsonObject }?.asJsonObject?.let { st ->
+            listOfNotNull(
+                st.get("actual")?.takeIf { it.isJsonPrimitive }?.asString,
+                st.get("stdout")?.takeIf { it.isJsonPrimitive }?.asString?.trim()?.takeLast(300),
+            ).filter { it.isNotBlank() }.joinToString(" · ")
+        }.orEmpty()
+        val body = listOf(summary, tail).filter { it.isNotBlank() }.joinToString("\n")
+        if (body.isBlank()) return
+        parent.addView(text(body, 11.5f,
+            if (ok) palette.muted else Color.parseColor("#E5484D"), bold = false).apply {
+            setPadding(0, dp(4f), 0, 0)
+        }, matchWrap())
+    }
 
     private fun addToggle(key: String, title: String, descKey: String?, def: Boolean) {
         val on = boolState(key) ?: def
