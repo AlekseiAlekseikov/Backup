@@ -85,7 +85,10 @@ object StatusIcons {
 
     private val AREAS = intArrayOf(0, 1, 2, 3, 4, 7, 0x10, 0x20, 0x30)
     private val RANGES = arrayOf(0x0..0x4FF, 0x11400000..0x117FFFFF, 0x15400000..0x167FFFFF)
-    // iter21 §5: 0x11600703 УДАЛЁН (всегда возвращал константу 25.0 — не реальный датчик).
+    // 0x11600703 в этом списке НЕ нужен: он читается отдельно и явно — см. readTempScan()
+    // и PROP_ENV_OUTSIDE_TEMP (это ENV_OUTSIDE_TEMPERATURE эталона, TempStepperService#i).
+    // «Константа 25.0» в 1.0.43 — следствие чтения одной зоны без int-ветки и без проверки
+    // диапазона, а не признак мёртвого ID.
     private val PRECISE_COMMON = intArrayOf(0x157, 0x11600005, 0x11600207, 0x11600208,
         0x16400017, 0x21600017, 0x16400001, 0x15500703, 0x11500703,
         0x16400703, 0x21600703, 0x11600502, 0x11600204, 0x11400204)
@@ -95,7 +98,8 @@ object StatusIcons {
     // ED_EV_BATTERY_PERCENTAGE=0x2140a6ed (Int, x10 — делим на 10)
     private const val PROP_EV_BATT_LEVEL = 0x11600309
     private const val PROP_ED_EV_BATT_PCT = 0x2140a6ed
-    // iter21 §5: 5 НОВЫХ ID для пробы наружной температуры (логгируем ВСЕ raw, "--" до верификации).
+    // ДИАГНОСТИКА (не источник): 5 альтернативных ID, значения идут ТОЛЬКО в лог
+    // (TEMP_PROBE), авто-выбора нет — источник наружки один, PROP_ENV_OUTSIDE_TEMP.
     private val TEMP_PROBE_IDS = intArrayOf(
         0x2140A863.toInt(), 0x2140B009, 0x2140B00D, 0x2140A6DC.toInt(), 0x21402063
     )
@@ -457,8 +461,13 @@ object StatusIcons {
         } catch (t: Throwable) { AppLog.e(TAG, "notify $notifId err", t) }
     }
 
-    // iter22 §1 pill-нотификация УДАЛЕНА: вместо неё — две отдельные иконки (batt/temp)
-    // с битмапами по геометрии CEX w0/kg#a, как того требует мандат.
+    // pill-нотификация (109) удалена: вместо неё — две отдельные иконки batt/temp
+    // с битмапами по геометрии CEX w0/kg#a.
+    // Константы — из w0/kg#b (вызов a(...)): padH=10, scale=0.82f; gap=h(3) при scale>=0.5.
+    private const val TEXT_DP = 56
+    private const val SUFFIX_SCALE = 0.82f
+    private const val PAD_H_DP = 10
+    private const val GAP_DP = 3
 
     /** h(dp) — CEX w0/kg#h */
     private fun h(ctx: Context, dp: Int): Int =
@@ -471,16 +480,22 @@ object StatusIcons {
     }
 
     /**
-     * РЕФЕРЕНС: w0/kg#a(ctx, main, suffix, color, padH=22, keepNum=true, modeKm=false, scale=0.61f).
-     * Рисует битмап под intrinsic-размер: TEXT_DP=56, суффикс 0.61×, padH=22dp,
-     * высота = max(1, (int)((descent-ascent)/0.61f)),
-     * ширина = 2*padH + measureText(main) + gap + measureText(suffix).
+     * РЕФЕРЕНС: w0/kg#a(ctx, main, suffix, color, padH, keepNum, modeKm, scale)
+     *   вызов из w0/kg#b: a(ctx, main, suffix, color, **padH=10**, keepNum=true, modeKm=false, **scale=0.82f**)
+     *   const/16 v4, 10 / const/4 v5, 1 / const/4 v6, 0 / const v7, 1062333317 (0.82f)
+     * Геометрия один-в-один:
+     *   TEXT_DP      = 56            (h(ctx,56))
+     *   SUFFIX_SCALE = 0.82f         (mul-float suffixSize = scale * mainSize)
+     *   PAD_H_DP     = 10            (h(ctx,10) слева и справа)
+     *   GAP_DP       = 3             (h(ctx, scale<0.5 ? 1 : 3))
+     *   bmpH         = max(1,(int)((descent-ascent)/0.61f))    ← 1058810102 = 0.61f
+     *   bmpW         = max(fact, reserve), где при keepNum резерв под "-40"+"°C" и "100"+"%",
+     *                  поэтому ширина иконки не «прыгает» при смене значения.
+     * Текст рисуется со сдвигом f9 = max(0,(bmpW-fact)/2), чтобы цифры стояли по центру резерва.
      */
-    private fun makeTextIconCex(ctx: Context, main: String, suffix: String, color: Int): Icon {
-        val TEXT_DP = 56
-        val SUFFIX_SCALE = 0.61f
-        val PAD_H_DP = 22
-        val GAP_DP = 0   // в CEX gap=0 между main и suffix (suffix стартует сразу после main)
+    private fun makeTextIconCex(ctx: Context, main: String, suffix: String, color: Int,
+                                padHDp: Int = PAD_H_DP, keepNum: Boolean = true,
+                                scale: Float = SUFFIX_SCALE, kind: String = ""): Icon {
         val p = Paint(Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG).apply {
             this.color = color; typeface = Typeface.DEFAULT; isAntiAlias = true
         }
@@ -489,21 +504,44 @@ object StatusIcons {
         val mainW = p.measureText(main)
         val fm = p.fontMetrics
         val textH = fm.descent - fm.ascent
-        val bmpH = (textH / SUFFIX_SCALE).toInt().coerceAtLeast(1)
-        var sfxW = 0f; val gapPx = h(ctx, GAP_DP)
+        val suffixSize = scale * mainSize
+        val gapPx = h(ctx, if (scale < 0.5f) 1 else GAP_DP)
         val sfxPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG).apply {
             this.color = color; typeface = Typeface.DEFAULT; isAntiAlias = true
-            textSize = SUFFIX_SCALE * mainSize
+            textSize = suffixSize
         }
-        if (suffix.isNotEmpty()) sfxW = sfxPaint.measureText(suffix)
-        val padH = h(ctx, PAD_H_DP)
-        var bmpW = padH*2 + (mainW + gapPx + sfxW).toInt()
+        val sfxW = if (suffix.isNotEmpty()) sfxPaint.measureText(suffix) else 0f
+        val bmpH = ((textH / 0.61f).toInt()).coerceAtLeast(1)
+        val padH = h(ctx, padHDp)
+        val factW = padH * 2 + (mainW + if (suffix.isNotEmpty()) gapPx + sfxW else 0f).toInt()
+
+        // keepNum: резерв ширины под худший случай, как в эталоне.
+        var bmpW = factW
+        if (keepNum) {
+            p.textSize = mainSize
+            val negW = p.measureText("-40")
+            val hundredW = p.measureText("100")
+            val reserve = maxOf(
+                padH * 2 + (negW + gapPx + sfxPaint.measureText("°C")).toInt(),
+                padH * 2 + (hundredW + gapPx + sfxPaint.measureText("%")).toInt(),
+            )
+            bmpW = maxOf(factW, reserve)
+        }
         if (bmpW < 1) bmpW = 1
         val bmp = Bitmap.createBitmap(bmpW, bmpH, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bmp)
         val y = ((bmpH - textH) / 2f) - fm.ascent
-        canvas.drawText(main, padH.toFloat(), y, p)
-        if (suffix.isNotEmpty()) canvas.drawText(suffix, padH + mainW + gapPx, y, sfxPaint)
+        val f9 = maxOf(0f, (bmpW - factW) / 2f)
+        p.textSize = mainSize
+        canvas.drawText(main, padH + f9, y, p)
+        if (suffix.isNotEmpty()) canvas.drawText(suffix, padH + mainW + gapPx + f9, y, sfxPaint)
+
+        // iter22 (ревью §2.1): фактическая геометрия в лог — по ней сразу видно, рисует ли
+        // вендорный плагин битмап в intrinsic-размере или масштабирует его сам.
+        val dens = ctx.resources.displayMetrics.density
+        AppLog.i(TAG, "ICON_GEOM: kind=${kind.ifEmpty { main + suffix }} w=${bmpW}px h=${bmpH}px " +
+                "(w=${"%.1f".format(bmpW / dens)}dp h=${"%.1f".format(bmpH / dens)}dp) " +
+                "textSize=${"%.1f".format(mainSize)} suffix=$suffix padH=${padHDp}dp gap=$GAP_DPdp keepNum=$keepNum")
         return Icon.createWithBitmap(bmp)
     }
 
@@ -512,12 +550,11 @@ object StatusIcons {
      * TEXT_DP масштабе, чтобы высота иконки совпадала с batt/temp в статус-баре).
      */
     private fun makeWifiIconCex(ctx: Context, level: Int, color: Int): Icon {
-        val TEXT_DP = 56
         val p = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             this.color = color; typeface = Typeface.DEFAULT; isAntiAlias = true; style = Paint.Style.FILL
         }
         val size = h(ctx, TEXT_DP)
-        val padH = h(ctx, 22)
+        val padH = h(ctx, PAD_H_DP)
         val bmpW = (padH*2 + size*0.55f).toInt().coerceAtLeast(1)
         val bmpH = size.coerceAtLeast(1)
         val bmp = Bitmap.createBitmap(bmpW, bmpH, Bitmap.Config.ARGB_8888)
@@ -536,86 +573,14 @@ object StatusIcons {
             canvas.drawArc(oval, -135f, 90f, false, p)
             p.alpha = 0xFF
         }
+        val dens = ctx.resources.displayMetrics.density
+        AppLog.i(TAG, "ICON_GEOM: kind=wifi w=${bmpW}px h=${bmpH}px " +
+                "(w=${"%.1f".format(bmpW / dens)}dp h=${"%.1f".format(bmpH / dens)}dp) level=$level padH=${PAD_H_DP}dp")
         return Icon.createWithBitmap(bmp)
     }
 
-    // DO NOT replace with a text placeholder — синоним для обратной совместимости.
-    private fun makeTextIcon(ctx: Context, main: String, suffix: String, color: Int): Icon =
-        makeTextIconCex(ctx, main, suffix, color)
 
-    /**
-     * Иконка температуры «снаружи»: компактный термометр (глиф, НЕ текст-заглушка)
-     * слева + цифра значения справа. Аналогично Wi-Fi: рисуется в Canvas, без
-     * использования эмодзи/текста как иконки — чтобы статус-бар не показывал
-     * регрессию "голое +12° вместо значка".
-     * DO NOT replace with text placeholder.
-     */
-    private fun makeTempIcon(ctx: Context, valueStr: String, color: Int): Icon {
-        val dp = ctx.resources.displayMetrics.density
-        val size = (24 * dp).toInt().coerceAtLeast(24)
-        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(bmp)
 
-        // Glyph-термометр слева:
-        //   ─ вертикальная колба (stroke-прямоугольник со скруглённым верхом),
-        //   ─ круглый шарик внизу (заполненный),
-        //   ─ короткая ртутная колонка внутри (для индикации «температура»).
-        val glyph = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            this.color = color; style = Paint.Style.STROKE
-            strokeWidth = size * 0.09f; strokeCap = Paint.Cap.ROUND
-        }
-        val gx0 = size * 0.15f                // левая граница глифа
-        val gx1 = size * 0.38f                // правая граница глифа
-        val colW = gx1 - gx0
-        val cx = (gx0 + gx1) / 2f
-        val topY = size * 0.15f
-        val midY = size * 0.66f                // нижняя точка колбы (без шарика)
-        // Колба (прямоугольник со скруглённым верхом и переходом в шарик внизу).
-        // Рисуем левую/правую вертикали + верхнюю дугу (нижняя дуга и шарик — ниже).
-        val bulbTop = midY - colW * 0.4f
-        val stemLeft = gx0 + colW * 0.25f
-        val stemRight = gx1 - colW * 0.25f
-        canvas.drawLine(stemLeft, topY + colW / 2f, stemLeft, bulbTop, glyph)
-        canvas.drawLine(stemRight, topY + colW / 2f, stemRight, bulbTop, glyph)
-        // Верхнее скругление (180° дуга от левой вертикали к правой):
-        val topOval = RectF(stemLeft, topY, stemRight, topY + colW)
-        canvas.drawArc(topOval, 180f, 180f, false, glyph)
-        // Нижнее скругление колбы — переход к шарику (180° дуга вниз):
-        val botOval = RectF(stemLeft, bulbTop, stemRight, bulbTop + colW)
-        canvas.drawArc(botOval, 0f, 180f, false, glyph)
-        // Шарик внизу (заполненный круг, центр ниже низа колбы):
-        val bulbR = colW * 0.75f
-        val bulbCy = midY + bulbR * 0.3f
-        glyph.style = Paint.Style.FILL
-        canvas.drawCircle(cx, bulbCy, bulbR, glyph)
-        // Иконка в статус-баре одноцветная, поэтому ртутную колонку внутри
-        // не рисуем (в монохроме она не видна и только ломает глиф).
-
-        // Значение температуры справа:
-        val num = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            this.color = color; typeface = Typeface.DEFAULT_BOLD
-            textSize = size * 0.55f; textAlign = Paint.Align.LEFT
-            style = Paint.Style.FILL
-        }
-        val deg = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            this.color = color; typeface = Typeface.DEFAULT
-            textSize = size * 0.32f; textAlign = Paint.Align.LEFT
-        }
-        val numX = size * 0.46f
-        val numY = size * 0.74f
-        canvas.drawText(valueStr, numX, numY, num)
-        val degX = numX + num.measureText(valueStr) - size * 0.02f
-        canvas.drawText("°", degX, numY - size*0.22f, deg)
-        AppLog.i(TAG, "TEMP: icon glyph=thermometer size=${size}x${size}px value=$valueStr")
-        return Icon.createWithBitmap(bmp)
-    }
-
-    private fun makeWifiIconWithLevel(ctx: Context, level: Int, color: Int): Icon {
-        // Тоже дуги, но активные дуги только до level (0..4 или -1 при disc/off).
-        // Для small icon статуса-бара всё же рисуем все дуги (размер не разглядеть),
-        // а level отражаем толщиной/альфой. Функция оставлена для будущего отображения.
-        return makeTextIcon(ctx, "wifi", "", color)
-    }
 
     private fun cancel(ctx: Context, id: Int) {
         try { (ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).cancel(id) } catch(_:Throwable){}
@@ -661,7 +626,7 @@ object StatusIcons {
             if (soc != null) {
                 // iter22 §1: одна цифра после запятой (42.4, 100.0, 7.0) — как w0/kg#i("%.1f").
                 val socStr = fmtOneDecimal(soc)
-                val icon = makeTextIconCex(app, socStr, "%", Color.WHITE)
+                val icon = makeTextIconCex(app, socStr, "%", Color.WHITE, kind = "batt")
                 val text = "$socStr% · $socSource"
                 postNotif(app, NOTIF_BATT, ICON_ID_BATT, RANK_BATT,
                     "Батарея $socStr%", text, "StatusIcon_BatteryPercent", icon,
@@ -680,7 +645,7 @@ object StatusIcons {
             if (display != null) {
                 val tStr = fmtOneDecimal(display)
                 val sign = if (display > 0f) "+" else ""
-                val icon = makeTextIconCex(app, tStr, "°C", Color.WHITE)
+                val icon = makeTextIconCex(app, tStr, "°C", Color.WHITE, kind = "temp")
                 val text = "$sign$tStr °C · $tempSource"
                 postNotif(app, NOTIF_TEMP, ICON_ID_TEMP, RANK_TEMP,
                     "Снаружи $sign$tStr°C", text, "StatusIcon_OutsideTemperature", icon,
@@ -695,7 +660,7 @@ object StatusIcons {
                 tempStr = "$sign$tStr°"; tempVal = display; tempHas = true
                 lastTempC = display; lastExtTempC = display
             } else {
-                val icon = makeTextIconCex(app, "--", "", Color.WHITE)
+                val icon = makeTextIconCex(app, "--", "", Color.WHITE, kind = "temp")
                 postNotif(app, NOTIF_TEMP, ICON_ID_TEMP, RANK_TEMP,
                     "Снаружи --°C", "нет данных от VHAL", "StatusIcon_OutsideTemperature", icon,
                     telemetryPi(app, NOTIF_TEMP))
@@ -770,97 +735,6 @@ object StatusIcons {
 
     @JvmStatic fun cancelAll(ctx: Context) {
         cancel(ctx, NOTIF_BATT); cancel(ctx, NOTIF_TEMP); cancel(ctx, NOTIF_WIFI)
-    }
-
-    // ─── Глифы для overlay (крупные, ICON_SIZE_DP=16px, белые) ───
-
-    private fun makeBattGlyph(ctx: Context, percent: Float): Icon {
-        val dp = ctx.resources.displayMetrics.density
-        val size = (16 * dp).toInt().coerceAtLeast(16)
-        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
-        val c = Canvas(bmp)
-        val p = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE; style = Paint.Style.STROKE; strokeWidth = size*0.09f; strokeCap = Paint.Cap.ROUND }
-        val pad = size*0.12f; val h = size*0.55f; val w = size*0.65f; val topY = (size-h)/2
-        val left = size*0.20f; val right = left+w
-        c.drawRoundRect(left, topY, right, topY+h, size*0.08f, size*0.08f, p)
-        c.drawRect(right - size*0.02f, topY + h*0.25f, right+size*0.08f, topY + h*0.75f, p)
-        // Заполненность (percent 0..100)
-        p.style = Paint.Style.FILL
-        val fillH = h*0.75f * (percent/100f).coerceIn(0f,1f)
-        c.drawRect(left+size*0.09f, topY+h-fillH-size*0.05f, right-size*0.09f, topY+h-size*0.12f, p)
-        return Icon.createWithBitmap(bmp)
-    }
-
-    private fun makeTempOverlayIcon(ctx: Context): Icon {
-        // reuse existing thermometer glyph but at overlay size
-        val dp = ctx.resources.displayMetrics.density
-        val size = (16 * dp).toInt().coerceAtLeast(16)
-        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
-        val c = Canvas(bmp)
-        val glyph = Paint(Paint.ANTI_ALIAS_FLAG).apply { color=Color.WHITE; style=Paint.Style.STROKE; strokeWidth=size*0.10f; strokeCap=Paint.Cap.ROUND }
-        val stemLeft = size*0.32f; val stemRight = size*0.52f; val topY = size*0.12f
-        val colW = stemRight - stemLeft
-        val bulbTop = size*0.48f
-        c.drawLine(stemLeft, topY+colW/2, stemLeft, bulbTop, glyph)
-        c.drawLine(stemRight, topY+colW/2, stemRight, bulbTop, glyph)
-        c.drawArc(RectF(stemLeft, topY, stemRight, topY+colW), 180f, 180f, false, glyph)
-        c.drawArc(RectF(stemLeft, bulbTop, stemRight, bulbTop+colW), 0f, 180f, false, glyph)
-        glyph.style = Paint.Style.FILL
-        val bulbR = colW*0.95f
-        val cx = (stemLeft+stemRight)/2f
-        c.drawCircle(cx, bulbTop+colW*0.45f+bulbR*0.05f, bulbR, glyph)
-        return Icon.createWithBitmap(bmp)
-    }
-
-    private fun makeWifiOverlayIcon(ctx: Context, level: Int): Icon {
-        val dp = ctx.resources.displayMetrics.density
-        val size = (16 * dp).toInt().coerceAtLeast(16)
-        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
-        val c = Canvas(bmp)
-        val p = Paint(Paint.ANTI_ALIAS_FLAG).apply { color=Color.WHITE; style=Paint.Style.STROKE; strokeWidth=size*0.10f; strokeCap=Paint.Cap.ROUND }
-        val cx = size/2f; val dotCy = size*0.82f; val dotR = size*0.07f
-        c.drawCircle(cx, dotCy, dotR, p)
-        val active = level.coerceIn(-1,4)
-        for (k in 1..3) {
-            val r = size*(0.20f + (k-1)*0.16f)
-            val oval = RectF(cx-r, dotCy-r, cx+r, dotCy+r)
-            val isActive = (active >= k || active < 0)
-            p.alpha = if (isActive) 255 else 90
-            c.drawArc(oval, -135f, 90f, false, p)
-        }
-        p.alpha = 255
-        return Icon.createWithBitmap(bmp)
-    }
-
-    @JvmStatic fun startPeriodicSync(ctx: Context) {
-        // P-фикс: если периодика уже запущена — не стартовать второй Handler/Runnable,
-        // иначе получаем N параллельных тиков (в логе у владельца "цикл 15с активен" ×4).
-        if (periodicRunning) {
-            Log.i(TAG, "startPeriodicSync: already running, skip (idempotent)")
-            return
-        }
-        stopPeriodicSync()
-        val hh = Handler(Looper.getMainLooper()); h = hh
-        val app = ctx.applicationContext
-        periodicRunning = true
-        hh.post(object : Runnable {
-            override fun run() {
-                if (!periodicRunning || h !== hh) return
-                BgWorker.post("StatusIcons.tick") {
-                    try { syncAll(app) } catch (t: Throwable) { Log.e(TAG,"tick err",t) }
-                }
-                hh.postDelayed(this, 15000L)
-            }
-        })
-        BgWorker.post("StatusIcons.firstTick") {
-            try { syncAll(app) } catch (t: Throwable) { Log.e(TAG,"first tick err",t) }
-        }
-        Log.i(TAG,"startPeriodicSync (single instance, 15s tick on BgWorker)")
-    }
-    @JvmStatic fun stopPeriodicSync() {
-        periodicRunning = false
-        h?.removeCallbacksAndMessages(null); h = null
-        Log.i(TAG,"stopPeriodicSync")
     }
 
     // ─── HVAC digital (флаги persist.sys.hvacdigital.*) ───

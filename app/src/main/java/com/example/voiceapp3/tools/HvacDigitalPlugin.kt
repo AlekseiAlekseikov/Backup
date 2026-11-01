@@ -123,13 +123,23 @@ object HvacDigitalPlugin {
                   VIA=bind
                   _RC=0
                 else
-                  # --- План А эталона: штатная установка APK ---
-                  _OUT=${D}(pm install -r -g $STAGE_APK 2>&1 | tail -n1)
-                  echo "PM=${D}_OUT"
-                  case "${D}_OUT" in
-                    *Success*) _FALHOU=0 ;;
-                    *)         _FALHOU=1 ;;
-                  esac
+                  # --- РЕФЕРЕНС w0/o#c: VIA_FORCADA — если в прошлый раз сработал bind,
+                  # pm install ПРОПУСКАЕТСЯ (иначе установка «затенит» /system и плагин
+                  # перестанет подхватываться SystemUI после перезагрузки).
+                  _VIA_PREV=${D}(getprop persist.sys.hvacdigital.via 2>/dev/null)
+                  echo "VIA_PREV=${D}_VIA_PREV"
+                  if [ "${D}_VIA_PREV" = "bind" ]; then
+                    echo "VIA_FORCADA=bind — pulando o pm install"
+                    _FALHOU=1
+                  else
+                    # --- План А эталона: штатная установка APK ---
+                    _OUT=${D}(pm install -r -g $STAGE_APK 2>&1 | tail -n1)
+                    echo "PM=${D}_OUT"
+                    case "${D}_OUT" in
+                      *Success*) _FALHOU=0 ;;
+                      *)         _FALHOU=1 ;;
+                    esac
+                  fi
                   # --- План Б эталона: bind поверх заводского APK ---
                   if [ "${D}_FALHOU" != "0" ]; then
                     chown root:root $STAGE_APK 2>/dev/null || true
@@ -205,12 +215,13 @@ object HvacDigitalPlugin {
         // Мандат iter22 §4: вердикт VIA/PM_PATH/SELINUX — ОБЯЗАТЕЛЬНО в лог,
         // иначе по логу сборки не видно, почему панель не встала.
         val via = Regex("VIA=([a-z]+)").find(out)?.groupValues?.get(1) ?: "?"
+        val viaPrev = Regex("VIA_PREV=([^\\n]*)").find(out)?.groupValues?.get(1)?.trim().orEmpty()
         val pmPath = Regex("PM_PATH=([^\\n]*)").find(out)?.groupValues?.get(1)?.trim().orEmpty()
         val selinuxPair = Regex("SELINUX_BEFORE=([^ ]*) SELINUX_AFTER=([^\\n]*)").find(out)
         val pmLine = Regex("PM=([^\\n]*)").find(out)?.groupValues?.get(1)?.trim().orEmpty()
         val semFonte = out.contains("SEM_FONTE")
         val semAlvo = out.contains("SEM_ALVO")
-        AppLog.i(TAG, "HVAC VERDICT: VIA=$via PM=$pmLine PM_PATH=$pmPath " +
+        AppLog.i(TAG, "HVAC VERDICT: VIA=$via VIA_PREV=$viaPrev PM=$pmLine PM_PATH=$pmPath " +
                 "SELINUX_BEFORE=${selinuxPair?.groupValues?.get(1)} SELINUX_AFTER=${selinuxPair?.groupValues?.get(2)} " +
                 "SEM_FONTE=$semFonte SEM_ALVO=$semAlvo")
         val mountOk = out.contains("HVAC_DIGITAL_OK") && !out.contains("MOUNT_FAIL")
