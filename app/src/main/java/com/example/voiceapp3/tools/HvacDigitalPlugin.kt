@@ -376,7 +376,7 @@ object HvacDigitalPlugin {
             echo "VIA=$(getprop persist.sys.hvacdigital.via)"
         """.trimIndent()
         val (dRc, dOut) = try { AdbClient.shellLocal(diagCmd, 8000) } catch (t: Throwable) { Pair(1, "EXC:${t.message}") }
-        AppLog.i(TAG, "RESTORE_DIAG rc=$dRc: " + dOut.replace('\n', " | "))
+        AppLog.i(TAG, "RESTORE_DIAG rc=$dRc: " + dOut.replace("\n", " | "))
 
         steps += stepOf("pre_check", "pm path + /proc/mounts + getprop via",
             if (pre.overlayMounted || pre.shadowedByInstall) ToolsStep.Status.PARTIAL else ToolsStep.Status.OK,
