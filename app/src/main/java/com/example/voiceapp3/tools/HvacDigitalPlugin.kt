@@ -20,30 +20,78 @@ object HvacDigitalPlugin {
         val oemPluginInstalled: Boolean,
         val overlayMounted: Boolean,
         val mountLine: String,
-        val oemPkgPath: String?
+        val oemPkgPath: String?,
+        /** iter23 P2: ok|err|nomount — почему именно такой вердикт по mount. */
+        val mountReason: String = "nomount",
+        /** iter23 P2: команда pm path не выполнилась (канал) — это НЕ «пакет не установлен». */
+        val pmCommandFailed: Boolean = false,
+        /** iter23 P2: путь pm path указывает в /data/app → установка «затенила» /system. */
+        val shadowedByInstall: Boolean = false
     )
 
+    /**
+     * iter23 P2: checkStatus БЕЗ root-канала.
+     * `pm path` и `grep /proc/mounts` — дешёвые команды, они идут через локальный sh
+     * (наше приложение работает как uid=1000(system)), а не через adb: раньше при
+     * мёртвом канале они падали, и результат трактовался как «пакет не установлен»
+     * и «смонтировано=true» одновременно.
+     *
+     * Строгий разбор /proc/mounts (iter23 P2.3): монтированием считается ТОЛЬКО строка
+     * формата `<dev> <mountpoint> <fstype> ...`, где mountpoint содержит
+     * GeelyAutoSystemUIPlugin. Любой `ERR_*`, пустой вывод и `NOMOUNT` — «не смонтировано».
+     */
     fun checkStatus(ctx: Context): Status {
-        var oemPath: String? = null; var mounted = false; var mountLine = ""
-        try {
-            val (rc, out) = AdbClient.execute("pm path $OEM_PKG", 4000)
-            AppLog.d(TAG, "checkStatus pm path rc=$rc out=${out.take(200)}")
-            if (rc == 0) {
-                val m = Regex("package:(\\S+)").find(out.trim())
-                if (m != null) oemPath = m.groupValues[1]
-            }
-        } catch (t: Throwable) { AppLog.e(TAG, "checkStatus pm path failed", t) }
-        try {
-            val (_, out2) = AdbClient.execute("grep -F GeelyAutoSystemUIPlugin /proc/mounts || echo NOMOUNT", 4000)
-            val t = out2.trim()
-            if (t.isNotEmpty() && t != "NOMOUNT" && !t.contains("NOMOUNT")) {
-                mounted = true
-                mountLine = t.lineSequence().firstOrNull { it.isNotBlank() } ?: ""
-            }
-            AppLog.d(TAG, "checkStatus mounts mounted=$mounted line=${mountLine.take(200)}")
-        } catch (t: Throwable) { AppLog.e(TAG, "checkStatus mounts failed", t) }
+        var oemPath: String? = null
+        var mounted = false
+        var mountLine = ""
+        var mountReason = "nomount"
+        var pmFailed = false
+
+        val (pmRc, pmOut) = try {
+            AdbClient.shellLocal("pm path $OEM_PKG 2>&1", 6000)
+        } catch (t: Throwable) {
+            AppLog.e(TAG, "checkStatus pm path threw", t); Pair(1, "EXC:${t.message}")
+        }
+        AppLog.d(TAG, "checkStatus pm path rc=$pmRc out=${pmOut.take(200)}")
+        val pmLine = pmOut.lineSequence().map { it.trim() }.firstOrNull { it.startsWith("package:") }
+        if (pmRc == 0 && pmLine != null) {
+            oemPath = pmLine.removePrefix("package:").trim()
+        } else if (pmOut.contains("ERR_") || pmOut.contains("Error") || pmOut.contains("Exception") || pmOut.isBlank()) {
+            pmFailed = true
+            AppLog.w(TAG, "checkStatus: pm path НЕ выполнился (это не «не установлен»): rc=$pmRc out=${pmOut.take(160)}")
+        }
+
+        val (mRc, mOut) = try {
+            AdbClient.shellLocal("grep -F GeelyAutoSystemUIPlugin /proc/mounts 2>&1; echo RC=\$?", 6000)
+        } catch (t: Throwable) { Pair(1, "EXC:${t.message}") }
+        val mountCandidates = mOut.lineSequence()
+            .filter { it.contains("GeelyAutoSystemUIPlugin") && it.contains("/system/") && it.split(" ").size >= 3 }
+            .toList()
+        if (mountCandidates.isNotEmpty()) {
+            mounted = true
+            mountReason = "ok"
+            mountLine = mountCandidates.first()
+        } else if (mOut.contains("ERR_") || mRc != 0) {
+            mountReason = "err"
+        } else {
+            mountReason = "nomount"
+        }
+        AppLog.i(TAG, "checkStatus mounts mounted=$mounted reason=$mountReason line=${mountLine.take(160)}")
+
         val oemInstalled = try { ctx.packageManager.getPackageInfo(OEM_PKG, 0); true } catch (_: Exception) { false }
-        return Status(oemInstalled, mounted, mountLine, oemPath)
+        val shadowed = oemPath?.contains("/data/app/") == true
+        if (shadowed) AppLog.w(TAG, "checkStatus: ПЛАГИН ЗАТЕНЁН установкой — pm path=$oemPath (ожидался /system/...)")
+        return Status(oemInstalled, mounted, mountLine, oemPath, mountReason, pmFailed, shadowed)
+    }
+
+    /** iter23 P2: путь заводского плагина без опоры на pm — простой ls по /system. */
+    private fun systemPluginPathFallback(): String? {
+        val (rc, out) = try {
+            AdbClient.shellLocal("ls -1 /system/app/*/*.apk /system/priv-app/*/*.apk /system/app/*/*/*.apk 2>/dev/null | grep -i -E 'systemuiplugin|GeelyAutoSystemUIPlugin'", 6000)
+        } catch (_: Throwable) { Pair(1, "") }
+        val first = out.lineSequence().map { it.trim() }.firstOrNull { it.startsWith("/system/") && it.endsWith(".apk") }
+        AppLog.i(TAG, "systemPluginPathFallback rc=$rc → ${first ?: "(none)"}")
+        return first
     }
 
     fun enable(ctx: Context): ToolsResult {
@@ -54,11 +102,24 @@ object HvacDigitalPlugin {
             expected = "oem installed",
             actual = "oem=${status0.oemPluginInstalled} path=${status0.oemPkgPath} mounted=${status0.overlayMounted}",
             stdout = status0.mountLine)
-        if (!status0.oemPluginInstalled || status0.oemPkgPath == null) {
-            AppLog.e(TAG, "enable aborted: OEM pkg not found")
+        // iter23 P2.4: «пакет отсутствует» и «команда не выполнилась» — РАЗНЫЕ вещи.
+        // Раньше при мёртвом канале мы писали «OEM pkg not found» и выходили, хотя
+        // пакет на месте (pm path просто не выполнился).
+        if (!status0.oemPluginInstalled || (status0.oemPkgPath == null && status0.pmCommandFailed)) {
+            if (status0.pmCommandFailed && status0.oemPluginInstalled) {
+                AppLog.w(TAG, "enable: pm path не выполнился, но пакет установлен (реeстрация в PM есть) — пробуем получить путь напрямую")
+            } else {
+                AppLog.e(TAG, "enable aborted: OEM pkg not found (installed=${status0.oemPluginInstalled} pmFailed=${status0.pmCommandFailed})")
+                return ToolsResult("hvacdigital.plugin.enable", "Цифровой климат", steps)
+            }
+        }
+        // Путь цели: pm path → иначе поиск по /system (при ls-совпадении с plugin).
+        val dst = status0.oemPkgPath ?: systemPluginPathFallback()
+        if (dst == null) {
+            AppLog.e(TAG, "enable aborted: не удалось определить путь плагина (pm path и /system-поиск пусты)")
             return ToolsResult("hvacdigital.plugin.enable", "Цифровой климат", steps)
         }
-        val dst = status0.oemPkgPath
+        AppLog.i(TAG, "enable: dst=$dst (из pm path=${status0.oemPkgPath != null})")
         val tmpFile = File(ctx.cacheDir, "sysui_staging.apk")
         var extracted = false; var copyErr = ""
         // Итерация 10 fix: ищем ресурс по имени, чтобы сборка не падала при
@@ -287,50 +348,110 @@ object HvacDigitalPlugin {
      * Нужен на случай, если сломанный/неполный mount оставил шторку чёрной.
      * Команды не зависят от OEM-пути (umount по имени плагина в /proc/mounts).
      */
+    /**
+     * iter23 P2: РЕСТАВРАЦИЯ ПАНЕЛИ.
+     *
+     * Проблема 1.0.44: `persist.sys.hvacdigital.via = install` — плагин «затенил» систему
+     * установленной копией в /data/app, а restore умел только `umount` bind-точек, поэтому
+     * кнопка не помогала.
+     *
+     * Порядок: диагностика (без root) → `pm uninstall` теневой копии → umount bind-точек →
+     * один `kill $(pidof com.android.systemui)` → readback `pm path` (ожидается /system/...).
+     *
+     * РЕФЕРЕНС: w0/o#c — вердикт `VIA` считается по факту `pm path`; ветка
+     * `*/data/app/*` там же снимает legado-bind и ставит `persist.sys.hvacdigital.via install`.
+     * Снятие установленной копии — наше дополнение (в эталоне этот случай не разбирается).
+     */
     fun restoreSystemUi(ctx: Context): ToolsResult {
-        AppLog.i(TAG, "restoreSystemUi called (iter21 §2)")
+        AppLog.i(TAG, "restoreSystemUi called (iter23 P2)")
         val steps = ArrayList<ToolsStep>()
         val pre = checkStatus(ctx)
-        steps += stepOf("pre_check", "grep mounts",
-            if (pre.overlayMounted) ToolsStep.Status.PARTIAL else ToolsStep.Status.OK,
-            expected = "no stale mount",
-            actual = "mounted=${pre.overlayMounted} line=${pre.mountLine.take(120)}",
-            stdout = pre.mountLine)
+
+        // 1) Диагностика без root — одной командой, в лог целиком.
+        val diagCmd = """
+            echo "PM_PATH=$(pm path $OEM_PKG 2>&1 | tr '\n' ' ')"
+            echo "PM_LIST=$(pm list packages -f 2>/dev/null | grep -i flyme | tr '\n' ' ')"
+            echo "SYS_APK=$(ls -1 /system/app/*/*.apk /system/priv-app/*/*.apk 2>/dev/null | grep -i -E 'systemuiplugin|GeelyAutoSystemUIPlugin' | tr '\n' ' ')"
+            echo "MOUNTS=$(grep -F systemuiplugin /proc/mounts 2>/dev/null | tr '\n' ' ' || echo NOMOUNT)"
+            echo "VIA=$(getprop persist.sys.hvacdigital.via)"
+        """.trimIndent()
+        val (dRc, dOut) = try { AdbClient.shellLocal(diagCmd, 8000) } catch (t: Throwable) { Pair(1, "EXC:${t.message}") }
+        AppLog.i(TAG, "RESTORE_DIAG rc=$dRc:
+$dOut")
+
+        steps += stepOf("pre_check", "pm path + /proc/mounts + getprop via",
+            if (pre.overlayMounted || pre.shadowedByInstall) ToolsStep.Status.PARTIAL else ToolsStep.Status.OK,
+            expected = "no stale mount, system path",
+            actual = "mounted=${pre.overlayMounted}(${pre.mountReason}) path=${pre.oemPkgPath} shadowed=${pre.shadowedByInstall}",
+            stdout = dOut)
+
         BgWorker.assertNotMain("HvacDigitalPlugin.restoreSystemUi")
-        val D = "$"
-        val script = """
-echo '=== HVAC_DIGITAL_RESTORE ==='
+
+        // 2) Снять «тень» установки: если pm path в /data/app — uninstall.
+        var uninstallRc = -1
+        if (pre.shadowedByInstall) {
+            val (uRc, uOut) = try {
+                AdbClient.shellLocal("pm uninstall $OEM_PKG 2>&1 || pm uninstall -k --user 0 $OEM_PKG 2>&1", 30000)
+            } catch (t: Throwable) { Pair(1, "EXC:${t.message}") }
+            uninstallRc = uRc
+            AppLog.i(TAG, "HVAC VERDICT: UNINSTALL=$uRc out=${uOut.replace('\n',' ').take(200)}")
+            steps += stepOf("uninstall_shadow", "pm uninstall $OEM_PKG",
+                if (uRc == 0) ToolsStep.Status.OK else ToolsStep.Status.FAILED,
+                expected = "Success", actual = "rc=$uRc ${uOut.replace('\n',' ').take(160)}", stdout = uOut)
+        } else {
+            AppLog.i(TAG, "HVAC VERDICT: UNINSTALL=skip (pm path=${pre.oemPkgPath ?: "unknown"}, тени нет)")
+        }
+
+        // 3) umount bind-точек + один перезапуск SystemUI. Нужен root-канал.
+        val rootState = AdbClient.currentState()
+        val haveRoot = rootState == AdbClient.ChannelState.ROOT_5555 || rootState == AdbClient.ChannelState.ROOT_65010
+        var restoreOk = false
+        var restoreOut = ""
+        if (!haveRoot) {
+            AppLog.e(TAG, "ROOT_UNAVAILABLE reason=restoreSystemUi needs root (state=$rootState port=${AdbClient.currentPort()})")
+            // iter23 P2.6: это ОШИБКА шага (не «пропущено»): панель останется смонтированной.
+            steps += stepOf("restore", "umount + kill systemui (нужен root-канал 5555)", ToolsStep.Status.FAILED,
+                expected = "RESTORE_OK", actual = "root_channel_unavailable state=$rootState port=${AdbClient.currentPort()}",
+                stdout = "Нет root-канала: 5555 не отвечает (uid=1000) — умонтировать bind и перезапустить SystemUI нельзя.")
+        } else {
+            val D = "$"
+            val script = """
 id
-# Найдём все bind-mount, указывающие на GeelyAutoSystemUIPlugin, и отмонтируем
-for MNT in ${D}(grep -F GeelyAutoSystemUIPlugin /proc/mounts | awk '{print ${D}2}'); do
+for MNT in ${D}(grep -F systemuiplugin /proc/mounts 2>/dev/null | awk '{print ${D}2}'); do
   echo "UMOUNT stale: ${D}MNT"
-  umount "${D}MNT" 2>&1 || echo "UMOUNT_FAIL ${D}MNT"
+  umount "${D}MNT" 2>&1 || umount -l "${D}MNT" 2>&1 || echo "UMOUNT_FAIL ${D}MNT"
 done
 SYSUI_PID_BEFORE=${D}(pidof com.android.systemui)
 echo "SYSUI_PID_BEFORE=${D}SYSUI_PID_BEFORE"
 kill ${D}SYSUI_PID_BEFORE 2>/dev/null || true
 sleep 4
-SYSUI_PID_AFTER=${D}(pidof com.android.systemui)
-echo "SYSUI_PID_AFTER=${D}SYSUI_PID_AFTER"
-if grep -F GeelyAutoSystemUIPlugin /proc/mounts >/dev/null 2>&1; then
-  echo RESTORE_STALE_MOUNT
-else
-  echo RESTORE_OK
-fi
+echo "SYSUI_PID_AFTER=${D}(pidof com.android.systemui)"
+echo "PM_PATH_AFTER=${D}(pm path $OEM_PKG 2>/dev/null | sed 's/^package://' | tr '
+' ' ')"
+if grep -F systemuiplugin /proc/mounts >/dev/null 2>&1; then echo RESTORE_STALE_MOUNT; else echo RESTORE_OK; fi
 """.trimIndent()
-        val (rc, out) = AdbClient.execute(script, 25000)
-        AppLog.i(TAG, "restoreSystemUi script rc=$rc out=${out.take(800)}")
-        val ok = rc == 0 && out.contains("RESTORE_OK") && !out.contains("UMOUNT_FAIL") && !out.contains("RESTORE_STALE_MOUNT")
-        steps += stepOf("restore", "umount+kill systemui",
-            if (ok) ToolsStep.Status.OK else ToolsStep.Status.FAILED,
-            expected = "RESTORE_OK", actual = "rc=$rc out_last=${out.lineSequence().lastOrNull()}", stdout = out)
+            val (rRc, rOut) = AdbClient.execute(script, 25000)
+            restoreOut = rOut
+            restoreOk = rRc == 0 && rOut.contains("RESTORE_OK") && !rOut.contains("RESTORE_STALE_MOUNT")
+            AppLog.i(TAG, "restoreSystemUi script rc=$rRc out=${rOut.take(800)}")
+            steps += stepOf("restore", "umount + kill systemui",
+                if (restoreOk) ToolsStep.Status.OK else ToolsStep.Status.FAILED,
+                expected = "RESTORE_OK", actual = "rc=$rRc last=${rOut.lineSequence().lastOrNull()}", stdout = rOut)
+        }
+
+        // 4) post_check: BLOCKED, если root не было (не FAILED — мы просто не проверяли).
         val post = checkStatus(ctx)
-        steps += stepOf("post_check", "grep mounts + sysui pid",
-            if (!post.overlayMounted) ToolsStep.Status.OK else ToolsStep.Status.FAILED,
-            expected = "unmounted, sysui alive",
-            actual = "mounted=${post.overlayMounted}", stdout = post.mountLine)
-        AppLog.i(TAG, "VERIFY hvacdigital.restore: ${if (ok) "OK" else "FAILED"}")
-        return ToolsResult("hvacdigital.plugin.restore", "Восстановить шторку", steps)
+        val postStatus = when {
+            !haveRoot -> ToolsStep.Status.BLOCKED
+            !post.overlayMounted && post.mountReason != "err" -> ToolsStep.Status.OK
+            else -> ToolsStep.Status.FAILED
+        }
+        steps += stepOf("post_check", "pm path + grep mounts", postStatus,
+            expected = "unmounted, /system/... path",
+            actual = "mounted=${post.overlayMounted}(${post.mountReason}) path=${post.oemPkgPath} shadowed=${post.shadowedByInstall}",
+            stdout = post.mountLine)
+        AppLog.i(TAG, "VERIFY hvacdigital.restore: restoreOk=$restoreOk uninstallRc=$uninstallRc postMounted=${post.overlayMounted}")
+        return ToolsResult("hvacdigital.plugin.restore", "Вернуть панель SystemUI", steps)
     }
 
     private fun stepOf(step: String, command: String, status: ToolsStep.Status,

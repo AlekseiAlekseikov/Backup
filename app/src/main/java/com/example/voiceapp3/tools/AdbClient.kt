@@ -28,9 +28,10 @@ import java.util.concurrent.atomic.AtomicReference
  *
  *  1. Команды НИКОГДА не выполняются через Runtime.exec("sh") в качестве основного пути.
  *     sh используется только как последний аварийный фоллбэк с явной пометкой NO_ROOT.
- *  2. Миграция на порт 65010 (`ctl.restart adbd`) производится ЧЕРЕЗ ADB-сокет 5555,
- *     а не через Runtime.sh (у uid=1000 system_app нет права на ctl.restart через sh,
- *     но есть через adb shell, где adbd работает от root).
+ *  2. iter23 P0: миграция порта УДАЛЕНА полностью. Никаких `setprop *.adb.tcp.port`
+ *     и `ctl.restart adbd` — в 1.0.44 именно они оставили машину без канала (рестарт
+ *     adbd запускался изнутри adb-шелла и рвал собственную сессию). Работаем по 5555,
+ *     65010 — только чтение.
  *  3. Всё сетевое — на отдельном рабочем потоке "AdbWorker". Из main только быстрый
  *     put в очередь и callback на Handler(Looper.getMainLooper()).
  *  4. Состояние (выбор рабочего порта, AUTH, connect-refused) логируется по шагам.
@@ -78,8 +79,8 @@ object AdbClient {
     enum class ChannelState {
         IDLE,
         BOOTING,
-        ROOT_65010,    // основной канал — рутовый порт 65010
-        ROOT_5555,     // рутовый канал на 5555 (миграция не прошла, но 5555 даёт root)
+        ROOT_65010,    // 65010 уже слушал и дал root (только чтение, порты не трогаем)
+        ROOT_5555,     // рутовый канал на 5555 (штатный путь: adbd уже слушает 5555 и даёт uid=0)
         NO_ROOT_SH,    // нет ADB — все команды идут через Runtime.sh от uid=1000
         PERM_FAIL      // рут невозможен
     }
@@ -243,132 +244,128 @@ object AdbClient {
     }
 
     /**
-     * Первоначальная подготовка root-канала. Пытается в точности повторить то,
-     * что делает w0/m.l в CentralEXAuto:
-     *  1. Проверить, работает ли уже какой-то из портов (65010, 5555) через ADB-сокет.
-     *  2. Если работает и даёт id=0(root) — отлично, готово.
-     *  3. Если 65010 не слушает — попробовать УЖЕ СУЩЕСТВУЮЩИЙ ADB-сокет (5555) чтобы
-     *     запустить скрипт миграции (setprop + ctl.restart adbd).
-     *  4. Подождать прослушивания 65010 после рестарта adbd.
-     *  5. Если ни один порт не даёт root — падаем в NO_ROOT_SH (Runtime.sh как аварийка).
+     * iter23 P0: подготовка root-канала БЕЗ миграции порта.
+     *
+     * РЕФЕРЕНС: в эталоне (cex.apk) все исполнители (Lw0/dh#a, Lw0/zf#a,
+     * QuickAccessFloaterService#I, CentralWatchdogService#c, Lw0/m#y) жёстко работают
+     * по 5555; миграция вынесена в отдельный w0/m#l (ensurePortMigrated) и «на всякий
+     * случай» не выполняется.
+     *
+     * Здесь: только ЧТЕНИЕ состояния + ретраи 5555. Никаких setprop adb.tcp.port и
+     * никакого ctl.restart adbd (именно они убивали канал в 1.0.44: рестарт adbd
+     * запускался изнутри adb-шелла и рвал собственную сессию).
+     *
+     * Ретраи: попытка 1 → пауза 2 с → попытка 2 → пауза 5 с → попытка 3 (~20 с суммарно),
+     * таймаут CNXN 8 с. 65010 проверяется ТОЛЬКО на чтение — если он уже слушает и даёт
+     * root, работаем через него.
      */
     private fun bootstrap() {
         state.set(ChannelState.BOOTING)
-        AppLog.i(TAG, "PORT65010 bootstrap starting on thread=${Thread.currentThread().name}")
+        AppLog.i(TAG, "ADB bootstrap: probe 5555 (3 attempts, no port migration — iter23 P0)")
 
-        // Шаг 1: попробовать порты «как есть» (как в w0/n — сначала рабочий порт, потом 65010, потом 5555)
-        val probePorts = mutableListOf<Int>()
-        val cached = workingPort.get()
-        if (cached != 0) probePorts.add(cached)
-        for (p in PORTS) if (p != cached) probePorts.add(p)
-
-        for (port in probePorts) {
+        var lastErr = "no attempt"
+        val pauses = intArrayOf(0, 2000, 5000)
+        for ((idx, pause) in pauses.withIndex()) {
+            if (pause > 0) {
+                try { Thread.sleep(pause.toLong()) } catch (_: InterruptedException) {}
+            }
             val t0 = SystemClock.uptimeMillis()
-            AppLog.d(TAG, "PORT65010 probe port=$port (connect + CNXN)...")
-            val probe = tryProbePort(port, connectTimeoutMs = 1500, totalTimeoutMs = 3000)
+            val probe = tryProbePort(ADB_PORT_DEFAULT, 2000, 8000)
             val dt = SystemClock.uptimeMillis() - t0
             if (probe != null) {
-                workingPort.set(port)
-                val (uid, _) = probe
-                if (isRootUid(uid)) {
-                    state.set(if (port == ADB_PORT_ROOT) ChannelState.ROOT_65010 else ChannelState.ROOT_5555)
-                    AppLog.i(TAG, "PORT65010 ИТОГ = UP on port=$port, shell uid=$uid (dt=${dt}ms) — root канал готов")
+                val uidLine = probe.first
+                if (isRootUid(uidLine)) {
+                    workingPort.set(ADB_PORT_DEFAULT)
+                    state.set(ChannelState.ROOT_5555)
+                    AppLog.i(TAG, "ADB_SELFTEST: port=5555 ok uid=0 dt=${dt}ms (attempt ${idx + 1})")
+                    logAdbPortReadback(5555)
                     logInitDiagnostics()
                     return
-                } else {
-                    AppLog.w(TAG, "PORT65010 port=$port reachable but shell NOT root: $uid (dt=${dt}ms)")
                 }
+                lastErr = "port 5555 reachable but uid is not root: ${uidLine.take(120)}"
+                AppLog.w(TAG, "ADB_SELFTEST: port=5555 answered but uid!=0 (attempt ${idx + 1}, dt=${dt}ms)")
             } else {
-                AppLog.w(TAG, "PORT65010 port=$port unreachable (dt=${dt}ms)")
+                lastErr = "port 5555: no CNXN response (dt=${dt}ms)"
+                AppLog.w(TAG, "ADB_SELFTEST: port=5555 no answer (attempt ${idx + 1}, dt=${dt}ms)")
             }
         }
 
-        // Шаг 2: ни один порт не дал root с ходу. Пробуем поднять 65010 через 5555.
-        // ТОНКОСТЬ: даже если 5555 не даёт root через shell — его CNXN мог бы пройти.
-        // У многих adbd можно слать shell-команды до setuid, если слушает на loopback.
-        // Проверим ещё раз 5555 отдельно без ожидания uid=0 — для выполнения setprop/ctl.restart.
-        AppLog.i(TAG, "PORT65010 миграция: пробуем выполнить setprop+ctl.restart adbd через ADB 5555...")
-        val migrateScript = """
-            cur="${'$'}(getprop service.adb.tcp.port)"
-            per="${'$'}(getprop persist.adb.tcp.port)"
-            echo "PORT65010: step1 cur=${'$'}cur per=${'$'}per"
-            if [ "${'$'}cur" = "65010" ] && [ "${'$'}per" = "65010" ]; then
-              echo "PORT65010: step2 props already 65010"
-            else
-              setprop persist.adb.tcp.port 65010
-              setprop service.adb.tcp.port 65010
-              echo "PORT65010: step2 setprop rc=${'$'}? -> ${'$'}(getprop persist.adb.tcp.port)/${'$'}(getprop service.adb.tcp.port)"
-              (sleep 1; setprop ctl.restart adbd >/dev/null 2>&1) &
-              echo "PORT65010: step3 ctl.restart adbd dispatched"
-            fi
-            echo "PORT65010: step4 id=${'$'}(id)"
-        """.trimIndent()
-
-        var migrateOut: String? = null
-        var migratedVia: Int? = null
-        for (port in intArrayOf(ADB_PORT_DEFAULT, ADB_PORT_ROOT)) {
-            migrateOut = try {
-                execAdbSocket(migrateScript, port, 10000)
-            } catch (e: Exception) {
-                AppLog.w(TAG, "PORT65010 migrate script via port=$port: ${e.javaClass.simpleName}: ${e.message}")
-                null
-            }
-            if (migrateOut != null) { migratedVia = port; break }
-        }
-
-        if (migrateOut != null) {
-            AppLog.i(TAG, "PORT65010 migrate via port=$migratedVia output:\n$migrateOut")
-        } else {
-            AppLog.e(TAG, "PORT65010 migrate: не удалось запустить скрипт ни через 5555, ни через 65010 (ADB не работает)")
-            // Падаем в Runtime.sh как фоллбэк последней надежды
-            fallbackNoRoot("ADB unreachable on 5555/65010 — shell uid=${runShellFallback("id", 1000)}")
-            return
-        }
-
-        // Шаг 3: ждём, пока 65010 поднимется (до 10 секунд, 20 попыток по 500мс).
-        AppLog.i(TAG, "PORT65010 ожидание слушателя 127.0.0.1:65010 (до 10с)...")
-        val deadline = SystemClock.uptimeMillis() + 10000
-        var ok = false
-        while (SystemClock.uptimeMillis() < deadline) {
-            try {
-                val probe = tryProbePort(ADB_PORT_ROOT, connectTimeoutMs = 500, totalTimeoutMs = 2000)
-                if (probe != null) {
-                    val (uid, _) = probe
-                    AppLog.i(TAG, "PORT65010: слушатель появился id=$uid")
-                    if (isRootUid(uid)) {
-                        workingPort.set(ADB_PORT_ROOT); state.set(ChannelState.ROOT_65010); ok = true; break
-                    }
-                }
-            } catch (_: Throwable) {}
-            Thread.sleep(500)
-        }
-
-        if (ok) {
-            AppLog.i(TAG, "PORT65010 ИТОГ = UP on port=65010 (root)")
+        // 65010 — только чтение: если он УЖЕ слушает (например, его подняли вручную), используем.
+        val probeRoot = tryProbePort(ADB_PORT_ROOT, 1500, 5000)
+        if (probeRoot != null && isRootUid(probeRoot.first)) {
+            workingPort.set(ADB_PORT_ROOT)
+            state.set(ChannelState.ROOT_65010)
+            AppLog.i(TAG, "ADB_SELFTEST: port=65010 ok uid=0 (already listening; port properties NOT touched)")
+            logAdbPortReadback(65010)
             logInitDiagnostics()
             return
         }
 
-        // Шаг 4: 65010 не поднялся, но 5555 работал — возможно через него и есть root,
-        // работаем через 5555.
-        val probe5555 = tryProbePort(ADB_PORT_DEFAULT, 1000, 3000)
-        if (probe5555 != null) {
-            val (uid, _) = probe5555
-            if (isRootUid(uid)) {
-                workingPort.set(ADB_PORT_DEFAULT); state.set(ChannelState.ROOT_5555)
-                AppLog.w(TAG, "PORT65010 ИТОГ = UP на порту 5555 (не 65010!) но shell uid=$uid — работаем через 5555")
-                logInitDiagnostics()
-                return
-            }
-            AppLog.e(TAG, "PORT65010 FAILED: порт 5555 reachable но shell uid=$uid (не root)")
-            portDiagnosticDump("port 5555 reachable but uid=$uid (not root)")
-            fallbackNoRoot("ADB reachable but not root (uid=$uid)")
-            return
-        }
+        AppLog.e(TAG, "ADB_SELFTEST: failed probes=5555,65010 last=$lastErr")
+        // iter23 P0.7: одна итоговая строка для UI/отчёта — причина и что именно проверяли.
+        AppLog.e(TAG, "ROOT_UNAVAILABLE reason=no_adb_root_channel probe=5555x3+65010 detail=$lastErr")
+        adbSelfTestDiagnostics(lastErr)
+        fallbackNoRoot(lastErr)
+    }
 
-        AppLog.e(TAG, "PORT65010 FAILED: ни 65010 ни 5555 не дают root. Смотри PORT65010 строки выше.")
-        portDiagnosticDump("all ports failed to give root")
-        fallbackNoRoot("adbd unreachable after ctl.restart")
+    /**
+     * Чтение свойств порта adbd — БЕЗ записи. Если в persist.adb.tcp.port застряло
+     * чужое значение, только сообщаем: ADB_PORT_STUCK=<v>. Менять его изнутри сессии
+     * нельзя (рестарт adbd рвёт соединение), поэтому — не трогаем.
+     */
+    private fun logAdbPortReadback(port: Int) {
+        val per = runShellFallback("getprop persist.adb.tcp.port", 2000).trim()
+        val cur = runShellFallback("getprop service.adb.tcp.port", 2000).trim()
+        AppLog.i(TAG, "ADB_PORT_READBACK: working=$port persist.adb.tcp.port=${per.ifEmpty { "(empty)" }} service.adb.tcp.port=${cur.ifEmpty { "(empty)" }}")
+        if (per.isNotEmpty() && per != "5555") {
+            AppLog.w(TAG, "ADB_PORT_STUCK=$per (persist.adb.tcp.port не 5555; НЕ меняем — рестарт adbd из сессии запрещён)")
+        }
+    }
+
+    /**
+     * iter23 P0.4: диагностика канала БЕЗ root (обычный sh от uid=1000 — этот путь
+     * работает всегда). Recv-Q в строке LISTEN покажет, копится ли очередь непринятых
+     * соединений; init.svc.adbd=stopped покажет, что adbd не запущен.
+     */
+    private fun adbSelfTestDiagnostics(reason: String) {
+        AppLog.e(TAG, "ADB_SELFTEST diagnostics — reason=$reason")
+        val cmds = listOf(
+            "getprop init.svc.adbd" to "init.svc.adbd",
+            "getprop service.adb.tcp.port" to "service.adb.tcp.port",
+            "getprop persist.adb.tcp.port" to "persist.adb.tcp.port",
+            "getprop ro.adb.secure" to "ro.adb.secure",
+            "ls -l /dev/socket/adbd 2>&1 || echo 'no /dev/socket/adbd'" to "adbd_socket",
+            "cat /proc/net/tcp | awk 'NR==1 || \$2 ~ /:15B3\$/ || \$2 ~ /:FDF2\$/' | head -6" to "proc_net_tcp(5555|65010)",
+        )
+        for ((c, n) in cmds) {
+            try {
+                val r = runShellFallback(c, 2000).replace('\n', ' ').trim()
+                AppLog.e(TAG, "ADB_SELFTEST diag [$n]: ${r.ifEmpty { "(empty)" }}")
+            } catch (t: Throwable) {
+                AppLog.w(TAG, "ADB_SELFTEST diag [$n] failed: ${t.message}")
+            }
+        }
+    }
+
+    /**
+     * iter23 P0.5: дешёвые команды (pm path, getprop, settings get/put system,
+     * grep /proc/mounts) не нуждаются в root и НЕ должны ходить через adb:
+     * наше приложение уже работает как uid=1000(system). Выполняем через Runtime.exec.
+     */
+    fun shellLocal(command: String, timeoutMs: Int = 4000): Pair<Int, String> {
+        return runShellFallbackWithRc(command, timeoutMs)
+    }
+
+    /**
+     * Умное выполнение: если root-канал жив — через adb; иначе — локальный sh.
+     * Только для команд, которым root НЕ нужен (expectRoot=false по смыслу).
+     */
+    fun executeSmart(command: String, timeoutMs: Int = 4000): Pair<Int, String> {
+        val st = state.get()
+        if (st == ChannelState.ROOT_5555 || st == ChannelState.ROOT_65010) {
+            return execute(command, timeoutMs, expectRoot = false)
+        }
+        return runShellFallbackWithRc(command, timeoutMs)
     }
 
     private fun fallbackNoRoot(reason: String) {

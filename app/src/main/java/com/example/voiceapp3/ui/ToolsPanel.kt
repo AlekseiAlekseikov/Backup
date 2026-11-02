@@ -734,6 +734,7 @@ class ToolsPanel(
 
     private fun pageDevDiagnostics() {
         addHead("page.devDiagnostics", "dev")
+        addRootBanner()
 
         addSect("page.devShell")
         page.addView(
@@ -798,6 +799,8 @@ class ToolsPanel(
             soundButton("Эмуляция: Дверь открыта (POS 10)", 1) { send("dev.simulateDoorOpen", "{}") },
             soundButton("Эмуляция: Дверь закрыта (POS 0)", 1) { send("dev.simulateDoorClose", "{}") },
             soundButton("Обновить иконки статус-бара", 1) { send("dev.testNotificationIcons", "{}") },
+            // iter23 P4: полный дамп VHAL — ТОЛЬКО по этой кнопке (в рабочем тике его нет).
+            soundButton("Диагностика VHAL (полный дамп ~9 с)", 2) { send("dev.dumpVhal", "{}") },
         )
 
         addDiv()
@@ -815,6 +818,25 @@ class ToolsPanel(
             .apply { leftMargin = dp(8f) })
         page.addView(logRow, matchWrap())
         logView = monoBox(devLogOutput, "#9ecbff", 260f)
+    }
+
+    /**
+     * iter23 P0.6: баннер состояния root-канала. Показываем честно: если канал недоступен,
+     * пользователь должен видеть это в интерфейсе, а не только в логе.
+     */
+    private fun addRootBanner() {
+        val st = state.get("rootState")?.takeIf { it.isJsonPrimitive }?.asString.orEmpty()
+        val port = state.get("rootPort")?.takeIf { it.isJsonPrimitive }?.asString.orEmpty()
+        if (st.isEmpty()) return
+        val ok = st == "ROOT_5555" || st == "ROOT_65010"
+        val msg = if (ok)
+            "ROOT: канал готов — порт ${if (port.isEmpty()) "?" else port}"
+        else
+            "ROOT: канал недоступен — 5555 не отвечает (uid=1000). Детали — кнопка «Проверить root»"
+        page.addView(text(msg, 13f, if (ok) Color.parseColor("#18963E") else Color.parseColor("#B54708"), bold = true).apply {
+            setPadding(dp(12f), dp(10f), dp(12f), dp(10f))
+            background = rounded(if (ok) Color.parseColor("#EBF7EE") else Color.parseColor("#FDF3E7"), 10f)
+        }, matchWrap().apply { setMargins(0, 0, 0, dp(10f)) })
     }
 
     // ── Строки страницы ───────────────────────────────────────────────────

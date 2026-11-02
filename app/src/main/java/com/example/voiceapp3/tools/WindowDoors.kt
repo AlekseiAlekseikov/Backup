@@ -43,6 +43,8 @@ object WindowDoors {
 
     const val PREF_WINDOW_DRIVER_ON_DOOR = "window_driver_on_door"
     const val PREF_WINDOW_OPPOSITE_ON_DOOR = "window_opposite_on_door"
+    /** iter23 P3: набор окон, которые МЫ приоткрыли и обязаны закрыть (переживает рестарт процесса). */
+    const val PREF_VENT_WINDOWS = "vent_windows"
 
     // VHAL VehiclePropertyIds (IHU629G Geely EX2) из ex2_carprops.csv:
     const val PROP_DOOR_POS = 373295872     // 0x16400b00 — позиция двери (1=открыта,2=закрыта)
@@ -84,6 +86,8 @@ object WindowDoors {
      * (метод T() в CentralWatchdogService).
      */
     private val activeVentWindows = hashSetOf<Int>()
+    /** iter23 P3: prefs уже прочитаны в набор (reseed делается один раз за процесс). */
+    @Volatile private var ventReseeded = false
 
     private var screenWakeReceiver: android.content.BroadcastReceiver? = null
     private var lastSleepTimeMs: Long = SystemClock.elapsedRealtime()
@@ -94,6 +98,34 @@ object WindowDoors {
      */
     private var lastUnlockSoundAtMs: Long = 0L
     private const val UNLOCK_DEBOUNCE_MS = 5000L
+
+    /**
+     * iter23 P3: набор окон хранится в SharedPreferences (`vent_windows`, hex через запятую),
+     * иначе рестарт процесса/приложения терял «наши» окна и дверь закрывалась без закрытия стекла.
+     */
+    private fun persistVentWindows(ctx: Context) {
+        runCatching {
+            val v = activeVentWindows.sorted().joinToString(",") { Integer.toHexString(it) }
+            Prefs2.putString(ctx, PREF_VENT_WINDOWS, v)
+            AppLog.i(ctx, TAG, "VENT_SAVE: set=[$v]")
+        }
+    }
+
+    /** Чтение набора из prefs; вызывается один раз за процесс. */
+    private fun reseedVentWindows(ctx: Context) {
+        if (ventReseeded) return
+        ventReseeded = true
+        val raw = Prefs2.getString(ctx, PREF_VENT_WINDOWS, "") ?: ""
+        if (raw.isBlank()) {
+            AppLog.i(ctx, TAG, "VENT_RESEED: пусто (нет приоткрытых нами окон)")
+            return
+        }
+        for (part in raw.split(',')) {
+            val a = part.trim().takeIf { it.isNotEmpty() }?.let { runCatching { it.toInt(16) }.getOrNull() } ?: continue
+            activeVentWindows.add(a)
+            AppLog.i(ctx, TAG, "VENT_RESEED: area=0x${Integer.toHexString(a)} pos=восстановлено")
+        }
+    }
 
     private fun fireUnlockSound(ctx: Context, reason: String) {
         if (!LockSound.isUnlockSoundEnabled(ctx)) {
@@ -276,6 +308,7 @@ object WindowDoors {
         // режимы работают НЕЗАВИСИМО: если включены ОБА — вентилируются оба
         // окна (своё + противоположное). Это соответствует k0()-семантике,
         // где z3=true помечает вторую подряд итерацию для oposta.
+        reseedVentWindows(ctx)
         val prefOwn = Prefs2.getBoolean(ctx, PREF_WINDOW_DRIVER_ON_DOOR, false)
         val prefOpp = Prefs2.getBoolean(ctx, PREF_WINDOW_OPPOSITE_ON_DOOR, false)
 
@@ -292,6 +325,17 @@ object WindowDoors {
         if (prefOwn) targets.add(ownWindow to false)
         val opp = OPPOSITE_WINDOW[ownWindow]
         if (prefOpp && opp != null) targets.add(opp to true)
+
+        // iter23 P3: при ЗАКРЫТИИ двери закрываем и своё, и противоположное окно,
+        // если мы их приоткрывали — даже если соответствующий тумблер уже выключили.
+        if (!isOpen) {
+            val oppWin = OPPOSITE_WINDOW[ownWindow]
+            for (w in listOfNotNull(ownWindow, oppWin)) {
+                if (w in activeVentWindows && targets.none { it.first == w }) {
+                    targets.add(w to (w != ownWindow))
+                }
+            }
+        }
 
         if (targets.isEmpty()) return
 
@@ -334,25 +378,33 @@ object WindowDoors {
             val ok = writeWindowPos(cpm, windowAreaId, WINDOW_OPEN_POS)
             if (ok) {
                 activeVentWindows.add(windowAreaId)
+                persistVentWindows(appCtx)
                 AppLog.i(appCtx, TAG, "janela ${tag}0x${Integer.toHexString(windowAreaId)} → POS $WINDOW_OPEN_POS (дверь 0x${Integer.toHexString(doorAreaId)} открыта); activeSet=$activeVentWindows")
             } else {
                 AppLog.w(appCtx, TAG, "windowDriver set ${tag}0x${Integer.toHexString(windowAreaId)} не удался")
             }
             return ok
         } else {
+            // iter23 P3: единая точка для диагностики закрытия — видно и набор, и позицию.
+            val inSet = windowAreaId in activeVentWindows
             // k0(z2=false): закрываем только если окно всё ещё около POS 10.
             if (kotlin.math.abs(curPos - WINDOW_OPEN_POS) > WINDOW_CLOSE_TOLERANCE) {
+                AppLog.i(appCtx, TAG, "DOOR_CLOSE area=0x${Integer.toHexString(doorAreaId)} win=0x${Integer.toHexString(windowAreaId)} pos=$curPos inSet=$inSet → skip reason=not_near_$WINDOW_OPEN_POS")
                 AppLog.i(appCtx, TAG, "janela ${tag}0x${Integer.toHexString(windowAreaId)} не около POS $WINDOW_OPEN_POS (pos=$curPos) — дверь 0x${Integer.toHexString(doorAreaId)} закрылась, не мешаю")
                 activeVentWindows.remove(windowAreaId)
+                persistVentWindows(appCtx)
                 return false
             }
-            if (windowAreaId !in activeVentWindows) {
+            if (!inSet) {
+                AppLog.i(appCtx, TAG, "DOOR_CLOSE area=0x${Integer.toHexString(doorAreaId)} win=0x${Integer.toHexString(windowAreaId)} pos=$curPos inSet=false → skip reason=not_ours")
                 AppLog.i(appCtx, TAG, "janela ${tag}0x${Integer.toHexString(windowAreaId)} не была открыта нами в этом цикле — не закрываю")
                 return false
             }
             val ok = writeWindowPos(cpm, windowAreaId, WINDOW_CLOSED_POS)
             if (ok) {
                 activeVentWindows.remove(windowAreaId)
+                persistVentWindows(appCtx)
+                AppLog.i(appCtx, TAG, "DOOR_CLOSE area=0x${Integer.toHexString(doorAreaId)} win=0x${Integer.toHexString(windowAreaId)} pos=$curPos inSet=true → POS $WINDOW_CLOSED_POS")
                 AppLog.i(appCtx, TAG, "janela ${tag}0x${Integer.toHexString(windowAreaId)} → POS $WINDOW_CLOSED_POS (дверь 0x${Integer.toHexString(doorAreaId)} закрыта); activeSet=$activeVentWindows")
             } else {
                 AppLog.w(appCtx, TAG, "windowDriver set ${tag}0x${Integer.toHexString(windowAreaId)} не удался")

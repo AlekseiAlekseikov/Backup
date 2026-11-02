@@ -692,6 +692,12 @@ class UiBridge(
                     runCatching { StatusIcons.syncAll(activity) }
                 }
             }
+            // iter23 P4: полный дамп VHAL — только по явной кнопке, в отдельный файл отчёта.
+            "dev.dumpVhal" -> {
+                com.example.voiceapp3.tools.BgWorker.post("UiBridge.dev.dumpVhal") {
+                    runCatching { StatusIcons.dumpVhalOnDemand(activity) }
+                }
+            }
             "perf.getKeepAliveList" -> {
                 com.example.voiceapp3.tools.BgWorker.run("UiBridge.perf.appList", {
                     AppPerformance.getInstalledAppsInfo(activity)

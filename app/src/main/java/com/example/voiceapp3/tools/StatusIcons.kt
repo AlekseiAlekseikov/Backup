@@ -85,10 +85,7 @@ object StatusIcons {
 
     private val AREAS = intArrayOf(0, 1, 2, 3, 4, 7, 0x10, 0x20, 0x30)
     private val RANGES = arrayOf(0x0..0x4FF, 0x11400000..0x117FFFFF, 0x15400000..0x167FFFFF)
-    // 0x11600703 в этом списке НЕ нужен: он читается отдельно и явно — см. readTempScan()
-    // и PROP_ENV_OUTSIDE_TEMP (это ENV_OUTSIDE_TEMPERATURE эталона, TempStepperService#i).
-    // «Константа 25.0» в 1.0.43 — следствие чтения одной зоны без int-ветки и без проверки
-    // диапазона, а не признак мёртвого ID.
+    // 0x11600703 в этом списке нет: это заглушка прошивки (25.0), источник — 0x2140A377.
     private val PRECISE_COMMON = intArrayOf(0x157, 0x11600005, 0x11600207, 0x11600208,
         0x16400017, 0x21600017, 0x16400001, 0x15500703, 0x11500703,
         0x16400703, 0x21600703, 0x11600502, 0x11600204, 0x11400204)
@@ -98,13 +95,17 @@ object StatusIcons {
     // ED_EV_BATTERY_PERCENTAGE=0x2140a6ed (Int, x10 — делим на 10)
     private const val PROP_EV_BATT_LEVEL = 0x11600309
     private const val PROP_ED_EV_BATT_PCT = 0x2140a6ed
-    // ДИАГНОСТИКА (не источник): 5 альтернативных ID, значения идут ТОЛЬКО в лог
-    // (TEMP_PROBE), авто-выбора нет — источник наружки один, PROP_ENV_OUTSIDE_TEMP.
-    private val TEMP_PROBE_IDS = intArrayOf(
-        0x2140A863.toInt(), 0x2140B009, 0x2140B00D, 0x2140A6DC.toInt(), 0x21402063
-    )
-    // AC_AMBIENT_TEMP (0x2140a377) — Int со смещением 80, половина градуса (norm: (raw-80)/2 °C).
+    // iter23 P1 (решение владельца): ИСТОЧНИК наружной температуры — 0x2140A377.
+    // На ГУ оно даёт реальные 9.2 °C при 92 (int, шаг 0.1 °C), access=3, areaType=0, areas=[0x0].
+    // Раньше константа называлась «салон» и в расчёте применялось (raw-80)/2 — это давало
+    // мусор; правильная нормализация: float как есть, иначе int/10.
     private const val PROP_AC_AMBIENT_TEMP = 0x2140A377
+    // Резервные ID — ТОЛЬКО для строки лога TEMP_CANDS, автопереключения нет.
+    private const val PROP_TEMP_RESERVE_1 = 0x2160A6E9
+    private const val PROP_TEMP_RESERVE_2 = 0x2140A673
+    // 0x11600703 (ENV_OUTSIDE_TEMPERATURE в прошивке) — ЗАГЛУШКА: на этой машине стабильно
+    // отдаёт 25.0 (14 тиков подряд в логе 1.0.44). Не используется ни как источник,
+    // ни в contentText, ни в дампе выбора.
 
     @Volatile private var cpm: android.car.hardware.property.CarPropertyManager? = null
     @Volatile private var carObj: Car? = null
@@ -115,6 +116,8 @@ object StatusIcons {
     private val syncInFlight = AtomicBoolean(false)
     private val tickSeq = AtomicInteger(0)
     @Volatile private var periodicRunning = false
+    @Volatile private var lastTickLogAtMs = 0L
+    @Volatile private var lastTickLogMs = 0L
 
     @Volatile private var socProp = 0; @Volatile private var socArea = 0
     @Volatile private var tmpProp = 0; @Volatile private var tmpArea = 0
@@ -154,22 +157,10 @@ object StatusIcons {
                 if (ready) try {
                     cpm = c.getCarManager(Car.PROPERTY_SERVICE) as? android.car.hardware.property.CarPropertyManager
                     AppLog.i(TAG, "CarPropertyManager ready=${cpm != null}")
-                    // iter17: дамп VHAL тяжёлый (1000+ binder-вызовов), нельзя
-                    // выполнять на main looper при старте (он и был причиной
-                    // белого окна). Откладываем на 8с на BgWorker — чтобы не
-                    // конкурировать с первым кадром.
-                    if (!dumpLogged && cpm != null) {
-                        dumpLogged = true
-                        android.os.Handler(Looper.getMainLooper()).postDelayed({
-                            BgWorker.post("StatusIcons.vhalDump") {
-                                val t0 = android.os.SystemClock.uptimeMillis()
-                                val propsBefore = dumpKnownPropsCount(cpm)
-                                dumpKnownProps()
-                                val dt = android.os.SystemClock.uptimeMillis() - t0
-                                AppLog.i(TAG, "VHAL_DUMP: end dt=${dt}ms props≈$propsBefore")
-                            }
-                        }, 8000L)
-                    }
+                    // iter23 P4: полный VHAL-дамп (≈9 с, ~1700 свойств, 3400+ строк лога)
+                    // НЕ запускается в рабочем пути. Только по явной кнопке
+                    // «Диагностика VHAL» (Инструменты → Для разработчика) через dumpVhalOnDemand().
+                    AppLog.i(TAG, "VHAL_DUMP: skipped in normal run (iter23 P4 — only on demand)")
                 } catch (e: Exception) { AppLog.w(TAG, "getCarManager err", e) }
             }
             carObj?.connect()
@@ -193,10 +184,45 @@ object StatusIcons {
         return try { m?.propertyList?.size ?: -1 } catch (_: Throwable) { -1 }
     }
 
+    /**
+     * iter23 P4: приёмник строк дампа. null — дамп не идёт (в рабочем тике его нет вообще),
+     * иначе — накапливаем строки, чтобы сохранить их в отдельный файл отчёта.
+     */
+    private var dumpSink: StringBuilder? = null
+
+    private fun dlog(msg: String) {
+        AppLog.i(TAG, msg)
+        dumpSink?.append(msg)?.append('\n')
+    }
+
+    /** iter23 P4: дамп только по кнопке «Диагностика VHAL» (не в рабочем пути). */
+    @JvmStatic
+    fun dumpVhalOnDemand(ctx: Context) {
+        BgWorker.assertNotMain("StatusIcons.dumpVhalOnDemand")
+        ensureCar(ctx)
+        val t0 = android.os.SystemClock.uptimeMillis()
+        val props = dumpKnownPropsCount(cpm)
+        val sink = StringBuilder()
+        dumpSink = sink
+        try {
+            dumpKnownProps()
+        } finally {
+            dumpSink = null
+        }
+        val dt = android.os.SystemClock.uptimeMillis() - t0
+        // Отдельный файл отчёта (не в общем журнале приложения, не в рабочем тике).
+        val outFile = runCatching {
+            val f = java.io.File(ctx.filesDir, "vhal_dump_${System.currentTimeMillis()}.txt")
+            f.writeText("VHAL_DUMP on demand dt=${dt}ms props≈$props\n" + sink)
+            f
+        }.getOrNull()
+        AppLog.i(TAG, "VHAL_DUMP: end dt=${dt}ms props≈$props (on demand) file=${outFile?.absolutePath ?: "write failed"}")
+    }
+
     private fun dumpKnownProps() {
         val m = cpm ?: return
-        AppLog.i(TAG, "VHAL_DUMP: start (bg thread=${Thread.currentThread().name})")
-        AppLog.i(TAG,"=== VHAL CANDPROP dump start (look for 10°C/98.1% matches HU panel) ===")
+        dlog( "VHAL_DUMP: start (bg thread=${Thread.currentThread().name})")
+        dlog("=== VHAL CANDPROP dump start (look for 10°C/98.1% matches HU panel) ===")
         // iter16: расширенные диапазоны (вкл. 0x10xxxxxx из dex плагина). ONE PASS за старт.
         val TEMP_RANGES = arrayOf(
             0x10000000..0x10FFFFFF,
@@ -211,7 +237,7 @@ object StatusIcons {
         val ALL_AREAS = intArrayOf(0)
         try {
             val propList = m.propertyList
-            AppLog.i(TAG,"VHAL: propertyList size=${propList?.size ?: "null"}")
+            dlog("VHAL: propertyList size=${propList?.size ?: "null"}")
             for (cfg in (propList ?: emptyList())) {
                 val pid = cfg.propertyId
                 // Итерация 11: dump конфига свойства (доступ/areaType/supportedAreas)
@@ -220,16 +246,16 @@ object StatusIcons {
                         pid == 0x15400701 || pid == 0x15400703
                 if (inRange) {
                     val areaIds = try { cfg.areaIds?.joinToString(",") { "0x%x".format(it) } } catch (_: Throwable) { "n/a" }
-                    AppLog.i(TAG, String.format("CANDCFG 0x%08X access=%d areaType=0x%08X areas=[$areaIds]", pid, cfg.access, cfg.areaType))
+                    dlog( String.format("CANDCFG 0x%08X access=%d areaType=0x%08X areas=[$areaIds]", pid, cfg.access, cfg.areaType))
                 }
                 if (!inRange) continue
                 for (a in ALL_AREAS) {
                     try {
                         val v = m.getFloatProperty(pid, a)
                         if (!v.isNaN() && v > -55f && v < 70f) {
-                            AppLog.i(TAG, String.format("CANDPROP 0x%08X@0x%02X F = %.2f °C", pid, a, v))
+                            dlog( String.format("CANDPROP 0x%08X@0x%02X F = %.2f °C", pid, a, v))
                         } else if (!v.isNaN() && v in 0f..101f) {
-                            AppLog.i(TAG, String.format("CANDPROP 0x%08X@0x%02X F = %.2f %%", pid, a, v))
+                            dlog( String.format("CANDPROP 0x%08X@0x%02X F = %.2f %%", pid, a, v))
                         }
                     } catch (_: Exception) {}
                     try {
@@ -240,11 +266,11 @@ object StatusIcons {
                             else -> Float.NaN
                         }
                         if (!fvT.isNaN() && fvT > -55f && fvT < 70f) {
-                            AppLog.i(TAG, String.format("CANDPROP 0x%08X@0x%02X I raw=%d = %.1f °C", pid, a, iv, fvT))
+                            dlog( String.format("CANDPROP 0x%08X@0x%02X I raw=%d = %.1f °C", pid, a, iv, fvT))
                         } else if (iv in 0..1010) {
-                            AppLog.i(TAG, String.format("CANDPROP 0x%08X@0x%02X I raw=%d = %.1f %%", pid, a, iv, iv/10.0f))
+                            dlog( String.format("CANDPROP 0x%08X@0x%02X I raw=%d = %.1f %%", pid, a, iv, iv/10.0f))
                         } else if (iv in 0..101) {
-                            AppLog.i(TAG, String.format("CANDPROP 0x%08X@0x%02X I raw=%d = %d %%", pid, a, iv, iv))
+                            dlog( String.format("CANDPROP 0x%08X@0x%02X I raw=%d = %d %%", pid, a, iv, iv))
                         }
                     } catch (_: Exception) {}
                 }
@@ -254,26 +280,26 @@ object StatusIcons {
                 for (a in ALL_AREAS) {
                     try {
                         val v = m.getFloatProperty(pid, a)
-                        if (!v.isNaN()) AppLog.i(TAG, String.format("CANDPROP(VEND) 0x%08X@0x%02X F = %.4f", pid, a, v))
+                        if (!v.isNaN()) dlog( String.format("CANDPROP(VEND) 0x%08X@0x%02X F = %.4f", pid, a, v))
                     } catch (_: Exception) {}
                     try {
                         val iv = m.getIntProperty(pid, a)
-                        AppLog.i(TAG, String.format("CANDPROP(VEND) 0x%08X@0x%02X I raw=%d", pid, a, iv))
+                        dlog( String.format("CANDPROP(VEND) 0x%08X@0x%02X I raw=%d", pid, a, iv))
                     } catch (_: Exception) {}
                 }
             }
         } catch (e: Exception) {
-            AppLog.w(TAG, "VHAL propertyList enumeration failed, fallback to PRECISE_COMMON+VENDOR scan: ${e.message}")
+            dlog( "VHAL propertyList enumeration failed, fallback to PRECISE_COMMON+VENDOR scan: ${e.message}")
             val allFallback = PRECISE_COMMON + VENDOR_PLUGIN_IDS
             for (p in allFallback) for (a in ALL_AREAS) {
-                try { val v = m.getFloatProperty(p,a); if (!v.isNaN()) AppLog.i(TAG,String.format("CANDPROP(fb) 0x%08X@0x%02X F=%f",p,a,v)) } catch(_:Exception){}
+                try { val v = m.getFloatProperty(p,a); if (!v.isNaN()) dlog(String.format("CANDPROP(fb) 0x%08X@0x%02X F=%f",p,a,v)) } catch(_:Exception){}
                 try {
                     val iv = m.getIntProperty(p,a)
-                    AppLog.i(TAG,String.format("CANDPROP(fb) 0x%08X@0x%02X I raw=%d",p,a,iv))
+                    dlog(String.format("CANDPROP(fb) 0x%08X@0x%02X I raw=%d",p,a,iv))
                 } catch(_:Exception){}
             }
         }
-        AppLog.i(TAG,"=== VHAL CANDPROP dump end ===")
+        dlog("=== VHAL CANDPROP dump end ===")
     }
 
     private fun readSocScan(): Float? {
@@ -324,83 +350,46 @@ object StatusIcons {
         return null
     }
 
-    // РЕФЕРЕНС: com.geely.hvacstepperv2.TempStepperService#i(int area) — getFloatProperty(291505923, area),
-    // при NaN — getIntProperty(291505923, area): -550..700 → /10.0f, -45..65 → as-is.
-    // РЕФЕРЕНС: #g() — перебор зон f1286d0 = {0,1,4,7}, первый валидный в (-55, 70) — «Exterior OK».
-    // 291505923 == 0x11600703 == ENV_OUTSIDE_TEMPERATURE. Именно этот ID эталон и использует
-    // для наружной температуры; прошлая «константа 25.0» — следствие чтения только area=0
-    // без проверки диапазона и без int-ветки. Отсюда: число возвращаем всегда, «--» — только
-    // если ни одна зона/ветка не дала значения за всё время жизни сервиса (см. syncAll).
-    private const val PROP_ENV_OUTSIDE_TEMP = 291505923 // 0x11600703
-    private val CEX_OUTSIDE_AREAS = intArrayOf(0, 1, 4, 7) // f1286d0
 
-    /** РЕФЕРЕНС: CarPropertyManager#getCarPropertyConfig (в CEX — через рефлексию, API разнится). */
-    private fun propConfigAccessAreaType(m: android.car.hardware.property.CarPropertyManager, propId: Int): Pair<Int, Int>? {
-        return try {
-            val meth = m.javaClass.getMethod("getCarPropertyConfig", Int::class.javaPrimitiveType!!)
-            val cfg = meth.invoke(m, propId) ?: return null
-            val access = runCatching { cfg.javaClass.getMethod("getAccess").invoke(cfg) as Int }.getOrNull() ?: -1
-            val areaType = runCatching { cfg.javaClass.getMethod("getAreaType").invoke(cfg) as Int }.getOrNull() ?: -1
-            access to areaType
-        } catch (t: Throwable) { null }
+    /** Чтение одного свойства: float → иначе int/10 (шаг 0.1 °C), диапазон −50…+70. */
+    private fun readTempProp(m: android.car.hardware.property.CarPropertyManager, propId: Int, area: Int): Pair<Float?, String> {
+        try {
+            val f = m.getFloatProperty(propId, area)
+            if (!f.isNaN()) {
+                return if (f > -50f && f < 70f) f to String.format("%.1f", f) else null to "float=${f}(out of range)"
+            }
+        } catch (e: Exception) {
+            // some VHALs throw for float on int props — это норма, идём в int-ветку
+        }
+        try {
+            val iv = m.getIntProperty(propId, area)
+            val v = iv / 10.0f
+            return if (v > -50f && v < 70f) v to "int=$iv→$v" else null to "int=$iv(out of range)"
+        } catch (e: Exception) {
+            return null to "ERR:${e.message}"
+        }
     }
 
+    /**
+     * iter23 P1: источник наружной температуры — 0x2140A377 (решение владельца по логу 1.0.44:
+     * реальные 9.2 °C при raw=92). Резервные 0x2160A6E9 / 0x2140A673 пишутся ТОЛЬКО в лог.
+     * 0x11600703 не читается вовсе — это заглушка прошивки (25.0).
+     */
     private fun readTempScan(): Float? {
         val m = cpm ?: run { AppLog.w(TAG, "TEMP: no CarPropertyManager"); return null }
-        val cfg = propConfigAccessAreaType(m, PROP_ENV_OUTSIDE_TEMP)
-        AppLog.i(TAG, "TEMP PROBE_CFG 0x11600703 access=${cfg?.first ?: "n/a"} areaType=${cfg?.second ?: "n/a"} " +
-                "(access 1=READ 3=READ_WRITE)")
-        // access: 1 = READ_ONLY, 3 = READ_WRITE; если свойство не читаемое — не тратим binder-вызовы.
-        if (cfg != null && cfg.first != 1 && cfg.first != 3) {
-            AppLog.w(TAG, "TEMP: 0x11600703 not readable (access=${cfg.first}) → skip")
+        val (main, mainRaw) = readTempProp(m, PROP_AC_AMBIENT_TEMP, 0)
+        val (r1, r1Raw) = readTempProp(m, PROP_TEMP_RESERVE_1, 0)
+        val (r2, r2Raw) = readTempProp(m, PROP_TEMP_RESERVE_2, 0)
+        val fmt = { v: Float? -> v?.let { String.format(Locale.US, "%.1f", it) } ?: "n/a" }
+        val src = if (main != null) "A377" else "none"
+        AppLog.i(TAG, "TEMP_CANDS: A377=${fmt(main)} A673=${fmt(r2)} A6E9=${fmt(r1)} src=$src")
+        if (main == null) {
+            AppLog.w(TAG, "TEMP: A377 недоступен (raw/$mainRaw; A673/$r2Raw; A6E9/$r1Raw) — значение с экрана не убираем")
             return null
         }
-        for (area in CEX_OUTSIDE_AREAS) {
-            // float-ветка CEX#i
-            try {
-                val f = m.getFloatProperty(PROP_ENV_OUTSIDE_TEMP, area)
-                AppLog.i(TAG, String.format("TEMP_PROBE 0x11600703@%d float=%.3f", area, f))
-                if (!f.isNaN() && f > -55f && f < 70f) {
-                    tempSource = "HAL 0x11600703@$area"
-                    AppLog.i(TAG, String.format("Temp HAL=%.1f → UI=%.1f (area=0x%x)", f, f, area))
-                    return f
-                }
-            } catch (e: Exception) {
-                AppLog.d(TAG, String.format("TEMP_PROBE 0x11600703@%d float ERR %s", area, e.message))
-            }
-            // int-ветка CEX#i
-            try {
-                val iv = m.getIntProperty(PROP_ENV_OUTSIDE_TEMP, area)
-                AppLog.i(TAG, String.format("TEMP_PROBE 0x11600703@%d int=%d", area, iv))
-                if (iv > -550 && iv < 700) {
-                    val v = iv / 10.0f
-                    if (v > -55f && v < 70f) {
-                        tempSource = "HAL 0x11600703@$area (int/10)"
-                        AppLog.i(TAG, String.format("Temp HAL=%.1f → UI=%.1f (area=0x%x int)", v, v, area))
-                        return v
-                    }
-                }
-                if (iv in -45..65) {
-                    tempSource = "HAL 0x11600703@$area (int)"
-                    AppLog.i(TAG, String.format("Temp HAL=%.1f → UI=%.1f (area=0x%x int raw)", iv.toFloat(), iv.toFloat(), area))
-                    return iv.toFloat()
-                }
-            } catch (e: Exception) {
-                AppLog.d(TAG, String.format("TEMP_PROBE 0x11600703@%d int ERR %s", area, e.message))
-            }
-        }
-        AppLog.w(TAG, "TEMP: 0x11600703 unavailable in all CEX areas {0,1,4,7}")
-
-        // ДИАГНОСТИКА (не источник): перебор альтернативных ID — ТОЛЬКО лог, значения
-        // никогда не выбираются автоматически (мандат iter22 §2.4: TEMP_PROBE = дамп).
-        val diag = StringBuilder()
-        for (pid in TEMP_PROBE_IDS) for (a in intArrayOf(0, 2, 7)) {
-            val f = runCatching { m.getFloatProperty(pid, a) }.getOrElse { Float.NaN }
-            val i = runCatching { m.getIntProperty(pid, a) }.getOrElse { Int.MIN_VALUE }
-            diag.append(String.format("\n  0x%08X@%d float=%s int=%d", pid, a, f.toString(), i))
-        }
-        AppLog.i(TAG, "TEMP_PROBE (diagnostics only, not a source):$diag")
-        return null
+        tempSource = "HAL 0x2140A377@0"
+        AppLog.i(TAG, "Temp HAL=%.1f → UI=%.1f°C (src=0x2140A377@0, raw=$mainRaw)".format(main, main))
+        return main
     }
 
     /** PendingIntent для клика по батарее/температуре → наше приложение, сразу вкладка «Телеметрия». */
@@ -541,6 +530,7 @@ object StatusIcons {
         val dens = ctx.resources.displayMetrics.density
         AppLog.i(TAG, "ICON_GEOM: kind=${kind.ifEmpty { main + suffix }} w=${bmpW}px h=${bmpH}px " +
                 "(w=${"%.1f".format(bmpW / dens)}dp h=${"%.1f".format(bmpH / dens)}dp) " +
+                "glyph=${"%.1f".format((fm.descent - fm.ascent) / dens)}dp " +
                 "textSize=${"%.1f".format(mainSize)} suffix=$suffix padH=${padHDp}dp gap=${GAP_DP}dp keepNum=$keepNum")
         return Icon.createWithBitmap(bmp)
     }
@@ -549,38 +539,50 @@ object StatusIcons {
      * Иконка Wi-Fi: 3 дуги + точка, РАЗМЕР по той же геометрии (рисуется в том же
      * TEXT_DP масштабе, чтобы высота иконки совпадала с batt/temp в статус-баре).
      */
+    /**
+     * iter23 P2.5: Wi-Fi в том же визуальном масштабе, что цифры.
+     *
+     * Факт из лога 1.0.44: битмап текстовых иконок 111 dp, но сами цифры занимают
+     * высоту заглавной ≈ 0.72 × textSize ≈ 40 dp (остальное — поля от деления на 0.61).
+     * Дуги Wi-Fi рисовались почти на весь битмап (54 dp) — отсюда «немного больше».
+     * Теперь: битмап ТОЙ ЖЕ высоты, что у текстовых (`(descent-ascent)/0.61`), а сама
+     * пиктограмма вписана в `glyph = 0.72 × textSize`.
+     */
     private fun makeWifiIconCex(ctx: Context, level: Int, color: Int): Icon {
         val p = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             this.color = color; typeface = Typeface.DEFAULT; isAntiAlias = true; style = Paint.Style.FILL
         }
-        val size = h(ctx, TEXT_DP)
+        val textPx = h(ctx, TEXT_DP).toFloat()
+        val fm = p.fontMetrics
+        val capPx = textPx * 0.72f                 // высота заглавной цифры = визуальный размер цифр
+        val bmpH = ((fm.descent - fm.ascent) / 0.61f).toInt().coerceAtLeast(1)  // как у текстовых
         val padH = h(ctx, PAD_H_DP)
-        val bmpW = (padH*2 + size*0.55f).toInt().coerceAtLeast(1)
-        val bmpH = size.coerceAtLeast(1)
+        val glyphW = capPx * 1.15f                 // чуть шире, чем высота — иначе дуги слипнутся
+        val bmpW = (padH * 2 + glyphW).toInt().coerceAtLeast(1)
         val bmp = Bitmap.createBitmap(bmpW, bmpH, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bmp)
-        val cx = bmpW/2f
-        val dotR = size * 0.05f
-        val dotCy = bmpH * 0.82f
+        val cx = bmpW / 2f
+        // Точка внизу и дуги сверху в сумме занимают ровно capPx по вертикали.
+        val dotR = capPx * 0.09f
+        val dotCy = bmpH / 2f + capPx / 2f - dotR
+        val maxR = capPx - dotR * 2f               // внешний радиус самой большой дуги
         canvas.drawCircle(cx, dotCy, dotR, p)
         p.style = Paint.Style.STROKE
-        p.strokeWidth = size * 0.06f
+        p.strokeWidth = capPx * 0.10f
         p.strokeCap = Paint.Cap.ROUND
         for (k in 1..3) {
-            if (k > level + 1) p.alpha = 0x55  // неактивные дуги — сероватые
-            val r = bmpH * (0.20f + (k-1)*0.14f)
+            if (k > level + 1) p.alpha = 0x55      // неактивные дуги бледнее (регресс-зона: уровни)
+            val r = maxR * (0.38f + (k - 1) * 0.31f)
             val oval = RectF(cx - r, dotCy - r, cx + r, dotCy + r)
             canvas.drawArc(oval, -135f, 90f, false, p)
             p.alpha = 0xFF
         }
         val dens = ctx.resources.displayMetrics.density
         AppLog.i(TAG, "ICON_GEOM: kind=wifi w=${bmpW}px h=${bmpH}px " +
-                "(w=${"%.1f".format(bmpW / dens)}dp h=${"%.1f".format(bmpH / dens)}dp) level=$level padH=${PAD_H_DP}dp")
+                "(w=${"%.1f".format(bmpW / dens)}dp h=${"%.1f".format(bmpH / dens)}dp) " +
+                "glyph=${"%.1f".format(capPx / dens)}dp level=$level padH=${PAD_H_DP}dp")
         return Icon.createWithBitmap(bmp)
     }
-
-
-
 
     private fun cancel(ctx: Context, id: Int) {
         try { (ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).cancel(id) } catch(_:Throwable){}
@@ -597,14 +599,27 @@ object StatusIcons {
             return
         }
         val seq = tickSeq.incrementAndGet()
+        val t0 = android.os.SystemClock.uptimeMillis()
+        var reads = 0
         try {
-            syncAllImpl(ctx.applicationContext, seq)
+            reads = syncAllImpl(ctx.applicationContext, seq)
         } finally {
             syncInFlight.set(false)
+            val dt = android.os.SystemClock.uptimeMillis() - t0
+            // iter23 P4: метрика тика — раз в минуту пишем, сколько занял опрос VHAL.
+            lastTickLogMs = dt
+            val now = android.os.SystemClock.uptimeMillis()
+            if (now - lastTickLogAtMs > 60_000L) {
+                lastTickLogAtMs = now
+                AppLog.i(TAG, "TICK: dt=${dt}ms reads=$reads overdue=${dt > 100}")
+            } else {
+                AppLog.d(TAG, "TICK: dt=${dt}ms reads=$reads")
+            }
         }
     }
 
-    private fun syncAllImpl(app: Context, seq: Int) {
+    private fun syncAllImpl(app: Context, seq: Int): Int {
+        var reads = 0
         ensureCar(app)
         val showBatt = prefs(app).getBoolean(PREF_BATTERY, false)
         val showTemp = prefs(app).getBoolean(PREF_EXT_TEMP, false)
@@ -622,7 +637,7 @@ object StatusIcons {
 
         if (showBatt) {
             AppLog.d(TAG, "BATT: toggle=on read start")
-            val soc = readSocScan()
+            val soc = readSocScan().also { reads++ }
             if (soc != null) {
                 // iter22 §1: одна цифра после запятой (42.4, 100.0, 7.0) — как w0/kg#i("%.1f").
                 val socStr = fmtOneDecimal(soc)
@@ -638,7 +653,7 @@ object StatusIcons {
         } else cancel(app, NOTIF_BATT)
 
         if (showTemp) {
-            val t = readTempScan()
+            val t = readTempScan().also { reads++ }
             // iter22 §2: число показываем ВСЕГДА, если хоть раз его прочитали
             // (аналогично OEM-панели "10°C"). "--" только при полном отсутствии данных.
             val display: Float? = t ?: lastTempC
@@ -700,6 +715,7 @@ object StatusIcons {
         // поэтому форматируем до одного знака после запятой, batt и temp — с .1f.
         // Если значение ещё не прочитано (первый tick) — не пишем ничего (пропускаем).
         pushHvacDigitalPropsIfEnabled(app)
+        return reads
     }
 
     /**

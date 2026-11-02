@@ -187,6 +187,9 @@ enum class Choice(
         addProperty("unlockSound", LockSound.isUnlockSoundEnabled(appContext))
         addProperty("unlockSoundPath", LockSound.getUnlockSelectedPath(appContext))
         add("keepAliveApps", AppPerformance.getKeepAliveAppsJson(appContext))
+        /* iter23 P0.6: состояние root-канала для баннера в «Инструментах». */
+        addProperty("rootState", AdbClient.currentState().name)
+        addProperty("rootPort", AdbClient.currentPort().toString())
     }
 }
 

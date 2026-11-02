@@ -107,7 +107,8 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
         }
 
         val reason = when {
-            hasNoRoot -> "требуется root-канал (порт 65010 не поднят). Проверьте в dev.checkRoot."
+            // iter23 P2.6: честный текст — канал НЕ про 65010 (он read-only), а про 5555.
+            hasNoRoot -> "канал недоступен — 5555 не отвечает (uid=1000). Проверьте «Для разработчика» → «Проверить root»."
             hasPerm   -> "Permission denied (нужен root-шелл uid=0)"
             hasLock   -> "xtables lock (iptables занят, попробуйте снова)"
             noTarget  -> "iptables target 'TTL' не поддерживается ядром (модуль отсутствует)"
