@@ -24,7 +24,7 @@ import java.util.Locale
  * кольцевом буфере и пишутся в файл сразу после init().
  *
  * Теги модулей:
- *   CENTRAL_AdbClient   — работа с портом 65010 и root-adb
+ *   CENTRAL_AdbClient   — root-канал 127.0.0.1:5555 (диагностика ADBDIAG, лечение ADBFIX)
  *   CENTRAL_StatusIcons — иконки статус-бара, VHAL чтения
  *   CENTRAL_Perf        — JIT/zygote, vcodec 60fps
  *   CENTRAL_TTL         — iptables TTL 65

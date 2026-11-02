@@ -635,7 +635,7 @@ class UiBridge(
                 }) { res ->
                     val r = res.getOrNull()
                     val msg = if (r != null)
-                        "PORT65010: connect → ${if(r.port>0)"OK on port ${r.port}" else "no port"}\n" +
+                        "ADB channel: connect → ${if(r.port>0)"OK on port ${r.port}" else "no port"}\n" +
                         "handshake CNXN → OK\n" +
                         "id → ${r.uidLine}\n" +
                         "state=${r.state}\n" +

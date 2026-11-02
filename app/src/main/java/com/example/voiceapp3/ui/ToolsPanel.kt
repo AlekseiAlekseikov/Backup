@@ -828,7 +828,7 @@ class ToolsPanel(
         val st = state.get("rootState")?.takeIf { it.isJsonPrimitive }?.asString.orEmpty()
         val port = state.get("rootPort")?.takeIf { it.isJsonPrimitive }?.asString.orEmpty()
         if (st.isEmpty()) return
-        val ok = st == "ROOT_5555" || st == "ROOT_65010"
+        val ok = st == "ROOT_5555"
         val msg = if (ok)
             "ROOT: канал готов — порт ${if (port.isEmpty()) "?" else port}"
         else

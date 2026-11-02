@@ -403,7 +403,8 @@ object HvacDigitalPlugin {
 
         // 3) umount bind-точек + один перезапуск SystemUI. Нужен root-канал.
         val rootState = AdbClient.currentState()
-        val haveRoot = rootState == AdbClient.ChannelState.ROOT_5555 || rootState == AdbClient.ChannelState.ROOT_65010
+        // iter24 P0.3: канал теперь ровно один — ROOT_5555 (второго порта нет).
+        val haveRoot = rootState == AdbClient.ChannelState.ROOT_5555
         var restoreOk = false
         var restoreOut = ""
         if (!haveRoot) {

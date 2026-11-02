@@ -107,7 +107,7 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
         }
 
         val reason = when {
-            // iter23 P2.6: честный текст — канал НЕ про 65010 (он read-only), а про 5555.
+            // iter23 P2.6: честный текст — канал это 5555, а не «второй»/резервный порт.
             hasNoRoot -> "канал недоступен — 5555 не отвечает (uid=1000). Проверьте «Для разработчика» → «Проверить root»."
             hasPerm   -> "Permission denied (нужен root-шелл uid=0)"
             hasLock   -> "xtables lock (iptables занят, попробуйте снова)"

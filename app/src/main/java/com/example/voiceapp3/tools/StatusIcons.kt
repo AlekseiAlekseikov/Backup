@@ -542,6 +542,10 @@ object StatusIcons {
     /**
      * iter23 P2.5: Wi-Fi в том же визуальном масштабе, что цифры.
      *
+     * iter24 P2.5: причина поломки 1.0.45 — у Paint не был задан textSize, поэтому
+     * fontMetrics были от дефолтных 12 px → bmpH = 23 px при глифе 40,3 dp (лог 1.0.45:
+     * `ICON_GEOM: kind=wifi w=66px h=23px glyph=40,3dp` против `kind=batt h=111px`).
+     *
      * Факт из лога 1.0.44: битмап текстовых иконок 111 dp, но сами цифры занимают
      * высоту заглавной ≈ 0.72 × textSize ≈ 40 dp (остальное — поля от деления на 0.61).
      * Дуги Wi-Fi рисовались почти на весь битмап (54 dp) — отсюда «немного больше».
@@ -549,26 +553,32 @@ object StatusIcons {
      * пиктограмма вписана в `glyph = 0.72 × textSize`.
      */
     private fun makeWifiIconCex(ctx: Context, level: Int, color: Int): Icon {
+        val textPx = h(ctx, TEXT_DP).toFloat()
         val p = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             this.color = color; typeface = Typeface.DEFAULT; isAntiAlias = true; style = Paint.Style.FILL
+            // iter24 P2.5: textSize ОБЯЗАТЕЛЬНО до fontMetrics — иначе метрики берутся от
+            // дефолтных 12 px и битмап получается 23 px при глифе 40 dp (обрезало сверху/снизу).
+            this.textSize = textPx
         }
-        val textPx = h(ctx, TEXT_DP).toFloat()
         val fm = p.fontMetrics
         val capPx = textPx * 0.72f                 // высота заглавной цифры = визуальный размер цифр
         val bmpH = ((fm.descent - fm.ascent) / 0.61f).toInt().coerceAtLeast(1)  // как у текстовых
         val padH = h(ctx, PAD_H_DP)
-        val glyphW = capPx * 1.15f                 // чуть шире, чем высота — иначе дуги слипнутся
+        // Страховка: глиф не может быть больше битмапа (иначе обрезка/растяжение).
+        val fit = if (capPx > bmpH * 0.98f) (bmpH * 0.98f) / capPx else 1f
+        val glyphPx = capPx * fit
+        val glyphW = glyphPx * 1.15f               // чуть шире, чем высота — иначе дуги слипнутся
         val bmpW = (padH * 2 + glyphW).toInt().coerceAtLeast(1)
         val bmp = Bitmap.createBitmap(bmpW, bmpH, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bmp)
         val cx = bmpW / 2f
-        // Точка внизу и дуги сверху в сумме занимают ровно capPx по вертикали.
-        val dotR = capPx * 0.09f
-        val dotCy = bmpH / 2f + capPx / 2f - dotR
-        val maxR = capPx - dotR * 2f               // внешний радиус самой большой дуги
+        // Точка внизу и дуги сверху в сумме занимают ровно glyphPx по вертикали.
+        val dotR = glyphPx * 0.09f
+        val dotCy = bmpH / 2f + glyphPx / 2f - dotR
+        val maxR = glyphPx - dotR * 2f             // внешний радиус самой большой дуги
         canvas.drawCircle(cx, dotCy, dotR, p)
         p.style = Paint.Style.STROKE
-        p.strokeWidth = capPx * 0.10f
+        p.strokeWidth = glyphPx * 0.10f
         p.strokeCap = Paint.Cap.ROUND
         for (k in 1..3) {
             if (k > level + 1) p.alpha = 0x55      // неактивные дуги бледнее (регресс-зона: уровни)
@@ -580,7 +590,8 @@ object StatusIcons {
         val dens = ctx.resources.displayMetrics.density
         AppLog.i(TAG, "ICON_GEOM: kind=wifi w=${bmpW}px h=${bmpH}px " +
                 "(w=${"%.1f".format(bmpW / dens)}dp h=${"%.1f".format(bmpH / dens)}dp) " +
-                "glyph=${"%.1f".format(capPx / dens)}dp level=$level padH=${PAD_H_DP}dp")
+                "glyph=${"%.1f".format(glyphPx / dens)}dp level=$level padH=${PAD_H_DP}dp " +
+                "fit=${"%.2f".format(fit)} textSize=${"%.1f".format(textPx / dens)}dp")
         return Icon.createWithBitmap(bmp)
     }
 

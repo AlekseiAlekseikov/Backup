@@ -335,6 +335,9 @@ class VoiceAssistantService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForegroundService()
+        // iter24 P0.4: AdbClient должен знать Context, чтобы после лечения канала сразу
+        // повторить отложенную работу (TTL, persist.sys.hvacdigital.*, плагин HvacDigital).
+        runCatching { com.example.voiceapp3.tools.AdbClient.attachContext(this) }
         /* Boot-ветка: BootReceiver помечает запуск — возвращаем сохранённую
            яркость (порт w() с boot-события; при обычном старте из приложения
            шаг не выполняется, чтобы не перебивать яркость штатной панели). */
