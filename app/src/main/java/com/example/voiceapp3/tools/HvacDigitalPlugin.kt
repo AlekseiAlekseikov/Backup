@@ -359,7 +359,7 @@ object HvacDigitalPlugin {
      * один `kill $(pidof com.android.systemui)` → readback `pm path` (ожидается /system/...).
      *
      * РЕФЕРЕНС: w0/o#c — вердикт `VIA` считается по факту `pm path`; ветка
-     * `*/data/app/*` там же снимает legado-bind и ставит `persist.sys.hvacdigital.via install`.
+     * ветка «путь в /data/app» там же снимает legado-bind и ставит `persist.sys.hvacdigital.via install`.
      * Снятие установленной копии — наше дополнение (в эталоне этот случай не разбирается).
      */
     fun restoreSystemUi(ctx: Context): ToolsResult {
@@ -376,8 +376,7 @@ object HvacDigitalPlugin {
             echo "VIA=$(getprop persist.sys.hvacdigital.via)"
         """.trimIndent()
         val (dRc, dOut) = try { AdbClient.shellLocal(diagCmd, 8000) } catch (t: Throwable) { Pair(1, "EXC:${t.message}") }
-        AppLog.i(TAG, "RESTORE_DIAG rc=$dRc:
-$dOut")
+        AppLog.i(TAG, "RESTORE_DIAG rc=$dRc: " + dOut.replace('\n', " | "))
 
         steps += stepOf("pre_check", "pm path + /proc/mounts + getprop via",
             if (pre.overlayMounted || pre.shadowedByInstall) ToolsStep.Status.PARTIAL else ToolsStep.Status.OK,
