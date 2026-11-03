@@ -18,6 +18,9 @@ class App : Application() {
         // Явная строка версии — чтобы владелец мгновенно видел в логе, какая
         // сборка запущена (без гаданий по размеру APK).
         AppLog.i("App", "BUILD: versionCode=${BuildConfig.VERSION_CODE} versionName=${BuildConfig.VERSION_NAME} commit=${BuildConfig.GIT_COMMIT}")
+        // iter25 P0-F: явная отметка «безопасной» сборки — в 1.0.46 старт писал в mt_gpio
+        // (пин 151) и гасил USB на машине. Теперь в sysfs/USB-узлы приложение не пишет.
+        AppLog.i("App", "USB_GUARD: iter25 — запись в mt_gpio отключена (1.0.46 гасила USB), sysfs/USB не трогаем")
         AppLog.i("App", "=== Application.onCreate === (uptime=${android.os.SystemClock.elapsedRealtime()}ms)")
         // iter17: явная диагностика хранилищ — чтобы сразу видеть, в каком
         // из них лежит какой флаг (CPS против DPS). Помогает отличить

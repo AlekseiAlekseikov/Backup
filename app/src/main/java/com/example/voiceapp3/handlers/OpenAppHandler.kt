@@ -38,11 +38,27 @@ class OpenAppHandler(private val context: Context) : IntentHandler {
             "ru.yandex.yandexnavi.core.NavigatorActivity")
     }
 
+    /**
+     * iter25 P0-A (USB): раньше эта функция вызывалась при СОЗДАНИИ handler-а — то есть
+     * на каждом старте приложения — и писала `Settings.Global "persist.switch.usbmode" = true`.
+     * Это глобальная настройка ГУ, связанная с режимом USB-порта: на старте её трогать нельзя
+     * (мандат iter25 §3: никаких `settings put`). Теперь запись делается только в момент,
+     * когда пользователь реально просит открыть инженерное меню.
+     */
     private fun getEngineerIntent() : Intent {
         if (CarModel.isE5) {
             return Intent()
         }
+        return Intent().apply {
+            component = ComponentName(
+                "com.geely.engineermode",
+                "com.geely.engineermode.MainActivity"
+            )
+        }
+    }
 
+    /** Отдельный шаг «инженерное меню»: единственное место, где мы вообще трогаем usbmode. */
+    private fun prepareEngineerUsbMode() {
         try {
             Settings.Global.putString(
                 context.contentResolver,
@@ -52,17 +68,13 @@ class OpenAppHandler(private val context: Context) : IntentHandler {
         } catch (e: SecurityException) {
             Log.e(TAG, "Error setting usbmode to true: ${e.toString()}")
         }
-
-        return Intent().apply {
-            component = ComponentName(
-                "com.geely.engineermode",
-                "com.geely.engineermode.MainActivity"
-            )
-        }
     }
 
+    /** Маркер «инженерное меню»: настоящий Intent и usbmode готовятся только по запросу. */
+    private val ENGINEER_INTENT: Intent = Intent().apply { action = "voiceapp3.ENGINEER" }
+
     private val customAppMap: Map<String, Intent> = mapOf(
-        "инженер" to getEngineerIntent(),
+        "инженер" to ENGINEER_INTENT,
         "музык" to yaMusicIntent,
         "параметры" to Intent(Settings.ACTION_SETTINGS),
         "карта" to naviIntent, "карту" to naviIntent, "карты" to naviIntent, "маршрут" to naviIntent,
@@ -79,7 +91,12 @@ class OpenAppHandler(private val context: Context) : IntentHandler {
         // Find first matching intent
         customAppMap.entries.firstOrNull { (key, _) ->
             commandText.contains(key)
-        }?.let { (_, intent) ->
+        }?.let { (_, intent0) ->
+            // iter25: «инженер» готовится здесь, а не на старте (см. prepareEngineerUsbMode).
+            val intent = if (intent0 === ENGINEER_INTENT) {
+                prepareEngineerUsbMode()
+                getEngineerIntent()
+            } else intent0
             return try {
                 if (intent.component == null && intent.action == null) {
                     return false
