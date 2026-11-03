@@ -528,6 +528,40 @@ object AdbClient {
     private fun hexOf(b: ByteArray, n: Int): String =
         (0 until n.coerceAtMost(b.size)).joinToString(" ") { "%02x".format(b[it]) }.ifEmpty { "(none)" }
 
+    /**
+     * Чтение свойств порта adbd — БЕЗ записи. Если в persist.adb.tcp.port застряло
+     * чужое значение, только сообщаем: ADB_PORT_STUCK=<v>. Менять его из приложения
+     * нельзя (рестарт adbd рвёт соединение), поэтому — не трогаем.
+     */
+    private fun logAdbPortReadback(port: Int) {
+        val per = runShellFallback("getprop persist.adb.tcp.port", 2000).trim()
+        val cur = runShellFallback("getprop service.adb.tcp.port", 2000).trim()
+        AppLog.i(TAG, "ADB_PORT_READBACK: working=$port persist.adb.tcp.port=${per.ifEmpty { "(empty)" }} service.adb.tcp.port=${cur.ifEmpty { "(empty)" }}")
+        if (per.isNotEmpty() && per != ADB_PORT_DEFAULT.toString()) {
+            AppLog.w(TAG, "ADB_PORT_STUCK=$per (persist.adb.tcp.port не $ADB_PORT_DEFAULT; НЕ меняем — запись adb-свойств из приложения запрещена)")
+        }
+    }
+
+    /**
+     * Дешёвые команды (pm path, getprop, settings get, grep /proc/mounts) не нуждаются
+     * в root и НЕ должны ходить через adb: приложение уже работает как uid=1000(system).
+     * Выполняем через Runtime.exec.
+     */
+    fun shellLocal(command: String, timeoutMs: Int = 4000): Pair<Int, String> {
+        return runShellFallbackWithRc(command, timeoutMs)
+    }
+
+    /**
+     * Умное выполнение: если root-канал жив — через adb; иначе — локальный sh.
+     * Только для команд, которым root НЕ нужен (expectRoot=false по смыслу).
+     */
+    fun executeSmart(command: String, timeoutMs: Int = 4000): Pair<Int, String> {
+        if (state.get() == ChannelState.ROOT_5555) {
+            return execute(command, timeoutMs, expectRoot = false)
+        }
+        return runShellFallbackWithRc(command, timeoutMs)
+    }
+
     private fun fallbackNoRoot(reason: String) {
         state.set(ChannelState.NO_ROOT_SH)
         AppLog.e(TAG, "ADB ИТОГ = NO_ROOT ($reason). Команды пойдут через Runtime.sh uid=1000 (root не гарантирован).")
