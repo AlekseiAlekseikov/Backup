@@ -658,7 +658,7 @@ object AdbClient {
                 return false
             }
             if (isRootUid(idOut)) {
-                unixChannelOk.set(true)
+                unixChannelOk = true
                 state.set(ChannelState.ROOT_UNIX)
                 AppLog.i(TAG, "ADB_SELFTEST: unix-socket ok uid=0 dt=${SystemClock.uptimeMillis() - t0}ms — канал найден БЕЗ TCP (ROOT_UNIX)")
                 AppLog.i(TAG, "ADBDIAG unix-socket uid=0 (работаем через unix, TCP 5555 не трогаем)")
