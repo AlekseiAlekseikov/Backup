@@ -45,8 +45,12 @@ object AdbClient {
     const val ADB_PORT_DEFAULT = 5555
     private const val PROBE_CONNECT_MS = 1500
     private const val PROBE_TOTAL_MS = 3000
-    /** iter25 P0-D: сырое чтение не должно держать поток 30 с — 8 с достаточно. */
-    private const val RAW_READ_MS = 8000
+    /** iter26 B.4: окна сырого чтения — 3 с (в 1.0.47 было 8 с, диагностика держала поток 35 с). */
+    private const val RAW_READ_MS = 3000
+    /** iter26 B.4: ADBDIAG — один раз за загрузку (флаг в prefs, сброс по boot_id). */
+    private const val PREF_DIAG_BOOT = "adbdiag_boot_id"
+    /** iter26 B.2: имя локального unix-сокета adbd. */
+    private const val ADBD_SOCKET = "adbd"
     /** Порт локального adb-СЕРВЕРА (хост-сторона), найден в логе 1.0.46 в LISTEN. */
     private const val ADB_SERVER_PORT = 5037
     private const val PROP_DIAG = "persist.sys.hvacdigital.diag"
@@ -86,6 +90,7 @@ object AdbClient {
         IDLE,
         BOOTING,
         ROOT_5555,     // рутовый канал на 5555 (штатный путь: adbd уже слушает 5555 и даёт uid=0)
+        ROOT_UNIX,     // рутовый канал через локальный unix-сокет "adbd" (iter26 B.2)
         NO_ROOT_SH,    // нет ADB — все команды идут через Runtime.sh от uid=1000
         PERM_FAIL      // рут невозможен
     }
@@ -275,13 +280,31 @@ object AdbClient {
         AppLog.i(TAG, "ADB_PROBE port=$ADB_PORT_DEFAULT kind=${p.kind} dt=${p.dt}ms uid=${p.uid.ifEmpty { "-" }}")
         if (p.kind == KIND_ROOT) { channelUp(p); return }
 
-        // P0.1: однозначный диагноз.
-        runCatching { adbDiag(p) }.onFailure { AppLog.w(TAG, "ADBDIAG failed: ${it.message}") }
+        // iter26 B.2: сначала пробуем канал БЕЗ TCP — локальный unix-сокет "adbd".
+        // Это дешевле любой диагностики и не зависит от того, обслуживается ли accept.
+        if (probeUnixAdbd()) return
 
-        // iter25 P0: лечения НЕТ. Шаги 1.0.46 (settings adb_enabled / tcpip через сокет /
-        // запись в mt_gpio) убраны: GPIO 151 на этой ГУ гасит USB (лог 1.0.46 + поведение
-        // машины), а два других шага были no-op/невозможны. Остаётся только диагноз.
-        AppLog.i(TAG, "ADBFIX disabled (iter25: gpio/settings/tcpip отключены — лог 1.0.46: GPIO 151 гасит USB)")
+        // P0.1: однозначный диагноз — один раз за загрузку (B.4).
+        if (diagAllowedThisBoot()) {
+            runCatching { adbDiag(p) }.onFailure { AppLog.w(TAG, "ADBDIAG failed: ${it.message}") }
+        } else {
+            AppLog.i(TAG, "ADBDIAG skipped: уже выполнялся в этой загрузке (повторно не растягиваем старт)")
+        }
+
+        // iter26 B.1: единственная новая запись в системе — Settings.Global.ADB_ENABLED.
+        // Это тот же путь, что тумблер «Отладка по USB»: system_server перезапускает adbd.
+        val toggled = runCatching { adbToggleFix() }.getOrElse {
+            AppLog.e(TAG, "ADB_TOGGLE crashed: ${it.javaClass.simpleName}: ${it.message}")
+            false
+        }
+        if (toggled) {
+            AppLog.i(TAG, "ADB_TOGGLE result=OK (uid=0 после перезапуска adbd)")
+            adbFixVerify("after_toggle")
+            return
+        }
+
+        // iter25 P0: шагов с записью в sysfs/tcpip в сборке нет и не будет.
+        AppLog.i(TAG, "ADBFIX disabled (iter26: gpio/tcpip отключены — лог 1.0.46: GPIO 151 гасит USB)")
 
         AppLog.e(TAG, "ADB_SELFTEST: failed probes=5555 kind=${p.kind} dt=${p.dt}ms err=${p.err ?: "-"}")
         AppLog.e(TAG, "ROOT_UNAVAILABLE reason=no_adb_root_channel probe=5555 detail=${p.err ?: p.kind}")
@@ -389,13 +412,16 @@ object AdbClient {
         AppLog.e(TAG, "ADBDIAG setprop $PROP_DIAG: rc=$wRc readback=${wOut.trim().ifEmpty { "(empty)" }}")
 
         // P0-E.1: три соединения подряд — adbd обслуживает accept-очередь или нет.
-        AppLog.e(TAG, "ADBDIAG raw5555 multi: 3 соединения по 24 байта (окно ${RAW_READ_MS}ms каждое)")
-        for (i in 1..3) {
+        AppLog.e(TAG, "ADBDIAG raw5555 multi: 2 соединения по 24 байта (окно ${RAW_READ_MS}ms каждое)")
+        for (i in 1..2) {
             val t0 = SystemClock.uptimeMillis()
             val r = runCatching { rawReadOnce() }
             val res = r.getOrElse { "exc=${it.javaClass.simpleName}:${it.message}" }
             AppLog.e(TAG, "ADBDIAG raw5555 #$i $res dt=${SystemClock.uptimeMillis() - t0}ms")
         }
+
+        // iter26 B.3: держим соединение открытым и смотрим, забирает ли adbd из accept-очереди.
+        measureAcceptQueue()
 
         // P0-E.2: на устройстве слушает adb-СЕРВЕР (127.0.0.1:5037) — спросим у него host:devices.
         smartSocketProbe()
@@ -444,6 +470,38 @@ object AdbClient {
             if (n < 24) return "n=$n hex=${hexOf(buf, n)} eof connectDt=${connectDt}ms"
             val cmd = ByteBuffer.wrap(buf, 0, 4).order(ByteOrder.LITTLE_ENDIAN).int
             return "n=24 cmd=${cmdName(cmd)} hex=${hexOf(buf, 24)} connectDt=${connectDt}ms"
+        }
+    }
+
+    /**
+     * iter26 B.3: пока соединение к 5555 открыто, читаем `/proc/net/tcp6` (+`tcp`) и
+     * смотрим строку с `:15B3`: состояние (`0A`=LISTEN, `01`=ESTABLISHED) и `rx_queue`.
+     * recvQ=0 без ESTABLISHED → ядро/сервис не забирает из очереди; recvQ>0 → забирает,
+     * но не отвечает.
+     */
+    private fun measureAcceptQueue() {
+        try {
+            Socket().use { s ->
+                s.connect(InetSocketAddress("127.0.0.1", ADB_PORT_DEFAULT), PROBE_CONNECT_MS)
+                writeMsg(s.getOutputStream(), CNXN, 0x01000000, 4096, "host::central-geely\u0000".toByteArray(StandardCharsets.UTF_8))
+                Thread.sleep(700)
+                for (tbl in listOf("/proc/net/tcp6", "/proc/net/tcp")) {
+                    val (_, out) = runShellFallbackWithRc("awk 'NR==1 || \$2 ~ /:15B3\$/ {print}' $tbl 2>/dev/null | head -8", 3000)
+                    for (line in out.lineSequence()) {
+                        if (!line.contains(":15B3")) continue
+                        val f = line.trim().split(Regex("\\s+"))
+                        if (f.size < 5) continue
+                        val st = f[3]
+                        val q = f[4].split(":")
+                        val txQ = q.getOrNull(0)?.toIntOrNull(16) ?: -1
+                        val rxQ = q.getOrNull(1)?.toIntOrNull(16) ?: -1
+                        val stName = when (st) { "0A" -> "LISTEN"; "01" -> "ESTABLISHED"; "06" -> "TIME_WAIT"; "08" -> "CLOSE_WAIT"; else -> st }
+                        AppLog.e(TAG, "ADBDIAG accept: recvQ=$rxQ sendQ=$txQ state=$stName established=${st == "01"} inode=${f.getOrNull(9) ?: "-"} table=$tbl")
+                    }
+                }
+            }
+        } catch (e: Throwable) {
+            AppLog.e(TAG, "ADBDIAG accept: ${e.javaClass.simpleName}: ${e.message}")
         }
     }
 
@@ -555,11 +613,211 @@ object AdbClient {
      * Умное выполнение: если root-канал жив — через adb; иначе — локальный sh.
      * Только для команд, которым root НЕ нужен (expectRoot=false по смыслу).
      */
+    /** Выполнение на текущем канале (TCP 5555 либо unix-сокет) — для adbFixVerify. */
+    private fun runOnChannel(command: String, timeoutMs: Int): String {
+        return if (state.get() == ChannelState.ROOT_UNIX) execAdbLocalSocket(command, timeoutMs)
+        else execAdbSocket(command, ADB_PORT_DEFAULT, timeoutMs)
+    }
+
     fun executeSmart(command: String, timeoutMs: Int = 4000): Pair<Int, String> {
-        if (state.get() == ChannelState.ROOT_5555) {
+        if (state.get() == ChannelState.ROOT_5555 || state.get() == ChannelState.ROOT_UNIX) {
             return execute(command, timeoutMs, expectRoot = false)
         }
         return runShellFallbackWithRc(command, timeoutMs)
+    }
+
+    // ─────────── iter26 B.2: канал через локальный unix-сокет ───────────
+
+    /**
+     * `android.net.LocalSocket` → `connect("adbd")` → CNXN → через него `OPEN shell:id`.
+     *
+     * РЕФЕРЕНС: `НЕТ В ЭТАЛОНЕ` (CEX работает только по TCP 5555). Механизм стандартный:
+     * adbd слушает abstract unix-сокет "adbd"; доступ к нему у system-uid есть не всегда,
+     * поэтому EACCES — штатный исход, а не ошибка.
+     *
+     * @return true, если канал ответил CNXN и `id` вернул uid=0 (state → ROOT_UNIX)
+     */
+    private fun probeUnixAdbd(): Boolean {
+        val t0 = SystemClock.uptimeMillis()
+        val sock = android.net.LocalSocket()
+        return try {
+            sock.connect(android.net.LocalSocketAddress(ADBD_SOCKET, android.net.LocalSocketAddress.Namespace.ABSTRACT), 2000)
+            val os = sock.outputStream
+            writeMsg(os, CNXN, 0x01000000, 4096, "host::central-geely\u0000".toByteArray(StandardCharsets.UTF_8))
+            sock.soTimeout = 3000
+            val dis = DataInputStream(sock.inputStream)
+            val msg = try { readMsg(dis) } catch (e: Throwable) {
+                AppLog.e(TAG, "ADBDIAG unix-socket connect=ok rx=0 abort=${e.javaClass.simpleName} dt=${SystemClock.uptimeMillis() - t0}ms")
+                return false
+            }
+            AppLog.e(TAG, "ADBDIAG unix-socket connect=ok rx=${msg.payload.size + 24} cmd=${cmdName(msg.cmd)} hex=${hexOf(msg.payload, minOf(24, msg.payload.size))} dt=${SystemClock.uptimeMillis() - t0}ms")
+            if (msg.cmd != CNXN) return false
+            // CNXN получен — пробуем выполнить id через этот же сокет.
+            val idOut = try { execAdbLocalSocket("id", 4000) } catch (e: Throwable) {
+                AppLog.w(TAG, "unix-socket OPEN shell:id failed: ${e.javaClass.simpleName}: ${e.message}")
+                return false
+            }
+            if (isRootUid(idOut)) {
+                unixChannelOk.set(true)
+                state.set(ChannelState.ROOT_UNIX)
+                AppLog.i(TAG, "ADB_SELFTEST: unix-socket ok uid=0 dt=${SystemClock.uptimeMillis() - t0}ms — канал найден БЕЗ TCP (ROOT_UNIX)")
+                AppLog.i(TAG, "ADBDIAG unix-socket uid=0 (работаем через unix, TCP 5555 не трогаем)")
+                return true
+            }
+            AppLog.w(TAG, "ADBDIAG unix-socket connect=ok, но uid не root: ${idOut.take(120)}")
+            false
+        } catch (e: Throwable) {
+            val kind = when (e) {
+                is SecurityException -> "EACCES"
+                is java.net.ConnectException -> "ECONNREFUSED"
+                is java.io.IOException -> "EIO:${e.message}"
+                else -> e.javaClass.simpleName
+            }
+            AppLog.e(TAG, "ADBDIAG unix-socket connect=${kind} rx=0 dt=${SystemClock.uptimeMillis() - t0}ms")
+            false
+        } finally {
+            runCatching { sock.close() }
+        }
+    }
+
+    @Volatile private var unixChannelOk = false
+
+    /** Выполнение shell-команды через unix-сокет (используется, когда state == ROOT_UNIX). */
+    private fun execAdbLocalSocket(command: String, timeoutMs: Int): String {
+        val sock = android.net.LocalSocket()
+        try {
+            sock.connect(android.net.LocalSocketAddress(ADBD_SOCKET, android.net.LocalSocketAddress.Namespace.ABSTRACT), 2000)
+            val os = sock.outputStream
+            writeMsg(os, CNXN, 0x01000000, 4096, "host::central-geely\u0000".toByteArray(StandardCharsets.UTF_8))
+            sock.soTimeout = timeoutMs
+            val dis = DataInputStream(sock.inputStream)
+            while (true) {
+                val m = readMsg(dis)
+                if (m.cmd == CNXN) break
+                if (m.cmd == AUTH) throw IOException("adbd unix: requires AUTH")
+            }
+            val payload = ("shell:$command\u0000").toByteArray(StandardCharsets.UTF_8)
+            writeMsg(os, OPEN, 1, 0, payload)
+            val out = ByteArrayOutputStream()
+            var localId = 0
+            val deadline = System.currentTimeMillis() + timeoutMs
+            while (System.currentTimeMillis() < deadline) {
+                val left = (deadline - System.currentTimeMillis()).toInt().coerceIn(1, Int.MAX_VALUE)
+                sock.soTimeout = left
+                val m = readMsg(dis)
+                when (m.cmd) {
+                    OKAY -> localId = m.arg0
+                    WRTE -> { out.write(m.payload); writeMsg(os, OKAY, 1, m.arg0, ByteArray(0)) }
+                    CLSE -> { writeMsg(os, CLSE, 1, localId, ByteArray(0)); return out.toString("UTF-8").trim() }
+                    else -> {}
+                }
+            }
+            throw IOException("unix shell timeout after ${timeoutMs}ms")
+        } finally {
+            runCatching { sock.close() }
+        }
+    }
+
+    // ─────────── iter26 B.1: штатный перезапуск adbd через настройку ───────────
+
+    /** Context нужен только для Settings.Global (WRITE_SECURE_SETTINGS). */
+    @Volatile private var appCtx: android.content.Context? = null
+    fun attachContext(c: android.content.Context) { if (appCtx == null) appCtx = c.applicationContext }
+    @Volatile private var toggleTried = false
+
+    /**
+     * `Settings.Global.ADB_ENABLED`: system_server наблюдает это значение и вызывает
+     * `UsbDeviceManager.setAdbEnabled()` → перезапуск adbd и его транспортов.
+     * Это ровно тот механизм, что тумблер «Отладка по USB» в «Для разработчиков».
+     * РЕФЕРЕНС: `НЕТ В ЭТАЛОНЕ` (CEX adbd не перезапускает).
+     *
+     * Правила мандата: одна попытка за старт, исходное значение восстанавливается
+     * в `finally` при любом исходе, включая исключение.
+     */
+    private fun adbToggleFix(): Boolean {
+        val ctx = appCtx
+        if (ctx == null) { AppLog.w(TAG, "ADB_TOGGLE skipped: нет Context"); return false }
+        if (toggleTried) { AppLog.i(TAG, "ADB_TOGGLE skipped: попытка уже была в этом запуске"); return false }
+        toggleTried = true
+
+        val cr = ctx.contentResolver
+        val before = try {
+            android.provider.Settings.Global.getInt(cr, android.provider.Settings.Global.ADB_ENABLED, -1)
+        } catch (e: Throwable) { AppLog.w(TAG, "ADB_TOGGLE before: ${e.javaClass.simpleName}: ${e.message}"); -1 }
+        AppLog.i(TAG, "ADB_TOGGLE before=$before")
+        AppLog.w(TAG, "ADB_TOGGLE: если после этого шага отвалится USB — виноват этот шаг, откатывать его первым")
+
+        var ok = false
+        try {
+            val w0 = try {
+                android.provider.Settings.Global.putInt(cr, android.provider.Settings.Global.ADB_ENABLED, 0)
+                true
+            } catch (e: Throwable) { AppLog.w(TAG, "ADB_TOGGLE put(0): ${e.javaClass.simpleName}: ${e.message}"); false }
+            AppLog.i(TAG, "ADB_TOGGLE write=0 accepted=$w0")
+            Thread.sleep(3000)
+            val p0 = fullProbe()
+            AppLog.i(TAG, "ADB_TOGGLE after=0 probe=${p0.kind} dt=${p0.dt}ms")
+
+            val w1 = try {
+                android.provider.Settings.Global.putInt(cr, android.provider.Settings.Global.ADB_ENABLED, 1)
+                true
+            } catch (e: Throwable) { AppLog.w(TAG, "ADB_TOGGLE put(1): ${e.javaClass.simpleName}: ${e.message}"); false }
+            AppLog.i(TAG, "ADB_TOGGLE write=1 accepted=$w1")
+            Thread.sleep(5000)
+            val p1 = fullProbe()
+            AppLog.i(TAG, "ADB_TOGGLE after=1 probe=${p1.kind} dt=${p1.dt}ms uid=${p1.uid.ifEmpty { "-" }}")
+            if (p1.kind == KIND_ROOT) { channelUp(p1); ok = true }
+            else if (p1.kind == KIND_NONROOT) AppLog.w(TAG, "ADB_TOGGLE: порт отвечает, но шелл не root (UP_NONROOT) — успехом не считаем")
+        } catch (e: Throwable) {
+            AppLog.w(TAG, "ADB_TOGGLE exception: ${e.javaClass.simpleName}: ${e.message}")
+        } finally {
+            // Возврат исходного значения при ЛЮБОМ исходе (мандат B.1 п.4).
+            if (before >= 0) {
+                val restored = try {
+                    android.provider.Settings.Global.putInt(cr, android.provider.Settings.Global.ADB_ENABLED, before)
+                    android.provider.Settings.Global.getInt(cr, android.provider.Settings.Global.ADB_ENABLED, -1)
+                } catch (e: Throwable) {
+                    AppLog.w(TAG, "ADB_TOGGLE restore failed: ${e.javaClass.simpleName}: ${e.message}"); null
+                }
+                AppLog.i(TAG, "ADB_TOGGLE restore=$before readback=$restored")
+            }
+        }
+        AppLog.i(TAG, "ADB_TOGGLE result=${if (ok) "OK" else "NO_EFFECT"}")
+        return ok
+    }
+
+    /** iter26 B.1 п.6: root реально вернулся — проверяем не порт, а права. */
+    private fun adbFixVerify(when_: String) {
+        val checks = ArrayList<String>()
+        fun chk(name: String, cmd: String, expect: String) {
+            try {
+                val out = runOnChannel(cmd, 5000).replace('\n', ' ').trim()
+                checks.add("$name=${if (out.contains(expect)) "OK" else "FAIL"}(${out.take(80)})")
+            } catch (e: Throwable) {
+                checks.add("$name=ERR(${e.javaClass.simpleName})")
+            }
+        }
+        chk("id", "id", "uid=0")
+        chk("screen_off_timeout", "settings get system screen_off_timeout; echo rc=\$?", "rc=0")
+        chk("prop_write", "setprop $PROP_DIAG 48; getprop $PROP_DIAG", "48")
+        // iter26: `$?` берём сразу после iptables, а не после head.
+        chk("iptables", "iptables -t mangle -S POSTROUTING >/dev/null 2>&1; echo rc=\$?", "rc=0")
+        val failed = checks.filter { !it.contains("=OK") }
+        AppLog.i(TAG, "ADBFIX verify[$when_]=${if (failed.isEmpty()) "OK" else "PARTIAL"} ${checks.joinToString(" ")}")
+    }
+
+    /** Диагноз — не чаще одного раза за загрузку (iter26 B.4). */
+    private fun diagAllowedThisBoot(): Boolean {
+        val ctx = appCtx
+        val bootId = try {
+            java.io.File("/proc/sys/kernel/random/boot_id").readText().trim()
+        } catch (_: Throwable) { "" }
+        if (ctx == null || bootId.isEmpty()) return true
+        val saved = Prefs2.getString(ctx, PREF_DIAG_BOOT, "") ?: ""
+        if (saved == bootId) return false
+        Prefs2.putString(ctx, PREF_DIAG_BOOT, bootId)
+        AppLog.i(TAG, "ADBDIAG: первая загрузка с этим boot_id=${bootId.take(8)} — полный диагноз разрешён")
+        return true
     }
 
     private fun fallbackNoRoot(reason: String) {
@@ -586,6 +844,18 @@ object AdbClient {
     private fun runCommand(cmd: String, timeoutMs: Int, expectRoot: Boolean): Pair<Int, String> {
         val shortCmd = cmd.replace("\\s+".toRegex(), " ").take(160)
         val st = state.get()
+
+        // iter26 B.2: если канал найден через unix-сокет — работаем через него, TCP не трогаем.
+        if (st == ChannelState.ROOT_UNIX) {
+            val out = try {
+                execAdbLocalSocket(cmd, timeoutMs)
+            } catch (e: Throwable) {
+                val msg = "ERR_ADB_UNIX: ${e.javaClass.simpleName}: ${e.message}"
+                AppLog.e(TAG, "VERIFY EXEC unix rc=1 cmd=${shortCmd} → FAILED ($msg)")
+                return Pair(1, msg)
+            }
+            return classify(0, expectRoot, shortCmd, out, 0)
+        }
 
         if (expectRoot && st != ChannelState.ROOT_5555) {
             // Жёсткий запрет: root-команда без root-канала — не падаем в sh.

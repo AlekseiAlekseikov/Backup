@@ -259,6 +259,9 @@ class VoiceAssistantService : Service() {
         OverlayPermission.ensure(this)
         checkAndRequestPermissions()
         startForegroundService()
+        // iter26 B.1/B.4: AdbClient нужен Context для Settings.Global.ADB_ENABLED и для
+        // флага «диагноз один раз за загрузку» (boot_id) в prefs.
+        runCatching { com.example.voiceapp3.tools.AdbClient.attachContext(this) }
         registerKeyReceiver()
         registerWakeWordSwitchReceiver()
         registerHubReceiver()
