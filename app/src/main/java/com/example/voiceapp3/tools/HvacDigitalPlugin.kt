@@ -403,14 +403,15 @@ object HvacDigitalPlugin {
 
         // 3) umount bind-точек + один перезапуск SystemUI. Нужен root-канал.
         val rootState = AdbClient.currentState()
-        // iter24 P0.3: канал теперь ровно один — ROOT_5555 (второго порта нет).
-        val haveRoot = rootState == AdbClient.ChannelState.ROOT_5555
+        // iter27 D2: «есть root» = ROOT_5555 ИЛИ ROOT_UNIX (единый хелпер, чтобы UI и логика
+        // не расходились). Второго TCP-порта по-прежнему нет.
+        val haveRoot = AdbClient.hasRoot()
         var restoreOk = false
         var restoreOut = ""
         if (!haveRoot) {
             AppLog.e(TAG, "ROOT_UNAVAILABLE reason=restoreSystemUi needs root (state=$rootState port=${AdbClient.currentPort()})")
             // iter23 P2.6: это ОШИБКА шага (не «пропущено»): панель останется смонтированной.
-            steps += stepOf("restore", "umount + kill systemui (нужен root-канал 5555)", ToolsStep.Status.FAILED,
+            steps += stepOf("restore", "umount + kill systemui (нужен root-канал: 5555 или unix-adbd)", ToolsStep.Status.FAILED,
                 expected = "RESTORE_OK", actual = "root_channel_unavailable state=$rootState port=${AdbClient.currentPort()}",
                 stdout = "Нет root-канала: 5555 не отвечает (uid=1000) — умонтировать bind и перезапустить SystemUI нельзя.")
         } else {

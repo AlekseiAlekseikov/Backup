@@ -828,9 +828,11 @@ class ToolsPanel(
         val st = state.get("rootState")?.takeIf { it.isJsonPrimitive }?.asString.orEmpty()
         val port = state.get("rootPort")?.takeIf { it.isJsonPrimitive }?.asString.orEmpty()
         if (st.isEmpty()) return
-        val ok = st == "ROOT_5555"
+        // iter27 D2: успех бывает и через unix-сокет (ROOT_UNIX) — не показываем ложное «недоступен».
+        val ok = st == "ROOT_5555" || st == "ROOT_UNIX"
         val msg = if (ok)
-            "ROOT: канал готов — порт ${if (port.isEmpty()) "?" else port}"
+            if (st == "ROOT_UNIX") "ROOT: канал готов — unix-сокет «adbd» (TCP не используется)"
+            else "ROOT: канал готов — порт ${if (port.isEmpty()) "?" else port}"
         else
             "ROOT: канал недоступен — 5555 не отвечает (uid=1000). Детали — кнопка «Проверить root»"
         page.addView(text(msg, 13f, if (ok) Color.parseColor("#18963E") else Color.parseColor("#B54708"), bold = true).apply {
