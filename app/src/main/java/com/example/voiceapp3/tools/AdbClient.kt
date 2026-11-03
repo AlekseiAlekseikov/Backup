@@ -595,7 +595,7 @@ object AdbClient {
         val line = AdbAuth.publicKeyLine()
         AppLog.i(TAG, "ADB_KEYS self-register check: key=${if (line == null) "none" else "ok len=${line.length}"}")
         val (rls, ls) = try { runShellFallbackWithRc("ls -l /data/misc/adb/ 2>&1", 3000) } catch (t: Throwable) { Pair(1, "EXC:${t.message}") }
-        AppLog.i(TAG, "ADB_KEYS: ls -l /data/misc/adb/ rc=$rls out=${ls.replace('\n', ' | ').take(200)}")
+        AppLog.i(TAG, "ADB_KEYS: ls -l /data/misc/adb/ rc=$rls out=${ls.replace("\n", " | ").take(200)}")
         val readable = try { java.io.File("/data/misc/adb/adb_keys").canRead() } catch (_: Throwable) { false }
         AppLog.i(TAG, "ADB_KEYS: readable=$readable")
         val writable = try { java.io.File("/data/misc/adb/adb_keys").canWrite() } catch (_: Throwable) { false }
