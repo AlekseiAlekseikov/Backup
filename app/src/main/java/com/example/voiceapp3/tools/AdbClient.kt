@@ -55,6 +55,18 @@ object AdbClient {
     /** Порт локального adb-СЕРВЕРА (хост-сторона), найден в логе 1.0.46 в LISTEN. */
     private const val ADB_SERVER_PORT = 5037
     private const val PROP_DIAG = "persist.sys.hvacdigital.diag"
+    // ── iter28 P0-A: параметры рукопожатия как у настоящего adb (platform-tools, SDK 28-30) ──
+    private const val A_VERSION = 0x01000000
+    private const val A_MAXDATA = 262144
+    private const val AUTH_TOKEN = 1
+    private const val AUTH_SIGNATURE = 2
+    private const val AUTH_RSAPUBLICKEY = 3
+    private const val HOST_BANNER_FEATURES =
+        "host::features=cmd,shell_v2,stat_v2,ls_v2,fixed_push_mkdir,apex,abb,abb_exec,remount_shell," +
+        "track_app,track_jdwp,sendrecv_v2,sendrecv_v2_brotli,sendrecv_v2_lz4,sendrecv_v2_zstd," +
+        "sendrecv_v2_dry_run_send,devicetracker_proto_format,delayed_ack,avarice,apap,ipv6,pushes"
+    private const val HOST_BANNER_LEGACY = "host::central-geely"
+
     private const val CNXN = 0x4e595343
     private const val AUTH = 0x48545541
     private const val OPEN = 0x4e45504f
@@ -281,9 +293,9 @@ object AdbClient {
         AppLog.i(TAG, "ADB_PROBE port=$ADB_PORT_DEFAULT kind=${p.kind} dt=${p.dt}ms uid=${p.uid.ifEmpty { "-" }}")
         if (p.kind == KIND_ROOT) { channelUp(p); return }
 
-        // iter26 B.2: сначала пробуем канал БЕЗ TCP — локальный unix-сокет "adbd".
-        // Это дешевле любой диагностики и не зависит от того, обслуживается ли accept.
-        if (probeUnixAdbd()) return
+        // iter28 P0-C: unix-путь из bootstrap убран (SELinux: canRead=false + UnsupportedOperationException).
+        // Оставляем одну строку-диагноз, канал — только TCP 5555.
+        logUnixSocketFacts()
 
         // P0.1: однозначный диагноз — один раз за загрузку (B.4).
         if (diagAllowedThisBoot()) {
@@ -292,20 +304,28 @@ object AdbClient {
             AppLog.i(TAG, "ADBDIAG skipped: уже выполнялся в этой загрузке (повторно не растягиваем старт)")
         }
 
-        // iter26 B.1: единственная новая запись в системе — Settings.Global.ADB_ENABLED.
-        // Это тот же путь, что тумблер «Отладка по USB»: system_server перезапускает adbd.
-        val toggled = runCatching { adbToggleFix() }.getOrElse {
-            AppLog.e(TAG, "ADB_TOGGLE crashed: ${it.javaClass.simpleName}: ${it.message}")
-            false
+        // iter28 P0-D: ADB_TOGGLE из bootstrap убран — в 1.0.49 дал NO_EFFECT, а риск для USB
+        // на этой ГУ остаётся. Шаг доступен только как ручное действие владельца (см. отчёт).
+
+        // iter28 P0-G: один раз за процесс проверяем, может ли system-uid дописать СВОЙ ключ
+        // в /data/misc/adb/adb_keys (чужие строки не трогаем никогда).
+        if (!keysChecked) {
+            keysChecked = true
+            runCatching { adbKeysSelfRegister() }.onFailure { AppLog.w(TAG, "ADB_KEYS check failed: ${it.message}") }
         }
-        if (toggled) {
-            AppLog.i(TAG, "ADB_TOGGLE result=OK (uid=0 после перезапуска adbd)")
-            adbFixVerify("after_toggle")
+
+        // iter28 P0-A/P0-B: эксперимент с рукопожатием и авторизацией. Это и есть главная попытка:
+        // проба выше шла тем же путём, но теперь handshake пробует оба варианта CNXN и умеет AUTH.
+        if (runCatching { handshakeExperiment() }.getOrElse {
+                AppLog.e(TAG, "ADB_HANDSHAKE crashed: ${it.javaClass.simpleName}: ${it.message}"); false
+            }) {
+            adbFixVerify("after_handshake")
+            replayDeferred()
             return
         }
 
-        // iter25 P0: шагов с записью в sysfs/tcpip в сборке нет и не будет.
-        AppLog.i(TAG, "ADBFIX disabled (iter26: gpio/tcpip отключены — лог 1.0.46: GPIO 151 гасит USB)")
+        // Записей в sysfs/tcpip в сборке нет и не будет.
+        AppLog.i(TAG, "ADBFIX disabled (iter28: gpio/tcpip/toggle отключены — лог 1.0.46: GPIO 151 гасит USB)")
 
         AppLog.e(TAG, "ADB_SELFTEST: failed probes=5555 kind=${p.kind} dt=${p.dt}ms err=${p.err ?: "-"}")
         AppLog.e(TAG, "ROOT_UNAVAILABLE reason=no_adb_root_channel probe=5555 detail=${p.err ?: p.kind}")
@@ -442,7 +462,177 @@ object AdbClient {
             AppLog.e(TAG, "ADBDIAG prop $prop rc=$rc val=${out.trim().ifEmpty { "(empty)" }}")
         }
 
+        // iter28 P0-E: данные для разбора авторизации — только чтение.
+        for ((cmd, name) in listOf(
+            "getprop ro.product.device" to "prop ro.product.device",
+            "getprop ro.build.version.sdk" to "prop ro.build.version.sdk",
+            "ls -l /data/misc/adb/ 2>&1" to "ls /data/misc/adb",
+            "wc -l < /data/misc/adb/adb_keys 2>&1" to "wc adb_keys",
+        )) {
+            val (rc, out) = try { runShellFallbackWithRc(cmd, 3000) } catch (t: Throwable) { Pair(1, "EXC:${t.message}") }
+            AppLog.e(TAG, "ADBDIAG $name rc=$rc val=${out.replace('\n', ' ').take(200).ifEmpty { "(empty)" }}")
+        }
+        AppLog.i(TAG, "ADB_HINT: при проблеме пришлите вывод logcat -d -b all | grep -iE 'adbd|auth'")
+
         AppLog.e(TAG, "ADBDIAG end")
+    }
+
+    // ─────────── iter28 P0-A/P0-B: рукопожатие и авторизация ───────────
+
+    /**
+     * Эксперимент: два варианта CNXN (A_VERSION 0x01000000 + features, затем 0x01000001 без features)
+     * с обработкой AUTH. При успехе — `channelUp` и `true`.
+     */
+    private fun handshakeExperiment(): Boolean {
+        AdbAuth.init(appCtx)
+        for ((idx, variant) in listOf(0, 1).withIndex()) {
+            val t0 = SystemClock.uptimeMillis()
+            val out = try {
+                execAdbSocket("id; id -Z 2>/dev/null", ADB_PORT_DEFAULT, PROBE_TOTAL_MS, PROBE_CONNECT_MS, variant)
+            } catch (e: Throwable) {
+                AppLog.e(TAG, "ADB_HANDSHAKE variant=${variantName(variant)} failed: ${e.javaClass.simpleName}: ${e.message} dt=${SystemClock.uptimeMillis() - t0}ms")
+                continue
+            }
+            val dt = SystemClock.uptimeMillis() - t0
+            if (isRootUid(out)) {
+                channelUp(Probe(KIND_ROOT, out.lineSequence().firstOrNull().orEmpty().trim(), "variant=${variantName(variant)}", dt, null))
+                AppLog.i(TAG, "ADB_HANDSHAKE OK variant=${variantName(variant)} dt=${dt}ms (attempt ${idx + 1})")
+                return true
+            }
+            AppLog.w(TAG, "ADB_HANDSHAKE variant=${variantName(variant)}: ответ есть, но uid не root: ${out.take(120)}")
+        }
+        AppLog.e(TAG, "ADB_HANDSHAKE: оба варианта не дали uid=0")
+        return false
+    }
+
+    private fun variantName(v: Int) = if (v == 0) "v0x01000000+features" else "v0x01000001+legacy"
+
+    /**
+     * Рукопожатие на уже подключённом сокете: CNXN → (AUTH TOKEN → SIGNATURE)* → CNXN.
+     * Возвращает null, если пришёл CNXN; иначе — причину.
+     * Логи: `ADB_TX …` (что отправили) и `ADB_RX attempt=… cmd=… hex=… dt=…` (что получили).
+     */
+    private fun handshake(s: Socket, dis: DataInputStream, os: OutputStream, attempt: Int, variant: Int, deadline: Long): String? {
+        val version = if (variant == 0) A_VERSION else 0x01000001
+        val banner = if (variant == 0) HOST_BANNER_FEATURES else HOST_BANNER_LEGACY
+        val payload = "$banner\u0000".toByteArray(StandardCharsets.UTF_8)
+        val hdrHex = msgHeaderHex(CNXN, version, A_MAXDATA, payload)
+        writeMsg(os, CNXN, version, A_MAXDATA, payload)
+        AppLog.i(TAG, "ADB_TX cmd=CNXN arg0=0x${"%08x".format(version)} arg1=$A_MAXDATA len=${payload.size} hex=$hdrHex")
+        var authSteps = 0
+        while (true) {
+            val left = deadline - System.currentTimeMillis()
+            if (left <= 0) return "silent (CNXN timeout)"
+            val tMsg = System.currentTimeMillis()
+            s.soTimeout = left.toInt().coerceIn(1, Int.MAX_VALUE)
+            val msg = try { readMsg(dis) } catch (e: Throwable) {
+                AppLog.e(TAG, "ADB_RX attempt=$attempt cmd=silent hex=(none) dt=${System.currentTimeMillis() - tMsg}ms err=${e.javaClass.simpleName}")
+                return "silent (${e.javaClass.simpleName})"
+            }
+            AppLog.i(TAG, "ADB_RX attempt=$attempt cmd=${cmdName(msg.cmd)} arg0=${msg.arg0} arg1=${msg.arg1} len=${msg.payload.size} hex=${hexOf(msg.payload, minOf(24, msg.payload.size))} dt=${System.currentTimeMillis() - tMsg}ms")
+            when (msg.cmd) {
+                CNXN -> {
+                    val bannerRx = try { String(msg.payload, Charsets.UTF_8).trim() } catch (_: Throwable) { "" }
+                    AppLog.i(TAG, "ADB_RX attempt=$attempt cmd=CNXN maxdata=${msg.arg1} device=${bannerRx.take(80)}")
+                    return null
+                }
+                AUTH -> {
+                    authSteps++
+                    if (authSteps > 4) return "auth loop (более 4 шагов)"
+                    when (msg.arg0) {
+                        AUTH_TOKEN -> {
+                            val sig = AdbAuth.signToken(msg.payload)
+                            if (sig == null) {
+                                AppLog.e(TAG, "ADB_AUTH token received, но ключа нет — подписать нечем")
+                                return "auth no key"
+                            }
+                            writeMsg(os, AUTH, AUTH_SIGNATURE, 0, sig)
+                            AppLog.i(TAG, "ADB_AUTH token received, signature sent, reply=<ждём> sig_len=${sig.size}")
+                        }
+                        AUTH_SIGNATURE, AUTH_RSAPUBLICKEY -> {
+                            val line = AdbAuth.publicKeyLine()
+                            AppLog.e(TAG, "ADB_AUTH: adbd просит ключ, которого нет в adb_keys (см. ADB_PUBKEY) — отправляем публичный ключ")
+                            if (line == null) return "adbd asks for key, no pubkey"
+                            writeMsg(os, AUTH, AUTH_RSAPUBLICKEY, 0, "$line\u0000".toByteArray(Charsets.UTF_8))
+                            AppLog.i(TAG, "ADB_AUTH publickey sent len=${line.length}")
+                        }
+                        else -> return "auth unknown type ${msg.arg0}"
+                    }
+                }
+                else -> AppLog.i(TAG, "ADB_RX attempt=$attempt cmd=${cmdName(msg.cmd)} (игнорируем в рукопожатии)")
+            }
+        }
+    }
+
+    /** hex 24-байтного заголовка того, что отправляем (для отчёта и сверки с платформой). */
+    private fun msgHeaderHex(cmd: Int, arg0: Int, arg1: Int, payload: ByteArray): String {
+        val bytes = msgBytes(cmd, arg0, arg1, payload)
+        return bytes.take(24).joinToString(" ") { "%02x".format(it) }
+    }
+
+    private fun msgBytes(cmd: Int, arg0: Int, arg1: Int, payload: ByteArray): ByteArray {
+        val buf = ByteBuffer.allocate(24).order(ByteOrder.LITTLE_ENDIAN)
+        buf.putInt(cmd); buf.putInt(arg0); buf.putInt(arg1); buf.putInt(payload.size)
+        var sum = 0; for (b in payload) sum += b.toInt() and 0xFF
+        buf.putInt(sum); buf.putInt(cmd.inv())
+        return buf.array()
+    }
+
+    // ─────────── iter28 P0-C: unix-сокет — только факт в лог ───────────
+
+    /** Одна строка: существует ли сокет, читается ли, и что ответил бы connect (мы НЕ подключаемся). */
+    private fun logUnixSocketFacts() {
+        try {
+            val f = java.io.File(ADBD_SOCKET_PATH)
+            AppLog.i(TAG, "ADBDIAG unix-socket exists=${f.exists()} canRead=${f.canRead()} path=$ADBD_SOCKET_PATH (в bootstrap не используется: SELinux + Namespace.FILESYSTEM без timeout)")
+        } catch (t: Throwable) {
+            AppLog.w(TAG, "ADBDIAG unix-socket facts failed: ${t.message}")
+        }
+    }
+
+    /** iter28 P0-G: может ли android.uid.system записать свой ключ в adb_keys (только своя строка). */
+    private fun adbKeysSelfRegister() {
+        val line = AdbAuth.publicKeyLine()
+        AppLog.i(TAG, "ADB_KEYS self-register check: key=${if (line == null) "none" else "ok len=${line.length}"}")
+        val (rls, ls) = try { runShellFallbackWithRc("ls -l /data/misc/adb/ 2>&1", 3000) } catch (t: Throwable) { Pair(1, "EXC:${t.message}") }
+        AppLog.i(TAG, "ADB_KEYS: ls -l /data/misc/adb/ rc=$rls out=${ls.replace('\n', ' | ').take(200)}")
+        val readable = try { java.io.File("/data/misc/adb/adb_keys").canRead() } catch (_: Throwable) { false }
+        AppLog.i(TAG, "ADB_KEYS: readable=$readable")
+        val writable = try { java.io.File("/data/misc/adb/adb_keys").canWrite() } catch (_: Throwable) { false }
+        AppLog.i(TAG, "ADB_KEYS: writable=$writable")
+        if (line == null) { AppLog.i(TAG, "ADB_KEYS self-register=denied reason=no_key"); return }
+        if (!writable) {
+            AppLog.i(TAG, "ADB_KEYS self-register=denied reason=${if (readable) "EPERM" else "EACCES|SELinux"}")
+            return
+        }
+        // Свою строку дописываем только если её ещё нет; чужие строки не трогаем никогда.
+        try {
+            val f = java.io.File("/data/misc/adb/adb_keys")
+            val cur = if (f.exists()) f.readText() else ""
+            if (cur.contains(line)) {
+                AppLog.i(TAG, "ADB_KEYS self-register=ok (наш ключ уже был в файле)")
+                return
+            }
+            f.appendText(if (cur.isEmpty() || cur.endsWith("\n")) "$line\n" else "\n$line\n")
+            for (cmd in listOf("chmod 640 /data/misc/adb/adb_keys", "chown system:shell /data/misc/adb/adb_keys", "restorecon /data/misc/adb/adb_keys")) {
+                val (rc, out) = runShellFallbackWithRc("$cmd 2>&1", 3000)
+                AppLog.i(TAG, "ADB_KEYS: $cmd rc=$rc ${out.replace('\n', ' ').take(120)}")
+            }
+            val after = runShellFallback("wc -l < /data/misc/adb/adb_keys 2>&1", 3000).trim()
+            AppLog.i(TAG, "ADB_KEYS self-register=ok lines_after=$after")
+        } catch (t: Throwable) {
+            AppLog.i(TAG, "ADB_KEYS self-register=denied reason=${t.javaClass.simpleName}: ${t.message}")
+        }
+    }
+
+    /** iter28 P0-D: после успеха доделываем отложенную работу, не дожидаясь следующего тика. */
+    private fun replayDeferred() {
+        val ctx = appCtx
+        AppLog.i(TAG, "ADB_REPLAY: отложенная работа после восстановления канала (ctx=${ctx != null})")
+        if (ctx == null) return
+        runCatching { NetworkTtl.bootRestore(ctx) }.onFailure { AppLog.w(TAG, "ADB_REPLAY TTL failed: ${it.message}") }
+        runCatching { StatusIcons.bootRestoreHvacDigital(ctx) }.onFailure { AppLog.w(TAG, "ADB_REPLAY HVAC failed: ${it.message}") }
+        runCatching { StatusIcons.syncAll(ctx) }.onFailure { AppLog.w(TAG, "ADB_REPLAY sync failed: ${it.message}") }
     }
 
     /**
@@ -707,6 +897,7 @@ object AdbClient {
     }
 
     @Volatile private var unixChannelOk = false
+    @Volatile private var keysChecked = false
     /** Какое пространство имён сработало: "filesystem" | "abstract" | "" (не найдено). */
     @Volatile private var unixNs = ""
 
@@ -1024,7 +1215,7 @@ object AdbClient {
      * Низкоуровневое выполнение одной shell-команды через ADB-сокет.
      * Поведение совпадает с kotlinx.coroutines.scheduling.h (порт CentralEXAuto).
      */
-    private fun execAdbSocket(command: String, port: Int, timeoutMs: Int, connectTimeoutMs: Int = PROBE_CONNECT_MS): String {
+    private fun execAdbSocket(command: String, port: Int, timeoutMs: Int, connectTimeoutMs: Int = PROBE_CONNECT_MS, variant: Int = 0): String {
         val payload = ("shell:$command\u0000").toByteArray(StandardCharsets.UTF_8)
         // iter21 §1.3: не валим IllegalArgumentException в общий поток — возвращаем ERR_ADB_TOO_LONG.
         if (payload.size > 4096) {
@@ -1036,25 +1227,10 @@ object AdbClient {
             s.soTimeout = timeoutMs
             val dis = DataInputStream(s.getInputStream())
             val os = s.getOutputStream()
-            val banner = "host::central-geely\u0000".toByteArray(StandardCharsets.UTF_8)
-            writeMsg(os, CNXN, 0x01000000, 4096, banner)
-            // Ждём CNXN в ответ; AUTH — ошибка (нужна авторизация по ключу).
-            while (true) {
-                val left = deadline - System.currentTimeMillis()
-                if (left <= 0) throw IOException("ADB CNXN timeout")
-                s.soTimeout = left.toInt().coerceIn(1, Int.MAX_VALUE)
-                val msg = readMsg(dis)
-                when (msg.cmd) {
-                    CNXN -> break
-                    AUTH -> {
-                        val authMsg = "adbd requires RSA auth on port $port (banner=${msg.txt()})"
-                        AppLog.e(TAG, "ADB: $authMsg")
-                        portDiagnosticDump(authMsg)
-                        throw IOException(authMsg)
-                    }
-                    else -> Log.d(TAG, "ADB $port rx ${cmdName(msg.cmd)} during CNXN (ignored)")
-                }
-            }
+            // iter28 P0-A/P0-B: рукопожатие как у настоящего adb, с обработкой AUTH.
+            AdbAuth.init(appCtx)
+            val hsErr = handshake(s, dis, os, attempt = variant + 1, variant = variant, deadline = deadline)
+            if (hsErr != null) throw IOException("ADB handshake failed: $hsErr")
             writeMsg(os, OPEN, 1, 0, payload)
             var localId = 0
             val out = ByteArrayOutputStream()
