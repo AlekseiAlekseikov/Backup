@@ -310,3 +310,27 @@
   перезапущен → `41793783872` success.
 - CI: run **41793783872** success, artifact **13305252463**, APK `/home/user/app-iter30-v1.0.51.apk`
   (215 308 089 B, sha256 `d29d8c9b02546c6a0db135a061a6cd22423c558055a1d2a6c2e52fa9570aead7`).
+
+## iter30b — дельта к 1.0.51 (номер версии НЕ менялся, `build.gradle.kts` не тронут)
+
+- **F1**: проба `ADB_DEST` покрывает оба варианта пакета — `probeDestination(addr, attempt, variant)`
+  (`AdbClient.kt:510`): `variant=0` → `arg1=262144` + `HOST_BANNER_FEATURES`; `variant=1` → `arg1=4096`
+  (`A_MAXDATA_LEGACY`, `:68`) + `HOST_BANNER_LEGACY`. Чередование `a % 2 == 1 → 0, иначе 1` (`:668`);
+  в логах появились поля `variant=` (`:522`, `:536`, `:556`, `:561`, `:565`) и `variants=0/1`
+  в сводке по адресу (`:688`). Протокол/заголовок/размеры/порядок адресов не менялись.
+- **F2**: `logAdbProps()` (`:709-714`) — `ADB_PROP key=<имя> val=<значение|(empty)> rc=<n>` для пяти
+  adb-свойств, вызывается **всегда** сразу после `ADB_SELF` (`:332`), вне гейта `diagAllowedThisBoot`;
+  дублирующий блок в `adbDiag` заменён комментарием (`:1008-1012`), литералы вынесены в `PROPS_ADB` (`:59`).
+- **F3**: при `listenerOwner == "foreign"` — **одна** проба unix-сокета (`:380-397`), итог
+  `ADB_UNIX verdict=up|down state=… uid=… ns=…` (`:386`), иначе строка `ADB_UNIX skipped reason=…` (`:398`).
+  При успехе: `listenerOwner="unix"`, `channelUpUnix(dt)` (`:987-994`) — **не** `channelUp`, потому что тот
+  ставит `state=ROOT_5555` и увёл бы команды на мёртвый TCP; далее `adbFixVerify`, `EXEC_PROP`,
+  `replayDeferred`, `logVerdict(true)` и `return` (без `scheduleDeferredRetry`).
+- Запреты (grep по `app/src/main`): `mt_gpio` 2 (комментарий + строка лога `App.kt`), `65010` 0,
+  `tcpip:5555` 0, `setprop *.adb.tcp.port` 0 (`AdbClient.kt:35` — комментарий), `ctl.restart` — только
+  комментарии в `AdbClient.kt` + чужие `AppPerformance.kt` (не менялись), записи в `adb_keys` 0,
+  `android_usb` 0, `ADB_TOGGLE` — только внутри невызываемой `adbToggleFix()`, новых `settings put` 0.
+- Сбои по пути: run `41796467201` — `failure` по вине раннера (`No space left on device`).
+  В дело не идут промежуточные `41798265725` и `41800171837` (сборки до правок).
+- CI: run **41802282277** success, artifact **13309251411**, APK `/home/user/app-iter30b-v1.0.51.apk`
+  (215 312 005 B, sha256 `7569b9879bcb5685d0053c1a41f6394013eabcd6af702e0cf1870e9603e6461f`).
