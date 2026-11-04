@@ -61,9 +61,9 @@ object AdbClient {
     private const val A_VERSION = 0x01000000
     private const val A_MAXDATA = 262144
     /**
-     * iter30b F1: ровно те байты, с которыми канал РЕАЛЬНО работал в 1.0.43
-     * (лог 1.0.43: `43 53 59 4e 00 00 00 01 00 10 00 00 14 00 00 00 …` ⇒ arg1=0x1000=4096,
-     * баннер `host::central-geely`, len=20). Используется как второй вариант пробы.
+     * iter30b F1: параметры пакета, с которыми канал РЕАЛЬНО работал в 1.0.43 —
+     * arg1=0x1000 (4096), баннер `host::central-geely`, len=20 (hex считается из них; в логе
+     * 1.0.43 hex-дампа не было). Используется как второй вариант пробы.
      */
     private const val A_MAXDATA_LEGACY = 4096
     private const val AUTH_TOKEN = 1
