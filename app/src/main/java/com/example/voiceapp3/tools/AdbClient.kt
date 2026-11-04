@@ -58,7 +58,18 @@ object AdbClient {
     /** iter30b F2: свойства, которые читаются всегда (ADB_PROP) и больше не дублируются в ADBDIAG. */
     private val PROPS_ADB = listOf("service.adb.tcp.port", "persist.adb.tcp.port", "init.svc.adbd", "ro.adb.secure", "ro.secure")
     // ── iter28 P0-A: параметры рукопожатия как у настоящего adb (platform-tools, SDK 28-30) ──
-    private const val A_VERSION = 0x01000000
+    /**
+     * iter32 §1а: версия протокола — как у platform-tools (`A_VERSION_SKIP_CHECKSUM`).
+     * Прошивка ГУ отвечает `arg0 = 0x01000001` и присылает `data_check = 0` (в том числе на пакет
+     * с версией 0x01000000), поэтому:
+     *   • в пакетах с версией ≥ 0x01000001 контрольная сумма НЕ считается (`sum = 0`), как в
+     *     `transport.cpp` у platform-tools;
+     *   • при чтении `sum = 0` считается валидным всегда (см. `readMsg`).
+     * `A_VERSION_LEGACY` — версия пакета 1.0.43 (вариант 1 пробы): там сумма считается по-старому.
+     */
+    private const val A_VERSION = 0x01000001
+    private const val A_VERSION_LEGACY = 0x01000000
+    private const val A_VERSION_SKIP_CHECKSUM = 0x01000001
     private const val A_MAXDATA = 262144
     /**
      * iter30b F1: параметры пакета, с которыми канал РЕАЛЬНО работал в 1.0.43 —
@@ -88,12 +99,46 @@ object AdbClient {
     private const val PROP_EXT_TEMP = "persist.sys.hvacdigital.temp_ext"
     private const val PROP_VIA = "persist.sys.hvacdigital.via"
 
-    private const val CNXN = 0x4e595343
-    private const val AUTH = 0x48545541
-    private const val OPEN = 0x4e45504f
-    private const val OKAY = 0x4b414b4f
-    private const val WRTE = 0x57525445
-    private const val CLSE = 0x434c5345
+    /**
+     * iter32 §0/§1: КОРНЕВАЯ ПРИЧИНА молчащего канала — числа команд были записаны руками и
+     * перевёрнуты. Было `CNXN = 0x4e595343` ⇒ в сеть уходили байты `43 53 59 4e` = "CSYN"
+     * (ровно это видно в логах 1.0.50/1.0.51: `ADB_TX … hex=43 53 59 4e …`), `OKAY = 0x4b414b4f`
+     * = "OAKB", `WRTE = 0x57525445` = "ETRW", `CLSE = 0x434c5345` = "ESLC".
+     * В AOSP `adb/adb.h`: `A_CNXN 0x4e584e43` (байты `43 4e 58 4e` = "CNXN"), `A_OKAY 0x59414b4f`,
+     * `A_WRTE 0x45545257`, `A_CLSE 0x45534c43`.
+     * `magic = ~command` согласован сам с собой, поэтому adbd такой пакет принимал, читал
+     * (`rx_queue` → 0), не находил `case` в `handle_packet()` и молчал — транспорт висел
+     * `ESTABLISHED`. Теперь значения ВЫЧИСЛЯЮТСЯ из имени команды, руками их не задать.
+     */
+    private fun cmdOf(name: String): Int =
+        ByteBuffer.wrap(name.toByteArray(Charsets.US_ASCII)).order(ByteOrder.LITTLE_ENDIAN).int
+
+    private val CNXN = cmdOf("CNXN")
+    private val AUTH = cmdOf("AUTH")
+    private val OPEN = cmdOf("OPEN")
+    private val OKAY = cmdOf("OKAY")
+    private val WRTE = cmdOf("WRTE")
+    private val CLSE = cmdOf("CLSE")
+
+    /** Обратное преобразование: 4 байта LE команды → ASCII-строка (для логов и самопроверки). */
+    private fun asciiOf(cmd: Int): String {
+        val b = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(cmd).array()
+        return String(b, Charsets.US_ASCII).map { if (it.code in 32..126) it else '.' }.joinToString("")
+    }
+
+    /** `43 4e 58 4e` — первые четыре байта пакета, чтобы регрессию было видно с первого взгляда. */
+    private fun hex4Of(cmd: Int): String =
+        ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(cmd).array()
+            .joinToString(" ") { "%02x".format(it) }
+
+    /**
+     * Действующая версия протокола соединения: от неё зависит, считается ли контрольная сумма.
+     * Выставляется на каждое соединение (проба/рукопожатие/unix) и уточняется версией из ответа adbd.
+     */
+    @Volatile private var sessionVersion: Int = A_VERSION
+
+    /** Версия пакета для варианта пробы: 0 → 0x01000001 (platform-tools), 1 → 0x01000000 (1.0.43). */
+    private fun versionOf(variant: Int): Int = if (variant == 0) A_VERSION else A_VERSION_LEGACY
 
     /**
      * iter24 P0.3: порт РОВНО ОДИН — 5555 (как у клиента эталона).
@@ -327,6 +372,9 @@ object AdbClient {
     private fun bootstrap() {
         state.set(ChannelState.BOOTING)
 
+        // iter32 §2.2: сначала — самопроверка констант протокола (одна строка на команду + итог).
+        runCatching { adbConstSelfTest() }.onFailure { AppLog.w(TAG, "ADB_CONST self-test failed: ${it.message}") }
+
         // iter29 P0-A0: ПЕРВОЙ строкой после старта AdbWorker — кто мы для ядра/SELinux.
         // Это нужно, чтобы гипотеза H1 (фильтр по контексту пира u:r:system_app:s0) была
         // подтверждена или снята ПО ЛОГУ, а не рассуждением.
@@ -348,7 +396,7 @@ object AdbClient {
         AppLog.i(TAG, "ADB_DEST targets=${targets.joinToString(",")} port=$ADB_PORT_DEFAULT " +
             "(connect ${PROBE_CONNECT_MS}ms, окон чтения ${ROW_WINDOW_1_MS}+${ROW_WINDOW_2_MS}ms, " +
             "попыток на адрес $DEST_ATTEMPTS, пауза ${DEST_RETRY_PAUSE_MS}ms, " +
-            "CNXN arg0=0x01000000, варианты: v0 arg1=$A_MAXDATA+features / v1 arg1=$A_MAXDATA_LEGACY+legacy)")
+            "CNXN v0 arg0=0x01000001 arg1=$A_MAXDATA+features / v1 arg0=0x01000000 arg1=$A_MAXDATA_LEGACY+legacy)")
         val winner = discoverDestination(targets)
 
         var p: Probe? = null
@@ -447,6 +495,40 @@ object AdbClient {
 
     // ─────────── iter29 P0-A0/P0-A: свой контекст + проба по всем адресам ───────────
 
+    /**
+     * iter32 §2.2: самопроверка констант команд. Печатает по строке на команду и итог.
+     * `ok = (ascii == name)` — ровно та проверка, которая поймала бы регрессию "CSYN".
+     */
+    private fun adbConstSelfTest(): Boolean {
+        var allOk = true
+        for ((name, v) in listOf(
+            "CNXN" to CNXN, "AUTH" to AUTH, "OPEN" to OPEN,
+            "OKAY" to OKAY, "WRTE" to WRTE, "CLSE" to CLSE,
+        )) {
+            val ascii = asciiOf(v)
+            val ok = ascii == name
+            if (!ok) allOk = false
+            AppLog.i(TAG, "ADB_CONST name=$name val=0x${"%08x".format(v)} ascii=$ascii ok=$ok")
+        }
+        // Контрольные значения из AOSP adb.h — независимая сверка, чтобы не «само с собой» сошлось.
+        val expect = mapOf(
+            "CNXN" to 0x4E584E43, "AUTH" to 0x48545541, "OPEN" to 0x4E45504F,
+            "OKAY" to 0x59414B4F, "WRTE" to 0x45545257, "CLSE" to 0x45534C43,
+        )
+        var expectOk = true
+        for ((name, v) in expect) {
+            val real = when (name) {
+                "CNXN" -> CNXN; "AUTH" -> AUTH; "OPEN" -> OPEN
+                "OKAY" -> OKAY; "WRTE" -> WRTE; else -> CLSE
+            }
+            val ok = real == v
+            if (!ok) expectOk = false
+            AppLog.i(TAG, "ADB_CONST aosp name=$name expect=0x${"%08x".format(v)} real=0x${"%08x".format(real)} ok=$ok")
+        }
+        AppLog.i(TAG, "ADB_CONST all=${if (allOk && expectOk) "ok" else "FAIL"}")
+        return allOk && expectOk
+    }
+
     /** `ADB_SELF`: uid/pid и SELinux-контекст процесса — первая строка AdbWorker. */
     private fun logSelfContext() {
         val uid = android.os.Process.myUid()
@@ -543,10 +625,13 @@ object AdbClient {
             val lport = s.localPort
             val banner = if (variant == 0) HOST_BANNER_FEATURES else HOST_BANNER_LEGACY
             val maxData = if (variant == 0) A_MAXDATA else A_MAXDATA_LEGACY
+            val version = versionOf(variant)
+            // iter32 §1а.3: от версии зависит, считается ли контрольная сумма.
+            sessionVersion = version
             val payload = "$banner\u0000".toByteArray(StandardCharsets.UTF_8)
             s.soTimeout = ROW_WINDOW_1_MS
-            writeMsg(os, CNXN, A_VERSION, maxData, payload)
-            AppLog.d(TAG, "ADB_TX(probe $addr) variant=$variant cmd=CNXN arg0=0x${"%08x".format(A_VERSION)} arg1=$maxData len=${payload.size} hex=${msgHeaderHex(CNXN, A_VERSION, maxData, payload)}")
+            writeMsg(os, CNXN, version, maxData, payload)
+            AppLog.d(TAG, "ADB_TX(probe $addr) variant=$variant cmd=CNXN arg0=0x${"%08x".format(version)} arg1=$maxData len=${payload.size} hex4=${hex4Of(CNXN)} ascii=${asciiOf(CNXN)} sum=${checksumFor(payload)} hex=${msgHeaderHex(CNXN, version, maxData, payload)}")
 
             val hdr = ByteArray(24)
             var got = 0
@@ -1047,17 +1132,18 @@ object AdbClient {
      * `ADB_RX attempt=<n> variant=<0|1> cmd=… hex=… dt=…` (что получили).
      */
     private fun handshake(s: Socket, dis: DataInputStream, os: OutputStream, attempt: Int, variant: Int, deadline: Long): String? {
-        // iter30c F4: РОВНО та же формула, что в probeDestination (одна на пробу и на канал):
-        //   variant 0 → version=A_VERSION (0x01000000), arg1=A_MAXDATA (262144), HOST_BANNER_FEATURES;
-        //   variant 1 → version=A_VERSION (0x01000000), arg1=A_MAXDATA_LEGACY (4096), HOST_BANNER_LEGACY.
-        // Никакого 0x01000001 здесь больше нет: вариант 1 — это буквально пакет 1.0.43.
-        val version = A_VERSION
+        // iter30c F4 + iter32 §1а: РОВНО та же формула, что в probeDestination (одна на пробу и на канал):
+        //   variant 0 → version=A_VERSION (0x01000001, platform-tools), arg1=A_MAXDATA (262144), HOST_BANNER_FEATURES;
+        //   variant 1 → version=A_VERSION_LEGACY (0x01000000), arg1=A_MAXDATA_LEGACY (4096), HOST_BANNER_LEGACY
+        //               — буквально пакет 1.0.43, включая НЕНУЛЕВУЮ контрольную сумму.
+        val version = versionOf(variant)
         val banner = if (variant == 0) HOST_BANNER_FEATURES else HOST_BANNER_LEGACY
         val maxData = if (variant == 0) A_MAXDATA else A_MAXDATA_LEGACY
+        sessionVersion = version
         val payload = "$banner\u0000".toByteArray(StandardCharsets.UTF_8)
         val hdrHex = msgHeaderHex(CNXN, version, maxData, payload)
         writeMsg(os, CNXN, version, maxData, payload)
-        AppLog.i(TAG, "ADB_TX cmd=CNXN arg0=0x${"%08x".format(version)} arg1=$maxData variant=$variant len=${payload.size} hex=$hdrHex")
+        AppLog.i(TAG, "ADB_TX cmd=CNXN arg0=0x${"%08x".format(version)} arg1=$maxData variant=$variant len=${payload.size} hex4=${hex4Of(CNXN)} ascii=${asciiOf(CNXN)} sum=${checksumFor(payload)} hex=$hdrHex")
         var authSteps = 0
         while (true) {
             val left = deadline - System.currentTimeMillis()
@@ -1068,11 +1154,13 @@ object AdbClient {
                 AppLog.e(TAG, "ADB_RX attempt=$attempt variant=$variant cmd=silent hex=(none) dt=${System.currentTimeMillis() - tMsg}ms err=${e.javaClass.simpleName}")
                 return "silent (${e.javaClass.simpleName})"
             }
-            AppLog.i(TAG, "ADB_RX attempt=$attempt variant=$variant cmd=${cmdName(msg.cmd)} arg0=${msg.arg0} arg1=${msg.arg1} len=${msg.payload.size} hex=${hexOf(msg.payload, minOf(24, msg.payload.size))} dt=${System.currentTimeMillis() - tMsg}ms")
+            AppLog.i(TAG, "ADB_RX attempt=$attempt variant=$variant cmd=${cmdName(msg.cmd)} hex4=${hex4Of(msg.cmd)} ascii=${asciiOf(msg.cmd)} arg0=0x${"%08x".format(msg.arg0)} arg1=${msg.arg1} len=${msg.payload.size} hex=${hexOf(msg.payload, minOf(24, msg.payload.size))} dt=${System.currentTimeMillis() - tMsg}ms")
             when (msg.cmd) {
                 CNXN -> {
                     val bannerRx = try { String(msg.payload, Charsets.UTF_8).trim() } catch (_: Throwable) { "" }
-                    AppLog.i(TAG, "ADB_RX attempt=$attempt cmd=CNXN maxdata=${msg.arg1} device=${bannerRx.take(80)}")
+                    // iter32 §1а.3: дальше работаем версией, которую назвал adbd (обычно 0x01000001).
+                    if (msg.arg0 != 0) sessionVersion = msg.arg0
+                    AppLog.i(TAG, "ADB_RX attempt=$attempt cmd=CNXN maxdata=${msg.arg1} device_ver=0x${"%08x".format(msg.arg0)} sessionVersion=0x${"%08x".format(sessionVersion)} device=${bannerRx.take(80)}")
                     return null
                 }
                 AUTH -> {
@@ -1112,9 +1200,16 @@ object AdbClient {
     private fun msgBytes(cmd: Int, arg0: Int, arg1: Int, payload: ByteArray): ByteArray {
         val buf = ByteBuffer.allocate(24).order(ByteOrder.LITTLE_ENDIAN)
         buf.putInt(cmd); buf.putInt(arg0); buf.putInt(arg1); buf.putInt(payload.size)
-        var sum = 0; for (b in payload) sum += b.toInt() and 0xFF
-        buf.putInt(sum); buf.putInt(cmd.inv())
+        buf.putInt(checksumFor(payload)); buf.putInt(cmd.inv())
         return buf.array()
+    }
+
+    /** iter32 §1а.3: при версии ≥ A_VERSION_SKIP_CHECKSUM сумма = 0, как у platform-tools. */
+    private fun checksumFor(payload: ByteArray): Int {
+        if (sessionVersion >= A_VERSION_SKIP_CHECKSUM) return 0
+        var sum = 0
+        for (b in payload) sum += b.toInt() and 0xFF
+        return sum
     }
 
     // ─────────── iter28 P0-C: unix-сокет — только факт в лог ───────────
@@ -1221,7 +1316,9 @@ object AdbClient {
         return try {
             sock.connect(addr, 2000)
             val os = sock.outputStream
-            writeMsg(os, CNXN, 0x01000000, 4096, "host::central-geely\u0000".toByteArray(StandardCharsets.UTF_8))
+            // iter32: unix-путь шлёт пакет 1.0.43 (версия 0x01000000 ⇒ сумма считается по-старому).
+            sessionVersion = A_VERSION_LEGACY
+            writeMsg(os, CNXN, A_VERSION_LEGACY, 4096, "host::central-geely\u0000".toByteArray(StandardCharsets.UTF_8))
             sock.soTimeout = 3000
             val dis = DataInputStream(sock.inputStream)
             val msg = try { readMsg(dis) } catch (e: Throwable) {
@@ -1272,7 +1369,9 @@ object AdbClient {
         try {
             sock.connect(addr, 2000)
             val os = sock.outputStream
-            writeMsg(os, CNXN, 0x01000000, 4096, "host::central-geely\u0000".toByteArray(StandardCharsets.UTF_8))
+            // iter32: unix-путь шлёт пакет 1.0.43 (версия 0x01000000 ⇒ сумма считается по-старому).
+            sessionVersion = A_VERSION_LEGACY
+            writeMsg(os, CNXN, A_VERSION_LEGACY, 4096, "host::central-geely\u0000".toByteArray(StandardCharsets.UTF_8))
             sock.soTimeout = timeoutMs
             val dis = DataInputStream(sock.inputStream)
             while (true) {
@@ -1650,15 +1749,21 @@ object AdbClient {
         check(cmd.inv() == magic) { "Bad ADB magic cmd=0x${Integer.toHexString(cmd)}" }
         val body = ByteArray(len); if (len > 0) dis.readFully(body)
         var s = 0; for (b in body) s += b.toInt() and 0xFF
-        check(s == sum) { "Bad ADB checksum ($s vs $sum)" }
+        // iter32 §1а.1: прошивка ГУ присылает data_check = 0 при len > 0 (в т.ч. на CNXN len=112).
+        // Нулевая сумма — валидна ВСЕГДА; строгая проверка остаётся для ненулевой.
+        if (sum == 0) {
+            if (s != 0) AppLog.d(TAG, "ADB_RX note=checksum_skipped len=$len sum=0 calc=$s cmd=${asciiOf(cmd)}")
+        } else {
+            check(s == sum) { "Bad ADB checksum ($s vs $sum) cmd=${asciiOf(cmd)} len=$len" }
+        }
         return Msg(cmd, arg0, arg1, body)
     }
 
     private fun writeMsg(os: OutputStream, cmd: Int, arg0: Int, arg1: Int, payload: ByteArray) {
         val buf = ByteBuffer.allocate(24).order(ByteOrder.LITTLE_ENDIAN)
         buf.putInt(cmd); buf.putInt(arg0); buf.putInt(arg1); buf.putInt(payload.size)
-        var sum = 0; for (b in payload) sum += b.toInt() and 0xFF
-        buf.putInt(sum); buf.putInt(cmd.inv())
+        // iter32 §1а.3: при sessionVersion ≥ 0x01000001 сумма = 0 (platform-tools), иначе — как в 1.0.43.
+        buf.putInt(checksumFor(payload)); buf.putInt(cmd.inv())
         os.write(buf.array()); os.write(payload); os.flush()
     }
 
