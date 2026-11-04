@@ -126,6 +126,12 @@ object AdbClient {
      * наше приложение до 1.0.50 всегда ходило на loopback — это и есть непроверенный признак.
      */
     @Volatile private var workingHost: String = "127.0.0.1"
+    /**
+     * iter30c F4: вариант пакета, которым адрес ОТВЕТИЛ (0 — 262144+features, 1 — 4096+legacy).
+     * Раньше он жил только внутри пробы: реальный канал (`fullProbe` → `execAdbSocket` → `handshake`)
+     * всегда шёл вариантом 0, даже если ответил вариант 1. Теперь вариант запоминается и используется.
+     */
+    @Volatile private var workingVariant: Int = 0
     @Volatile private var channelLoggedHost = ""
     // iter30 P0-C/P0-F: результаты для итогового ADB_VERDICT
     @Volatile private var lastRxQueue: Int = -1
@@ -398,7 +404,9 @@ object AdbClient {
                     return
                 }
             } else {
-                AppLog.i(TAG, "ADB_UNIX skipped reason=listener_owner=$listenerOwner (мандат F3: только при foreign)")
+                // iter30c п.6: причина называется явно, чтобы лог читался без догадок.
+                val why = if (listenerOwner == "adbd") "owner_adbd" else "owner_unknown"
+                AppLog.i(TAG, "ADB_UNIX skipped reason=$why listener_owner=$listenerOwner (мандат F3: unix-проба только при foreign)")
             }
         }
 
@@ -506,6 +514,9 @@ object AdbClient {
      * `variant = 1` — `arg1=A_MAXDATA_LEGACY (4096)` + `HOST_BANNER_LEGACY` — те самые байты,
      * с которыми канал работал в 1.0.43. Протокол/заголовок/размеры НЕ меняются: это тот же
      * `writeMsg(CNXN, …)`, различаются только arg1 и текст баннера.
+     *
+     * iter30c F4: эта же формула (`version = A_VERSION`, `maxData = …`, `banner = …`) теперь стоит и в
+     * `handshake`, поэтому победивший вариант доходит до реального канала без «пересборки» пакета.
      */
     private fun probeDestination(addr: String, attempt: Int, variant: Int): Dest {
         val t0 = SystemClock.uptimeMillis()
@@ -675,7 +686,9 @@ object AdbClient {
                 if (d == null) continue
                 last = d
                 if (d.cmd == "CNXN") {
+                    workingVariant = d.variant
                     AppLog.i(TAG, "ADB_DEST result=${d.addr} working=${d.addr} connect=${d.connectMs}ms attempt=$a variant=${d.variant}")
+                    AppLog.i(TAG, "ADB_CHANNEL host=${d.addr} port=$ADB_PORT_DEFAULT variant=${d.variant} (вариант берётся из ADB_DEST — им же пойдёт и рукопожатие)")
                     return d
                 }
                 if (d.cmd == "AUTH") { authOnly = authOnly ?: d; break }
@@ -693,7 +706,8 @@ object AdbClient {
 
     private fun finishDiscovery(auth: Dest?): Dest? {
         if (auth != null) {
-            AppLog.w(TAG, "ADB_DEST result=${auth.addr} working=${auth.addr} auth=required (AUTH вместо CNXN)")
+            workingVariant = auth.variant
+            AppLog.w(TAG, "ADB_DEST result=${auth.addr} working=${auth.addr} auth=required (AUTH вместо CNXN) variant=${auth.variant}")
             return auth
         }
         return null
@@ -944,9 +958,10 @@ object AdbClient {
     private fun fullProbe(): Probe {
         val t0 = SystemClock.uptimeMillis()
         return try {
+            // iter30c F4: канал идёт ТЕМ ЖЕ вариантом пакета, которым ответил адрес (ADB_DEST).
             val out = execAdbSocket(
                 "id; id -Z 2>/dev/null; getenforce 2>/dev/null",
-                ADB_PORT_DEFAULT, PROBE_TOTAL_MS, PROBE_CONNECT_MS,
+                ADB_PORT_DEFAULT, PROBE_TOTAL_MS, PROBE_CONNECT_MS, workingVariant,
             )
             val dt = SystemClock.uptimeMillis() - t0
             val root = isRootUid(out)
@@ -1028,15 +1043,21 @@ object AdbClient {
     /**
      * Рукопожатие на уже подключённом сокете: CNXN → (AUTH TOKEN → SIGNATURE)* → CNXN.
      * Возвращает null, если пришёл CNXN; иначе — причину.
-     * Логи: `ADB_TX …` (что отправили) и `ADB_RX attempt=… cmd=… hex=… dt=…` (что получили).
+     * Логи: `ADB_TX cmd=CNXN arg0=… arg1=… variant=<0|1> len=… hex=…` (что отправили) и
+     * `ADB_RX attempt=<n> variant=<0|1> cmd=… hex=… dt=…` (что получили).
      */
     private fun handshake(s: Socket, dis: DataInputStream, os: OutputStream, attempt: Int, variant: Int, deadline: Long): String? {
-        val version = if (variant == 0) A_VERSION else 0x01000001
+        // iter30c F4: РОВНО та же формула, что в probeDestination (одна на пробу и на канал):
+        //   variant 0 → version=A_VERSION (0x01000000), arg1=A_MAXDATA (262144), HOST_BANNER_FEATURES;
+        //   variant 1 → version=A_VERSION (0x01000000), arg1=A_MAXDATA_LEGACY (4096), HOST_BANNER_LEGACY.
+        // Никакого 0x01000001 здесь больше нет: вариант 1 — это буквально пакет 1.0.43.
+        val version = A_VERSION
         val banner = if (variant == 0) HOST_BANNER_FEATURES else HOST_BANNER_LEGACY
+        val maxData = if (variant == 0) A_MAXDATA else A_MAXDATA_LEGACY
         val payload = "$banner\u0000".toByteArray(StandardCharsets.UTF_8)
-        val hdrHex = msgHeaderHex(CNXN, version, A_MAXDATA, payload)
-        writeMsg(os, CNXN, version, A_MAXDATA, payload)
-        AppLog.i(TAG, "ADB_TX cmd=CNXN arg0=0x${"%08x".format(version)} arg1=$A_MAXDATA len=${payload.size} hex=$hdrHex")
+        val hdrHex = msgHeaderHex(CNXN, version, maxData, payload)
+        writeMsg(os, CNXN, version, maxData, payload)
+        AppLog.i(TAG, "ADB_TX cmd=CNXN arg0=0x${"%08x".format(version)} arg1=$maxData variant=$variant len=${payload.size} hex=$hdrHex")
         var authSteps = 0
         while (true) {
             val left = deadline - System.currentTimeMillis()
@@ -1044,10 +1065,10 @@ object AdbClient {
             val tMsg = System.currentTimeMillis()
             s.soTimeout = left.toInt().coerceIn(1, Int.MAX_VALUE)
             val msg = try { readMsg(dis) } catch (e: Throwable) {
-                AppLog.e(TAG, "ADB_RX attempt=$attempt cmd=silent hex=(none) dt=${System.currentTimeMillis() - tMsg}ms err=${e.javaClass.simpleName}")
+                AppLog.e(TAG, "ADB_RX attempt=$attempt variant=$variant cmd=silent hex=(none) dt=${System.currentTimeMillis() - tMsg}ms err=${e.javaClass.simpleName}")
                 return "silent (${e.javaClass.simpleName})"
             }
-            AppLog.i(TAG, "ADB_RX attempt=$attempt cmd=${cmdName(msg.cmd)} arg0=${msg.arg0} arg1=${msg.arg1} len=${msg.payload.size} hex=${hexOf(msg.payload, minOf(24, msg.payload.size))} dt=${System.currentTimeMillis() - tMsg}ms")
+            AppLog.i(TAG, "ADB_RX attempt=$attempt variant=$variant cmd=${cmdName(msg.cmd)} arg0=${msg.arg0} arg1=${msg.arg1} len=${msg.payload.size} hex=${hexOf(msg.payload, minOf(24, msg.payload.size))} dt=${System.currentTimeMillis() - tMsg}ms")
             when (msg.cmd) {
                 CNXN -> {
                     val bannerRx = try { String(msg.payload, Charsets.UTF_8).trim() } catch (_: Throwable) { "" }
@@ -1555,7 +1576,10 @@ object AdbClient {
      * Низкоуровневое выполнение одной shell-команды через ADB-сокет.
      * Поведение совпадает с kotlinx.coroutines.scheduling.h (порт CentralEXAuto).
      */
-    private fun execAdbSocket(command: String, port: Int, timeoutMs: Int, connectTimeoutMs: Int = PROBE_CONNECT_MS, variant: Int = 0): String {
+    private fun execAdbSocket(command: String, port: Int, timeoutMs: Int, connectTimeoutMs: Int = PROBE_CONNECT_MS, variant: Int = -1): String {
+        // iter30c F4: по умолчанию — вариант, которым ответил адрес (workingVariant), а не жёсткий 0.
+        // Явное значение (-1 = «не задано») остаётся для особых случаев.
+        val effVariant = if (variant < 0) workingVariant else variant
         val payload = ("shell:$command\u0000").toByteArray(StandardCharsets.UTF_8)
         // iter21 §1.3: не валим IllegalArgumentException в общий поток — возвращаем ERR_ADB_TOO_LONG.
         if (payload.size > 4096) {
@@ -1566,9 +1590,9 @@ object AdbClient {
             val host = workingHost
             if (host != channelLoggedHost) {
                 channelLoggedHost = host
-                AppLog.i(TAG, "ADB_CHANNEL host=$host port=$port (канал по адресу из ADB_DEST)")
+                AppLog.i(TAG, "ADB_CHANNEL host=$host port=$port variant=$effVariant (канал по адресу из ADB_DEST)")
             } else {
-                AppLog.d(TAG, "ADB_CHANNEL host=$host port=$port")
+                AppLog.d(TAG, "ADB_CHANNEL host=$host port=$port variant=$effVariant")
             }
             s.connect(InetSocketAddress(host, port), connectTimeoutMs)
             s.soTimeout = timeoutMs
@@ -1576,7 +1600,9 @@ object AdbClient {
             val os = s.getOutputStream()
             // iter28 P0-A/P0-B: рукопожатие как у настоящего adb, с обработкой AUTH.
             AdbAuth.init(appCtx)
-            val hsErr = handshake(s, dis, os, attempt = variant + 1, variant = variant, deadline = deadline)
+            // iter30c п.5: номер попытки больше не зависит от варианта (`variant + 1` давал attempt=2
+            // на первой же попытке при варианте 1). Попытка всегда 1, вариант печатается отдельным полем.
+            val hsErr = handshake(s, dis, os, attempt = 1, variant = effVariant, deadline = deadline)
             if (hsErr != null) throw IOException("ADB handshake failed: $hsErr")
             writeMsg(os, OPEN, 1, 0, payload)
             var localId = 0
