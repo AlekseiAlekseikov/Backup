@@ -334,3 +334,25 @@
   В дело не идут промежуточные `41798265725` и `41800171837` (сборки до правок).
 - CI: run **41802282277** success, artifact **13309251411**, APK `/home/user/app-iter30b-v1.0.51.apk`
   (215 312 005 B, sha256 `7569b9879bcb5685d0053c1a41f6394013eabcd6af702e0cf1870e9603e6461f`).
+
+## iter30c — правка 1.0.51 (номер версии НЕ менялся, `build.gradle.kts` не тронут)
+
+- **F4**: победивший вариант пакета теперь доходит до реального канала. Новое поле
+  `@Volatile workingVariant` (`AdbClient.kt:134`), записывается в `discoverDestination` при `CNXN` (`:689`)
+  и в AUTH-ветке (`:709`); `ADB_CHANNEL host=… port=… variant=…` (`:691`, `:1593`, `:1595`).
+  `fullProbe()` передаёт вариант явно (`:961-965`), `execAdbSocket` по умолчанию берёт
+  `workingVariant` (`variant: Int = -1` → `effVariant` `:1575-1582`, `:1605`).
+- **Согласование байт**: в `handshake` вариант 1 = `version = A_VERSION (0x01000000)`,
+  `arg1 = A_MAXDATA_LEGACY (4096)`, `HOST_BANNER_LEGACY` (`:1054-1059`); `0x01000001` из кода убран
+  (осталось только упоминание в комментарии). Проба `:544-549` и рукопожатие `:1054-1059` —
+  одна и та же формула; hex-заголовки совпадают (см. таблицу в `REPORT_iter30c.md` §2).
+- **`ADB_TX`** печатает фактические значения + `variant=` (`:1060`), `ADB_RX` — `attempt=1 variant=…`
+  (`:1068`, `:1071`); `attempt = variant + 1` убран (`:1605`).
+- **`ADB_UNIX skipped`**: причины раздельно — `owner_adbd` / `owner_unknown` (`:407-409`).
+- Запреты не нарушены (grep: `mt_gpio` — комментарий+лог в `App.kt`, `65010` 0, `tcpip:5555` 0,
+  `setprop *.adb.tcp.port` 0, `ctl.restart adbd` только комментарии, `adb_keys` без записей,
+  `android_usb` 0, `ADB_TOGGLE` только в невызываемой `adbToggleFix()`, новых `settings put` 0).
+- CI: run **41805548902** success, artifact **13309338493**, APK `/home/user/app-iter30c-v1.0.51.apk`
+  (215 313 093 B, sha256 `ae1ba6150835dc82d5b7a6b42f7cb4496e47bfafbaeef7fbd7bcfbc02e30433c`).
+- Косметика: у коммита `98ae5b6` автор записан как `AlekseiAlekseiKov <x@y>` (мой промах);
+  исправление требует `--force`, который запрещён, поэтому оставлено как есть.
