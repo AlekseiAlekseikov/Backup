@@ -327,7 +327,8 @@ object AdbClient {
         // iter29 P0-A: проба по ВСЕМ локальным адресам, не только 127.0.0.1 (гипотеза H2).
         val targets = localTargets()
         AppLog.i(TAG, "ADB_DEST targets=${targets.joinToString(",")} port=$ADB_PORT_DEFAULT " +
-            "(connect ${PROBE_CONNECT_MS}ms, окно ${RAW_READ_MS}ms на адрес, CNXN arg0=0x01000000 arg1=$A_MAXDATA)")
+            "(connect ${PROBE_CONNECT_MS}ms, окон чтения ${ROW_WINDOW_1_MS}+${ROW_WINDOW_2_MS}ms, " +
+            "попыток на адрес $DEST_ATTEMPTS, пауза ${DEST_RETRY_PAUSE_MS}ms, CNXN arg0=0x01000000 arg1=$A_MAXDATA)")
         val winner = discoverDestination(targets)
 
         var p: Probe? = null
