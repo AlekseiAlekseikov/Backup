@@ -67,6 +67,19 @@ object AdbClient {
         "sendrecv_v2_dry_run_send,devicetracker_proto_format,delayed_ack,avarice,apap,ipv6,pushes"
     private const val HOST_BANNER_LEGACY = "host::central-geely"
 
+    // ── iter30 P0-F: повторы и бюджет проб; P0-C: окна снимков строки ядра ──
+    private const val DEST_ATTEMPTS = 3           // 3 попытки на адрес (мандат §6)
+    private const val DEST_RETRY_PAUSE_MS = 1000L // пауза между попытками — 1 с
+    private const val DEST_BUDGET_MS = 32000L     // общий бюджет ADB_DEST, чтобы старт не «висел»
+    private const val ROW_WINDOW_1_MS = 500       // первый снимок ADB_ROW — на 500 мс
+    private const val ROW_WINDOW_2_MS = 1500      // второй снимок ADB_ROW — на 2000 мс суммарно
+    private const val RETRY_AFTER_MS = 60_000L    // отложенный ретрай (мандат §6)
+    // iter30 P0-E: свойства, которые приложение пишет само (round-trip без смены смысла)
+    private const val PROP_BATT = "persist.sys.hvacdigital.batt"
+    private const val PROP_TEMP = "persist.sys.hvacdigital.temp"
+    private const val PROP_EXT_TEMP = "persist.sys.hvacdigital.temp_ext"
+    private const val PROP_VIA = "persist.sys.hvacdigital.via"
+
     private const val CNXN = 0x4e595343
     private const val AUTH = 0x48545541
     private const val OPEN = 0x4e45504f
@@ -105,7 +118,11 @@ object AdbClient {
      * наше приложение до 1.0.50 всегда ходило на loopback — это и есть непроверенный признак.
      */
     @Volatile private var workingHost: String = "127.0.0.1"
-    @Volatile private var channelLoggedHost: String = ""
+    @Volatile private var channelLoggedHost = ""
+    // iter30 P0-C/P0-F: результаты для итогового ADB_VERDICT
+    @Volatile private var lastRxQueue: Int = -1
+    @Volatile private var listenerOwner: String = "unknown"
+    @Volatile private var propWriteOk = false
 
     enum class ChannelState {
         IDLE,
@@ -323,7 +340,13 @@ object AdbClient {
             if (pr.kind == KIND_ROOT) {
                 channelUp(pr)
                 adbFixVerify("after_dest")
+                // Канал живой ⇒ листенер на 5555 — это adbd (мы получили от него root-шелл).
+                listenerOwner = "adbd"
+                // iter30 P0-E: право записи наших props проверяем и в успешной ветке —
+                // от него зависит, включаем ли плагин напрямую (`via=app`).
+                runCatching { execPropDirect() }.onFailure { AppLog.w(TAG, "EXEC_PROP failed: ${it.message}") }
                 replayDeferred()
+                logVerdict(true)
                 return
             }
             // CNXN пришёл, но канал не root — редкий случай (UP_NONROOT). Дальше только диагноз.
@@ -333,6 +356,9 @@ object AdbClient {
             // Пометка означает: замер сделан БЕЗ активной сессии ПК на 5555 (владелец закрывает её до запуска).
             AppLog.e(TAG, "ADB_DEST result=none working=none")
             AppLog.i(TAG, "ADB_DEST note=probe-without-pc-session (сессия ПК на 5555 закрыта до запуска)")
+
+            // iter30 P0-B: КТО держит 5555 — inode, владелец, ps, ss (мандат §2).
+            runCatching { logListenerOwner() }.onFailure { AppLog.w(TAG, "ADB_LISTEN failed: ${it.message}") }
         }
 
         // iter28 P0-C: unix-путь из bootstrap убран (SELinux: canRead=false + UnsupportedOperationException).
@@ -355,6 +381,16 @@ object AdbClient {
         // Записей в sysfs/tcpip в сборке нет и не будет.
         AppLog.i(TAG, "ADBFIX disabled (iter29: gpio/tcpip/toggle отключены — лог 1.0.46: GPIO 151 гасит USB)")
 
+        // iter30 P0-D: лог самого adbd (вдруг он пишет причину отказа).
+        runCatching { logAdbdLogcat() }.onFailure { AppLog.w(TAG, "ADB_LOGCAT failed: ${it.message}") }
+
+        // iter30 P0-E: пишем ли мы свои props без root (и включаем ветку via=app, если да).
+        runCatching { execPropDirect() }.onFailure { AppLog.w(TAG, "EXEC_PROP failed: ${it.message}") }
+
+        // iter30 P0-F: итоговый вердикт + один отложенный ретрай через 60 с.
+        logVerdict(false)
+        scheduleDeferredRetry()
+
         AppLog.e(TAG, "ADB_SELFTEST: failed targets=${targets.joinToString(",")} kind=${failed.kind} dt=${failed.dt}ms err=${failed.err ?: "-"}")
         AppLog.e(TAG, "ROOT_UNAVAILABLE reason=no_adb_root_channel probe=$ADB_PORT_DEFAULT detail=${failed.err ?: failed.kind}")
         fallbackNoRoot("probe=${failed.kind} ${failed.err ?: ""}")
@@ -370,7 +406,8 @@ object AdbClient {
         if (ctx.isEmpty()) {
             ctx = runCatching { runShellFallback("cat /proc/self/attr/current 2>/dev/null", 1500).trim() }.getOrDefault("")
         }
-        AppLog.i(TAG, "ADB_SELF: uid=$uid pid=$pid scontext=${ctx.ifEmpty { "(unreadable)" }}")
+        // iter30 P0-B2: порядок полей — как в мандате §2а, чтобы строку было легко грепать.
+        AppLog.i(TAG, "ADB_SELF scontext=${ctx.ifEmpty { "(unreadable)" }} uid=$uid pid=$pid")
     }
 
     /**
@@ -396,11 +433,14 @@ object AdbClient {
         } catch (t: Throwable) {
             AppLog.w(TAG, "ADB_DEST targets: NetworkInterface failed: ${t.javaClass.simpleName}: ${t.message}")
         }
+        // iter30 P0-A: порядок ровно как в мандате §1 —
+        // 1) не-loopback IPv4 (Wi-Fi, «другой адрес источника», чем у loopback);
+        // 2) 127.0.0.1; 3) ::1; 4) остальные IPv4/IPv6.
         val out = ArrayList<String>()
         out.addAll(v4)
         out.add("127.0.0.1")
-        out.addAll(v6)
         out.add("::1")
+        out.addAll(v6)
         return out.distinct()
     }
 
@@ -411,11 +451,16 @@ object AdbClient {
         val connectErr: String?,
         val cmd: String,
         val rx: Int,
-        val dt: Long
+        val dt: Long,
+        val attempt: Int = 0
     )
 
-    /** Одна строка на адрес: `ADB_DEST addr=… connect=… rx=… cmd=… dt=…`. */
-    private fun probeDestination(addr: String): Dest {
+    /**
+     * Одна попытка на адрес: connect → CNXN → снимки строки ядра (0/500/2000 мс) → разбор ответа.
+     * Строка лога: `ADB_DEST attempt=<n> addr=… connect=… rx=… cmd=… dt=…`
+     * (iter30 P0-A: формат из мандата §1, добавлено только поле `attempt`).
+     */
+    private fun probeDestination(addr: String, attempt: Int): Dest {
         val t0 = SystemClock.uptimeMillis()
         val s = Socket()
         val tConn = SystemClock.uptimeMillis()
@@ -430,67 +475,392 @@ object AdbClient {
                 else -> e.javaClass.simpleName
             }
             val dt = SystemClock.uptimeMillis() - t0
-            AppLog.e(TAG, "ADB_DEST addr=$addr connect=$err rx=0 cmd=n/a dt=${dt}ms")
-            return Dest(addr, -1, err, "n/a", 0, dt)
+            AppLog.e(TAG, "ADB_DEST attempt=$attempt addr=$addr connect=$err rx=0 cmd=n/a dt=${dt}ms")
+            return Dest(addr, -1, err, "n/a", 0, dt, attempt)
         }
         val connectMs = SystemClock.uptimeMillis() - tConn
         try {
-            s.soTimeout = RAW_READ_MS
             val os = s.getOutputStream()
             val dis = DataInputStream(s.getInputStream())
+            val lport = s.localPort
             val payload = "$HOST_BANNER_FEATURES\u0000".toByteArray(StandardCharsets.UTF_8)
+            s.soTimeout = ROW_WINDOW_1_MS
             writeMsg(os, CNXN, A_VERSION, A_MAXDATA, payload)
             AppLog.d(TAG, "ADB_TX(probe $addr) cmd=CNXN arg0=0x${"%08x".format(A_VERSION)} arg1=$A_MAXDATA len=${payload.size} hex=${msgHeaderHex(CNXN, A_VERSION, A_MAXDATA, payload)}")
+
             val hdr = ByteArray(24)
             var got = 0
             var abort: String? = null
-            try {
-                while (got < 24) {
-                    val r = dis.read(hdr, got, 24 - got)
-                    if (r < 0) break
-                    got += r
-                }
-            } catch (e: Throwable) {
-                abort = e.javaClass.simpleName
+
+            // P0-C: три снимка строки ядра — до чтения, через 500 мс и через 2000 мс.
+            logRow(lport, 0)
+            got = readSome(dis, hdr, got)
+            if (got < 0) { abort = "EOF"; got = 0 }
+            logRow(lport, 500)
+            if (abort == null && got < 24) {
+                s.soTimeout = ROW_WINDOW_2_MS
+                val g2 = readSome(dis, hdr, got)
+                if (g2 < 0) { abort = "EOF"; got = 0 } else got = g2
             }
+            logRow(lport, 2000)
+
             val dt = SystemClock.uptimeMillis() - t0
             if (got < 24) {
                 val cmd = if (got == 0) "silent" else "short:$got"
-                AppLog.e(TAG, "ADB_DEST addr=$addr connect=${connectMs}ms rx=$got cmd=$cmd dt=${dt}ms${if (abort != null) " err=$abort" else ""}")
-                return Dest(addr, connectMs, abort, cmd, got, dt)
+                AppLog.e(TAG, "ADB_DEST attempt=$attempt addr=$addr connect=${connectMs}ms rx=$got cmd=$cmd dt=${dt}ms${if (abort != null) " err=$abort" else ""}")
+                return Dest(addr, connectMs, abort, cmd, got, dt, attempt)
             }
             val c = ByteBuffer.wrap(hdr, 0, 4).order(ByteOrder.LITTLE_ENDIAN).int
             val name = cmdName(c)
-            AppLog.i(TAG, "ADB_DEST addr=$addr connect=${connectMs}ms rx=24 cmd=$name hex=${hexOf(hdr, 24)} dt=${dt}ms${if (name == "AUTH") " auth=required" else ""}")
-            return Dest(addr, connectMs, null, name, 24, dt)
+            AppLog.i(TAG, "ADB_DEST attempt=$attempt addr=$addr connect=${connectMs}ms rx=24 cmd=$name hex=${hexOf(hdr, 24)} dt=${dt}ms${if (name == "AUTH") " auth=required" else ""}")
+            return Dest(addr, connectMs, null, name, 24, dt, attempt)
         } catch (e: Throwable) {
             val dt = SystemClock.uptimeMillis() - t0
-            AppLog.e(TAG, "ADB_DEST addr=$addr connect=${connectMs}ms rx=0 cmd=error:${e.javaClass.simpleName} dt=${dt}ms")
-            return Dest(addr, connectMs, e.javaClass.simpleName, "error", 0, dt)
+            AppLog.e(TAG, "ADB_DEST attempt=$attempt addr=$addr connect=${connectMs}ms rx=0 cmd=error:${e.javaClass.simpleName} dt=${dt}ms")
+            return Dest(addr, connectMs, e.javaClass.simpleName, "error", 0, dt, attempt)
         } finally {
             runCatching { s.close() }
         }
     }
 
-    /** Идём по списку адресов и возвращаем первый, который ответил CNXN (или AUTH). */
-    private fun discoverDestination(targets: List<String>): Dest? {
+    /** Чтение «сколько придёт в окне»: таймаут окна — это не ошибка, EOF возвращаем как -1. */
+    private fun readSome(dis: DataInputStream, hdr: ByteArray, have: Int): Int {
+        var got = have
+        while (got < hdr.size) {
+            val r = try {
+                dis.read(hdr, got, hdr.size - got)
+            } catch (e: java.net.SocketTimeoutException) {
+                return if (got == 0) 0 else got
+            } catch (e: Throwable) {
+                return if (got == 0) -1 else got
+            }
+            if (r < 0) return -1
+            got += r
+        }
+        return got
+    }
+
+    // ─────────── iter30 P0-C: снимки строки ядра для НАШЕГО соединения ───────────
+
+    /** Строки таблиц ядра: сначала прямым чтением файла, иначе через `sh cat`. */
+    private fun procNetLines(table: String): List<String> {
+        val viaFile = runCatching { java.io.File(table).readLines() }.getOrNull()
+        if (viaFile != null && viaFile.isNotEmpty()) return viaFile
+        val out = runCatching { runShellFallback("cat $table 2>/dev/null", 2000) }.getOrDefault("")
+        return if (out.isBlank()) emptyList() else out.lines()
+    }
+
+    /** Поля строки /proc/net/tcp{,6}: 0 sl, 1 local, 2 rem, 3 st, 4 tx:rx, 5 tr, 6 retrnsmt, 7 uid, 8 timeout, 9 inode. */
+    private fun rowFields(line: String): List<String>? {
+        val f = line.trim().split(Regex("\\s+"))
+        if (f.size < 10) return null
+        if (!f[0].endsWith(":")) return null
+        return f
+    }
+
+    private fun portOfAddr(field: String): String = field.substringAfterLast(':')
+
+    private fun qPair(field: String): Pair<Int, Int> {
+        val a = field.split(":")
+        return Pair(a.getOrNull(0)?.toIntOrNull(16) ?: -1, a.getOrNull(1)?.toIntOrNull(16) ?: -1)
+    }
+
+    /**
+     * `ADB_ROW t=<0|500|2000>ms lport=<p> st=<hex|имя> rx_queue=<n> tx_queue=<n> found=<true|false>`
+     * rx_queue=0 при живом соединении ⇒ байты уже прочитаны процессом на 5555 и ответа нет.
+     * rx_queue>0 ⇒ соединение не читают вообще.
+     */
+    private fun logRow(lport: Int, tMs: Int) {
+        val hexPort = "%04X".format(lport)
+        var found = false
+        var st = "-"
+        var rx = -1
+        var tx = -1
+        var table = "-"
+        for (tb in listOf("/proc/net/tcp6", "/proc/net/tcp")) {
+            for (line in procNetLines(tb)) {
+                val f = rowFields(line) ?: continue
+                if (!portOfAddr(f[2]).equals(hexPort, ignoreCase = true)) continue
+                val q = qPair(f[4])
+                tx = q.first
+                rx = q.second
+                st = f[3]
+                table = tb
+                found = true
+                break
+            }
+            if (found) break
+        }
+        if (found) lastRxQueue = rx
+        val stName = when (st.uppercase()) {
+            "01" -> "01/ESTABLISHED"; "0A" -> "0A/LISTEN"; "06" -> "06/TIME_WAIT"
+            "08" -> "08/CLOSE_WAIT"; "02" -> "02/SYN_SENT"; "09" -> "09/LAST_ACK"
+            else -> st
+        }
+        AppLog.i(TAG, "ADB_ROW t=${tMs}ms lport=$lport st=$stName rx_queue=$rx tx_queue=$tx found=$found table=$table")
+    }
+
+    /**
+     * Идём по списку адресов; на каждый — до [attempts] попыток с паузой 1 с (iter30 P0-F).
+     * Возвращаем первый адрес, ответивший CNXN (или, в крайнем случае, AUTH).
+     */
+    private fun discoverDestination(targets: List<String>, attempts: Int = DEST_ATTEMPTS): Dest? {
+        val tStart = SystemClock.uptimeMillis()
         var authOnly: Dest? = null
         for (addr in targets) {
-            val d = try { probeDestination(addr) } catch (e: Throwable) {
-                AppLog.e(TAG, "ADB_DEST addr=$addr probe crashed: ${e.javaClass.simpleName}: ${e.message}")
-                null
-            } ?: continue
-            if (d.cmd == "CNXN") {
-                AppLog.i(TAG, "ADB_DEST result=${d.addr} working=${d.addr} connect=${d.connectMs}ms")
-                return d
+            var last: Dest? = null
+            for (a in 1..attempts) {
+                if (SystemClock.uptimeMillis() - tStart > DEST_BUDGET_MS) {
+                    AppLog.w(TAG, "ADB_DEST budget=${DEST_BUDGET_MS}ms exhausted (address=$addr attempt=$a) — прекращаем пробы")
+                    if (last != null && last.cmd == "AUTH") authOnly = authOnly ?: last
+                    return finishDiscovery(authOnly)
+                }
+                val d = try {
+                    probeDestination(addr, a)
+                } catch (e: Throwable) {
+                    AppLog.e(TAG, "ADB_DEST attempt=$a addr=$addr probe crashed: ${e.javaClass.simpleName}: ${e.message}")
+                    null
+                }
+                if (d == null) continue
+                last = d
+                if (d.cmd == "CNXN") {
+                    AppLog.i(TAG, "ADB_DEST result=${d.addr} working=${d.addr} connect=${d.connectMs}ms attempt=$a")
+                    return d
+                }
+                if (d.cmd == "AUTH") { authOnly = authOnly ?: d; break }
+                if (a < attempts) {
+                    AppLog.d(TAG, "ADB_DEST retry addr=$addr next=${a + 1}/$attempts in ${DEST_RETRY_PAUSE_MS}ms (last cmd=${d.cmd})")
+                    runCatching { Thread.sleep(DEST_RETRY_PAUSE_MS) }
+                }
             }
-            if (d.cmd == "AUTH" && authOnly == null) authOnly = d
+            if (last != null) {
+                AppLog.i(TAG, "ADB_DEST addr=${last.addr} attempts=$attempts last=${last.cmd} connect=${last.connectMs}ms")
+            }
         }
-        if (authOnly != null) {
-            AppLog.w(TAG, "ADB_DEST result=${authOnly.addr} working=${authOnly.addr} auth=required (AUTH вместо CNXN)")
-            return authOnly
+        return finishDiscovery(authOnly)
+    }
+
+    private fun finishDiscovery(auth: Dest?): Dest? {
+        if (auth != null) {
+            AppLog.w(TAG, "ADB_DEST result=${auth.addr} working=${auth.addr} auth=required (AUTH вместо CNXN)")
+            return auth
         }
         return null
+    }
+
+    // ─────────── iter30 P0-B: КТО слушает 5555 ───────────
+
+    /**
+     * `ADB_LISTEN` (inode/uid/st листенера :15B3) → `ADB_OWNER` (поиск `socket:[inode]` в /proc/<pid>/fd)
+     * → `ADB_PS` (ps -A по adb/proxy/bridge/tunnel) → `ADB_SS` (ss/netstat).
+     * Смысл: если в `ADB_SS` нет `pid/adbd`, а `init.svc.adbd=running` — порт держит кто-то другой.
+     */
+    private fun logListenerOwner() {
+        val hex = "%04X".format(ADB_PORT_DEFAULT)
+        var listenerInode = ""
+        var seen = 0
+        for (tb in listOf("/proc/net/tcp6", "/proc/net/tcp")) {
+            for (line in procNetLines(tb)) {
+                val f = rowFields(line) ?: continue
+                if (!portOfAddr(f[1]).equals(hex, ignoreCase = true)) continue
+                seen++
+                AppLog.i(TAG, "ADB_LISTEN inode=${f[9]} uid=${f[7]} st=${f[3]} table=$tb local=${f[1]}")
+                if (f[3].equals("0A", true) && listenerInode.isEmpty()) listenerInode = f[9]
+            }
+        }
+        if (seen == 0) AppLog.w(TAG, "ADB_LISTEN: строк :15B3 в /proc/net/tcp{,6} нет вообще")
+
+        if (listenerInode.isEmpty() || listenerInode == "0") {
+            AppLog.i(TAG, "ADB_OWNER err=no_inode (листенер :15B3 не найден)")
+            listenerOwner = "unknown"
+        } else {
+            val want = "socket:[$listenerInode]"
+            var scanned = 0
+            var denied = 0
+            var found = false
+            val pids = java.io.File("/proc").list()?.filter { p -> p.all { it.isDigit() } } ?: emptyList()
+            for (p in pids) {
+                val fdPath = "/proc/$p/fd"
+                val fds = try { java.io.File(fdPath).list() } catch (e: Throwable) { null }
+                if (fds == null) { denied++; continue }
+                scanned++
+                for (fd in fds) {
+                    val link = try { android.system.Os.readlink("$fdPath/$fd") } catch (e: Throwable) { null } ?: continue
+                    if (link != want) continue
+                    val comm = runCatching { java.io.File("/proc/$p/comm").readText().trim() }.getOrDefault("?")
+                    AppLog.i(TAG, "ADB_OWNER pid=$p cmd=$comm fd=$fd inode=$listenerInode")
+                    listenerOwner = if (comm.contains("adbd")) "adbd" else "foreign"
+                    found = true
+                    break
+                }
+                if (found) break
+            }
+            if (!found) {
+                AppLog.i(TAG, "ADB_OWNER err=${if (denied > 0) "denied" else "not_found"} scanned=$scanned denied=$denied inode=$listenerInode")
+                listenerOwner = "unknown"
+            }
+        }
+
+        val (prc, pout) = try {
+            runShellFallbackWithRc("ps -A 2>/dev/null | grep -iE 'adb|proxy|bridge|tunnel' | head -10", 3000)
+        } catch (t: Throwable) { Pair(1, "EXC:${t.message}") }
+        AppLog.i(TAG, "ADB_PS rc=$prc out=${pout.replace("\n", " | ").take(400).ifEmpty { "(empty)" }}")
+
+        for (cmd in listOf(
+            "ss -ltnp 2>/dev/null | grep -E '5555|15B3' | head -5",
+            "netstat -ltnp 2>/dev/null | grep -E '5555|15B3' | head -5",
+        )) {
+            val src = cmd.substringBefore(" ")
+            val (rc, out) = try { runShellFallbackWithRc(cmd, 3000) } catch (t: Throwable) { Pair(1, "EXC:${t.message}") }
+            val hasAdbd = out.contains("adbd")
+            AppLog.i(TAG, "ADB_SS src=$src rc=$rc has_adbd=$hasAdbd out=${out.replace("\n", " | ").take(300).ifEmpty { "(empty)" }}")
+            if (hasAdbd) listenerOwner = "adbd"
+        }
+        AppLog.i(TAG, "ADB_LISTEN verdict owner=$listenerOwner inode=${listenerInode.ifEmpty { "-" }}")
+    }
+
+    // ─────────── iter30 P0-D: лог самого adbd ───────────
+
+    /** Читаем logcat: ищем `new connection on fd`, `cannot bind`, `Address already in use`, `send_auth_request`. */
+    private fun logAdbdLogcat() {
+        for ((src, cmd) in listOf(
+            "tag_adbd" to "logcat -d -b all -s adbd '*:S' 2>&1 | tail -20",
+            "grep" to "logcat -d -b all 2>&1 | grep -iE 'adbd|adb_auth|transport' | tail -20",
+        )) {
+            val (rc, out) = try { runShellFallbackWithRc(cmd, 6000) } catch (t: Throwable) { Pair(1, "EXC:${t.message}") }
+            val txt = out.trim()
+            if (txt.contains("Permission denied") && !txt.contains("adbd ")) {
+                AppLog.i(TAG, "ADB_LOGCAT src=$src err=denied rc=$rc")
+                continue
+            }
+            val lines = txt.lines().filter { it.isNotBlank() }.take(10)
+            val hits = listOf("cannot bind", "Address already in use", "new connection on fd",
+                "send_auth_request", "failed to write apacket").filter { txt.contains(it) }
+            AppLog.i(TAG, "ADB_LOGCAT src=$src hit=${lines.isNotEmpty()} rc=$rc lines=${lines.size} keys=${hits.joinToString(",").ifEmpty { "-" }}")
+            for (l in lines) AppLog.i(TAG, "ADB_LOGCAT src=$src text=${l.take(220)}")
+        }
+    }
+
+    // ─────────── iter30 P0-E: пишем ли мы свои props без root ───────────
+
+    /**
+     * `EXEC_PROP`: уникальное значение в НАШ props + round-trip трёх HVAC-свойств.
+     *
+     * Отличие от буквы мандата §5: `batt`/`temp`/`ext_temp` — НЕ флаги, а значения, которые
+     * SystemUI-плагин показывает в статус-баре (`StatusIcons.kt:724-760` пишет «98.1», «22.0», «9.7»).
+     * Записать туда тестовые `42.4` — значит испортить индикацию (зона регресса). Поэтому проверка
+     * идёт round-trip’ом: читаем текущее значение и записываем ЕГО ЖЕ назад — доказывает право записи
+     * и ничего не меняет на экране.
+     */
+    private fun execPropDirect() {
+        var ok = 0
+        // 1) diag — наше собственное свойство: можно и уникальное значение.
+        val unique = System.currentTimeMillis().toString()
+        val (rc, out, err) = runShellCapture("setprop $PROP_DIAG $unique; getprop $PROP_DIAG", 4000)
+        val got = out.trim()
+        val match = got == unique
+        AppLog.i(TAG, "EXEC_PROP key=diag sent=$unique got=${got.ifEmpty { "(empty)" }} match=$match rc=$rc out=${out.replace("\n", " ").take(120)} err=${err.replace("\n", " ").take(120)}")
+        if (match) ok++
+        // 2) три HVAC-свойства: round-trip текущего значения.
+        for ((key, prop) in listOf(
+            "batt" to PROP_BATT,
+            "temp" to PROP_TEMP,
+            "ext_temp" to PROP_EXT_TEMP,
+        )) {
+            val cur = runShellFallback("getprop $prop", 2000).trim()
+            if (cur.isEmpty()) {
+                AppLog.i(TAG, "EXEC_PROP key=$key sent=n/a got=(empty) match=n/a reason=prop_empty (round-trip невозможен, значение ещё не публиковалось)")
+                continue
+            }
+            val (r2, o2, e2) = runShellCapture("setprop $prop '$cur'; getprop $prop", 3000)
+            val g2 = o2.trim()
+            val m2 = g2 == cur
+            AppLog.i(TAG, "EXEC_PROP key=$key sent=$cur got=${g2.ifEmpty { "(empty)" }} match=$m2 rc=$r2 out=${o2.replace("\n", " ").take(100)} err=${e2.replace("\n", " ").take(100)}")
+            if (m2) ok++
+        }
+        propWriteOk = ok >= 1
+        AppLog.i(TAG, "EXEC_PROP keys=ok=$ok/3 propwrite=${if (propWriteOk) "ok" else "denied"}")
+
+        // 3) Ветка мандата: при праве записи включить плагин через `via=app`.
+        //    Не перетираем уже выставленное состояние монтирования (install/bind) — им управляет
+        //    HvacDigitalPlugin, который в этой итерации трогать запрещено (§7 мандата).
+        if (propWriteOk) {
+            val viaNow = runShellFallback("getprop $PROP_VIA", 2000).trim()
+            if (viaNow.isEmpty() || viaNow == "app") {
+                val (vr, vo, ve) = runShellCapture("setprop $PROP_VIA app; getprop $PROP_VIA", 3000)
+                AppLog.i(TAG, "EXEC_PROP via=app sent=app got=${vo.trim().ifEmpty { "(empty)" }} match=${vo.trim() == "app"} rc=$vr err=${ve.take(120)}")
+            } else {
+                AppLog.i(TAG, "EXEC_PROP via=app skipped reason=already_set via=$viaNow (состояние плагина не трогаем)")
+            }
+        } else {
+            AppLog.i(TAG, "EXEC_PROP via=app skipped reason=propwrite_denied")
+        }
+    }
+
+    /** sh-команда с РАЗДЕЛЬНЫМИ stdout и stderr (мандат §5 требует err=… в логе). */
+    private fun runShellCapture(cmd: String, timeoutMs: Int): Triple<Int, String, String> = try {
+        val p = Runtime.getRuntime().exec(arrayOf("sh", "-c", cmd))
+        val outBuf = StringBuilder()
+        val errBuf = StringBuilder()
+        val t1 = Thread { runCatching { outBuf.append(p.inputStream.bufferedReader().readText()) } }
+        val t2 = Thread { runCatching { errBuf.append(p.errorStream.bufferedReader().readText()) } }
+        t1.isDaemon = true; t2.isDaemon = true; t1.start(); t2.start()
+        val w = Thread { runCatching { p.waitFor() } }
+        w.isDaemon = true; w.start(); w.join(timeoutMs.toLong())
+        if (w.isAlive) {
+            runCatching { p.destroyForcibly() }
+            t1.join(300); t2.join(300)
+            Triple(137, outBuf.toString().trim(), errBuf.toString().trim() + "(timeout ${timeoutMs}ms)")
+        } else {
+            t1.join(500); t2.join(500)
+            Triple(p.exitValue(), outBuf.toString().trim(), errBuf.toString().trim())
+        }
+    } catch (t: Throwable) {
+        Triple(1, "", "sh-fatal: ${t.message}")
+    }
+
+    // ─────────── iter30 P0-F: вердикт и отложенный ретрай ───────────
+
+    /** Одна итоговая строка: чем кончилось и кто виноват по данным лога. */
+    private fun logVerdict(up: Boolean) {
+        AppLog.i(TAG, "ADB_VERDICT channel=${if (up) "up" else "down"} listener_owner=$listenerOwner " +
+            "rx_queue_last=$lastRxQueue propwrite=${if (propWriteOk) "ok" else "denied"}")
+    }
+
+    /** Один ретрай через 60 с: если за это время канал появился сам — поднимаем его без перезапуска. */
+    private fun scheduleDeferredRetry() {
+        val t = Thread {
+            try {
+                Thread.sleep(RETRY_AFTER_MS)
+                if (state.get() == ChannelState.ROOT_5555) {
+                    AppLog.i(TAG, "ADB_RETRY t=60s result=skip(channel_up host=$workingHost)")
+                    return@Thread
+                }
+                val targets = localTargets()
+                AppLog.i(TAG, "ADB_RETRY t=60s start targets=${targets.joinToString(",")}")
+                val w = discoverDestination(targets, attempts = 1)
+                if (w == null) {
+                    AppLog.i(TAG, "ADB_RETRY t=60s result=silent targets=${targets.joinToString(",")} rx_queue_last=$lastRxQueue")
+                    return@Thread
+                }
+                workingHost = w.addr
+                val pr = fullProbe()
+                if (pr.kind == KIND_ROOT) {
+                    channelUp(pr)
+                    adbFixVerify("after_retry")
+                    replayDeferred()
+                    logVerdict(true)
+                    AppLog.i(TAG, "ADB_RETRY t=60s result=up host=$workingHost")
+                } else {
+                    AppLog.i(TAG, "ADB_RETRY t=60s result=${pr.kind} host=$workingHost uid=${pr.uid.ifEmpty { "-" }}")
+                }
+            } catch (t2: Throwable) {
+                AppLog.w(TAG, "ADB_RETRY failed: ${t2.javaClass.simpleName}: ${t2.message}")
+            }
+        }
+        t.name = "AdbDeferredRetry"
+        t.isDaemon = true
+        t.start()
     }
 
     // ─────────── проба канала ───────────
