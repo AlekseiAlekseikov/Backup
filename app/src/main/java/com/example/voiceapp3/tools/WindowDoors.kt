@@ -43,8 +43,15 @@ object WindowDoors {
 
     const val PREF_WINDOW_DRIVER_ON_DOOR = "window_driver_on_door"
     const val PREF_WINDOW_OPPOSITE_ON_DOOR = "window_opposite_on_door"
-    /** iter23 P3: набор окон, которые МЫ приоткрыли и обязаны закрыть (переживает рестарт процесса). */
+    /** iter23 P3 / iter32: СТАРЫЙ ключ — только для миграции (читается, больше не пишется). */
     const val PREF_VENT_WINDOWS = "vent_windows"
+    /**
+     * iter32 §3.2: КАРТА ВЛАДЕЛЬЦЕВ «окно → набор дверей, по чьей причине оно приоткрыто»
+     * в формате `10=1,4;40=4` (hex через `;` и `,`; окно без владельцев — `100=`).
+     * Плоский набор окон (`vent_windows`) не хранил, КАКАЯ дверь открыла окно, поэтому закрытие
+     * одной двери закрывало окна обеих. Теперь владелец известен.
+     */
+    const val PREF_VENT_OWNERS = "vent_owners"
 
     // VHAL VehiclePropertyIds (IHU629G Geely EX2) из ex2_carprops.csv:
     const val PROP_DOOR_POS = 373295872     // 0x16400b00 — позиция двери (1=открыта,2=закрыта)
@@ -85,7 +92,20 @@ object WindowDoors {
      * последней из всех открытых дверей окно всё ещё в POS ~10 — закрывает его
      * (метод T() в CentralWatchdogService).
      */
-    private val activeVentWindows = hashSetOf<Int>()
+    private val ventOwners = HashMap<Int, MutableSet<Int>>()
+
+    /** Набор дверей-владельцев окна (создаётся по требованию). */
+    private fun ownersOf(w: Int): MutableSet<Int> = synchronized(ventOwners) { ventOwners.getOrPut(w) { HashSet() } }
+
+    /** Окно вообще наше (есть запись владельцев — возможно пустая, это legacy-окно). */
+    private fun isOurs(w: Int): Boolean = synchronized(ventOwners) { ventOwners.containsKey(w) }
+
+    /** Снимок карты владельцев для логов и чистой логики. */
+    private fun ownersSnapshot(): Map<Int, Set<Int>> =
+        synchronized(ventOwners) { ventOwners.mapValues { it.value.toSet() } }
+
+    /** Снимок состояний дверей (для чистой логики; обновляется ДО вычисления владельцев). */
+    private fun doorStatesSnapshot(): Map<Int, Boolean> = synchronized(doorStates) { HashMap(doorStates) }
     /** iter23 P3: prefs уже прочитаны в набор (reseed делается один раз за процесс). */
     @Volatile private var ventReseeded = false
 
@@ -103,28 +123,53 @@ object WindowDoors {
      * iter23 P3: набор окон хранится в SharedPreferences (`vent_windows`, hex через запятую),
      * иначе рестарт процесса/приложения терял «наши» окна и дверь закрывалась без закрытия стекла.
      */
-    private fun persistVentWindows(ctx: Context) {
+    private fun persistVentOwners(ctx: Context) {
         runCatching {
-            val v = activeVentWindows.sorted().joinToString(",") { Integer.toHexString(it) }
-            Prefs2.putString(ctx, PREF_VENT_WINDOWS, v)
-            AppLog.i(ctx, TAG, "VENT_SAVE: set=[$v]")
+            val v = synchronized(ventOwners) {
+                ventOwners.entries.sortedBy { it.key }.joinToString(";") { (w, ds) ->
+                    Integer.toHexString(w) + "=" + ds.sorted().joinToString(",") { Integer.toHexString(it) }
+                }
+            }
+            Prefs2.putString(ctx, PREF_VENT_OWNERS, v)
+            // iter32: старый ключ `vent_windows` больше НЕ пишем (пусть остаётся следом).
+            AppLog.i(ctx, TAG, "VENT_SAVE owners=[$v]")
         }
     }
 
     /** Чтение набора из prefs; вызывается один раз за процесс. */
-    private fun reseedVentWindows(ctx: Context) {
+    private fun reseedVentOwners(ctx: Context) {
         if (ventReseeded) return
         ventReseeded = true
-        val raw = Prefs2.getString(ctx, PREF_VENT_WINDOWS, "") ?: ""
-        if (raw.isBlank()) {
+        val raw = Prefs2.getString(ctx, PREF_VENT_OWNERS, "") ?: ""
+        if (raw.isNotBlank()) {
+            for (part in raw.split(';')) {
+                val p = part.trim()
+                if (p.isEmpty() || !p.contains('=')) continue
+                val winHex = p.substringBefore('=').trim()
+                val doors = p.substringAfter('=')
+                val w = runCatching { winHex.toInt(16) }.getOrNull() ?: continue
+                val set = ownersOf(w)
+                for (d in doors.split(',')) {
+                    val dv = d.trim().takeIf { it.isNotEmpty() }?.let { runCatching { it.toInt(16) }.getOrNull() } ?: continue
+                    set.add(dv)
+                }
+                AppLog.i(ctx, TAG, "VENT_RESEED win=0x${Integer.toHexString(w)} owners=${set.joinToString(",") { Integer.toHexString(it) }}")
+            }
+            AppLog.i(ctx, TAG, "VENT_RESEED: восстановлено окон=${ventOwners.size}")
+            return
+        }
+        // Миграция со старого ключа: окна «наши», но чья дверь — неизвестно (пустой набор владельцев).
+        val legacy = Prefs2.getString(ctx, PREF_VENT_WINDOWS, "") ?: ""
+        if (legacy.isBlank()) {
             AppLog.i(ctx, TAG, "VENT_RESEED: пусто (нет приоткрытых нами окон)")
             return
         }
-        for (part in raw.split(',')) {
+        for (part in legacy.split(',')) {
             val a = part.trim().takeIf { it.isNotEmpty() }?.let { runCatching { it.toInt(16) }.getOrNull() } ?: continue
-            activeVentWindows.add(a)
-            AppLog.i(ctx, TAG, "VENT_RESEED: area=0x${Integer.toHexString(a)} pos=восстановлено")
+            ownersOf(a)   // ключ без владельцев = «наше окно, дверь неизвестна»
+            AppLog.i(ctx, TAG, "VENT_LEGACY_MIGRATE win=0x${Integer.toHexString(a)} (owners неизвестны)")
         }
+        AppLog.i(ctx, TAG, "VENT_RESEED: миграция со старого ключа, окон=${ventOwners.size}")
     }
 
     private fun fireUnlockSound(ctx: Context, reason: String) {
@@ -225,6 +270,8 @@ object WindowDoors {
         val oppOn = isWindowOppositeOnDoor(appCtx)
         val unlockOn = LockSound.isUnlockSoundEnabled(appCtx)
         AppLog.i(appCtx, TAG, "maybeInit driverOn=$driverOn oppOn=$oppOn unlockOn=$unlockOn isRegistered=$isRegistered")
+        // iter32 §3.4: самопроверка чистой логики закрытия окон (6 кейсов мандата) — один раз при старте.
+        runCatching { ventLogicSelfTest() }.onFailure { AppLog.w(appCtx, TAG, "VENT_SELFTEST failed: ${it.message}") }
         if (driverOn || oppOn || unlockOn) {
             initCarService(appCtx)
         }
@@ -308,7 +355,7 @@ object WindowDoors {
         // режимы работают НЕЗАВИСИМО: если включены ОБА — вентилируются оба
         // окна (своё + противоположное). Это соответствует k0()-семантике,
         // где z3=true помечает вторую подряд итерацию для oposta.
-        reseedVentWindows(ctx)
+        reseedVentOwners(ctx)
         val prefOwn = Prefs2.getBoolean(ctx, PREF_WINDOW_DRIVER_ON_DOOR, false)
         val prefOpp = Prefs2.getBoolean(ctx, PREF_WINDOW_OPPOSITE_ON_DOOR, false)
 
@@ -326,31 +373,33 @@ object WindowDoors {
         val opp = OPPOSITE_WINDOW[ownWindow]
         if (prefOpp && opp != null) targets.add(opp to true)
 
-        // iter23 P3: при ЗАКРЫТИИ двери закрываем и своё, и противоположное окно,
-        // если мы их приоткрывали — даже если соответствующий тумблер уже выключили.
+        // iter32 §3.2: при ЗАКРЫТИИ двери кандидатов даёт КАРТА ВЛАДЕЛЬЦЕВ, а не «своё + противоположное».
+        // Именно старый код `listOfNotNull(ownWindow, OPPOSITE_WINDOW[ownWindow])` закрывал оба окна,
+        // когда были открыты две двери (окно соседней двери попадало в плоский набор).
         if (!isOpen) {
-            val oppWin = OPPOSITE_WINDOW[ownWindow]
-            for (w in listOfNotNull(ownWindow, oppWin)) {
-                if (w in activeVentWindows && targets.none { it.first == w }) {
-                    targets.add(w to (w != ownWindow))
-                }
+            val candidates = closeCandidates(doorAreaId, ownWindow)
+            if (candidates.isEmpty()) {
+                AppLog.i(ctx, TAG, "VENT_CLOSE door=0x${Integer.toHexString(doorAreaId)} candidates=(none) — закрывать нечего")
+                return
             }
+            for (w in candidates) closeVentWindow(cpm, w, doorAreaId)
+            return
         }
 
         if (targets.isEmpty()) return
 
         for ((target, oposta) in targets) {
-            applyFilete(cpm, target, doorAreaId, isOpen, oposta)
+            applyFilete(cpm, target, doorAreaId, true, oposta)
         }
     }
 
     /**
      * Применить filete de ar для одного окна — дословный перенос кода k0().
      *
-     * Багфикс двух дверей (b3/auditr3): activeVentWindows — МНОЖЕСТВО, а не одно поле.
-     * При открытии нескольких дверей КАЖДОЕ соотв. окно добавляется в набор;
-     * при закрытии — удаляется и закрывается. Это соответствует независимому
-     * вызову k0 для каждой двери в s2.onChangeEvent в OEM.
+     * iter32 §3.2: раньше здесь был плоский набор `activeVentWindows` (iter23 P3) — он не хранил,
+     * КАКАЯ дверь открыла окно, из-за чего закрытие одной двери закрывало окна обеих.
+     * Теперь окно помнит владельцев (`ventOwners`), а закрытие решает [ventCloseDecision].
+     * Открытие по-прежнему соответствует независимому вызову k0() для каждой двери в OEM.
      *
      * @return true если команду в VHAL удалось отправить
      */
@@ -377,39 +426,83 @@ object WindowDoors {
             }
             val ok = writeWindowPos(cpm, windowAreaId, WINDOW_OPEN_POS)
             if (ok) {
-                activeVentWindows.add(windowAreaId)
-                persistVentWindows(appCtx)
-                AppLog.i(appCtx, TAG, "janela ${tag}0x${Integer.toHexString(windowAreaId)} → POS $WINDOW_OPEN_POS (дверь 0x${Integer.toHexString(doorAreaId)} открыта); activeSet=$activeVentWindows")
+                // iter32 §3.2: владельцем окна становится ИМЕННО эта дверь (и для «своего» окна,
+                // и для «противоположного» — это требование §3.3 п.2).
+                val owners = ownersOf(windowAreaId)
+                owners.add(doorAreaId)
+                persistVentOwners(appCtx)
+                AppLog.i(appCtx, TAG, "VENT_OPEN door=0x${Integer.toHexString(doorAreaId)} win=0x${Integer.toHexString(windowAreaId)} pos=$curPos owners=${owners.sorted().joinToString(",") { Integer.toHexString(it) }}")
+                AppLog.i(appCtx, TAG, "janela ${tag}0x${Integer.toHexString(windowAreaId)} → POS $WINDOW_OPEN_POS (дверь 0x${Integer.toHexString(doorAreaId)} открыта)")
             } else {
                 AppLog.w(appCtx, TAG, "windowDriver set ${tag}0x${Integer.toHexString(windowAreaId)} не удался")
             }
             return ok
+        }
+        // iter32 §3.2: ветка ЗАКРЫТИЯ больше не живёт здесь — закрытие решает closeVentWindow()
+        // по карте владельцев (раньше здесь закрывалось «своё + противоположное» окно).
+        return false
+    }
+
+    /**
+     * iter32 §3.2: кандидаты на закрытие при закрытии двери `door`.
+     * 1) все окна, у которых `door` есть в наборе владельцев;
+     * 2) legacy-окна (запись есть, набор владельцев пуст) — только своё и противоположное этой двери.
+     * Никакого `OPPOSITE_WINDOW` для «настоящих» окон здесь нет.
+     */
+    private fun closeCandidates(door: Int, ownWindow: Int): List<Int> {
+        val out = LinkedHashSet<Int>()
+        synchronized(ventOwners) {
+            for ((w, ds) in ventOwners) if (door in ds) out.add(w)
+            for (w in listOfNotNull(ownWindow, OPPOSITE_WINDOW[ownWindow])) {
+                if (ventOwners.containsKey(w) && ventOwners[w]!!.isEmpty()) out.add(w)
+            }
+        }
+        return out.toList()
+    }
+
+    /**
+     * iter32 §3.2: закрытие одного окна по решению чистой функции [ventCloseDecision].
+     * Порядок: снять «эту дверь» из владельцев → решить → (если закрываем) проверить POS и записать 0.
+     */
+    private fun closeVentWindow(cpm: CarPropertyManager, windowAreaId: Int, doorAreaId: Int) {
+        val appCtx = appContext ?: return
+        val posBefore = readWindowPos(cpm, windowAreaId)
+        val before = ownersSnapshot()[windowAreaId]?.toSet() ?: emptySet()
+        val wasOurs = isOurs(windowAreaId)
+        // 0) СИНХРОНИЗАЦИЯ: если окно принадлежит напрямую ДРУГОЙ открытой двери
+        //    (`DOOR_TO_WINDOW[d] == w`), эта дверь становится его владельцем — иначе окно
+        //    осталось бы «ничьим» и не закрылось бы при закрытии той двери.
+        for ((d, open) in doorStatesSnapshot()) {
+            if (open && d != doorAreaId && DOOR_TO_WINDOW[d] == windowAreaId) ownersOf(windowAreaId).add(d)
+        }
+        // 1) снимаем ЭТУ дверь из владельцев
+        if (before.contains(doorAreaId)) synchronized(ventOwners) { ventOwners[windowAreaId]?.remove(doorAreaId) }
+        val after = synchronized(ventOwners) { ventOwners[windowAreaId]?.toSet() ?: emptySet() }
+        val pos = posBefore ?: -1
+        val decision = ventCloseDecision(
+            door = doorAreaId, window = windowAreaId,
+            doorStates = doorStatesSnapshot(), owners = ownersSnapshot(),
+            doorToWindow = DOOR_TO_WINDOW, pos = pos,
+            openPos = WINDOW_OPEN_POS, tolerance = WINDOW_CLOSE_TOLERANCE,
+        ).let { if (it == "close" && !wasOurs) "skip:not_ours" else it }
+        val ownersLog = "owners_before=${before.sorted().joinToString(",") { Integer.toHexString(it) }}" +
+            " owners_after=${after.sorted().joinToString(",") { Integer.toHexString(it) }}"
+
+        if (decision != "close") {
+            // п.6: окно не закрываем — причину в лог. Владельцы уже приведены к реальности
+            // (снята только закрывшаяся дверь, добавлены остальные открытые).
+            persistVentOwners(appCtx)
+            AppLog.i(appCtx, TAG, "VENT_CLOSE door=0x${Integer.toHexString(doorAreaId)} win=0x${Integer.toHexString(windowAreaId)} pos=$pos $ownersLog → skip reason=${decision.removePrefix("skip:")}")
+            return
+        }
+
+        val ok = writeWindowPos(cpm, windowAreaId, WINDOW_CLOSED_POS)
+        if (ok) {
+            synchronized(ventOwners) { if (ventOwners[windowAreaId]?.isEmpty() == true) ventOwners.remove(windowAreaId) }
+            persistVentOwners(appCtx)
+            AppLog.i(appCtx, TAG, "VENT_CLOSE door=0x${Integer.toHexString(doorAreaId)} win=0x${Integer.toHexString(windowAreaId)} pos=$pos $ownersLog → POS $WINDOW_CLOSED_POS")
         } else {
-            // iter23 P3: единая точка для диагностики закрытия — видно и набор, и позицию.
-            val inSet = windowAreaId in activeVentWindows
-            // k0(z2=false): закрываем только если окно всё ещё около POS 10.
-            if (kotlin.math.abs(curPos - WINDOW_OPEN_POS) > WINDOW_CLOSE_TOLERANCE) {
-                AppLog.i(appCtx, TAG, "DOOR_CLOSE area=0x${Integer.toHexString(doorAreaId)} win=0x${Integer.toHexString(windowAreaId)} pos=$curPos inSet=$inSet → skip reason=not_near_$WINDOW_OPEN_POS")
-                AppLog.i(appCtx, TAG, "janela ${tag}0x${Integer.toHexString(windowAreaId)} не около POS $WINDOW_OPEN_POS (pos=$curPos) — дверь 0x${Integer.toHexString(doorAreaId)} закрылась, не мешаю")
-                activeVentWindows.remove(windowAreaId)
-                persistVentWindows(appCtx)
-                return false
-            }
-            if (!inSet) {
-                AppLog.i(appCtx, TAG, "DOOR_CLOSE area=0x${Integer.toHexString(doorAreaId)} win=0x${Integer.toHexString(windowAreaId)} pos=$curPos inSet=false → skip reason=not_ours")
-                AppLog.i(appCtx, TAG, "janela ${tag}0x${Integer.toHexString(windowAreaId)} не была открыта нами в этом цикле — не закрываю")
-                return false
-            }
-            val ok = writeWindowPos(cpm, windowAreaId, WINDOW_CLOSED_POS)
-            if (ok) {
-                activeVentWindows.remove(windowAreaId)
-                persistVentWindows(appCtx)
-                AppLog.i(appCtx, TAG, "DOOR_CLOSE area=0x${Integer.toHexString(doorAreaId)} win=0x${Integer.toHexString(windowAreaId)} pos=$curPos inSet=true → POS $WINDOW_CLOSED_POS")
-                AppLog.i(appCtx, TAG, "janela ${tag}0x${Integer.toHexString(windowAreaId)} → POS $WINDOW_CLOSED_POS (дверь 0x${Integer.toHexString(doorAreaId)} закрыта); activeSet=$activeVentWindows")
-            } else {
-                AppLog.w(appCtx, TAG, "windowDriver set ${tag}0x${Integer.toHexString(windowAreaId)} не удался")
-            }
-            return ok
+            AppLog.w(appCtx, TAG, "VENT_CLOSE door=0x${Integer.toHexString(doorAreaId)} win=0x${Integer.toHexString(windowAreaId)} set POS $WINDOW_CLOSED_POS НЕ удался")
         }
     }
 
@@ -478,4 +571,94 @@ object WindowDoors {
             steps = listOf(step)
         )
     }
+}
+
+// ─────────── iter32 §3.2/§3.4: ЧИСТАЯ логика закрытия окна (без Android/VHAL) ───────────
+
+/**
+ * Решение «закрывать ли окно после закрытия двери» (iter32 §3.4).
+ *
+ * Правила:
+ *  - окно не наше (`window` отсутствует в карте) → не закрывать никогда (открыто вручную);
+ *  - после снятия `door` из владельцев набор не пуст → окно нужно другой открытой двери;
+ *  - есть другая ОТКРЫТАЯ дверь, которой это окно принадлежит напрямую (`doorToWindow[d] == window`) → не закрывать.
+ * Проверка позиции (`|pos − 10| ≤ 3`) — отдельно, в [ventCloseDecision], т.к. требует VHAL.
+ */
+internal fun shouldCloseAfterDoorClose(
+    door: Int,
+    window: Int,
+    doorStates: Map<Int, Boolean>,
+    owners: Map<Int, Set<Int>>,
+    doorToWindow: Map<Int, Int>,
+): Boolean {
+    if (!owners.containsKey(window)) return false
+    val after = (owners[window] ?: emptySet()) - door
+    if (after.isNotEmpty()) return false
+    if (doorStates.any { (d, open) -> open && d != door && doorToWindow[d] == window }) return false
+    return true
+}
+
+/**
+ * Полное решение с причиной — то, что печатается в `VENT_CLOSE … reason=…`.
+ * Возвращает `close` либо `skip:<причина>`.
+ */
+internal fun ventCloseDecision(
+    door: Int,
+    window: Int,
+    doorStates: Map<Int, Boolean>,
+    owners: Map<Int, Set<Int>>,
+    doorToWindow: Map<Int, Int>,
+    pos: Int,
+    openPos: Int,
+    tolerance: Int,
+): String {
+    if (!owners.containsKey(window)) return "skip:not_ours"
+    val after = (owners[window] ?: emptySet()) - door
+    if (after.isNotEmpty()) {
+        val holder = after.sorted().first()
+        return "skip:needed_by_door_0x" + Integer.toHexString(holder)
+    }
+    val openOwner = doorStates.entries.firstOrNull { (d, open) -> open && d != door && doorToWindow[d] == window }
+    if (openOwner != null) return "skip:needed_by_door_0x" + Integer.toHexString(openOwner.key)
+    if (pos >= 0 && kotlin.math.abs(pos - openPos) > tolerance) return "skip:not_near_$openPos"
+    return "close"
+}
+
+private data class VentCase(
+    val n: Int,
+    val door: Int,
+    val win: Int,
+    val states: Map<Int, Boolean>,
+    val owners: Map<Int, Set<Int>>,
+    val pos: Int,
+    val expect: String,
+)
+
+/**
+ * iter32 §3.4: самопроверка чистой логики шестью кейсами из мандата.
+ * В проекте нет юнит-тест-инфраструктуры (нет `app/src/test`, нет junit), поэтому тест —
+ * обычная функция, которая вызывается при старте и печатает результат в лог.
+ */
+internal fun ventLogicSelfTest(): Boolean {
+    val d2w = mapOf(1 to 16, 4 to 64, 16 to 256, 64 to 1024)
+    val cases = listOf(
+        VentCase(1, 1, 16, mapOf(1 to true, 4 to true), mapOf(16 to setOf(1), 64 to setOf(4)), 10, "close"),
+        VentCase(2, 1, 64, mapOf(1 to true, 4 to true), mapOf(16 to setOf(4), 64 to setOf(1)), 10, "skip:needed_by_door_0x4"),
+        VentCase(3, 4, 16, mapOf(4 to true), mapOf(16 to setOf(4)), 10, "close"),
+        VentCase(4, 1, 16, mapOf(1 to true), mapOf<Int, Set<Int>>(), 10, "skip:not_ours"),
+        VentCase(5, 1, 16, mapOf(1 to true), mapOf(16 to setOf(1)), 40, "skip:not_near_10"),
+        VentCase(6, 1, 256, mapOf(1 to true), mapOf(256 to emptySet()), 10, "close"),
+    )
+    var allOk = true
+    for (c in cases) {
+        val got = ventCloseDecision(c.door, c.win, c.states - c.door, c.owners, d2w, c.pos, 10, 3)
+        val decision = if (got == "close" && !c.owners.containsKey(c.win)) "skip:not_ours" else got
+        val ok = decision == c.expect
+        if (!ok) allOk = false
+        Log.i("CENTRAL_WindowDoors",
+            "VENT_SELFTEST n=${c.n} door=0x${Integer.toHexString(c.door)} win=0x${Integer.toHexString(c.win)} " +
+                "pos=${c.pos} decision=$decision expect=${c.expect} ok=$ok")
+    }
+    Log.i("CENTRAL_WindowDoors", "VENT_SELFTEST all=${if (allOk) "ok" else "FAIL"} n=${cases.size}")
+    return allOk
 }
