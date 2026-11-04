@@ -386,7 +386,10 @@ object AdbClient {
                 AppLog.i(TAG, "ADB_UNIX verdict=${if (ok) "up" else "down"} state=${state.get()} uid=${if (ok) "0" else "-"} dt=${SystemClock.uptimeMillis() - tU}ms ns=${unixNs.ifEmpty { "-" }}")
                 if (ok) {
                     listenerOwner = "unix"
-                    channelUp(Probe(KIND_ROOT, "uid=0 (unix)", "unix ns=${unixNs.ifEmpty { "filesystem" }}", SystemClock.uptimeMillis() - tU, null))
+                    // ВАЖНО: channelUp() здесь звать НЕЛЬЗЯ — он ставит state=ROOT_5555 и увел бы все
+                    // команды обратно на мёртвый TCP (runCommand маршрутизирует по state). Канал unix
+                    // уже выставлен в tryUnixChannel (state=ROOT_UNIX, unixNs), поэтому только фиксируем.
+                    channelUpUnix(SystemClock.uptimeMillis() - tU)
                     adbFixVerify("after_unix")
                     runCatching { execPropDirect() }.onFailure { AppLog.w(TAG, "EXEC_PROP failed: ${it.message}") }
                     replayDeferred()
@@ -974,6 +977,18 @@ object AdbClient {
         AppLog.i(TAG, "ADB_SELFTEST: port=5555 ok uid=0 dt=${p.dt}ms ctx=${p.ctx.ifEmpty { "-" }}")
         logAdbPortReadback(ADB_PORT_DEFAULT)
         logInitDiagnostics()
+    }
+
+    /**
+     * iter30b F3: фиксация канала, найденного через unix-сокет.
+     * В отличие от [channelUp] НЕ переводит состояние в ROOT_5555 — иначе `runCommand`
+     * увёл бы все команды на TCP 5555, который в этой ветке как раз не отвечает.
+     */
+    private fun channelUpUnix(dt: Long) {
+        workingPort.set(ADB_PORT_DEFAULT)
+        state.set(ChannelState.ROOT_UNIX)
+        AppLog.i(TAG, "ADB_SELFTEST: unix ok uid=0 dt=${dt}ms ns=${unixNs.ifEmpty { "filesystem" }} (TCP 5555 не отвечает — работаем через unix)")
+        AppLog.i(TAG, "ADB_CHANNEL unix ns=${unixNs.ifEmpty { "filesystem" }} path=$ADBD_SOCKET_PATH port=-")
     }
 
     /**
