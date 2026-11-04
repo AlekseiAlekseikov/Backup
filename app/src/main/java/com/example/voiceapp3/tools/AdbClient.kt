@@ -8,7 +8,9 @@ import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
 import java.io.IOException
 import java.io.OutputStream
+import java.net.Inet4Address
 import java.net.InetSocketAddress
+import java.net.NetworkInterface
 import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -52,8 +54,6 @@ object AdbClient {
     /** iter26 B.2 / iter27 D1: adbd создаёт ФАЙЛОВЫЙ сокет; abstract "@adbd" тоже пробуем. */
     private const val ADBD_SOCKET = "adbd"
     private const val ADBD_SOCKET_PATH = "/dev/socket/adbd"
-    /** Порт локального adb-СЕРВЕРА (хост-сторона), найден в логе 1.0.46 в LISTEN. */
-    private const val ADB_SERVER_PORT = 5037
     private const val PROP_DIAG = "persist.sys.hvacdigital.diag"
     // ── iter28 P0-A: параметры рукопожатия как у настоящего adb (platform-tools, SDK 28-30) ──
     private const val A_VERSION = 0x01000000
@@ -98,6 +98,14 @@ object AdbClient {
 
     private val queue = LinkedBlockingQueue<Job>()
     private val workingPort = AtomicInteger(0)
+    /**
+     * iter29 P0-A: РАБОЧИЙ АДРЕС канала. Больше не константа `127.0.0.1`:
+     * адрес выбирается пробой `ADB_DEST` (Wi-Fi IPv4 → 127.0.0.1 → ::1) и используется
+     * всеми последующими командами (`execAdbSocket`). ПК подключается к 172.20.10.2:5555,
+     * наше приложение до 1.0.50 всегда ходило на loopback — это и есть непроверенный признак.
+     */
+    @Volatile private var workingHost: String = "127.0.0.1"
+    @Volatile private var channelLoggedHost: String = ""
 
     enum class ChannelState {
         IDLE,
@@ -287,49 +295,202 @@ object AdbClient {
      */
     private fun bootstrap() {
         state.set(ChannelState.BOOTING)
-        AppLog.i(TAG, "ADB bootstrap: single probe 127.0.0.1:$ADB_PORT_DEFAULT (connect ${PROBE_CONNECT_MS}ms, total ${PROBE_TOTAL_MS}ms, no retries)")
 
-        var p = fullProbe()
-        AppLog.i(TAG, "ADB_PROBE port=$ADB_PORT_DEFAULT kind=${p.kind} dt=${p.dt}ms uid=${p.uid.ifEmpty { "-" }}")
-        if (p.kind == KIND_ROOT) { channelUp(p); return }
+        // iter29 P0-A0: ПЕРВОЙ строкой после старта AdbWorker — кто мы для ядра/SELinux.
+        // Это нужно, чтобы гипотеза H1 (фильтр по контексту пира u:r:system_app:s0) была
+        // подтверждена или снята ПО ЛОГУ, а не рассуждением.
+        logSelfContext()
+
+        // iter29 P0-B: ключ нужен только ради одной строки ADB_PUBKEY в отчёте.
+        // Ни подписи токенов на старте, ни записей в /data/misc/adb/adb_keys, ни AUTH-попыток:
+        // ro.secure=0 ⇒ adbd авторизацию не требует (вывод ПК в 1.0.50: /data/misc/adb пуст,
+        // adb_keys отсутствует, а uid=0(root) с ПК выдаётся).
+        runCatching { AdbAuth.init(appCtx) }.onFailure { AppLog.w(TAG, "ADB_PUBKEY init failed: ${it.message}") }
+
+        // iter29 P0-A: проба по ВСЕМ локальным адресам, не только 127.0.0.1 (гипотеза H2).
+        val targets = localTargets()
+        AppLog.i(TAG, "ADB_DEST targets=${targets.joinToString(",")} port=$ADB_PORT_DEFAULT " +
+            "(connect ${PROBE_CONNECT_MS}ms, окно ${RAW_READ_MS}ms на адрес, CNXN arg0=0x01000000 arg1=$A_MAXDATA)")
+        val winner = discoverDestination(targets)
+
+        var p: Probe? = null
+        if (winner != null) {
+            workingHost = winner.addr
+            AppLog.i(TAG, "ADB_CHANNEL host=$workingHost port=$ADB_PORT_DEFAULT")
+            val pr = fullProbe()
+            p = pr
+            AppLog.i(TAG, "ADB_PROBE port=$ADB_PORT_DEFAULT host=$workingHost kind=${pr.kind} dt=${pr.dt}ms uid=${pr.uid.ifEmpty { "-" }}")
+            if (pr.kind == KIND_ROOT) {
+                channelUp(pr)
+                adbFixVerify("after_dest")
+                replayDeferred()
+                return
+            }
+            // CNXN пришёл, но канал не root — редкий случай (UP_NONROOT). Дальше только диагноз.
+            AppLog.w(TAG, "ADB_DEST note=cnxn_ok_but_not_root host=$workingHost kind=${pr.kind} uid=${pr.uid.ifEmpty { "-" }}")
+        } else {
+            // P0-C: ни один адрес не ответил — фиксируем это и переходим к диагнозу.
+            // Пометка означает: замер сделан БЕЗ активной сессии ПК на 5555 (владелец закрывает её до запуска).
+            AppLog.e(TAG, "ADB_DEST result=none working=none")
+            AppLog.i(TAG, "ADB_DEST note=probe-without-pc-session (сессия ПК на 5555 закрыта до запуска)")
+        }
 
         // iter28 P0-C: unix-путь из bootstrap убран (SELinux: canRead=false + UnsupportedOperationException).
         // Оставляем одну строку-диагноз, канал — только TCP 5555.
         logUnixSocketFacts()
 
-        // P0.1: однозначный диагноз — один раз за загрузку (B.4).
+        // iter29 P0-B: ключи не нужны вовсе — одна строка-факт вместо self-register.
+        AppLog.i(TAG, "ADB_KEYS: n/a (ro.secure=0 — adbd не требует ключей)")
+
+        // iter28 P0-D: ADB_TOGGLE из bootstrap убран (1.0.49: NO_EFFECT + риск для USB).
+
+        // P0.1/P0-D: диагноз — один раз за загрузку и ТОЛЬКО если ни один адрес не ответил.
+        val failed = p ?: Probe(KIND_SILENT, "", "", 0, "all targets silent: ${targets.joinToString(",")}")
         if (diagAllowedThisBoot()) {
-            runCatching { adbDiag(p) }.onFailure { AppLog.w(TAG, "ADBDIAG failed: ${it.message}") }
+            runCatching { adbDiag(failed) }.onFailure { AppLog.w(TAG, "ADBDIAG failed: ${it.message}") }
         } else {
             AppLog.i(TAG, "ADBDIAG skipped: уже выполнялся в этой загрузке (повторно не растягиваем старт)")
         }
 
-        // iter28 P0-D: ADB_TOGGLE из bootstrap убран — в 1.0.49 дал NO_EFFECT, а риск для USB
-        // на этой ГУ остаётся. Шаг доступен только как ручное действие владельца (см. отчёт).
-
-        // iter28 P0-G: один раз за процесс проверяем, может ли system-uid дописать СВОЙ ключ
-        // в /data/misc/adb/adb_keys (чужие строки не трогаем никогда).
-        if (!keysChecked) {
-            keysChecked = true
-            runCatching { adbKeysSelfRegister() }.onFailure { AppLog.w(TAG, "ADB_KEYS check failed: ${it.message}") }
-        }
-
-        // iter28 P0-A/P0-B: эксперимент с рукопожатием и авторизацией. Это и есть главная попытка:
-        // проба выше шла тем же путём, но теперь handshake пробует оба варианта CNXN и умеет AUTH.
-        if (runCatching { handshakeExperiment() }.getOrElse {
-                AppLog.e(TAG, "ADB_HANDSHAKE crashed: ${it.javaClass.simpleName}: ${it.message}"); false
-            }) {
-            adbFixVerify("after_handshake")
-            replayDeferred()
-            return
-        }
-
         // Записей в sysfs/tcpip в сборке нет и не будет.
-        AppLog.i(TAG, "ADBFIX disabled (iter28: gpio/tcpip/toggle отключены — лог 1.0.46: GPIO 151 гасит USB)")
+        AppLog.i(TAG, "ADBFIX disabled (iter29: gpio/tcpip/toggle отключены — лог 1.0.46: GPIO 151 гасит USB)")
 
-        AppLog.e(TAG, "ADB_SELFTEST: failed probes=5555 kind=${p.kind} dt=${p.dt}ms err=${p.err ?: "-"}")
-        AppLog.e(TAG, "ROOT_UNAVAILABLE reason=no_adb_root_channel probe=5555 detail=${p.err ?: p.kind}")
-        fallbackNoRoot("probe=${p.kind} ${p.err ?: ""}")
+        AppLog.e(TAG, "ADB_SELFTEST: failed targets=${targets.joinToString(",")} kind=${failed.kind} dt=${failed.dt}ms err=${failed.err ?: "-"}")
+        AppLog.e(TAG, "ROOT_UNAVAILABLE reason=no_adb_root_channel probe=$ADB_PORT_DEFAULT detail=${failed.err ?: failed.kind}")
+        fallbackNoRoot("probe=${failed.kind} ${failed.err ?: ""}")
+    }
+
+    // ─────────── iter29 P0-A0/P0-A: свой контекст + проба по всем адресам ───────────
+
+    /** `ADB_SELF`: uid/pid и SELinux-контекст процесса — первая строка AdbWorker. */
+    private fun logSelfContext() {
+        val uid = android.os.Process.myUid()
+        val pid = android.os.Process.myPid()
+        var ctx = runCatching { java.io.File("/proc/self/attr/current").readText().trim() }.getOrDefault("")
+        if (ctx.isEmpty()) {
+            ctx = runCatching { runShellFallback("cat /proc/self/attr/current 2>/dev/null", 1500).trim() }.getOrDefault("")
+        }
+        AppLog.i(TAG, "ADB_SELF: uid=$uid pid=$pid scontext=${ctx.ifEmpty { "(unreadable)" }}")
+    }
+
+    /**
+     * Все локальные адреса, по которым может слушать adbd.
+     * Порядок: сначала НЕ-loopback IPv4 (Wi-Fi — как у ПК), затем 127.0.0.1, затем ::1 и IPv6.
+     */
+    private fun localTargets(): List<String> {
+        val v4 = ArrayList<String>()
+        val v6 = ArrayList<String>()
+        try {
+            val ifs = NetworkInterface.getNetworkInterfaces()
+            while (ifs != null && ifs.hasMoreElements()) {
+                val ni = ifs.nextElement()
+                if (!runCatching { ni.isUp }.getOrDefault(false)) continue
+                if (runCatching { ni.isLoopback }.getOrDefault(false)) continue
+                for (ia in ni.inetAddresses) {
+                    if (ia.isLoopbackAddress || ia.isLinkLocalAddress || ia.isAnyLocalAddress) continue
+                    val host = ia.hostAddress ?: continue
+                    if (ia is Inet4Address) { if (!v4.contains(host)) v4.add(host) }
+                    else if (!v6.contains(host)) v6.add(host)
+                }
+            }
+        } catch (t: Throwable) {
+            AppLog.w(TAG, "ADB_DEST targets: NetworkInterface failed: ${t.javaClass.simpleName}: ${t.message}")
+        }
+        val out = ArrayList<String>()
+        out.addAll(v4)
+        out.add("127.0.0.1")
+        out.addAll(v6)
+        out.add("::1")
+        return out.distinct()
+    }
+
+    /** Результат пробы одного адреса (для `ADB_DEST`). */
+    private data class Dest(
+        val addr: String,
+        val connectMs: Long,
+        val connectErr: String?,
+        val cmd: String,
+        val rx: Int,
+        val dt: Long
+    )
+
+    /** Одна строка на адрес: `ADB_DEST addr=… connect=… rx=… cmd=… dt=…`. */
+    private fun probeDestination(addr: String): Dest {
+        val t0 = SystemClock.uptimeMillis()
+        val s = Socket()
+        val tConn = SystemClock.uptimeMillis()
+        try {
+            s.connect(InetSocketAddress(addr, ADB_PORT_DEFAULT), PROBE_CONNECT_MS)
+        } catch (e: Throwable) {
+            runCatching { s.close() }
+            val err = when (e) {
+                is java.net.SocketTimeoutException -> "ETIMEDOUT"
+                is java.net.ConnectException -> "ECONNREFUSED"
+                is java.net.NoRouteToHostException -> "EHOSTUNREACH"
+                else -> e.javaClass.simpleName
+            }
+            val dt = SystemClock.uptimeMillis() - t0
+            AppLog.e(TAG, "ADB_DEST addr=$addr connect=$err rx=0 cmd=n/a dt=${dt}ms")
+            return Dest(addr, -1, err, "n/a", 0, dt)
+        }
+        val connectMs = SystemClock.uptimeMillis() - tConn
+        try {
+            s.soTimeout = RAW_READ_MS
+            val os = s.getOutputStream()
+            val dis = DataInputStream(s.getInputStream())
+            val payload = "$HOST_BANNER_FEATURES\u0000".toByteArray(StandardCharsets.UTF_8)
+            writeMsg(os, CNXN, A_VERSION, A_MAXDATA, payload)
+            AppLog.d(TAG, "ADB_TX(probe $addr) cmd=CNXN arg0=0x${"%08x".format(A_VERSION)} arg1=$A_MAXDATA len=${payload.size} hex=${msgHeaderHex(CNXN, A_VERSION, A_MAXDATA, payload)}")
+            val hdr = ByteArray(24)
+            var got = 0
+            var abort: String? = null
+            try {
+                while (got < 24) {
+                    val r = dis.read(hdr, got, 24 - got)
+                    if (r < 0) break
+                    got += r
+                }
+            } catch (e: Throwable) {
+                abort = e.javaClass.simpleName
+            }
+            val dt = SystemClock.uptimeMillis() - t0
+            if (got < 24) {
+                val cmd = if (got == 0) "silent" else "short:$got"
+                AppLog.e(TAG, "ADB_DEST addr=$addr connect=${connectMs}ms rx=$got cmd=$cmd dt=${dt}ms${if (abort != null) " err=$abort" else ""}")
+                return Dest(addr, connectMs, abort, cmd, got, dt)
+            }
+            val c = ByteBuffer.wrap(hdr, 0, 4).order(ByteOrder.LITTLE_ENDIAN).int
+            val name = cmdName(c)
+            AppLog.i(TAG, "ADB_DEST addr=$addr connect=${connectMs}ms rx=24 cmd=$name hex=${hexOf(hdr, 24)} dt=${dt}ms${if (name == "AUTH") " auth=required" else ""}")
+            return Dest(addr, connectMs, null, name, 24, dt)
+        } catch (e: Throwable) {
+            val dt = SystemClock.uptimeMillis() - t0
+            AppLog.e(TAG, "ADB_DEST addr=$addr connect=${connectMs}ms rx=0 cmd=error:${e.javaClass.simpleName} dt=${dt}ms")
+            return Dest(addr, connectMs, e.javaClass.simpleName, "error", 0, dt)
+        } finally {
+            runCatching { s.close() }
+        }
+    }
+
+    /** Идём по списку адресов и возвращаем первый, который ответил CNXN (или AUTH). */
+    private fun discoverDestination(targets: List<String>): Dest? {
+        var authOnly: Dest? = null
+        for (addr in targets) {
+            val d = try { probeDestination(addr) } catch (e: Throwable) {
+                AppLog.e(TAG, "ADB_DEST addr=$addr probe crashed: ${e.javaClass.simpleName}: ${e.message}")
+                null
+            } ?: continue
+            if (d.cmd == "CNXN") {
+                AppLog.i(TAG, "ADB_DEST result=${d.addr} working=${d.addr} connect=${d.connectMs}ms")
+                return d
+            }
+            if (d.cmd == "AUTH" && authOnly == null) authOnly = d
+        }
+        if (authOnly != null) {
+            AppLog.w(TAG, "ADB_DEST result=${authOnly.addr} working=${authOnly.addr} auth=required (AUTH вместо CNXN)")
+            return authOnly
+        }
+        return null
     }
 
     // ─────────── проба канала ───────────
@@ -389,123 +550,35 @@ object AdbClient {
      * поиск по hex :15B3) → снимок свойств → проверка записи нашего props без root.
      */
     private fun adbDiag(failed: Probe) {
-        AppLog.e(TAG, "ADBDIAG start iter25: failedProbe=${failed.kind} dt=${failed.dt}ms err=${failed.err ?: "-"}")
+        AppLog.e(TAG, "ADBDIAG start iter29: failedProbe=${failed.kind} dt=${failed.dt}ms err=${failed.err ?: "-"}")
 
-        // 1) Контроль: заведомо закрытые порты. Эталон «ОС отказывает быстро».
-        for (port in intArrayOf(5556, 65011)) {
-            val t0 = SystemClock.uptimeMillis()
-            try {
-                Socket().use { it.connect(InetSocketAddress("127.0.0.1", port), PROBE_CONNECT_MS) }
-                AppLog.e(TAG, "ADBDIAG ctrl port=$port connect=OK dt=${SystemClock.uptimeMillis() - t0}ms (неожиданно открыт)")
-            } catch (e: Throwable) {
-                AppLog.e(TAG, "ADBDIAG ctrl port=$port ${e.javaClass.simpleName}: ${e.message} dt=${SystemClock.uptimeMillis() - t0}ms")
-            }
-        }
+        // 1) Таблица ядра — только tcp6 (в 1.0.43 слушатель был `:::`), hex :15B3.
+        //    Всё остальное (tcp, ss, netstat, 5037, ps adbd, /proc/net/unix, 5556/65011,
+        //    raw-чтения, accept-очередь) из диагноза убрано: ответы уже получены в 1.0.47–1.0.50.
+        val tbl = "/proc/net/tcp6"
+        val cmd = "(awk 'NR==1 || \$2 ~ /:15B3\$/ {print}' $tbl 2>/dev/null || cat $tbl 2>/dev/null) | head -5"
+        val (rc, out) = try { runShellFallbackWithRc(cmd, 3000) } catch (t: Throwable) { Pair(1, "EXC:${t.message}") }
+        AppLog.e(TAG, "ADBDIAG $tbl rc=$rc listen15B3=${out.lineSequence().any { it.contains(":15B3") }} out=${out.replace('\n', ' ').take(300).ifEmpty { "(empty)" }}")
 
-        // 2) Сырое чтение от 5555: различит CNXN / AUTH / молчание / отказ.
-        rawReadProbe()
-
-        // 3) Таблицы ядра: и tcp, и tcp6 (в 1.0.43 слушатель был в tcp6 `:::`), hex :15B3.
-        for (tbl in listOf("/proc/net/tcp", "/proc/net/tcp6")) {
-            val cmd = "(awk 'NR==1 || \$2 ~ /:15B3\$/ {print}' $tbl 2>/dev/null || cat $tbl 2>/dev/null) | head -5"
-            val (rc, out) = try {
-                runShellFallbackWithRc(cmd, 3000)
-            } catch (t: Throwable) { Pair(1, "EXC:${t.message}") }
-            val flat = out.replace('\n', ' ').take(300)
-            AppLog.e(TAG, "ADBDIAG $tbl rc=$rc listen15B3=${out.lineSequence().any { it.contains(":15B3") }} out=${flat.ifEmpty { "(empty)" }}")
-        }
-        for (cmd in listOf("ss -ltn 2>/dev/null | head -10", "netstat -ltn 2>/dev/null | head -10")) {
-            val (rc, out) = try { runShellFallbackWithRc(cmd, 3000) } catch (t: Throwable) { Pair(1, "EXC:${t.message}") }
-            AppLog.e(TAG, "ADBDIAG [${cmd.substringBefore(" ")}] rc=$rc out=${out.replace('\n', ' ').take(240).ifEmpty { "(empty)" }}")
-        }
-
-        // 4) Снимок свойств — только чтение.
+        // 2) Пять свойств — только чтение.
         for (prop in listOf("service.adb.tcp.port", "persist.adb.tcp.port", "init.svc.adbd", "ro.adb.secure", "ro.secure")) {
-            val (rc, out) = try { runShellFallbackWithRc("getprop $prop", 2500) } catch (t: Throwable) { Pair(1, "EXC:${t.message}") }
-            AppLog.e(TAG, "ADBDIAG prop $prop rc=$rc val=${out.trim().ifEmpty { "(empty)" }}")
+            val (prc, pout) = try { runShellFallbackWithRc("getprop $prop", 2500) } catch (t: Throwable) { Pair(1, "EXC:${t.message}") }
+            AppLog.e(TAG, "ADBDIAG prop $prop rc=$prc val=${pout.trim().ifEmpty { "(empty)" }}")
         }
 
-        // 5) Можно ли писать НАШ props из uid=1000 без adb (не глобальные настройки и не
-        //    adb-свойства — проверяется только запись persist.sys.hvacdigital.diag).
-        val (wRc, wOut) = try {
-            runShellFallbackWithRc("setprop $PROP_DIAG 46; getprop $PROP_DIAG", 3000)
-        } catch (t: Throwable) { Pair(1, "EXC:${t.message}") }
-        AppLog.e(TAG, "ADBDIAG setprop $PROP_DIAG: rc=$wRc readback=${wOut.trim().ifEmpty { "(empty)" }}")
-
-        // P0-E.1: три соединения подряд — adbd обслуживает accept-очередь или нет.
-        AppLog.e(TAG, "ADBDIAG raw5555 multi: 2 соединения по 24 байта (окно ${RAW_READ_MS}ms каждое)")
-        for (i in 1..2) {
-            val t0 = SystemClock.uptimeMillis()
-            val r = runCatching { rawReadOnce() }
-            val res = r.getOrElse { "exc=${it.javaClass.simpleName}:${it.message}" }
-            AppLog.e(TAG, "ADBDIAG raw5555 #$i $res dt=${SystemClock.uptimeMillis() - t0}ms")
+        // 3) Ключи: читаются ли вообще (записей в adb_keys из приложения НЕТ и не будет).
+        val keysReadable = runCatching { java.io.File("/data/misc/adb/adb_keys").canRead() }.getOrDefault(false)
+        if (keysReadable) {
+            val (krc, kout) = try { runShellFallbackWithRc("wc -l < /data/misc/adb/adb_keys 2>&1", 2500) } catch (t: Throwable) { Pair(1, "EXC:${t.message}") }
+            AppLog.e(TAG, "ADBDIAG wc adb_keys rc=$krc val=${kout.trim().ifEmpty { "(empty)" }}")
+        } else {
+            AppLog.e(TAG, "ADBDIAG wc adb_keys: n/a (файл не читается из uid=1000; ключи не нужны при ro.secure=0)")
         }
-
-        // iter26 B.3: держим соединение открытым и смотрим, забирает ли adbd из accept-очереди.
-        measureAcceptQueue()
-
-        // P0-E.2: на устройстве слушает adb-СЕРВЕР (127.0.0.1:5037) — спросим у него host:devices.
-        smartSocketProbe()
-
-        // P0-E.3: кто такой adbd — PID и unix-сокеты (только чтение).
-        for ((cmd, name) in listOf(
-            "ps -A 2>/dev/null | grep -i adbd || ps 2>/dev/null | grep -i adbd" to "ps adbd",
-            "cat /proc/net/unix 2>/dev/null | grep -i adbd" to "unix adbd",
-        )) {
-            val (rc, out) = try { runShellFallbackWithRc(cmd, 3000) } catch (t: Throwable) { Pair(1, "EXC:${t.message}") }
-            AppLog.e(TAG, "ADBDIAG $name rc=$rc out=${out.replace('\n', ' ').take(240).ifEmpty { "(empty)" }}")
-        }
-
-        // P0-E.4: состояние USB — ТОЛЬКО ЧТЕНИЕ, для будущего разбора.
-        for (prop in listOf("sys.usb.state", "persist.sys.usb.config", "sys.usb.config")) {
-            val (rc, out) = try { runShellFallbackWithRc("getprop $prop", 2500) } catch (t: Throwable) { Pair(1, "EXC:${t.message}") }
-            AppLog.e(TAG, "ADBDIAG prop $prop rc=$rc val=${out.trim().ifEmpty { "(empty)" }}")
-        }
-
-        // iter28 P0-E: данные для разбора авторизации — только чтение.
-        for ((cmd, name) in listOf(
-            "getprop ro.product.device" to "prop ro.product.device",
-            "getprop ro.build.version.sdk" to "prop ro.build.version.sdk",
-            "ls -l /data/misc/adb/ 2>&1" to "ls /data/misc/adb",
-            "wc -l < /data/misc/adb/adb_keys 2>&1" to "wc adb_keys",
-        )) {
-            val (rc, out) = try { runShellFallbackWithRc(cmd, 3000) } catch (t: Throwable) { Pair(1, "EXC:${t.message}") }
-            AppLog.e(TAG, "ADBDIAG $name rc=$rc val=${out.replace('\n', ' ').take(200).ifEmpty { "(empty)" }}")
-        }
-        AppLog.i(TAG, "ADB_HINT: при проблеме пришлите вывод logcat -d -b all | grep -iE 'adbd|auth'")
 
         AppLog.e(TAG, "ADBDIAG end")
     }
 
     // ─────────── iter28 P0-A/P0-B: рукопожатие и авторизация ───────────
-
-    /**
-     * Эксперимент: два варианта CNXN (A_VERSION 0x01000000 + features, затем 0x01000001 без features)
-     * с обработкой AUTH. При успехе — `channelUp` и `true`.
-     */
-    private fun handshakeExperiment(): Boolean {
-        AdbAuth.init(appCtx)
-        for ((idx, variant) in listOf(0, 1).withIndex()) {
-            val t0 = SystemClock.uptimeMillis()
-            val out = try {
-                execAdbSocket("id; id -Z 2>/dev/null", ADB_PORT_DEFAULT, PROBE_TOTAL_MS, PROBE_CONNECT_MS, variant)
-            } catch (e: Throwable) {
-                AppLog.e(TAG, "ADB_HANDSHAKE variant=${variantName(variant)} failed: ${e.javaClass.simpleName}: ${e.message} dt=${SystemClock.uptimeMillis() - t0}ms")
-                continue
-            }
-            val dt = SystemClock.uptimeMillis() - t0
-            if (isRootUid(out)) {
-                channelUp(Probe(KIND_ROOT, out.lineSequence().firstOrNull().orEmpty().trim(), "variant=${variantName(variant)}", dt, null))
-                AppLog.i(TAG, "ADB_HANDSHAKE OK variant=${variantName(variant)} dt=${dt}ms (attempt ${idx + 1})")
-                return true
-            }
-            AppLog.w(TAG, "ADB_HANDSHAKE variant=${variantName(variant)}: ответ есть, но uid не root: ${out.take(120)}")
-        }
-        AppLog.e(TAG, "ADB_HANDSHAKE: оба варианта не дали uid=0")
-        return false
-    }
-
-    private fun variantName(v: Int) = if (v == 0) "v0x01000000+features" else "v0x01000001+legacy"
 
     /**
      * Рукопожатие на уже подключённом сокете: CNXN → (AUTH TOKEN → SIGNATURE)* → CNXN.
@@ -590,41 +663,6 @@ object AdbClient {
         }
     }
 
-    /** iter28 P0-G: может ли android.uid.system записать свой ключ в adb_keys (только своя строка). */
-    private fun adbKeysSelfRegister() {
-        val line = AdbAuth.publicKeyLine()
-        AppLog.i(TAG, "ADB_KEYS self-register check: key=${if (line == null) "none" else "ok len=${line.length}"}")
-        val (rls, ls) = try { runShellFallbackWithRc("ls -l /data/misc/adb/ 2>&1", 3000) } catch (t: Throwable) { Pair(1, "EXC:${t.message}") }
-        AppLog.i(TAG, "ADB_KEYS: ls -l /data/misc/adb/ rc=$rls out=${ls.replace("\n", " | ").take(200)}")
-        val readable = try { java.io.File("/data/misc/adb/adb_keys").canRead() } catch (_: Throwable) { false }
-        AppLog.i(TAG, "ADB_KEYS: readable=$readable")
-        val writable = try { java.io.File("/data/misc/adb/adb_keys").canWrite() } catch (_: Throwable) { false }
-        AppLog.i(TAG, "ADB_KEYS: writable=$writable")
-        if (line == null) { AppLog.i(TAG, "ADB_KEYS self-register=denied reason=no_key"); return }
-        if (!writable) {
-            AppLog.i(TAG, "ADB_KEYS self-register=denied reason=${if (readable) "EPERM" else "EACCES|SELinux"}")
-            return
-        }
-        // Свою строку дописываем только если её ещё нет; чужие строки не трогаем никогда.
-        try {
-            val f = java.io.File("/data/misc/adb/adb_keys")
-            val cur = if (f.exists()) f.readText() else ""
-            if (cur.contains(line)) {
-                AppLog.i(TAG, "ADB_KEYS self-register=ok (наш ключ уже был в файле)")
-                return
-            }
-            f.appendText(if (cur.isEmpty() || cur.endsWith("\n")) "$line\n" else "\n$line\n")
-            for (cmd in listOf("chmod 640 /data/misc/adb/adb_keys", "chown system:shell /data/misc/adb/adb_keys", "restorecon /data/misc/adb/adb_keys")) {
-                val (rc, out) = runShellFallbackWithRc("$cmd 2>&1", 3000)
-                AppLog.i(TAG, "ADB_KEYS: $cmd rc=$rc ${out.replace('\n', ' ').take(120)}")
-            }
-            val after = runShellFallback("wc -l < /data/misc/adb/adb_keys 2>&1", 3000).trim()
-            AppLog.i(TAG, "ADB_KEYS self-register=ok lines_after=$after")
-        } catch (t: Throwable) {
-            AppLog.i(TAG, "ADB_KEYS self-register=denied reason=${t.javaClass.simpleName}: ${t.message}")
-        }
-    }
-
     /** iter28 P0-D: после успеха доделываем отложенную работу, не дожидаясь следующего тика. */
     private fun replayDeferred() {
         val ctx = appCtx
@@ -633,148 +671,6 @@ object AdbClient {
         runCatching { NetworkTtl.bootRestore(ctx) }.onFailure { AppLog.w(TAG, "ADB_REPLAY TTL failed: ${it.message}") }
         runCatching { StatusIcons.bootRestoreHvacDigital(ctx) }.onFailure { AppLog.w(TAG, "ADB_REPLAY HVAC failed: ${it.message}") }
         runCatching { StatusIcons.syncAll(ctx) }.onFailure { AppLog.w(TAG, "ADB_REPLAY sync failed: ${it.message}") }
-    }
-
-    /**
-     * Одно сырое соединение с 5555: connect → CNXN → первые 24 байта.
-     * Возвращает короткое описание результата (без записи в лог — это делает вызывающий).
-     */
-    private fun rawReadOnce(): String {
-        Socket().use { s ->
-            val t0 = SystemClock.uptimeMillis()
-            s.connect(InetSocketAddress("127.0.0.1", ADB_PORT_DEFAULT), PROBE_CONNECT_MS)
-            val connectDt = SystemClock.uptimeMillis() - t0
-            writeMsg(s.getOutputStream(), CNXN, 0x01000000, 4096, "host::central-geely\u0000".toByteArray(StandardCharsets.UTF_8))
-            s.soTimeout = RAW_READ_MS
-            val buf = ByteArray(24)
-            var n = 0
-            try {
-                val ins = s.getInputStream()
-                while (n < 24) {
-                    val r = ins.read(buf, n, 24 - n)
-                    if (r < 0) break
-                    n += r
-                }
-            } catch (e: Throwable) {
-                return "n=$n hex=${hexOf(buf, n)} abort=${e.javaClass.simpleName} connectDt=${connectDt}ms"
-            }
-            if (n < 24) return "n=$n hex=${hexOf(buf, n)} eof connectDt=${connectDt}ms"
-            val cmd = ByteBuffer.wrap(buf, 0, 4).order(ByteOrder.LITTLE_ENDIAN).int
-            return "n=24 cmd=${cmdName(cmd)} hex=${hexOf(buf, 24)} connectDt=${connectDt}ms"
-        }
-    }
-
-    /**
-     * iter26 B.3: пока соединение к 5555 открыто, читаем `/proc/net/tcp6` (+`tcp`) и
-     * смотрим строку с `:15B3`: состояние (`0A`=LISTEN, `01`=ESTABLISHED) и `rx_queue`.
-     * recvQ=0 без ESTABLISHED → ядро/сервис не забирает из очереди; recvQ>0 → забирает,
-     * но не отвечает.
-     */
-    private fun measureAcceptQueue() {
-        // iter27 D4: замер идёт ПРИ ОТКРЫТОМ соединении к 5555 — в очереди на время замера
-        // есть один наш элемент. Это указано в логе, чтобы не путать с естественной очередью.
-        AppLog.e(TAG, "ADBDIAG accept: (держим 1 соединение, пока читаем таблицы)")
-        try {
-            Socket().use { s ->
-                s.connect(InetSocketAddress("127.0.0.1", ADB_PORT_DEFAULT), PROBE_CONNECT_MS)
-                writeMsg(s.getOutputStream(), CNXN, 0x01000000, 4096, "host::central-geely\u0000".toByteArray(StandardCharsets.UTF_8))
-                Thread.sleep(700)
-                for (tbl in listOf("/proc/net/tcp6", "/proc/net/tcp")) {
-                    val (_, out) = runShellFallbackWithRc("awk 'NR==1 || \$2 ~ /:15B3\$/ {print}' $tbl 2>/dev/null | head -8", 3000)
-                    for (line in out.lineSequence()) {
-                        if (!line.contains(":15B3")) continue
-                        val f = line.trim().split(Regex("\\s+"))
-                        if (f.size < 5) continue
-                        val st = f[3]
-                        val q = f[4].split(":")
-                        val txQ = q.getOrNull(0)?.toIntOrNull(16) ?: -1
-                        val rxQ = q.getOrNull(1)?.toIntOrNull(16) ?: -1
-                        val stName = when (st) { "0A" -> "LISTEN"; "01" -> "ESTABLISHED"; "06" -> "TIME_WAIT"; "08" -> "CLOSE_WAIT"; else -> st }
-                        AppLog.e(TAG, "ADBDIAG accept: recvQ=$rxQ sendQ=$txQ state=$stName established=${st == "01"} inode=${f.getOrNull(9) ?: "-"} table=$tbl")
-                    }
-                }
-            }
-        } catch (e: Throwable) {
-            AppLog.e(TAG, "ADBDIAG accept: ${e.javaClass.simpleName}: ${e.message}")
-        }
-    }
-
-    /**
-     * P0-E.2: умный запрос к adb-серверу на 127.0.0.1:5037 в формате smart-socket
-     * (`4 hex-цифры длины` + строка). Только чтение: `host:devices` и `host:version`.
-     */
-    private fun smartSocketProbe() {
-        for (req in listOf("host:version", "host:devices")) {
-            val t0 = SystemClock.uptimeMillis()
-            try {
-                Socket().use { s ->
-                    s.connect(InetSocketAddress("127.0.0.1", ADB_SERVER_PORT), PROBE_CONNECT_MS)
-                    s.soTimeout = 3000
-                    val os = s.getOutputStream()
-                    os.write("%04x%s".format(req.length, req).toByteArray(StandardCharsets.UTF_8))
-                    os.flush()
-                    val ins = s.getInputStream()
-                    val head = ByteArray(4)
-                    var got = 0
-                    while (got < 4) {
-                        val r = ins.read(head, got, 4 - got)
-                        if (r < 0) break
-                        got += r
-                    }
-                    val status = if (got == 4) String(head, StandardCharsets.UTF_8) else "(eof)"
-                    val len = if (got == 4) (String(head, StandardCharsets.UTF_8).toIntOrNull(16) ?: 0) else 0
-                    val body = ByteArray(len.coerceIn(0, 512))
-                    var bn = 0
-                    while (bn < body.size) {
-                        val r = ins.read(body, bn, body.size - bn)
-                        if (r < 0) break
-                        bn += r
-                    }
-                    val payload = if (bn > 0) String(body, 0, bn, StandardCharsets.UTF_8) else ""
-                    AppLog.e(TAG, "ADBDIAG 5037 $req → status=$status len=$len body=${payload.replace('\n', '|').take(300).ifEmpty { "(empty)" }} dt=${SystemClock.uptimeMillis() - t0}ms")
-                }
-            } catch (e: Throwable) {
-                AppLog.e(TAG, "ADBDIAG 5037 $req ${e.javaClass.simpleName}: ${e.message} dt=${SystemClock.uptimeMillis() - t0}ms")
-            }
-        }
-    }
-
-    /** Сырое чтение 24 байт от 5555 после CNXN — без разбора протокола. */
-    private fun rawReadProbe() {
-        val t0 = SystemClock.uptimeMillis()
-        try {
-            Socket().use { s ->
-                s.connect(InetSocketAddress("127.0.0.1", ADB_PORT_DEFAULT), PROBE_CONNECT_MS)
-                val connectDt = SystemClock.uptimeMillis() - t0
-                val os = s.getOutputStream()
-                writeMsg(os, CNXN, 0x01000000, 4096, "host::central-geely\u0000".toByteArray(StandardCharsets.UTF_8))
-                s.soTimeout = RAW_READ_MS
-                val buf = ByteArray(24)
-                var n = 0
-                try {
-                    val ins = s.getInputStream()
-                    while (n < 24) {
-                        val r = ins.read(buf, n, 24 - n)
-                        if (r < 0) break
-                        n += r
-                    }
-                } catch (e: Throwable) {
-                    AppLog.e(TAG, "ADBDIAG raw5555 rx n=$n hex=${hexOf(buf, n)} abort=${e.javaClass.simpleName}: ${e.message} connectDt=${connectDt}ms dt=${SystemClock.uptimeMillis() - t0}ms")
-                    return@use
-                }
-                val dt = SystemClock.uptimeMillis() - t0
-                if (n == 0) {
-                    AppLog.e(TAG, "ADBDIAG raw5555 rx n=0 EOF (adbd закрыл соединение) connectDt=${connectDt}ms dt=${dt}ms")
-                } else if (n < 24) {
-                    AppLog.e(TAG, "ADBDIAG raw5555 rx n=$n hex=${hexOf(buf, n)} (короткий ответ) connectDt=${connectDt}ms dt=${dt}ms")
-                } else {
-                    val cmd = ByteBuffer.wrap(buf, 0, 4).order(ByteOrder.LITTLE_ENDIAN).int
-                    AppLog.e(TAG, "ADBDIAG raw5555 rx n=24 cmd=${cmdName(cmd)} hex=${hexOf(buf, 24)} connectDt=${connectDt}ms dt=${dt}ms")
-                }
-            }
-        } catch (e: Throwable) {
-            AppLog.e(TAG, "ADBDIAG raw5555 ${e.javaClass.simpleName}: ${e.message} dt=${SystemClock.uptimeMillis() - t0}ms")
-        }
     }
 
     private fun hexOf(b: ByteArray, n: Int): String =
@@ -897,7 +793,6 @@ object AdbClient {
     }
 
     @Volatile private var unixChannelOk = false
-    @Volatile private var keysChecked = false
     /** Какое пространство имён сработало: "filesystem" | "abstract" | "" (не найдено). */
     @Volatile private var unixNs = ""
 
@@ -1223,7 +1118,14 @@ object AdbClient {
         }
         val deadline = System.currentTimeMillis() + timeoutMs
         Socket().use { s ->
-            s.connect(InetSocketAddress("127.0.0.1", port), connectTimeoutMs)
+            val host = workingHost
+            if (host != channelLoggedHost) {
+                channelLoggedHost = host
+                AppLog.i(TAG, "ADB_CHANNEL host=$host port=$port (канал по адресу из ADB_DEST)")
+            } else {
+                AppLog.d(TAG, "ADB_CHANNEL host=$host port=$port")
+            }
+            s.connect(InetSocketAddress(host, port), connectTimeoutMs)
             s.soTimeout = timeoutMs
             val dis = DataInputStream(s.getInputStream())
             val os = s.getOutputStream()
@@ -1362,7 +1264,7 @@ object AdbClient {
     /** Человеческое имя активного канала для UI. */
     @JvmStatic
     fun channelLabel(): String = when (state.get()) {
-        ChannelState.ROOT_5555 -> "TCP 127.0.0.1:5555"
+        ChannelState.ROOT_5555 -> "TCP $workingHost:$ADB_PORT_DEFAULT"
         ChannelState.ROOT_UNIX -> "unix-сокет ns=${unixNs.ifEmpty { "filesystem" }}"
         ChannelState.NO_ROOT_SH -> "нет (uid=1000, без root)"
         ChannelState.PERM_FAIL -> "нет (root запрещён)"
