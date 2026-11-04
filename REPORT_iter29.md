@@ -124,6 +124,7 @@ cmd=CNXN arg0=0x01000000 arg1=262144 len=265
 | `smartSocketProbe()` (5037 `host:version`/`host:devices`) | 1.0.50: `status=FAIL len=0` — на ГУ adb-сервера нет |
 | `rawReadProbe()` / `rawReadOnce()` | заменены на `probeDestination()` (то же самое, но с адресом и с `ADB_DEST`) |
 | контрольные порты `5556/65011`, `ps adbd`, `/proc/net/unix`, `ss`, `netstat` в `ADBDIAG` | все дали `ECONNREFUSED`/`(empty)`/`rc=1` в 1.0.47–1.0.50; диагноз сжат до ≤3 с |
+| `ls -l /data/misc/adb/`, `ro.product.device`, `ro.build.version.sdk`, строка `ADB_HINT` в `ADBDIAG` | iter28-диагностика: `ls → Permission denied`, а устройство/SDK и так известны (`IHU629G`, `sdk=28`); вместо них в логе появились `ADB_DEST`/`ADB_SELF`, которые важнее |
 | константа `ADB_SERVER_PORT = 5037` | использовалась только удалённым `smartSocketProbe()` |
 
 Осталось как есть (мандат §2): ветка `AUTH` в `handshake()`, `hasRoot()`, `channelLabel()`, весь unix-путь
