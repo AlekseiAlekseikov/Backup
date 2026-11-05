@@ -550,3 +550,22 @@
   артефакт **`13415209603`**: zip **177 084 785 Б** · apk **215 423 525 Б** · manifest-отчёт **105 294 Б**.
 - Отчёт: `REPORT_iter33e.md` (таблица A1–A6/B/C1–C2/C3, 13 проверок с `sed -n`, примеры лога из формат-строк,
   ответ про `voiceapp3.log` после рестарта zygote, честные пробелы).
+
+## iter33f — 1.0.53, пятая пересборка (`fix5`), 2026-11-05
+
+- База `9d36e69` (код `4ff7ead`). Коммиты: `a1f4333` (A1/A3/B), `578f355` (A2: `claim none`).
+  Версия не менялась: `53` / `"1.0.53"`.
+- A1: `claimPendingIntent` (`AppPerformance.kt:964-999`) — синхронный `renameTo`
+  `jit_pending_verify` → `.processing` (`:974`) **до** `BgWorker.post` (`:947`); флаг
+  `jitVerifyScheduled` (`:710`); решение по содержимому захваченного файла (`:935`); `STALE` удаляет
+  `.processing` (`:943`); `VERIFY` получает путь и удаляет файл в `OK` (`:1033`) и `FAILED` (`:1037`);
+  остаток от убитого процесса забирается как `claim ok reason=leftover` (`:987`).
+- A2: на один рестарт — 1 `claim ok` + 1 `claim taken reason=already_scheduled` + 1 `source=after_restart`
+  + ≤1 `match_after_zygote`; таблица сценариев в отчёте.
+- A3: `JitBootMark.VerifyOutcome` + `verifyOutcome` (`JitBootMark.kt:122-128`) + 3 теста → 13 `@Test`.
+- B1/B2/B3: три исхода; `UNKNOWN` не сжигает намерение, ≤3 повторов по 10 с только `getprop`
+  (`:1040-1050`), после — итоговая строка и возврат файла; пустые значения через `kvE` (`:717`).
+- CI: прогон **`42035283163`** (job `127271703677`), `BUILD SUCCESSFUL in 4m 17s`, **23 PASSED / 0 FAILED**;
+  артефакт **`13419106325`**: zip **177 085 868 Б** · apk **215 429 529 Б** · manifest-отчёт **105 294 Б**.
+- Отчёт: `REPORT_iter33f.md` (в т.ч. C1–C4: `flushOpsNow` ≠ `app.log`, `JIT_PROBE` раз за загрузку,
+  `grep -c persist_present` = 3 с выводом, правило «каждая `grep -c` с выводом»).
