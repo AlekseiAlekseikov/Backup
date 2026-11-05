@@ -163,8 +163,8 @@ object AdbClient {
         val cmd: String,
         val timeoutMs: Int,
         val expectRoot: Boolean,
-        val onResult: (Pair<Int, String>) -> Unit,
-        val op: String? = LogKit.currentOp()
+        val op: String? = LogKit.currentOp(),
+        val onResult: (Pair<Int, String>) -> Unit
     )
 
     private val queue = LinkedBlockingQueue<Job>()
