@@ -530,3 +530,23 @@
 **16 тестов PASSED / 0 FAILED**; артефакт **13412982735**: `zip` **177 081 062 Б**,
 `apk/debug/app-debug.apk` **215 418 521 Б**, `logs/manifest-merger-debug-report.txt` **105 294 Б**.
 Отчёт — `REPORT_iter33d.md`.
+
+## iter33e — 1.0.53, четвёртая пересборка (`fix4`), 2026-11-05
+
+- База `8b31998` (iter33d). Коммиты: `1919c24` (A1–A6/B/C1/C2), `0fddb68` (A3: удалена мёртвая ветка
+  `attemptInThisLoad`/`runtime_raised_by_our_zygote`), `4ff7ead` (C1: ветка `match` тоже печатает
+  `probeCommon` — 4 ветки из 4). Версия не менялась: `53` / `"1.0.53"`.
+- A1: `AppPerformance.kt:820` метка → `:827` строка `JIT_BOOT: zygote_restart intent=pending` →
+  `:831` файл `jit_pending_verify` → `:832` `LogKit.flushOpsNow()` → `:838-839` `runSuCommand(... ctl.restart zygote)`.
+- A2: `checkPendingZygoteVerify` (`:905-928`) вызывается из `VoiceAssistantService.kt:266` (`onCreate`) и
+  `:348` (`onStartCommand`) — оба **выше** проверки extra `:352`.
+- A3: `JIT_BOOT: match_after_zygote` печатается только из A2 (`:922`), второй проход — только маршрут 1.
+- A4: `JIT_PROBE: runtime=true …` (`:951`) один раз на загрузку, флаг — `files/jit_verified` (`:690`).
+- A6: `JitBootMark.PendingDecision` + `pendingDecision` (`JitBootMark.kt:95`, `:105`) + 3 теста.
+- B: `EPOCH_PREFIX`/`epochTag`/`stripEpochPrefix` (`:40`, `:48`, `:50`), допуск мс→с (`:84`), тесты на прод-функциях.
+  Исправлен дефект единиц: раньше `epochTag` получал секунды при допуске в мс (±16 ч).
+- C1: `persist_present` убран, добавлен `persist_after`; C2: `sameBootIgnoresUptime` с меньшим uptime.
+- CI: прогон **`42029651330`** (job `127252532655`), `BUILD SUCCESSFUL in 4m 8s`, **20 PASSED / 0 FAILED**;
+  артефакт **`13415209603`**: zip **177 084 785 Б** · apk **215 423 525 Б** · manifest-отчёт **105 294 Б**.
+- Отчёт: `REPORT_iter33e.md` (таблица A1–A6/B/C1–C2/C3, 13 проверок с `sed -n`, примеры лога из формат-строк,
+  ответ про `voiceapp3.log` после рестарта zygote, честные пробелы).
