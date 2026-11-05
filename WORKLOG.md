@@ -403,3 +403,37 @@
 - Юнит-тест-инфраструктуры в проекте нет (`app/src/test` отсутствует, junit не подключён) → по разрешению мандата
   проверки оформлены как обычные функции с логом (`ADB_CONST all=…`, `VENT_SELFTEST all=…`).
 - Проверка на автомобиле не выполнялась; байтовые доказательства — воспроизведение формулы в Python.
+
+## iter33 — 1.0.53 (versionCode 53), ветка `fix/v2`
+
+**Что сделано (файлы → суть)**
+- `app/build.gradle.kts:60-61` — 53 / «1.0.53»; `:159` junit; `:218-221` `assembleDebug|assembleRelease` зависят от `testDebugUnitTest`
+  (workflow не правился: PAT без scope `workflow`, push в `.github/workflows/build.yml` был отклонён).
+- `tools/ScriptChunker.kt` (новый) — заливка скрипта **только через base64** (`chunks()` `:36`, `clearCommand()` `:50`,
+  `chunkCommand()` `:59`, `verifyAndRunCommand()` `:67` c предохранителем `exit 99`). A0.
+- `tools/AdbClient.kt:1748-1762` — `wrapForRc`/`splitRc`: `sh -c '<cmd>'; echo "__ADB_RC=$?"`, значение → `rc` (A1).
+  `:257-280` — `executeScript` ≤3500 Б напрямую, иначе чанкер; `ERR_SCRIPT_UPLOAD` → `AppLog.e` (A0.2).
+  ADB_TX/RX через `LogKit.trace` с `ADB_TRACE_SUPPRESSED` (C3). `Job.op` + порядок параметров (trailing lambda = `onResult`).
+- `tools/LogKit.kt` (новый) — единственный источник структурированного лога: `SESSION_START`/`LOG_INDEX`/`OP_START`/`OP_STEP`/
+  `OP_SUMMARY`/`CYCLE_*`/`HEARTBEAT` (`:244`) /`LOG_SUMMARY` (`:261`) /`SCRIPT_TRACE` (`:111`) /`RU:`; `app.ops.log` ≤200 строк
+  (`flushOps` `:84`); подавление шума `trace()` `:293`; `kv()` `:325`. Писатель остался один — `AppLog.writeRaw` (C8).
+- `tools/HvacDigitalPlugin.kt` — A3: ветка `PM_PATH=/data/app/*` → `pm uninstall` / `pm uninstall-system-updates` /
+  `cmd package uninstall-system-updates` (+`HVAC_UNSHADOW: before=… result=OK|FAILED`, `:218/:224`, `exit 2` при провале);
+  A4: убраны `setenforce 0`, `rm -rf /data/dalvik-cache/*`, `sleep 3`; `kill` SystemUI только при `APK_REPLACED=1` и
+  один раз за процесс (`:23`, `:175`, `:264-283`); A5: `HVAC_PROBE`/`HVAC_RESULT` (`:329-338`); `###STAGE` → `SCRIPT_TRACE`.
+- `tools/StatusIcons.kt:886-905` — A2: реальный `Status` через `when`; `bootRestoreHvacDigital` (`:939`) только читает;
+  `HVACDIGITAL_PUSH` только при смене fingerprint (`:776-806`, B5).
+- `tools/AppPerformance.kt:354-376,398-410` — `isVideoApplied()` первым делом, `SKIP (already applied)`, ожидание по `pidof`
+  вместо `sleep 3` (`:470-480`); watchdog вызывает только `verifyVideoOnly`.
+- `tools/NetworkTtl.kt:238-272` — read-first `ttlRuleCounts()`, `TTL: SKIP (rule present)` (B4).
+- `tools/LockSound.kt:828-836` — звук через `executeScript` (чанкер), не в watchdog (B3).
+- `VoiceAssistantService.kt:413-440` — watchdog только читает: `NetworkTtl.bootRestore`, `StatusIcons.bootRestoreHvacDigital`,
+  `AppPerformance.verifyVideoOnly`, `LogKit.heartbeat()/writeSummary()`; `:447` `onDestroy` → `LOG_SUMMARY`.
+- `app/src/test/.../ScriptChunkerTest.kt` — 4 теста, `scriptOfExactly(4963)` даёт ровно 4963 Б кириллицы.
+
+**CI:** прогон **41996706107** = success (`> Task :app:testDebugUnitTest`, `BUILD SUCCESSFUL in 3m 16s`),
+артефакт **13400294287**, zip **177 067 555 Б**, APK **215 383 361 Б**. До него 3 неудачных прогона (вложенный `/*`,
+порядок параметров `Job`, генератор теста) — исправлены коммитами `44526ed`, `a3a4964`, `6acbc27`.
+
+**Пробелы:** на ГУ не проверялось; бюджеты B5 не измерены (ждут первого лога 1.0.53); какая ветка
+`uninstall-system-updates` нужна прошивке — НЕ ДОКАЗАНО. Подробно — `REPORT_iter33.md` §F3.
