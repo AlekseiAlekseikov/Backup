@@ -219,3 +219,13 @@ dependencies {
 tasks.matching { it.name == "assembleDebug" || it.name == "assembleRelease" }.configureEach {
     dependsOn("testDebugUnitTest")
 }
+
+// iter33c A3: в лог CI должны попадать ИМЕНА и ЧИСЛО выполненных тестов — иначе «тест зелёный»
+// ничем не доказан (задача могла быть NO-SOURCE/UP-TO-DATE). Workflow не правим (нет scope `workflow`).
+tasks.withType<Test>().configureEach {
+    testLogging {
+        // Каждый тест — строкой в логе CI: видно ИМЕНА и КЛАССЫ, а не только «задача прошла».
+        events("passed", "failed", "skipped")
+        showStandardStreams = false
+    }
+}
