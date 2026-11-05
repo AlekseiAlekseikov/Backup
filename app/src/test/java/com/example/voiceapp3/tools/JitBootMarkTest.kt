@@ -124,4 +124,32 @@ class JitBootMarkTest {
         // legacy-намерение (число без ':') — консервативно VERIFY.
         assertEquals(JitBootMark.PendingDecision.VERIFY, JitBootMark.pendingDecision("40000", "boot-A"))
     }
+
+    // 9. iter33f A3/B1: три исхода сверки после рестарта zygote.
+    @Test
+    fun verifyOutcomeOk() {
+        assertEquals(JitBootMark.VerifyOutcome.OK,
+            JitBootMark.verifyOutcome("true", "true"))
+        // persist роли не играет: важен только runtime.
+        assertEquals(JitBootMark.VerifyOutcome.OK,
+            JitBootMark.verifyOutcome("true", ""))
+    }
+
+    @Test
+    fun verifyOutcomeFailed() {
+        // Ответ канала определённый: свойство прочитано, но JIT не поднят.
+        assertEquals(JitBootMark.VerifyOutcome.FAILED,
+            JitBootMark.verifyOutcome("false", "true"))
+        assertEquals(JitBootMark.VerifyOutcome.FAILED,
+            JitBootMark.verifyOutcome("unknown", "true"))
+    }
+
+    @Test
+    fun verifyOutcomeUnknownWhenEmpty() {
+        // Канал не ответил — это НЕ FAILED: намерение сжигать нельзя.
+        assertEquals(JitBootMark.VerifyOutcome.UNKNOWN,
+            JitBootMark.verifyOutcome("", ""))
+        assertEquals(JitBootMark.VerifyOutcome.UNKNOWN,
+            JitBootMark.verifyOutcome("", "true"))
+    }
 }

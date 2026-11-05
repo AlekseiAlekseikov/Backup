@@ -688,11 +688,33 @@ object AppPerformance {
     private const val JIT_PENDING_FILE = "jit_pending_verify"
     /** iter33e A4: bootTag, для которого положительный `JIT_PROBE` уже напечатан. */
     private const val JIT_VERIFIED_FILE = "jit_verified"
+    /**
+     * iter33f A1: суффикс «захваченного» намерения. Захват — это `renameTo` обычного файла в этот,
+     * атомарный в пределах одной ФС (`filesDir`); пока файл так называется, второй вход
+     * (`onStartCommand` сразу после `onCreate`) намерения уже не видит и сверку не планирует.
+     */
+    private const val PROCESSING_SUFFIX = ".processing"
+    /** iter33f B2: рамки повторов при `UNKNOWN` — не больше 3 раз по 10 с (окно ≤ 60 с). */
+    private const val JIT_VERIFY_RETRY_MAX = 3
+    private const val JIT_VERIFY_RETRY_DELAY_MS = 10_000L
     /** iter33c C1: окно, в котором перезапуск zygote РАЗРЕШЁН (было имя «late start» — наоборот по смыслу). */
     private const val JIT_ZYGOTE_WINDOW_MS = 120_000L
 
     private val jitBootAttempted = java.util.concurrent.atomic.AtomicBoolean(false)
 
+    /**
+     * iter33f A1.3: сверка уже запланирована этим процессом. Основную работу делает `renameTo`
+     * (второй захват физически невозможен), флаг нужен, чтобы причина в логе была осмысленной:
+     * `JIT_VERIFY: claim taken reason=already_scheduled` вместо молчаливого выхода.
+     */
+    private val jitVerifyScheduled = java.util.concurrent.atomic.AtomicBoolean(false)
+
+
+    /**
+     * iter33f B3: в JIT-строках пустое значение печатается как `empty`.
+     * `LogKit.kv("")` даёт `-`, а голое `runtime_after=` читается как обрезанная строка.
+     */
+    private fun kvE(s: String): String = if (s.isEmpty()) "empty" else LogKit.kv(s)
 
     /** Один короткий read-only вызов: runtime + persist-дублёр (две строки). */
     private fun jitProps(): Pair<String, String> {
@@ -892,37 +914,138 @@ object AppPerformance {
     }
 
     /**
-     * iter33e A2/A3 — сверка ПОСЛЕ перезапуска zygote.
+     * iter33e A2/A3 + iter33f A1 — сверка ПОСЛЕ перезапуска zygote.
      *
      * Зачем: наш процесс — потомок zygote, поэтому после `ctl.restart zygote` ни `postDelayed(20 c)`,
      * ни второй проход boot-ветки не наступают (сервис поднимается по `START_STICKY` с `intent == null`,
      * а boot-ветка требует extra). Значит сверка должна жить на САМОМ старте сервиса.
      *
      * Вызывается из `VoiceAssistantService.onCreate` и `onStartCommand` ДО проверки
-     * `EXTRA_BOOT_RESTORE`. Работа — на `BgWorker`, главный поток не участвует.
-     * Ничего не пишет в систему: только читает `getprop` и удаляет свой файл-намерение.
+     * `EXTRA_BOOT_RESTORE`. Ничего не пишет в систему: только читает `getprop` и удаляет свой
+     * файл-намерение.
+     *
+     * iter33f A1: намерение СНАЧАЛА захватывается синхронно ([claimPendingIntent]), поэтому
+     * `onCreate` + `onStartCommand` на один рестарт zygote дают РОВНО одну сверку
+     * (раньше файл удалялся только в фоновой задаче — и оба входа успевали его увидеть).
      */
     fun checkPendingZygoteVerify(context: Context) {
         val app = context.applicationContext
-        val pending = runCatching { File(app.filesDir, JIT_PENDING_FILE).readText().trim() }.getOrDefault("")
+        val claimed = claimPendingIntent(app) ?: return
         val bootTag = currentBootTag()
+        val pending = runCatching { claimed.readText().trim() }.getOrDefault("")
         when (JitBootMark.pendingDecision(pending, bootTag)) {
-            JitBootMark.PendingDecision.NONE -> Unit
+            JitBootMark.PendingDecision.NONE -> {
+                runCatching { claimed.delete() }
+                jitVerifyScheduled.set(false)
+            }
             JitBootMark.PendingDecision.STALE -> {
-                runCatching { File(app.filesDir, JIT_PENDING_FILE).delete() }
-                AppLog.i(TAG, "JIT_VERIFY: skip reason=pending_stale pending=${LogKit.kv(pending)} boot_tag=$bootTag")
+                // Намерение от прошлой загрузки: удаляем ЗАХВАЧЕННЫЙ файл — исходного уже нет.
+                runCatching { claimed.delete() }
+                jitVerifyScheduled.set(false)
+                AppLog.i(TAG, "JIT_VERIFY: skip reason=pending_stale pending=${kvE(pending)} boot_tag=$bootTag")
             }
             JitBootMark.PendingDecision.VERIFY -> BgWorker.post("AppPerformance.jitVerifyAfterRestart") {
-                val (runtime, persist) = jitProps()
-                val ok = runtime == "true"
-                AppLog.i(TAG, "JIT_VERIFY: runtime_after=$runtime persist=$persist source=after_restart " +
-                    "result=${if (ok) "OK" else "FAILED"} boot_tag=$bootTag")
-                if (ok) {
-                    // A3: этот факт печатается ЗДЕСЬ (второй проход после рестарта не наступает).
-                    AppLog.i(TAG, "JIT_BOOT: match_after_zygote runtime=$runtime persist=$persist " +
-                        "(поднят перезапуском zygote в этой загрузке)")
+                verifyClaimedAfterRestart(app, claimed, bootTag, 0)
+            }
+        }
+    }
+
+    /**
+     * iter33f A1.1/A1.2/A1.4/A1.7 — атомарный захват намерения в вызывающем потоке.
+     *
+     * `renameTo` в пределах одного `filesDir` атомарен: либо файл достался нам, либо его забрал
+     * другой вызов. Решение принимается по содержимому ЗАХВАЧЕННОГО файла, не исходного.
+     * Флаг [jitVerifyScheduled] ставится прямо здесь (захват = «сверка запланирована»), поэтому
+     * второй вход видит `claim taken` и ничего не планирует; снимается флаг в конце сверки
+     * или сразу, если сверка не нужна (`NONE`/`STALE`).
+     *
+     * Возвращает `null`, когда захватывать нечего.
+     */
+    private fun claimPendingIntent(app: Context): File? {
+        val src = File(app.filesDir, JIT_PENDING_FILE)
+        val claimed = File(app.filesDir, JIT_PENDING_FILE + PROCESSING_SUFFIX)
+        val bootTag = currentBootTag()
+        // 1. Второй вход (onStartCommand сразу после onCreate): сверка уже забрана этим процессом.
+        if (jitVerifyScheduled.get()) {
+            AppLog.i(TAG, "JIT_VERIFY: claim taken reason=already_scheduled boot_tag=$bootTag")
+            return null
+        }
+        // 2. Захват: переименование, а не чтение.
+        val renamed = runCatching { src.renameTo(claimed) }.getOrDefault(false)
+        if (!renamed) {
+            if (src.exists()) {
+                // renameTo отказал, а намерение на месте — не теряем его молча.
+                val left = runCatching { src.readText().trim() }.getOrDefault("")
+                AppLog.i(TAG, "JIT_VERIFY: claim failed reason=rename pending=${kvE(left)} boot_tag=$bootTag")
+                return null
+            }
+            if (claimed.exists()) {
+                // Остаток прерванной сверки (процесс умер между захватом и проверкой):
+                // забираем его, иначе `.processing` висел бы вечно.
+                jitVerifyScheduled.set(true)
+                val left = runCatching { claimed.readText().trim() }.getOrDefault("")
+                AppLog.i(TAG, "JIT_VERIFY: claim ok reason=leftover boot_tag=$bootTag pending=${kvE(left)}")
+                return claimed
+            }
+            AppLog.i(TAG, "JIT_VERIFY: claim taken boot_tag=$bootTag pending=empty")
+            return null
+        }
+        jitVerifyScheduled.set(true)
+        val pending = runCatching { claimed.readText().trim() }.getOrDefault("")
+        AppLog.i(TAG, "JIT_VERIFY: claim ok boot_tag=$bootTag pending=${kvE(pending)}")
+        return claimed
+    }
+
+    /** Вернуть захваченное намерение на место (чтобы следующий старт всё-таки его увидел). */
+    private fun restorePendingIntent(app: Context, claimed: File) {
+        val src = File(app.filesDir, JIT_PENDING_FILE)
+        val ok = runCatching { claimed.renameTo(src) }.getOrDefault(false)
+        if (!ok) AppLog.i(TAG, "JIT_VERIFY: restore failed reason=rename file=${kvE(claimed.name)}")
+    }
+
+    /**
+     * iter33f A1.6/B1/B2 — сверка захваченного намерения с тремя исходами.
+     *
+     * `OK` / `FAILED` — ответ определённый, намерение удаляется (повторять бессмысленно).
+     * `UNKNOWN` (канал не ответил, `jitProps()` вернул пустоту) — намерение НЕ сжигается:
+     * до 3 повторов через 10 с, и в повторе ЕДИНСТВЕННОЕ действие — `jitProps()` (read-only):
+     * никаких записей в систему и никаких повторных `ctl.restart zygote`. После третьего повтора —
+     * одна итоговая строка, намерение возвращается на место, `.processing` не остаётся висеть.
+     */
+    private fun verifyClaimedAfterRestart(app: Context, claimed: File, bootTag: String, attempt: Int) {
+        val (runtime, persist) = jitProps()   // единственное действие повтора: чтение getprop
+        val outcome = JitBootMark.verifyOutcome(runtime, persist)
+        val reason = when (outcome) {
+            JitBootMark.VerifyOutcome.OK -> ""
+            JitBootMark.VerifyOutcome.FAILED -> " reason=runtime_not_true"
+            JitBootMark.VerifyOutcome.UNKNOWN -> " reason=no_channel"
+        }
+        AppLog.i(TAG, "JIT_VERIFY: runtime_after=${kvE(runtime)} persist=${kvE(persist)} source=after_restart " +
+            "result=${outcome.name}$reason boot_tag=$bootTag attempt=${attempt + 1}")
+        when (outcome) {
+            JitBootMark.VerifyOutcome.OK -> {
+                // A3: этот факт печатается ЗДЕСЬ (второй проход после рестарта не наступает),
+                // и только на исходе OK — поэтому строк не больше, чем сверок.
+                AppLog.i(TAG, "JIT_BOOT: match_after_zygote runtime=${kvE(runtime)} persist=${kvE(persist)} " +
+                    "(поднят перезапуском zygote в этой загрузке)")
+                runCatching { claimed.delete() }
+                jitVerifyScheduled.set(false)
+            }
+            JitBootMark.VerifyOutcome.FAILED -> {
+                runCatching { claimed.delete() }
+                jitVerifyScheduled.set(false)
+            }
+            JitBootMark.VerifyOutcome.UNKNOWN -> {
+                if (attempt + 1 >= JIT_VERIFY_RETRY_MAX) {
+                    AppLog.i(TAG, "JIT_VERIFY: result=UNKNOWN retries=$JIT_VERIFY_RETRY_MAX reason=no_channel " +
+                        "boot_tag=$bootTag (намерение оставлено следующему старту)")
+                    restorePendingIntent(app, claimed)
+                    jitVerifyScheduled.set(false)
+                } else {
+                    BgWorker.postDelayed("AppPerformance.jitVerifyRetry", JIT_VERIFY_RETRY_DELAY_MS) {
+                        verifyClaimedAfterRestart(app, claimed, bootTag, attempt + 1)
+                    }
                 }
-                runCatching { File(app.filesDir, JIT_PENDING_FILE).delete() }
             }
         }
     }

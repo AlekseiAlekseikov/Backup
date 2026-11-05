@@ -108,6 +108,25 @@ object JitBootMark {
         else -> PendingDecision.STALE
     }
 
+    /**
+     * iter33f A3/B1 — три исхода сверки после перезапуска zygote.
+     *
+     * • [VerifyOutcome.OK]      — `runtime == "true"` (JIT поднят);
+     * • [VerifyOutcome.FAILED]  — `runtime` прочитан, но не `true` (ответ определённый);
+     * • [VerifyOutcome.UNKNOWN] — `runtime` пуст: канал не ответил. Это НЕ провал: намерение
+     *   нельзя сжигать, иначе в логе останется ложный `FAILED` там, где нужна определённость.
+     *
+     * `persist` в решении не участвует — он остаётся в подписи, чтобы обе величины читались
+     * из одного места и не приходилось звать `jitProps()` ради лога.
+     */
+    enum class VerifyOutcome { OK, FAILED, UNKNOWN }
+
+    fun verifyOutcome(runtime: String, persist: String): VerifyOutcome = when {
+        runtime == "true" -> VerifyOutcome.OK
+        runtime.isEmpty() -> VerifyOutcome.UNKNOWN
+        else -> VerifyOutcome.FAILED
+    }
+
     /** Uptime из метки, если он там есть (для лога), иначе -1. */
     fun uptimeOf(marker: String): Long {
         val m = marker.trim()
