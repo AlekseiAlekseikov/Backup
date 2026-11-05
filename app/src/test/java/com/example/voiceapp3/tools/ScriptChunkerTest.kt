@@ -31,31 +31,30 @@ class ScriptChunkerTest {
         return ScriptChunker.decode(listOf(sb.toString()))
     }
 
-    /** Скрипт «как настоящий»: кириллица в комментариях + латиница в коде, ровно 4963 байта. */
-    private fun scriptOfExactly(bytes: Int): String {
+    /**
+     * Скрипт «как настоящий»: кириллица в комментариях + латиница в коде, РОВНО [target] байт.
+     * Хвост добивается ASCII-символами, поэтому точный размер гарантирован при любой длине
+     * многобайтовой части (именно на ней ломался старый байтовый разрез).
+     */
+    private fun scriptOfExactly(target: Int): String {
         val head = "# РЕФЕРЕНС: план А эталона — иначе установка «затенят» /system …\n" +
             "# если окно не около POS 10 — не мешаю; ключ vent_owners=10=1,4;40=4\n"
         val body = "echo HVAC_DIGITAL_OK; id; getenforce; pm path com.flyme.auto.systemuiplugin\n"
-        val sb = StringBuilder(head)
+        val sb = StringBuilder(head).append(body)
         var i = 0
-        while (sb.toString().toByteArray(StandardCharsets.UTF_8).size + body.toByteArray(StandardCharsets.UTF_8).size < bytes) {
+        // оставляем 120 байт под точную ASCII-подгонку
+        while (sb.toString().toByteArray(StandardCharsets.UTF_8).size < target - 120) {
             sb.append("# шаг ").append(i++).append(": кириллица для проверки границ символов\n")
         }
-        sb.append(body)
-        // добиваем ASCII-комментарием до точного размера в байтах
+        sb.append("#")
         var cur = sb.toString().toByteArray(StandardCharsets.UTF_8).size
-        if (cur < bytes) {
-            sb.append("#")
-            cur += 1
-            while (cur < bytes) { sb.append("x"); cur += 1 }
-        }
-        sb.append("\n")
+        while (cur < target) { sb.append("x"); cur += 1 }
         return sb.toString()
     }
 
     @Test
     fun chunkerKeepsBytesForCyrillicScript() {
-        val script = scriptOfExactly(4962) // + "\n" → 4963
+        val script = scriptOfExactly(4963)
         val bytes = script.toByteArray(StandardCharsets.UTF_8)
         assertEquals("исходник должен быть ровно 4963 байта", 4963, bytes.size)
         assertArrayEquals("после нарезки+сборки байты обязаны совпасть", bytes, reassembleByBase64(script))
@@ -63,7 +62,7 @@ class ScriptChunkerTest {
 
     @Test
     fun chunkerProducesAsciiOnly() {
-        val script = scriptOfExactly(4962)
+        val script = scriptOfExactly(4963)
         for (c in chunks(script)) {
             for (ch in c) {
                 assertTrue("чанк обязан быть ASCII (символ '$ch' вне ASCII)", ch.code in 32..126)
