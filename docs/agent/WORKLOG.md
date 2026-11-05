@@ -569,3 +569,25 @@
   артефакт **`13419106325`**: zip **177 085 868 Б** · apk **215 429 529 Б** · manifest-отчёт **105 294 Б**.
 - Отчёт: `REPORT_iter33f.md` (в т.ч. C1–C4: `flushOpsNow` ≠ `app.log`, `JIT_PROBE` раз за загрузку,
   `grep -c persist_present` = 3 с выводом, правило «каждая `grep -c` с выводом»).
+
+## iter33g — 1.0.53, шестая пересборка (`fix6`), 2026-11-05
+
+- База `578f355`. Коммиты: `55aefd2` (C4: `git mv` 21 `*.md` агента в `docs/agent/`), `86a4238`
+  (A/B/C1/C2), `df0bb25` (B2 fix: `sameTag`). Версия не менялась: `53` / `"1.0.53"`.
+- A1: `JitBootMark.verifyOutcome` — четыре ветви, `persist` участвует (`JitBootMark.kt:132-137`):
+  пустой `runtime` при прочитанном `persist` = `FAILED`, `UNKNOWN` только когда обе строки пусты.
+- A2: `outcomeReason` (`:144-149`) → `runtime_not_true` / `runtime_empty` / `no_channel`;
+  `AppPerformance.kt:1048-1051` печатает `result=… reason=…`.
+- A3: `verifyOutcomeUnknownWhenEmpty` **изменён** (`("", "true")` теперь `FAILED`), добавлены
+  `verifyOutcomeEmptyRuntimeWithPersistIsFailed`, `verifyOutcomeFailedKeepsRuntimeReason`,
+  `cycleDecisionSkipsOnlySameBoot` → 16 `@Test` (в мандате 15: 16-й — по требованию B2 покрыть
+  чистую функцию счётчика).
+- B1: `files/jit_verify_cycle` + `skip reason=already_this_boot`; запись тега `:969` **выше**
+  `BgWorker.post` `:970`.
+- B2: `cycleDecision(stored, current)` → `RUN|SKIP` через `sameTag` (`:173-181`); первая версия через
+  `sameLoad` упала в CI (`42039165265`, `cycleDecisionSkipsOnlySameBoot:187`) — исправлено `df0bb25`.
+- C1: сверка перенесена **ниже** `AdbClient.attachContext` (`VAS:268` → `:270`), по-прежнему выше
+  `EXTRA_BOOT_RESTORE` (`:353`). C2: `claim none` раз за процесс (`saidNoClaim`, `:718`, `:1016`).
+- CI: прогон **`42041029635`** (job `127291563056`), `BUILD SUCCESSFUL in 4m 8s`, **26 PASSED / 0 FAILED**;
+  артефакт **`13421983008`**: zip **177 087 351 Б** · apk **215 432 385 Б** · manifest-отчёт **105 294 Б**.
+- Отчёт: `docs/agent/REPORT_iter33g.md` (два вида `JIT_VERIFY` разведены, честные пробелы).

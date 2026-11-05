@@ -5,8 +5,8 @@
 | что | значение |
 |---|---|
 | база | `578f355` (кончик `fix/v2` = код iter33f; сверху был коммит отчёта `14768b2`) |
-| коммиты итерации | `55aefd2` (C4 — перенос `*.md` в `docs/agent/`), `86a4238` (A1/A2/A3/B1/B2/C1/C2) |
-| HEAD кода (= head прогона CI) | `86a4238` |
+| коммиты итерации | `55aefd2` (C4 — перенос `*.md` в `docs/agent/`), `86a4238` (A1/A2/A3/B1/B2/C1/C2), `df0bb25` (B2 fix: `sameTag`) |
+| HEAD кода (= head прогона CI) | `df0bb25` |
 | версия | `versionCode = 53`, `versionName = "1.0.53"` — `app/build.gradle.kts:60-61` |
 
 ---
@@ -15,18 +15,27 @@
 
 | что | значение |
 |---|---|
-| прогон | **`<<RUN>>`** (`fix/v2`, head `86a4238`), `conclusion = success` |
-| джоба | **`<<JOB>>`** (шаг `Gradle build (debug)` — success) |
-| сборка | `BUILD SUCCESSFUL in <<DUR>>` |
-| тесты | `> Task :app:testDebugUnitTest` + **<<PASSED>> PASSED / 0 FAILED** (JitBootMarkTest **16**, HvacVerdictTest 6, ScriptChunkerTest 4) |
-| артефакт | **`<<ART>>`** (`app-debug`) |
-| размеры *раздельно* | zip **<<SZIP>> Б** · `apk/debug/app-debug.apk` **<<SAPK>> Б** · `logs/manifest-merger-debug-report.txt` **<<SLOG>> Б** |
+| прогон | **`42041029635`** (`fix/v2`, head `df0bb25`), `conclusion = success` |
+| джоба | **`127291563056`** (шаг `Gradle build (debug)` — success) |
+| сборка | `BUILD SUCCESSFUL in 4m 8s` |
+| тесты | `> Task :app:testDebugUnitTest` + **26 PASSED / 0 FAILED** (JitBootMarkTest **16**, HvacVerdictTest 6, ScriptChunkerTest 4) |
+| артефакт | **`13421983008`** (`app-debug`) |
+| размеры *раздельно* | zip **177087351 Б** · `apk/debug/app-debug.apk` **215432385 Б** · `logs/manifest-merger-debug-report.txt` **105294 Б** |
+
+Промежуточные прогоны этой итерации (для трассировки):
+
+| прогон | что было | итог |
+|---|---|---|
+| `42039165265` | первая версия B2: `cycleDecision` сравнивал **метки** через `sameLoad` | ❌ `conclusion = failure`: `JitBootMarkTest > cycleDecisionSkipsOnlySameBoot FAILED` (`AssertionError at JitBootMarkTest.kt:187`), `BUILD FAILED in 4m 13s` |
+| `42041029635` | после `df0bb25` (`sameTag`) | ✅ success, числа ниже |
+
+Это ровно тот случай, ради которого тесты и нужны: ошибка была не в тесте, а в коде — `sameLoad` ищет в строке `:` (формат `тег:uptime`), а в файле `jit_verify_cycle` лежит «голый» тег, поэтому сравнение всегда давало `false` и счётчик не блокировал ничего. Исправлено в `df0bb25` функцией `JitBootMark.sameTag` (`:173-181`), тест дополнен случаем «часы уехали на 30 с».
 
 Каждая `grep -c` — с напечатанным выводом:
 
 ```
 $ grep -ac "PASSED" "11_Gradle build (debug).txt"
-<<PASSED>>
+26
 $ grep -a "PASSED" "11_Gradle build (debug).txt" | grep -ac "JitBootMarkTest"
 16
 $ grep -a "PASSED" "11_Gradle build (debug).txt" | grep -ac "HvacVerdictTest"
@@ -36,14 +45,14 @@ $ grep -a "PASSED" "11_Gradle build (debug).txt" | grep -ac "ScriptChunkerTest"
 $ grep -ac "FAILED" "11_Gradle build (debug).txt"
 0
 $ grep -a "> Task" "11_Gradle build (debug).txt" | grep testDebugUnitTest
-<<TASKLINE>>
+2026-11-05T14:13:17.5986635Z > Task :app:testDebugUnitTest
 $ grep -a "BUILD SUCCESSFUL" "11_Gradle build (debug).txt"
-<<BUILDLINE>>
+2026-11-05T14:13:18.4981347Z BUILD SUCCESSFUL in 4m 8s
 $ ls -l art.zip | awk '{print "zip_B="$5}'
-zip_B=<<SZIP>>
+zip_B=177087351
 $ unzip -l art.zip | awk '/app-debug.apk/ {print "apk_B="$1} /manifest-merger-debug-report/ {print "logs_B="$1}'
-apk_B=<<SAPK>>
-logs_B=<<SLOG>>
+apk_B=215432385
+logs_B=105294
 ```
 
 ---
@@ -56,7 +65,7 @@ logs_B=<<SLOG>>
 | A2 два разных `reason` у `FAILED` | ✅ | `JitBootMark.kt:144-149`; `AppPerformance.kt:1048-1051` | `runtime_not_true` / `runtime_empty` / `no_channel`, слово берётся из `JitBootMark.outcomeReason` |
 | A3 тесты: изменён + 2 новых (+1 на `cycleDecision`) | ✅ | `JitBootMarkTest.kt:148/163/172/182` | `grep -c "@Test"` = **16**; изменённый `verifyOutcomeUnknownWhenEmpty` теперь ждёт `FAILED` |
 | B1 `files/jit_verify_cycle` + `skip reason=already_this_boot` | ✅ | `AppPerformance.kt:699`, `:959-969` | запись тега **выше** `BgWorker.post` (`:969` < `:970`) |
-| B2 границы счётчика | ✅ | `JitBootMark.kt:152-163` | `cycleDecision(stored, current)` → `RUN|SKIP` + `@Test` на три случая |
+| B2 границы счётчика | ✅ | `JitBootMark.kt:152-163`, `:173-181` | `cycleDecision` через `sameTag` (теги, не метки) → `RUN|SKIP`; `@Test` на 4 случая |
 | C1 сверка ниже `AdbClient.attachContext` | ✅ | `VoiceAssistantService.kt:268` → `:270` | вызов остался выше `EXTRA_BOOT_RESTORE` (`:353`) |
 | C2 `claim none` один раз за процесс | ✅ | `AppPerformance.kt:718`, `:1016-1018` | `saidNoClaim.compareAndSet(false, true)` |
 | C3 два вида `JIT_VERIFY` названы | ✅ | §5 | без `source=` — «процесс выжил, +20 с»; с `source=after_restart` — «процесс поднялся» |
@@ -171,9 +180,18 @@ $ sed -n '132,137p' app/src/main/java/com/example/voiceapp3/tools/JitBootMark.kt
 152    enum class CycleDecision { RUN, SKIP }
 159    fun cycleDecision(stored: String, currentTag: String): CycleDecision = when {
 160        stored.isBlank() -> CycleDecision.RUN
-161        sameLoad(stored.trim(), currentTag.trim()) -> CycleDecision.SKIP
+161        sameTag(stored, currentTag) -> CycleDecision.SKIP
 162        else -> CycleDecision.RUN
 163    }
+173    fun sameTag(a: String, b: String): Boolean {
+174        val x = a.trim()
+175        val y = b.trim()
+176        if (x.isEmpty() || y.isEmpty()) return false
+177        if (x == y) return true
+178        val na = stripEpochPrefix(x).toLongOrNull() ?: return false
+179        val nb = stripEpochPrefix(y).toLongOrNull() ?: return false
+180        return kotlin.math.abs(na - nb) <= (DEFAULT_TOLERANCE_MS / 1000L).coerceAtLeast(1L)
+181    }
 ```
 
 Тест `cycleDecisionSkipsOnlySameBoot` (`JitBootMarkTest.kt:182-192`): пустой файл → `RUN`; тот же `epochTag(t)` → `SKIP`; `epochTag(t + 300_000)` → `RUN`.
@@ -227,10 +245,10 @@ $ sed -n '132,137p' app/src/main/java/com/example/voiceapp3/tools/JitBootMark.kt
 $ grep -c "@Test" app/src/test/java/com/example/voiceapp3/tools/JitBootMarkTest.kt
 16
 $ grep -a "PASSED" "11_Gradle build (debug).txt" | wc -l
-<<PASSED>>
+26
 ```
 
-16 в классе, <<PASSED>> суммарно (см. §1 и объяснение в §3.3, почему 16, а не 15).
+16 в классе, 26 суммарно (см. §1 и объяснение в §3.3, почему 16, а не 15).
 
 ### 4.4 Счётчик цикла стоит до сверки
 
@@ -320,6 +338,7 @@ JitBootMark.kt:144   | fun outcomeReason(outcome: VerifyOutcome, runtime: String
 JitBootMark.kt:146   |     outcome == VerifyOutcome.FAILED && runtime.isEmpty() -> "runtime_empty"
 JitBootMark.kt:152   | enum class CycleDecision { RUN, SKIP }
 JitBootMark.kt:159   | fun cycleDecision(stored: String, currentTag: String): CycleDecision = when {
+JitBootMark.kt:173   | fun sameTag(a: String, b: String): Boolean {
 AppPerformance.kt:699  | private const val JIT_VERIFY_CYCLE_FILE = "jit_verify_cycle"
 AppPerformance.kt:959  | val cycleFile = File(app.filesDir, JIT_VERIFY_CYCLE_FILE)
 AppPerformance.kt:962  | AppLog.i(TAG, "JIT_VERIFY: skip reason=already_this_boot boot_tag=$bootTag " +
@@ -356,7 +375,7 @@ $ sed -n '60,61p' app/build.gradle.kts
 
 ### 4.16 Тесты реально идут
 
-§1: `> Task :app:testDebugUnitTest` + <<PASSED>> `PASSED`, 0 `FAILED`, включая имена `verifyOutcomeOk`, `verifyOutcomeFailed`, `verifyOutcomeUnknownWhenEmpty`, `verifyOutcomeEmptyRuntimeWithPersistIsFailed`, `verifyOutcomeFailedKeepsRuntimeReason`, `cycleDecisionSkipsOnlySameBoot`.
+§1: `> Task :app:testDebugUnitTest` + 26 `PASSED`, 0 `FAILED`, включая имена `verifyOutcomeOk`, `verifyOutcomeFailed`, `verifyOutcomeUnknownWhenEmpty`, `verifyOutcomeEmptyRuntimeWithPersistIsFailed`, `verifyOutcomeFailedKeepsRuntimeReason`, `cycleDecisionSkipsOnlySameBoot`.
 
 ---
 
