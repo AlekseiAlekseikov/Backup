@@ -54,14 +54,15 @@ object StatusIcons {
     const val PREF_HVAC_BATT = "hvacdigital_batt"
     const val PREF_HVAC_TEMP = "hvacdigital_temp"
     const val PREF_HVAC_EXT_TEMP = "hvacdigital_temp_ext"
-    private const val SYS_HVAC_BATT = "persist.sys.hvacdigital.batt"
+    // iter33i P0-a: имена берём из HvacDigitalProps (один источник истины), значения не пишем.
+    private const val SYS_HVAC_BATT = HvacDigitalProps.PROP_BATT
     // E1 (iter33h): `persist.sys.hvacdigital.temp` приложением БОЛЬШЕ НЕ ПИШЕТСЯ.
     // Уставку климата плагин читает сам (HvacVehicleTempWidget.getPropertyId() → HVAC_TEMPERATURE_SET),
     // а наше «значение» уходило в слот климата поверх стандартной полоски.
     // F2: ключ наружной — ОДИН (`persist.sys.hvacdigital.exttemp`), как в референсе
     // (w0/x7.java:142, w0/ah.java:17, w0/u5.java:27); `temp_ext` больше не пишем.
-    private const val SYS_HVAC_VIA = "persist.sys.hvacdigital.via"                // round-trip самого приложения
-    private const val SYS_HVAC_EXT_EXTTEMP = "persist.sys.hvacdigital.exttemp"    // F2: единственный ключ наружной
+    private const val SYS_HVAC_VIA = HvacDigitalProps.PROP_VIA                    // только ЧТЕНИЕ (диагностика)
+    private const val SYS_HVAC_EXT_EXTTEMP = HvacDigitalProps.PROP_EXT              // F2: единственный ключ наружной
 
     // iter22 §1: канал и ранги ОДИН-В-ОДИН как в CEX w0/kg#j: единый канал
     // "central_ex_status_temp", IMPORTANCE_LOW, setShowBadge(false);
@@ -80,7 +81,7 @@ object StatusIcons {
 
     private val AREAS = intArrayOf(0, 1, 2, 3, 4, 7, 0x10, 0x20, 0x30)
     private val RANGES = arrayOf(0x0..0x4FF, 0x11400000..0x117FFFFF, 0x15400000..0x167FFFFF)
-    // 0x11600703 в этом списке нет: это заглушка прошивки (25.0), источник — 0x2140A377.
+    // 0x11600703 в этом списке не нужен: наружная читается отдельно, с зонами (см. readTempScan).
     private val PRECISE_COMMON = intArrayOf(0x157, 0x11600005, 0x11600207, 0x11600208,
         0x16400017, 0x21600017, 0x16400001, 0x15500703, 0x11500703,
         0x16400703, 0x21600703, 0x11600502, 0x11600204, 0x11400204)
@@ -108,16 +109,11 @@ object StatusIcons {
     private const val PROP_ENV_OUTSIDE_TEMP = 0x11600703
     /** Зоны ENV_OUTSIDE_TEMPERATURE — порядок референса (TempStepperService.f1286d0). */
     private val ENV_OUTSIDE_AREAS = intArrayOf(0, 1, 4, 7)
-    /** HVAC_TEMPERATURE_CURRENT — id из референса (`TempStepperService.i/g`), зоны {1,4,0,7}. */
-    private const val PROP_HVAC_TEMP_CURRENT = 0x15600502
-    /** HVAC_TEMPERATURE_SET — 0x15600503 из VHAL-дампа, areas=[49, 68]. */
-    private const val PROP_HVAC_TEMP_SET = 0x15600503
     // Резервные ID — ТОЛЬКО для строки лога TEMP_CANDS, автопереключения нет.
     private const val PROP_TEMP_RESERVE_1 = 0x2160A6E9
     private const val PROP_TEMP_RESERVE_2 = 0x2140A673
-    // 0x11600703 (ENV_OUTSIDE_TEMPERATURE в прошивке) — ЗАГЛУШКА: на этой машине стабильно
-    // отдаёт 25.0 (14 тиков подряд в логе 1.0.44). Не используется ни как источник,
-    // ни в contentText, ни в дампе выбора.
+    // Резервные 0x2160A6E9/0x2140A673 и ambient — только диагностика; источник наружной —
+    // ENV_OUTSIDE_TEMPERATURE 0x11600703 с зонами (iter33h F1, итерация 33i ничего не меняет).
 
     @Volatile private var cpm: android.car.hardware.property.CarPropertyManager? = null
     @Volatile private var carObj: Car? = null
@@ -442,21 +438,13 @@ object StatusIcons {
     // (`envOutsideToCelsius` / `formatOutsideTempC`) — их проверяет `TempFormatTest`.
 
     /**
-     * F1.3 (iter33h) — read-only действие «Температуры: разведка».
+     * iter33i P1 — read-only действие «Температуры: разведка».
      *
-     * Один проход, ничего не пишем: по строке на свойство, формат
-     * `TEMP_PROBE hex=0x… name=… area=… value=… err=<none|ExceptionName>`.
+     * Список свойств, ID и зоны — в [TEMP_PROBE_TABLE] (ID сверены с эталоном имён машины
+     * `app/src/main/assets/ex2_carprops.csv` и с VHAL-дампом). Строк «err=no_id» больше нет:
+     * ID известен для каждого свойства, `err=` — только результат чтения.
      *
-     * ID взяты ТОЛЬКО из фактов, а не из головы:
-     *  • `0x11600703` ENV_OUTSIDE_TEMPERATURE — VHAL-дамп `uploads/vhal-dump.txt` (FLOAT, areas=[0], 25.0)
-     *    и референс `TempStepperService.i(int)` (`getFloatProperty(291505923, area)`);
-     *  • `0x2140A377` / `0x2140A376` — тот же дамп (INT32, 95 / INVALID=1), только диагностика;
-     *  • `0x15600503` HVAC_TEMPERATURE_SET, areas [49, 68] — тот же дамп;
-     *  • `0x15600502` — из референса (`TempStepperService`, «Sensor cabina OK (HVAC_TEMPERATURE_CURRENT)
-     *    area=0x%x»), зоны референса {1,4,0,7}.
-     * Свойства, для которых ID нет ни в дампе, ни в референсе (AC_INSIDE_TEMP_INVALID,
-     * HVAC_IN_OUT_TEMP, HU_ENVIRONMENTAL_TEMP, TEMPERATURE_STATE), печатаются с `err=no_id` —
-     * придумывать hex запрещено.
+     * Формат строки: `TEMP_PROBE hex=0x… name=… area=0x… value=… err=<none|none(int)|ExceptionName>`.
      */
     fun tempProbe(ctx: android.content.Context): ToolsResult {
         val m = cpm ?: run {
@@ -466,47 +454,44 @@ object StatusIcons {
                     status = ToolsStep.Status.BLOCKED)))
         }
         val steps = ArrayList<ToolsStep>()
-        fun probeFloat(hex: String, name: String, propId: Int, areas: IntArray) {
-            for (a in areas) {
+        for (e in TEMP_PROBE_TABLE) {
+            for (area in e.areas) {
                 val t = android.os.SystemClock.elapsedRealtime()
                 var value = "н/д"
                 var err = "none"
-                try {
-                    val f = m.getFloatProperty(propId, a)
-                    value = if (f.isNaN()) "н/д" else String.format(Locale.US, "%.1f", f)
-                } catch (e: Exception) {
-                    err = e.javaClass.simpleName
+                if (e.floatFirst) {
                     try {
-                        val iv = m.getIntProperty(propId, a)
-                        value = iv.toString()
-                        err = "none(int)"
-                    } catch (e2: Exception) {
-                        err = e.javaClass.simpleName
+                        val f = m.getFloatProperty(e.propId, area)
+                        value = if (f.isNaN()) "н/д" else String.format(Locale.US, "%.1f", f)
+                    } catch (ex: Exception) {
+                        err = ex.javaClass.simpleName
+                        try {
+                            value = m.getIntProperty(e.propId, area).toString()
+                            err = "none(int)"
+                        } catch (ex2: Exception) {
+                            err = ex2.javaClass.simpleName
+                        }
+                    }
+                } else {
+                    try {
+                        value = m.getIntProperty(e.propId, area).toString()
+                    } catch (ex: Exception) {
+                        err = ex.javaClass.simpleName
+                        try {
+                            val f = m.getFloatProperty(e.propId, area)
+                            value = if (f.isNaN()) "н/д" else String.format(Locale.US, "%.1f", f)
+                            err = "none(float)"
+                        } catch (ex2: Exception) {
+                            err = ex.javaClass.simpleName
+                        }
                     }
                 }
-                val line = "TEMP_PROBE hex=$hex name=$name area=0x%x value=$value err=$err".format(a)
+                val line = tempProbeLine(e.hex, e.name, area, value, err)
                 AppLog.i(TAG, line)
-                steps.add(ToolsStep("probe", line, t, t, if (err == "none") 0 else 1, stdout = line,
-                    status = ToolsStep.Status.OK))
+                steps.add(ToolsStep("probe", line, t, t, if (err == "none" || err == "none(int)") 0 else 1,
+                    stdout = line, status = ToolsStep.Status.OK))
             }
         }
-        fun noId(name: String) {
-            val t = android.os.SystemClock.elapsedRealtime()
-            val line = "TEMP_PROBE hex=n/a name=$name area=n/a value=н/д err=no_id"
-            AppLog.w(TAG, line)
-            steps.add(ToolsStep("probe", line, t, t, 1, stderr = "no_id", stdout = line,
-                status = ToolsStep.Status.OK))
-        }
-        probeFloat("0x11600703", "ENV_OUTSIDE_TEMPERATURE", PROP_ENV_OUTSIDE_TEMP, ENV_OUTSIDE_AREAS)
-        probeFloat("0x2140A377", "AC_AMBIENT_TEMP", PROP_AC_AMBIENT_TEMP, intArrayOf(0))
-        probeFloat("0x2140A376", "AC_AMBIENT_TEMP_INVALID", PROP_AC_AMBIENT_INVALID, intArrayOf(0))
-        probeFloat("0x15600502", "AC_INSIDE_TEMP(HVAC_TEMPERATURE_CURRENT)", PROP_HVAC_TEMP_CURRENT, intArrayOf(1, 4, 0, 7))
-        noId("AC_INSIDE_TEMP_INVALID")
-        noId("HVAC_IN_OUT_TEMP")
-        noId("HU_ENVIRONMENTAL_TEMP")
-        noId("TEMPERATURE_STATE")
-        probeFloat("0x15600503", "HVAC_TEMPERATURE_SET", PROP_HVAC_TEMP_SET, intArrayOf(49))
-        probeFloat("0x15600503", "HVAC_TEMPERATURE_SET", PROP_HVAC_TEMP_SET, intArrayOf(68))
         val t = android.os.SystemClock.elapsedRealtime()
         val hint = "Сравните с приборкой. Если число отличается — нажмите «Отправить» (уйдёт в отчёт)"
         steps.add(ToolsStep("hint", hint, t, t, 0, stdout = hint, status = ToolsStep.Status.OK))
@@ -907,24 +892,21 @@ object StatusIcons {
 
     private fun pushHvacDigitalPropsIfEnabled(app: Context) {
         val p = prefs(app)
-        val sb = StringBuilder()
-        val fmt = { v: Float? -> if (v == null) null else String.format(Locale.US, "%.1f", v) }
-        // batt
+        // iter33i P0-a: в чужие props уходят ТОЛЬКО флаги 0|1 — ровно как в референсе
+        // (`w0/x7.java:137-147`: setprop …temp/batt/exttemp = "1"/"0"). Значения (°C, %) в эти
+        // свойства НЕ пишем: наш плагин их не читает вовсе (0 вхождений "hvacdigital" в APK),
+        // а цифры нашей строки состояния рисуются своими иконками ниже.
+        val tempOn = p.getBoolean(PREF_HVAC_TEMP, false)
         val battOn = p.getBoolean(PREF_HVAC_BATT, false)
-        val bv = if (battOn) fmt(lastBattPct) ?: return else "0"
-        sb.append("setprop $SYS_HVAC_BATT $bv; ")
+        val extOn = p.getBoolean(PREF_HVAC_EXT_TEMP, false)
+        val command = HvacDigitalProps.flagsCommand(tempOn, battOn, extOn)
         // E1.1 (iter33h): setprop persist.sys.hvacdigital.temp УБРАН. Уставку климата плагин
         // читает сам (com.flyme.auto.hvacapi.widget.HvacVehicleTempWidget.getPropertyId() →
         // 358614275 == HVAC_TEMPERATURE_SET, area=1), а наше «значение» уходило в слот климата
         // и ложилось поверх стандартной полоски.
-        // E1.2: строке состояния нужны от приложения exttemp (наружная, %.1f) и batt;
-        // F2: ключ наружной — ОДИН (`exttemp`), `temp_ext` больше не пишем.
-        val extOn = p.getBoolean(PREF_HVAC_EXT_TEMP, false)
-        val ev = if (extOn) fmt(lastExtTempC) ?: return else "0"
-        sb.append("setprop $SYS_HVAC_EXT_EXTTEMP $ev; ")
         // iter33 B5: dirty-флаг. Раньше setprop уходил каждые 15 с «на всякий случай»
-        // (44 записи за 10 минут). Теперь — только когда значение реально изменилось.
-        val fingerprint = "batt=" + bv + " ext=" + ev
+        // (44 записи за 10 минут). Теперь — только когда набор флагов реально изменился.
+        val fingerprint = HvacDigitalProps.flagsFingerprint(tempOn, battOn, extOn)
         if (fingerprint == lastPushedHvac) {
             // H1: не чаще одного раза в 5 минут.
             val now = android.os.SystemClock.elapsedRealtime()
@@ -934,12 +916,14 @@ object StatusIcons {
             }
             return
         }
-        // verify echo — без `temp` (E4: в логе прогона не должно быть temp=)
-        sb.append("echo batt=\$(getprop $SYS_HVAC_BATT) exttemp=\$(getprop $SYS_HVAC_EXT_EXTTEMP) via=\$(getprop $SYS_HVAC_VIA)")
+        // verify echo: читаем обратно ровно то, что записали (три флага), плюс `via` — ТОЛЬКО чтение.
+        val script = command.replace("&& echo FLAGS_OK",
+            "&& echo \"temp=\$(getprop ${HvacDigitalProps.PROP_TEMP}) batt=\$(getprop ${HvacDigitalProps.PROP_BATT}) " +
+                "exttemp=\$(getprop ${HvacDigitalProps.PROP_EXT}) via=\$(getprop ${HvacDigitalProps.PROP_VIA})\"")
         try {
-            val (rc, out) = AdbClient.execute(sb.toString(), 5000)
+            val (rc, out) = AdbClient.execute(script, 5000)
             if (rc == 0) lastPushedHvac = fingerprint
-            AppLog.i(TAG, "HVACDIGITAL_PUSH rc=$rc batt=$bv exttemp=$ev via=${lastViaForLog()} out=${out.replace('\n',' ').take(200)}")
+            AppLog.i(TAG, "HVACDIGITAL_PUSH rc=$rc $fingerprint out=${out.replace('\n', ' ').take(200)}")
         } catch (t: Throwable) {
             AppLog.w(TAG, "HVACDIGITAL_PUSH failed: ${t.message}")
         }

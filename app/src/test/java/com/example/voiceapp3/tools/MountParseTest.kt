@@ -45,6 +45,22 @@ class MountParseTest {
         assertEquals("", HvacDigitalPlugin.firstOurMountLine(foreign.joinToString("\n")))
     }
 
+    // 2b. iter33i P2-3: вторая РЕАЛЬНАЯ фикстура — путь, который печатает `pm path` на машине
+    //     владельца (`voiceapp3 4.log`): /system/priv-app/…, а не /system/app/….
+    @Test
+    fun privAppMountLineIsOurMount() {
+        val privLine =
+            "/dev/block/platform/bootdevice/by-name/userdata " +
+                "/system/priv-app/GeelyAutoSystemUIPlugin/GeelyAutoSystemUIPlugin.apk ext4 " +
+                "rw,seclabel,nosuid,nodev,noatime,noauto_da_alloc,resgid=1065,errors=panic,data=ordered"
+        assertTrue("priv-app фикстура должна распознаваться", HvacDigitalPlugin.isOurMountLine(privLine))
+        assertEquals(privLine, HvacDigitalPlugin.firstOurMountLine("noise\n$privLine\n"))
+        assertEquals(2, HvacDigitalPlugin.countOurMounts("$realLine\n$privLine"))
+        // Обе строки — про наш плагин, но это разные mount point'ы.
+        assertEquals(1, HvacDigitalPlugin.umountCountOf("UMOUNT stale: " +
+            "/system/priv-app/GeelyAutoSystemUIPlugin/GeelyAutoSystemUIPlugin.apk\nUMOUNT_COUNT=1"))
+    }
+
     // 3. Пустой вывод (/proc/mounts без плагина) + счётчик umount из скрипта.
     @Test
     fun emptyMountsAndUmountCounter() {

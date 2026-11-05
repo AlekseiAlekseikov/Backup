@@ -792,7 +792,7 @@ class ToolsPanel(
         addSect("page.devAvas")
         soundButtons(
             // Имена событий — те, что обрабатывает UiBridge (см. комментарий в отчёте этапа 5c).
-            soundButton("Тест звука открытия (AVAS 29)", 1) { send("dev.testAvasSound", "{}") },
+            soundButton("Тест звука открытия", 1) { send("dev.testAvasSound", "{}") },
             soundButton("Тест звука закрытия (Lock)", 1) { send("audio.preview", "{}") },
             soundButton("Тест штатного gong.wav", 2) {
                 // Обработчика нет ни в JS, ни в Kotlin — как и в HTML.

@@ -1005,16 +1005,14 @@ object AdbClient {
         // 3) Ветка мандата: при праве записи включить плагин через `via=app`.
         //    Не перетираем уже выставленное состояние монтирования (install/bind) — им управляет
         //    HvacDigitalPlugin, который в этой итерации трогать запрещено (§7 мандата).
+        // iter33i P0-a.3: `persist.sys.hvacdigital.via` — механизм установки плагина
+        // (`bind`/`install`, референс `w0/o.java:73`). Своё значение («app», маршрутная пилюля)
+        // туда НЕ пишем: чужой prop не наш. Только чтение — для диагностики.
         if (propWriteOk) {
             val viaNow = runShellFallback("getprop $PROP_VIA", 2000).trim()
-            if (viaNow.isEmpty() || viaNow == "app") {
-                val (vr, vo, ve) = runShellCapture("setprop $PROP_VIA app; getprop $PROP_VIA", 3000)
-                AppLog.i(TAG, "EXEC_PROP via=app sent=app got=${vo.trim().ifEmpty { "(empty)" }} match=${vo.trim() == "app"} rc=$vr err=${ve.take(120)}")
-            } else {
-                AppLog.i(TAG, "EXEC_PROP via=app skipped reason=already_set via=$viaNow (состояние плагина не трогаем)")
-            }
+            AppLog.i(TAG, "EXEC_PROP via=read only value=${viaNow.ifEmpty { "(empty)" }} (не пишем: проп принадлежит плагину)")
         } else {
-            AppLog.i(TAG, "EXEC_PROP via=app skipped reason=propwrite_denied")
+            AppLog.i(TAG, "EXEC_PROP via=skipped reason=propwrite_denied")
         }
     }
 
