@@ -464,7 +464,9 @@ done
 SYSUI_PID_BEFORE=${D}(pidof com.android.systemui)
 echo "SYSUI_PID_BEFORE=${D}SYSUI_PID_BEFORE"
 kill ${D}SYSUI_PID_BEFORE 2>/dev/null || true
-sleep 4
+_k=0
+while [ -n "${D}(pidof com.android.systemui)" ] && [ ${D}_k -lt 10 ]; do sleep 0.5; _k=${D}((${D}_k+1)); done
+echo "SYSUI_WAIT_TICKS=${D}_k"
 echo "SYSUI_PID_AFTER=${D}(pidof com.android.systemui)"
 echo "PM_PATH_AFTER=${D}(pm path $OEM_PKG 2>/dev/null | sed 's/^package://' | tr '
 ' ' ')"

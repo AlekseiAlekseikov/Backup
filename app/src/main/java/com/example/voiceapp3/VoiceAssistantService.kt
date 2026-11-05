@@ -402,7 +402,7 @@ class VoiceAssistantService : Service() {
      *     + `sleep 3` — медиакодек (media.swcodec) перезапускался каждую минуту под работающим
      *     видеопотоком ⇒ «CarPlay заикается, ViperFX отваливается» (13 перезапусков за 10 минут);
      *   • `StatusIcons.bootRestoreHvacDigital` → `HvacDigitalPlugin.enable` → `setenforce 0`,
-     *     `kill SystemUI` (PID 1174 → 20740), `rm -rf /data/dalvik-cache/*` ⇒ система
+     *     `kill SystemUI` (PID 1174 → 20740), `rm -rf /data/dalvik-cache/…` ⇒ система
      *     перезапускала SystemUI каждую минуту;
      *   • `LockSound.onBootOrWatchdog` → повторная заливка звука;
      *   • `NetworkTtl.bootRestore` → заливка скрипта чанками при уже существующем правиле.
