@@ -591,3 +591,43 @@
 - CI: прогон **`42041029635`** (job `127291563056`), `BUILD SUCCESSFUL in 4m 8s`, **26 PASSED / 0 FAILED**;
   артефакт **`13421983008`**: zip **177 087 351 Б** · apk **215 432 385 Б** · manifest-отчёт **105 294 Б**.
 - Отчёт: `docs/agent/REPORT_iter33g.md` (два вида `JIT_VERIFY` разведены, честные пробелы).
+
+## iter33h — 1.0.54 (A…I)
+
+- База `6097ead`. Коммиты: `d62f364` (A + B), `67c7213` (D/E/F/G/H/I + тесты), `c77da0b` (фикс
+  компиляции: закрыт блочный комментарий в `LockSound` из-за `avas/**` внутри KDoc; `sysPropFor`
+  без удалённых свойств; наружная вынесена в `OutsideTemp.kt`), `77191bc` (фикс ожиданий тестов).
+- Версия `54` / `"1.0.54"` (`app/build.gradle.kts:62-63`), плюс guard `gitSha` → `unknown` и `CI_RUN`
+  из `GITHUB_RUN_ID`.
+- A: единственный путь `/vendor/etc/carlock/<файл>.wav` (`LockSound.kt:860-878`, `isOurLockPath`
+  `:1002-1008`), снятие только своих маунтов по своему списку (`:967-999`),
+  `LOCKSOUND_BOOT enabled=false action=none` (`:766`); `pkill -9 -f avas` и `killall -9 audioserver`
+  удалены (осталась строка-комментарий `:880`).
+- B1: `AdbClient.RootState` + `probeRootState` (`:209`, `:246+`), `ADB_STATE` (`:230`),
+  `ROOT_RESTORED bootrestore pass=1` (`:234`), `noRootUiText()` (`:1606`), проба из
+  `settingsWatchdog` (`VoiceAssistantService.kt:439`). B2: `bootGateDecision` (`HvacDigitalPlugin.kt:50`),
+  префы `hvac_boot_tag_v2`/`hvac_boot_result_v2`, `HVAC_BOOT: retry reason=root_back` (`:458`);
+  `prev_uptime_ms` удалён (осталось 2 упоминания в комментариях).
+- C: `ventOwnersAfterClose` (`WindowDoors.kt:637`), шаг 0 только для `legacy`, `WINDOW_EVENT …
+  result=closed pos_after=…` (`:507-524`), `VENT_CLOSE_FAIL` (`:533`).
+- D: один предикат `MOUNT_GREP` (`HvacDigitalPlugin.kt:28`) для pre/post/umount/`HVAC_PROBE`,
+  `isOurMountLine`/`firstOurMountLine`/`countOurMounts`/`umountCountOf` (`:502-519`),
+  `restoreOk = haveRoot && !post.overlayMounted` (`:674`), `RESTORE_RESULT` (`:675`).
+- E: temp-push убран (`StatusIcons.kt:916-929`), ключ наружной один — `exttemp` (`:924`),
+  `sysPropFor` без `temp` (`:992`).
+- F: наружная = `0x11600703` с зонами {0,1,4,7} (`StatusIcons.kt:108-110`, `:391-435`,
+  `OutsideTemp.kt`), `TEMP_SRC` (диагностика), read-only «Температуры: разведка» (`:461-518`,
+  `ToolsPanel.kt:282`, `ToolsBackend.kt:978`).
+- G: `ENABLE=<0|1>` вместо имени переменной (`TtlScript.kt:27`, `:230`), `TTL_RESULT` (`:228`),
+  `ROUTE_SRC=none reason=…` (`:39`), `rule_not_installed` → FAILED (`NetworkTtl.kt:122`).
+- H: `redactTrace` (`LogKit.kt:454`), краткая/полная трасса (`:385`), `traceHandshake` 3/процесс
+  (`:417`), `checksum_skipped` 1/команду (`AdbClient.kt:1899`), бюджет 150 КБ/10 мин
+  (`AppLog.kt:261-300`), `BUILD: … commit=<7> ci_run=<id>` (`App.kt:22-24`).
+- I: `source=after_restart` только первая попытка (`AppPerformance.kt:1057-1063`),
+  `JIT_VERIFY_ATTEMPTS_MAX` (`:701`), кэш `currentBootTag` (`:915-928`).
+- Тесты: +6 классов (`BootGateTest`, `MountParseTest`, `RedactTraceTest`, `TempFormatTest`,
+  `TtlScriptTest`, `VentOwnersTest`) → 43 `PASSED`.
+- CI: два падения по пути — `42078312721` (`LockSound.kt:957 Missing '}'`, вложенный блочный
+  комментарий из `avas/**`) и `42080288285` (неверные ожидания в трёх тестах); зелёный прогон
+  **`42082578996`** (head `77191bc`), артефакт **`13442117857`**: zip **177 100 457 Б** ·
+  apk **215 465 513 Б** · manifest-отчёт **105 294 Б**.
