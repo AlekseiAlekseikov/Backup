@@ -804,9 +804,6 @@ object AppPerformance {
         AppLog.i(TAG, "JIT_PROBE: runtime=$runtime persist=$persist desired=true (read-only, без записи)")
     }
 
-    private fun isAutoOptimizeEnabled(context: Context): Boolean =
-        runCatching { getPrefs(context).getBoolean(PREF_PERF_AUTO_OPTIMIZE, false) }.getOrDefault(false)
-
     private fun runSuCommand(command: String): ExecResult {
         return try {
             val (code, out) = AdbClient.execute(command, 30000)
