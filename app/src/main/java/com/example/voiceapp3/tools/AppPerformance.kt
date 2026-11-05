@@ -686,7 +686,6 @@ object AppPerformance {
     private const val JIT_BOOT_MARKER = "jit_boot_attempt"
     /** iter33c C1: окно, в котором перезапуск zygote РАЗРЕШЁН (было имя «late start» — наоборот по смыслу). */
     private const val JIT_ZYGOTE_WINDOW_MS = 120_000L
-    private const val JIT_ATTEMPT_GUARD_MS = 600_000L
 
     private val jitBootAttempted = java.util.concurrent.atomic.AtomicBoolean(false)
 
@@ -724,18 +723,43 @@ object AppPerformance {
             return
         }
         val desired = "true"
+        // ── iter33d A2/A3: опознание загрузки. Одна функция ([JitBootMark.sameLoad]) и для guard'а
+        // маршрута 2, и для решения «restored_from_persist или match_after_zygote».
+        val bootTag = currentBootTag()
+        val upNow = android.os.SystemClock.elapsedRealtime()
+        val markerFile = File(app.filesDir, JIT_BOOT_MARKER)
+        val markerRaw = runCatching { markerFile.readText().trim() }.getOrDefault("")
+        val sameLoad = JitBootMark.sameLoad(markerRaw, bootTag)
+        AppLog.i(TAG, "JIT_BOOT: attempt_marker boot_tag=$bootTag same_load=$sameLoad uptime_ms=$upNow " +
+            "marker=${LogKit.kv(markerRaw.ifEmpty { "empty" })}")
+        // A2: метка старого формата (просто uptime) — консервативно считаем «эта загрузка»
+        // и сразу переписываем в новый формат, чтобы состояние не залипало.
+        if (JitBootMark.isLegacy(markerRaw)) {
+            runCatching { markerFile.writeText(JitBootMark.format(bootTag, JitBootMark.uptimeOf(markerRaw))) }
+            AppLog.i(TAG, "JIT_BOOT: attempt_marker legacy=true action=rewrite " +
+                "was=$markerRaw now=${JitBootMark.format(bootTag, JitBootMark.uptimeOf(markerRaw))}")
+        }
         var (runtime, persist) = jitProps()
 
         // ── B2: маршрут 1 должен быть самодостаточен ────────────────────────────
         // Дублёр писался ТОЛЬКО по клику (`setAutoOptimize`), поэтому у владельца, включавшего JIT
         // в 1.0.52 (и после сброса настроек), persist был пуст и маршрут 1 не срабатывал никогда.
         // Теперь: тумблер включён, а дублёра нет (или он врёт) ⇒ пишем ЕГО ЖЕ один раз и читаем обратно.
+        // iter33d C: снимок ДО дозаписи. Раньше `persist_present` считался после неё и означал
+        // почти только «канал ответил», а не «дублёр был». Теперь в пробе три поля.
+        val persistBefore = persist
+        var backfilled = false
         if (persist != desired) {
             val reason = if (persist.isEmpty()) "boot_backfill" else "boot_mismatch"
             jitPersistBackfill(desired, reason)
             persist = jitProps().second
+            backfilled = true
         }
-        val persistPresent = persist.isNotEmpty()
+        val persistPresent = persistBefore.isNotEmpty()
+        val persistBeforeWire = if (persistBefore.isEmpty()) "empty" else LogKit.kv(persistBefore)
+        val backfillWire = if (backfilled) "yes" else "no"
+        val probeCommon = "persist_before=$persistBeforeWire persist_present=$persistPresent backfill=$backfillWire " +
+            "runtime=$runtime persist=$persist"
 
         if (runtime == desired) {
             // ── B1: честная строка ───────────────────────────────────────────────
@@ -745,13 +769,13 @@ object AppPerformance {
             val attempted = attemptInThisLoad(app)
             if (secondPass && persist == desired) {
                 if (attempted) {
-                    AppLog.i(TAG, "JIT_PERSIST_PROBE: supported=false persist_present=$persistPresent runtime=$runtime " +
-                        "persist=$persist reason=runtime_raised_by_our_zygote")
+                    AppLog.i(TAG, "JIT_PERSIST_PROBE: supported=false $probeCommon " +
+                        "reason=runtime_raised_by_our_zygote")
                     AppLog.i(TAG, "JIT_BOOT: match_after_zygote runtime=$runtime persist=$persist " +
                         "(поднят перезапуском zygote в этой загрузке)")
                 } else {
-                    AppLog.i(TAG, "JIT_PERSIST_PROBE: supported=true persist_present=$persistPresent runtime=$runtime " +
-                        "persist=$persist reason=runtime_raised_from_persist")
+                    AppLog.i(TAG, "JIT_PERSIST_PROBE: supported=true $probeCommon " +
+                        "reason=runtime_raised_from_persist")
                     AppLog.i(TAG, "JIT_BOOT: restored_from_persist prop=$PROP_PERSIST_USEJIT runtime=$runtime " +
                         "persist=$persist (zygote не перезапускали)")
                 }
@@ -766,12 +790,10 @@ object AppPerformance {
         // SystemUI), и только потом — один перезапуск zygote. Иначе статус-бар мигал бы дважды
         // подряд, а между ними был бы пустым.
         if (!secondPass) {
-            AppLog.i(TAG, "JIT_PERSIST_PROBE: supported=unknown persist_present=$persistPresent runtime=$runtime " +
-                "persist=$persist action=read_again_in_30s")
+            AppLog.i(TAG, "JIT_PERSIST_PROBE: supported=unknown $probeCommon action=read_again_in_30s")
             return
         }
-        AppLog.i(TAG, "JIT_PERSIST_PROBE: supported=false persist_present=$persistPresent runtime=$runtime " +
-            "persist=$persist reason=runtime_not_raised_from_persist")
+        AppLog.i(TAG, "JIT_PERSIST_PROBE: supported=false $probeCommon reason=runtime_not_raised_from_persist")
 
         // маршрут 2
         val up = android.os.SystemClock.elapsedRealtime()
@@ -779,18 +801,20 @@ object AppPerformance {
             AppLog.i(TAG, "JIT_BOOT: deferred reason=outside_window uptime_ms=$up (перезапуск zygote на этой стадии запрещён)")
             return
         }
-        val marker = File(app.filesDir, JIT_BOOT_MARKER)
-        val prev = runCatching { marker.readText().trim().toLong() }.getOrDefault(0L)
-        // prev < up ⇒ попытка была в ЭТОЙ загрузке (uptime монотонен); после ребута uptime меньше.
-        if (prev in 1..up && up - prev < JIT_ATTEMPT_GUARD_MS) {
-            AppLog.i(TAG, "JIT_BOOT: skip reason=attempt_guard prev_uptime_ms=$prev now_ms=$up")
+        // iter33d A1/A2: guard по ОПОЗНАНИЮ ЗАГРУЗКИ, арифметики по разнице uptime больше нет.
+        // Старое условие сравнивало метку с текущим uptime и давало SKIP после каждого второго
+        // ребута: метка прошлой загрузки (≤120 с) оказывалась меньше текущего uptime.
+        if (sameLoad) {
+            AppLog.i(TAG, "JIT_BOOT: skip reason=attempt_guard same_load=true " +
+                "marker_uptime_ms=${JitBootMark.uptimeOf(markerRaw)} now_ms=$up")
             return
         }
         if (!jitBootAttempted.compareAndSet(false, true)) {
             AppLog.i(TAG, "JIT_BOOT: skip reason=attempt_guard_process")
             return
         }
-        runCatching { marker.writeText(up.toString()) }
+        // Метка этой попытки: идентификатор загрузки + uptime (A2).
+        runCatching { markerFile.writeText(JitBootMark.format(bootTag, up)) }
 
         // Ровно три команды, без svc wifi / umount /data/app / sleep.
         val pidBefore = runCatching {
@@ -834,12 +858,28 @@ object AppPerformance {
         return rb
     }
 
-    /** Была ли попытка перезапуска zygote в ЭТОЙ загрузке (метка `files/jit_boot_attempt`). */
+    /**
+     * Была ли попытка перезапуска zygote в ЭТОЙ загрузке — по метке `files/jit_boot_attempt`.
+     * iter33d A2: тело — один вызов [JitBootMark.sameLoad]; своей арифметики здесь больше нет
+     * (раньше это была ВТОРАЯ копия эвристики, и обе ошибались одинаково).
+     */
     private fun attemptInThisLoad(app: Context): Boolean {
-        val prev = runCatching { File(app.filesDir, JIT_BOOT_MARKER).readText().trim().toLong() }
-            .getOrDefault(0L)
-        val up = android.os.SystemClock.elapsedRealtime()
-        return prev in 1..up
+        val marker = runCatching { File(app.filesDir, JIT_BOOT_MARKER).readText().trim() }.getOrDefault("")
+        return JitBootMark.sameLoad(marker, currentBootTag())
+    }
+
+    /**
+     * iter33d A2: идентификатор текущей загрузки.
+     *  1. `/proc/sys/kernel/random/boot_id` — обычный файл, разрешений не требует;
+     *  2. иначе `bootEpoch = System.currentTimeMillis() - elapsedRealtime()` (секунды) —
+     *     для него в [JitBootMark.sameLoad] работает допуск ±60 с.
+     */
+    private fun currentBootTag(): String {
+        val id = runCatching { File("/proc/sys/kernel/random/boot_id").readText().trim() }
+            .getOrDefault("")
+        if (id.isNotEmpty()) return id
+        val epochSec = (System.currentTimeMillis() - android.os.SystemClock.elapsedRealtime()) / 1000L
+        return "epoch$epochSec"
     }
 
     /**

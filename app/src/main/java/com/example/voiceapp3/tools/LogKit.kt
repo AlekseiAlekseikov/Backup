@@ -70,9 +70,7 @@ object LogKit {
     @Volatile private var opsDirty = false
     /** iter33c C2: досрочный сброс хвоста уже запланирован (один на пачку). */
     @Volatile private var tailFlushScheduled = false
-    private val mainHandler: android.os.Handler by lazy {
-        android.os.Handler(android.os.Looper.getMainLooper())
-    }
+
     /** iter33b B3.2: строки ТЕКУЩЕЙ команды — при провале печатаются целиком. */
     private val jobRing = ArrayDeque<String>(JOB_RING)
     @Volatile private var jobFailed = false
@@ -133,10 +131,12 @@ object LogKit {
     private fun scheduleTailFlush() {
         if (tailFlushScheduled) return
         tailFlushScheduled = true
-        mainHandler.postDelayed({
+        // iter33d B: сброс — на BgWorker (было `mainHandler.postDelayed` ⇒ запись файла могла идти
+        // на главном потоке и вставать за фоновым на том же `lock`).
+        BgWorker.postDelayed("LogKit.tailFlush", OPS_FLUSH_MIN_MS) {
             tailFlushScheduled = false
             flushOps(force = true)
-        }, OPS_FLUSH_MIN_MS)
+        }
     }
 
     /** Немедленная запись выжимки (onDestroy: терять последние строки нельзя). */

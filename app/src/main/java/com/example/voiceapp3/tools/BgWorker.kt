@@ -35,6 +35,11 @@ object BgWorker {
         }
     )
 
+    /** Планировщик отложенных фоновых задач (iter33d B): один daemon-поток, сама работа — в пуле. */
+    private val scheduler: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { r ->
+        Thread(r, "CENTRAL_BgSched").apply { isDaemon = true }
+    }
+
     private val threadSeq = java.util.concurrent.atomic.AtomicInteger(0)
     private fun threadNumber() = threadSeq.incrementAndGet()
 
@@ -74,6 +79,18 @@ object BgWorker {
      */
     fun post(name: String, block: () -> Unit) {
         executor.execute(wrap(name, block))
+    }
+
+    /**
+     * iter33d B: postDelayed — отложенная ФОНОВАЯ задача.
+     *
+     * Зачем: `LogKit` держал `Handler(Looper.getMainLooper())` для хвостового сброса выжимки,
+     * то есть `File.writeText` мог выполняться на главном потоке (и вставать за фоновым на том же
+     * локе). Здесь задержку отсчитывает отдельный планировщик, а сама работа уходит в пул
+     * `CENTRAL_Bg-N` через тот же [post], что и обычные фоновые задачи.
+     */
+    fun postDelayed(name: String, delayMs: Long, block: () -> Unit) {
+        scheduler.schedule({ post(name, block) }, delayMs, TimeUnit.MILLISECONDS)
     }
 
     /**
