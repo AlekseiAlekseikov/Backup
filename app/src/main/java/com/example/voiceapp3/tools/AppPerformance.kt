@@ -781,7 +781,9 @@ object AppPerformance {
                 AppLog.i(TAG, "JIT_BOOT: restored_from_persist prop=$PROP_PERSIST_USEJIT runtime=$runtime " +
                     "persist=$persist (zygote не перезапускали)")
             } else {
-                AppLog.i(TAG, "JIT_BOOT: match runtime=$runtime persist=$persist (ноль пишущих команд)")
+                // iter33e C1: та же четвёрка полей, что и в остальных трёх ветках, — `persist=`
+                // рядом с `persist_after=` не дублируем (именно за дубль убран `persist_present`).
+                AppLog.i(TAG, "JIT_BOOT: match $probeCommon (ноль пишущих команд)")
             }
             return
         }
