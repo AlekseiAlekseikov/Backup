@@ -158,8 +158,26 @@ object JitBootMark {
      */
     fun cycleDecision(stored: String, currentTag: String): CycleDecision = when {
         stored.isBlank() -> CycleDecision.RUN
-        sameLoad(stored.trim(), currentTag.trim()) -> CycleDecision.SKIP
+        sameTag(stored, currentTag) -> CycleDecision.SKIP
         else -> CycleDecision.RUN
+    }
+
+    /**
+     * iter33g B2 — сравнение ДВУХ ТЕГОВ (не меток формата `тег:uptime`).
+     *
+     * В файле `jit_verify_cycle` лежит «голый» bootTag, а не метка, поэтому `sameLoad` здесь
+     * неприменим: он ищет `:` и на строке без него всегда отвечает `false` (первая версия
+     * `cycleDecision` на этом и упала в CI — `JitBootMarkTest.kt:187`). Допуск ±60 с сохранён:
+     * часы/NTP в пределах одной загрузки не должны выглядеть новой загрузкой.
+     */
+    fun sameTag(a: String, b: String): Boolean {
+        val x = a.trim()
+        val y = b.trim()
+        if (x.isEmpty() || y.isEmpty()) return false
+        if (x == y) return true
+        val na = stripEpochPrefix(x).toLongOrNull() ?: return false
+        val nb = stripEpochPrefix(y).toLongOrNull() ?: return false
+        return kotlin.math.abs(na - nb) <= (DEFAULT_TOLERANCE_MS / 1000L).coerceAtLeast(1L)
     }
 
     /** Uptime из метки, если он там есть (для лога), иначе -1. */

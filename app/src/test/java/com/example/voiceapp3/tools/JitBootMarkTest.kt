@@ -186,6 +186,9 @@ class JitBootMarkTest {
         // Тот же bootTag — цикл в этой загрузке уже был.
         assertEquals(JitBootMark.CycleDecision.SKIP,
             JitBootMark.cycleDecision(JitBootMark.epochTag(t), JitBootMark.epochTag(t)))
+        // Тот же bootTag, но часы уехали на 30 с (NTP) — это всё ещё та же загрузка.
+        assertEquals(JitBootMark.CycleDecision.SKIP,
+            JitBootMark.cycleDecision(JitBootMark.epochTag(t), JitBootMark.epochTag(t + 30_000)))
         // Другая загрузка (через 5 минут) — счётчик не блокирует.
         assertEquals(JitBootMark.CycleDecision.RUN,
             JitBootMark.cycleDecision(JitBootMark.epochTag(t), JitBootMark.epochTag(t + 300_000)))
