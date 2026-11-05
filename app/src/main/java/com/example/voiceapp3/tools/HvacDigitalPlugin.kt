@@ -222,14 +222,14 @@ object HvacDigitalPlugin {
                 esac
                 case "@@PM_AFTER" in
                   /data/app/*)
-                    echo "HVAC_UNSHADOW: before=@@PM_PATH after=@@PM_AFTER via=@@VIA_UNSHADOW result=FAILED"
+                    echo "HVAC_UNSHADOW: before=@@PM_PATH after=@@PM_AFTER unshadow_via=@@VIA_UNSHADOW result=FAILED"
                     echo "VIA=install"
                     echo "###STAGE name=unshadow status=FAILED reason=pm_path:@@PM_AFTER"
                     echo "HVAC_DIGITAL_FALHOU"
                     exit 2
                     ;;
                   *)
-                    echo "HVAC_UNSHADOW: before=@@PM_PATH after=@@PM_AFTER via=@@VIA_UNSHADOW result=OK"
+                    echo "HVAC_UNSHADOW: before=@@PM_PATH after=@@PM_AFTER unshadow_via=@@VIA_UNSHADOW result=OK"
                     echo "###STAGE name=unshadow status=OK reason=pm_path:@@PM_AFTER"
                     ;;
                 esac
@@ -244,6 +244,9 @@ object HvacDigitalPlugin {
             TGT=@@(pm path $OEM_PKG 2>/dev/null | sed 's/^package://' | head -n1)
             [ -z "@@TGT" ] && TGT=@@PM_AFTER
             TGT_INODE=@@(stat -c '%i' "@@TGT" 2>/dev/null)
+            # iter33c A1: раньше TGT_INODE существовал ТОЛЬКО внутри reason у ###STAGE, отдельного
+            # echo не было — поэтому `HVAC_PROBE … tgt_inode=-`, а разбор inode не срабатывал.
+            echo "TGT_INODE=@@TGT_INODE"
             MOUNTED=0
             grep -F " @@TGT " /proc/mounts >/dev/null 2>&1 && MOUNTED=1
             APK_REPLACED=0
@@ -259,6 +262,7 @@ object HvacDigitalPlugin {
               mount --bind $STAGE_APK "@@TGT" 2>/dev/null || echo BIND_FAILED
               restorecon -v "@@TGT" 2>/dev/null || true
               TGT_INODE=@@(stat -c '%i' "@@TGT" 2>/dev/null)
+              echo "TGT_INODE=@@TGT_INODE"
               MOUNTED=0
               grep -F " @@TGT " /proc/mounts >/dev/null 2>&1 && MOUNTED=1
               if [ "@@MOUNTED" = "1" ] && [ "@@SRC_INODE" = "@@TGT_INODE" ]; then
@@ -307,37 +311,48 @@ object HvacDigitalPlugin {
         LogKit.scriptTrace("hvac_enable", out)
         // Мандат iter22 §4: вердикт VIA/PM_PATH/SELINUX — ОБЯЗАТЕЛЬНО в лог,
         // иначе по логу сборки не видно, почему панель не встала.
-        // iter33b B5.2: IGNORE_CASE — регистр в выводе скрипта больше не решает судьбу строки.
-        val via = Regex("VIA=([A-Za-z]+)", RegexOption.IGNORE_CASE).find(out)?.groupValues?.get(1) ?: "?"
+        // iter33c A1/A2: единственный источник истины — вердикт самого скрипта
+        // (`###STAGE name=bind status=… reason=inode_match:…` + итоговая строка `VIA=…`).
+        // Разбор вынесен в чистую функцию [HvacVerdict] и покрыт JVM-тестом HvacVerdictTest:
+        //  • A1 — `inodeMatch` больше не зависит от несуществующей строки "SRC_INODE=n TGT_INODE=n";
+        //  • A2 — `Via` читается только с начала строки (`^VIA=…$`), служебное поле стало `unshadow_via=`.
+        val verdict = HvacVerdict.parse(out)
+        val via = verdict.via
         val viaPrev = Regex("VIA_PREV=([^\\n]*)").find(out)?.groupValues?.get(1)?.trim().orEmpty()
         val pmPath = Regex("PM_PATH=([^\\n]*)").find(out)?.groupValues?.get(1)?.trim().orEmpty()
         val selinuxPair = Regex("SELINUX_BEFORE=([^ ]*) SELINUX_AFTER=([^\\n]*)").find(out)
         val pmLine = Regex("PM=([^\\n]*)").find(out)?.groupValues?.get(1)?.trim().orEmpty()
         val semFonte = out.contains("SEM_FONTE")
         val semAlvo = out.contains("SEM_ALVO")
-        AppLog.i(TAG, "HVAC VERDICT: VIA=$via VIA_PREV=$viaPrev PM=$pmLine PM_PATH=$pmPath " +
+        AppLog.i(TAG, "HVAC VERDICT: VIA=$via unshadow_via=${verdict.unshadowVia} bind_stage=${verdict.bindStage} " +
+                "VIA_PREV=$viaPrev PM=$pmLine PM_PATH=$pmPath " +
                 "SELINUX_BEFORE=${selinuxPair?.groupValues?.get(1)} SELINUX_AFTER=${selinuxPair?.groupValues?.get(2)} " +
                 "SEM_FONTE=$semFonte SEM_ALVO=$semAlvo")
         val mountOk = out.contains("HVAC_DIGITAL_OK") && !out.contains("MOUNT_FAIL")
-        val inodeMatch = Regex("SRC_INODE=(\\d+) TGT_INODE=(\\d+)").find(out)?.let {
-            it.groupValues[1] == it.groupValues[2] && it.groupValues[1].isNotEmpty() && it.groupValues[1] != "0"
-        } ?: false
-        val activateStatus = when {
-            out.contains("ERR_ROOT_CHANNEL_UNAVAILABLE") -> ToolsStep.Status.BLOCKED
-            out.contains("Permission denied") || out.contains("avc: denied") -> ToolsStep.Status.FAILED
-            via == "install" && pmPath.contains("/data/app/") -> ToolsStep.Status.OK
-            via == "bind" && (mountOk || inodeMatch) -> ToolsStep.Status.OK
-            via == "nenhum" || out.contains("NAO_VINGOU") -> ToolsStep.Status.FAILED
-            mountOk && inodeMatch -> ToolsStep.Status.OK
-            mountOk -> ToolsStep.Status.PARTIAL
+        val inodeMatch = verdict.inodeMatch
+        // A1 (третье следствие): при `mountOk == true` и bind-стадии OK|SKIP шаг обязан быть OK,
+        // даже если inode посчитать не удалось. PARTIAL — только когда mount есть, а вердикта по bind нет.
+        val activateStatus = when (
+            HvacVerdict.statusOf(
+                verdict,
+                mountOk = mountOk,
+                rc = rc,
+                permDenied = out.contains("Permission denied") || out.contains("avc: denied"),
+                rootUnavailable = out.contains("ERR_ROOT_CHANNEL_UNAVAILABLE"),
+                naoVingou = out.contains("NAO_VINGOU")
+            )
+        ) {
+            "OK" -> ToolsStep.Status.OK
+            "PARTIAL" -> ToolsStep.Status.PARTIAL
+            "BLOCKED" -> ToolsStep.Status.BLOCKED
             else -> ToolsStep.Status.FAILED
         }
         val reason = "rc=$rc VIA=$via PM_PATH=$pmPath inode=$inodeMatch mount=$mountOk"
         AppLog.i(TAG, "VERIFY hvacdigital.enable: $activateStatus ($reason)")
         // iter33 A5: одна строка на попытку — по ней владелец сразу видит, где стоит.
         val unshadowLine = Regex("HVAC_UNSHADOW: ([^\\n]*)").find(out)?.groupValues?.get(1)?.trim()
-        val probeSrc = Regex("SRC_INODE=(\\d+)").find(out)?.groupValues?.get(1) ?: "-"
-        val probeTgt = Regex("TGT_INODE=(\\d+)").find(out)?.groupValues?.get(1) ?: "-"
+        val probeSrc = verdict.srcInode
+        val probeTgt = verdict.tgtInode
         val probeSel = Regex("SELINUX=([A-Za-z]+)").find(out)?.groupValues?.get(1) ?: "?"
         val probeProps = Regex("PROPS=([^\\n]*)").find(out)?.groupValues?.get(1)?.trim() ?: "-"
         val probePath = pmPath.ifEmpty { status0.oemPkgPath ?: "?" }

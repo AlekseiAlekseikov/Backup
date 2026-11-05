@@ -68,6 +68,11 @@ object LogKit {
     /** iter33b B4: отложенная запись выжимки. */
     @Volatile private var lastOpsFlushMs = 0L
     @Volatile private var opsDirty = false
+    /** iter33c C2: досрочный сброс хвоста уже запланирован (один на пачку). */
+    @Volatile private var tailFlushScheduled = false
+    private val mainHandler: android.os.Handler by lazy {
+        android.os.Handler(android.os.Looper.getMainLooper())
+    }
     /** iter33b B3.2: строки ТЕКУЩЕЙ команды — при провале печатаются целиком. */
     private val jobRing = ArrayDeque<String>(JOB_RING)
     @Volatile private var jobFailed = false
@@ -107,13 +112,31 @@ object LogKit {
         val now = SystemClock.uptimeMillis()
         synchronized(lock) {
             if (!force && now - lastOpsFlushMs < OPS_FLUSH_MIN_MS) {
+                // iter33c C2: попадание в окно debounce БОЛЬШЕ НЕ теряет хвост. Раньше флаг
+                // opsDirty никто не читал, и последняя пачка маркеров лежала в памяти до
+                // ближайшего HEARTBEAT (60 с) — при убийстве процесса терялось до минуты выжимки.
                 opsDirty = true
+                scheduleTailFlush()
                 return
             }
             lastOpsFlushMs = now
             opsDirty = false
             runCatching { f.writeText(opsLines.joinToString("\n") + "\n") }
         }
+    }
+
+    /**
+     * iter33c C2: один отложенный сброс на пачку — ровно через [OPS_FLUSH_MIN_MS] от первого
+     * отложенного маркера. Худшая задержка хвоста теперь = [OPS_FLUSH_MIN_MS] (2 с), а не 60 с.
+     * Флаг `tailFlushScheduled` не даёт наплодить задачи по числу маркеров.
+     */
+    private fun scheduleTailFlush() {
+        if (tailFlushScheduled) return
+        tailFlushScheduled = true
+        mainHandler.postDelayed({
+            tailFlushScheduled = false
+            flushOps(force = true)
+        }, OPS_FLUSH_MIN_MS)
     }
 
     /** Немедленная запись выжимки (onDestroy: терять последние строки нельзя). */

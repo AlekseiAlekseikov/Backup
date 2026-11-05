@@ -254,11 +254,8 @@ object AppPerformance {
             // из него runtime-значение — тогда JIT восстанавливается БЕЗ перезапуска zygote.
             // Это НЕ adb-свойства (запрет владельца — `persist.adb.tcp.port` и порты).
             // Добавлена РОВНО ОДНА persist-запись — `persist.sys.dalvik.vm.usejit`; других нет.
-            val persistRet = runSuCommand(
-                "setprop persist.sys.dalvik.vm.usejit $valStr; " +
-                    "echo JIT_PERSIST_READBACK=\$(getprop persist.sys.dalvik.vm.usejit)")
-            AppLog.i(TAG, "JIT_PERSIST_SET desired=$valStr readback=" +
-                (parseTag(persistRet.output, "JIT_PERSIST_READBACK") ?: "?"))
+            // Одна строка на запись (её печатает jitPersistBackfill): JIT_PERSIST_SET … reason=toggle.
+            jitPersistBackfill(valStr, "toggle")
 
             val t0 = System.currentTimeMillis()
             val ret = runSuCommand(script)
@@ -687,7 +684,8 @@ object AppPerformance {
     private const val PROP_USEJIT_PROFILES = "dalvik.vm.usejitprofiles"
     private const val PROP_PERSIST_USEJIT = "persist.sys.dalvik.vm.usejit"
     private const val JIT_BOOT_MARKER = "jit_boot_attempt"
-    private const val JIT_LATE_START_MS = 120_000L
+    /** iter33c C1: окно, в котором перезапуск zygote РАЗРЕШЁН (было имя «late start» — наоборот по смыслу). */
+    private const val JIT_ZYGOTE_WINDOW_MS = 120_000L
     private const val JIT_ATTEMPT_GUARD_MS = 600_000L
 
     private val jitBootAttempted = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -726,38 +724,59 @@ object AppPerformance {
             return
         }
         val desired = "true"
-        val (runtime, persist) = jitProps()
+        var (runtime, persist) = jitProps()
+
+        // ── B2: маршрут 1 должен быть самодостаточен ────────────────────────────
+        // Дублёр писался ТОЛЬКО по клику (`setAutoOptimize`), поэтому у владельца, включавшего JIT
+        // в 1.0.52 (и после сброса настроек), persist был пуст и маршрут 1 не срабатывал никогда.
+        // Теперь: тумблер включён, а дублёра нет (или он врёт) ⇒ пишем ЕГО ЖЕ один раз и читаем обратно.
+        if (persist != desired) {
+            val reason = if (persist.isEmpty()) "boot_backfill" else "boot_mismatch"
+            jitPersistBackfill(desired, reason)
+            persist = jitProps().second
+        }
+        val persistPresent = persist.isNotEmpty()
 
         if (runtime == desired) {
-            // Маршрут 1 сработал: на втором проходе runtime поднялся САМ из persist-дублёра —
-            // значит прошивка умеет читать `persist.sys.dalvik.vm.usejit` при загрузке,
-            // и перезапуск zygote не нужен вообще.
+            // ── B1: честная строка ───────────────────────────────────────────────
+            // Раньше здесь ВСЕГДА печаталось «restored_from_persist (zygote не перезапускали)»,
+            // в том числе когда zygote перезапустили мы сами 30 секундами раньше (маршрут 2
+            // первого прохода). Теперь смотрим метку попытки этой загрузки.
+            val attempted = attemptInThisLoad(app)
             if (secondPass && persist == desired) {
-                AppLog.i(TAG, "JIT_BOOT: restored_from_persist prop=$PROP_PERSIST_USEJIT runtime=$runtime " +
-                    "persist=$persist (zygote не перезапускали)")
+                if (attempted) {
+                    AppLog.i(TAG, "JIT_PERSIST_PROBE: supported=false persist_present=$persistPresent runtime=$runtime " +
+                        "persist=$persist reason=runtime_raised_by_our_zygote")
+                    AppLog.i(TAG, "JIT_BOOT: match_after_zygote runtime=$runtime persist=$persist " +
+                        "(поднят перезапуском zygote в этой загрузке)")
+                } else {
+                    AppLog.i(TAG, "JIT_PERSIST_PROBE: supported=true persist_present=$persistPresent runtime=$runtime " +
+                        "persist=$persist reason=runtime_raised_from_persist")
+                    AppLog.i(TAG, "JIT_BOOT: restored_from_persist prop=$PROP_PERSIST_USEJIT runtime=$runtime " +
+                        "persist=$persist (zygote не перезапускали)")
+                }
             } else {
                 AppLog.i(TAG, "JIT_BOOT: match runtime=$runtime persist=$persist (ноль пишущих команд)")
             }
             return
         }
-        // маршрут 1
-        if (persist == desired) {
-            if (!secondPass) {
-                AppLog.i(TAG, "JIT_PERSIST_PROBE: supported=unknown runtime=$runtime persist=$persist " +
-                    "action=read_again_in_30s")
-                return
-            }
-            AppLog.i(TAG, "JIT_PERSIST_PROBE: supported=false runtime=$runtime persist=$persist " +
-                "reason=runtime_not_raised_from_persist")
-        } else {
-            AppLog.i(TAG, "JIT_PERSIST_PROBE: supported=false runtime=$runtime persist=$persist " +
-                "reason=persist_differs")
+
+        // ── B3: перезапуск zygote — ТОЛЬКО на втором проходе ────────────────────
+        // Порядок в boot-ветке: сначала ставим плагин климата (при смене APK он перезапускает
+        // SystemUI), и только потом — один перезапуск zygote. Иначе статус-бар мигал бы дважды
+        // подряд, а между ними был бы пустым.
+        if (!secondPass) {
+            AppLog.i(TAG, "JIT_PERSIST_PROBE: supported=unknown persist_present=$persistPresent runtime=$runtime " +
+                "persist=$persist action=read_again_in_30s")
+            return
         }
+        AppLog.i(TAG, "JIT_PERSIST_PROBE: supported=false persist_present=$persistPresent runtime=$runtime " +
+            "persist=$persist reason=runtime_not_raised_from_persist")
 
         // маршрут 2
         val up = android.os.SystemClock.elapsedRealtime()
-        if (up >= JIT_LATE_START_MS) {
-            AppLog.i(TAG, "JIT_BOOT: deferred reason=late_start uptime_ms=$up (перезапуск zygote на этой стадии запрещён)")
+        if (up >= JIT_ZYGOTE_WINDOW_MS) {
+            AppLog.i(TAG, "JIT_BOOT: deferred reason=outside_window uptime_ms=$up (перезапуск zygote на этой стадии запрещён)")
             return
         }
         val marker = File(app.filesDir, JIT_BOOT_MARKER)
@@ -773,7 +792,7 @@ object AppPerformance {
         }
         runCatching { marker.writeText(up.toString()) }
 
-        // Ровно три команды, без svc wifi / umount / data-app / sleep.
+        // Ровно три команды, без svc wifi / umount /data/app / sleep.
         val pidBefore = runCatching {
             AdbClient.execute("pidof zygote; pidof zygote64", 4000, expectRoot = false).second.trim()
         }.getOrDefault("")
@@ -798,6 +817,29 @@ object AppPerformance {
                 }
             }
         }, 20_000L)
+    }
+
+    /**
+     * iter33c B2: единственная разрешённая persist-запись — `persist.sys.dalvik.vm.usejit`.
+     * Пишется и по клику (`reason=toggle`), и на boot как backfill (`reason=boot_backfill`),
+     * всегда с чтением обратно. Никаких других persist-свойств не добавляется.
+     */
+    private fun jitPersistBackfill(value: String, reason: String): String {
+        val ret = runCatching {
+            runSuCommand("setprop $PROP_PERSIST_USEJIT $value; " +
+                "echo JIT_PERSIST_READBACK=\$(getprop $PROP_PERSIST_USEJIT)")
+        }.getOrNull()
+        val rb = ret?.let { parseTag(it.output, "JIT_PERSIST_READBACK") } ?: "?"
+        AppLog.i(TAG, "JIT_PERSIST_SET desired=$value readback=$rb reason=$reason")
+        return rb
+    }
+
+    /** Была ли попытка перезапуска zygote в ЭТОЙ загрузке (метка `files/jit_boot_attempt`). */
+    private fun attemptInThisLoad(app: Context): Boolean {
+        val prev = runCatching { File(app.filesDir, JIT_BOOT_MARKER).readText().trim().toLong() }
+            .getOrDefault(0L)
+        val up = android.os.SystemClock.elapsedRealtime()
+        return prev in 1..up
     }
 
     /**
