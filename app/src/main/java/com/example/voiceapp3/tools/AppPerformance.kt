@@ -727,8 +727,8 @@ object AppPerformance {
             return
         }
         val desired = "true"
-        // ── iter33d A2/A3: опознание загрузки. Одна функция ([JitBootMark.sameLoad]) и для guard'а
-        // маршрута 2, и для решения «restored_from_persist или match_after_zygote».
+        // ── iter33d A2 / iter33e A2: опознание загрузки одной функцией ([JitBootMark.sameLoad]) —
+        // здесь (guard маршрута 2) и в `checkPendingZygoteVerify` (классификация намерения).
         val bootTag = currentBootTag()
         val upNow = android.os.SystemClock.elapsedRealtime()
         val markerFile = File(app.filesDir, JIT_BOOT_MARKER)
@@ -768,23 +768,18 @@ object AppPerformance {
             "backfill=$backfillWire runtime=$runtime"
 
         if (runtime == desired) {
-            // ── B1: честная строка ───────────────────────────────────────────────
-            // Раньше здесь ВСЕГДА печаталось «restored_from_persist (zygote не перезапускали)»,
-            // в том числе когда zygote перезапустили мы сами 30 секундами раньше (маршрут 2
-            // первого прохода). Теперь смотрим метку попытки этой загрузки.
-            val attempted = attemptInThisLoad(app)
+            // ── B1/A3: честная строка ────────────────────────────────────────────
+            // Этот второй проход отвечает ТОЛЬКО за маршрут 1 (persist): runtime уже поднят,
+            // попытки zygote в этой загрузке быть не могло — иначе процесс не дожил бы до прохода.
+            // Факт «поднято перезапуском zygote» печатает A2
+            // (`checkPendingZygoteVerify` → `JIT_BOOT: match_after_zygote`), потому что после
+            // рестарта zygote второй проход не наступает вообще. Ветка `attempted` удалена как
+            // недостижимая (мёртвый код), вместе с ней ушла вторая копия опознания загрузки.
             if (secondPass && persist == desired) {
-                if (attempted) {
-                    AppLog.i(TAG, "JIT_PERSIST_PROBE: supported=false $probeCommon " +
-                        "reason=runtime_raised_by_our_zygote")
-                    AppLog.i(TAG, "JIT_BOOT: match_after_zygote runtime=$runtime persist=$persist " +
-                        "(поднят перезапуском zygote в этой загрузке)")
-                } else {
-                    AppLog.i(TAG, "JIT_PERSIST_PROBE: supported=true $probeCommon " +
-                        "reason=runtime_raised_from_persist")
-                    AppLog.i(TAG, "JIT_BOOT: restored_from_persist prop=$PROP_PERSIST_USEJIT runtime=$runtime " +
-                        "persist=$persist (zygote не перезапускали)")
-                }
+                AppLog.i(TAG, "JIT_PERSIST_PROBE: supported=true $probeCommon " +
+                    "reason=runtime_raised_from_persist")
+                AppLog.i(TAG, "JIT_BOOT: restored_from_persist prop=$PROP_PERSIST_USEJIT runtime=$runtime " +
+                    "persist=$persist (zygote не перезапускали)")
             } else {
                 AppLog.i(TAG, "JIT_BOOT: match runtime=$runtime persist=$persist (ноль пишущих команд)")
             }
@@ -875,16 +870,6 @@ object AppPerformance {
         val rb = ret?.let { parseTag(it.output, "JIT_PERSIST_READBACK") } ?: "?"
         AppLog.i(TAG, "JIT_PERSIST_SET desired=$value readback=$rb reason=$reason")
         return rb
-    }
-
-    /**
-     * Была ли попытка перезапуска zygote в ЭТОЙ загрузке — по метке `files/jit_boot_attempt`.
-     * iter33d A2: тело — один вызов [JitBootMark.sameLoad]; своей арифметики здесь больше нет
-     * (раньше это была ВТОРАЯ копия эвристики, и обе ошибались одинаково).
-     */
-    private fun attemptInThisLoad(app: Context): Boolean {
-        val marker = runCatching { File(app.filesDir, JIT_BOOT_MARKER).readText().trim() }.getOrDefault("")
-        return JitBootMark.sameLoad(marker, currentBootTag())
     }
 
     /**
