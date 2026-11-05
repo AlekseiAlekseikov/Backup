@@ -437,3 +437,37 @@
 
 **Пробелы:** на ГУ не проверялось; бюджеты B5 не измерены (ждут первого лога 1.0.53); какая ветка
 `uninstall-system-updates` нужна прошивке — НЕ ДОКАЗАНО. Подробно — `REPORT_iter33.md` §F3.
+
+## iter33b — 1.0.53 (пересборка, версия НЕ поднята), ветка `fix/v2`
+
+База `6acbc27`. Коммиты: `14dbf68` (все правки), `de67be0` (fix сборки), `455678e` (строка `restored_from_persist`).
+
+**A — после ребута ГУ**
+- `HvacDigitalPlugin.kt:382-419` `bootInstall()`: `AtomicBoolean` + преф `hvac_boot_install_uptime` (повтор <5 мин uptime = рестарт процесса),
+  `checkStatus` + `stat -c '%i'` источника/цели ДО записи (`inodeMatchesStage`, `:421-431`), лог
+  `HVAC_BOOT: attempt=1 reason=first_boot|not_mounted kill=0|1 result=OK|FAILED ms=…`; при FAILED повторов нет.
+  Вход: `StatusIcons.bootInstallHvacDigital` (`:946`), вызов только из boot-ветки (`VoiceAssistantService.kt:368`).
+- `AppPerformance.kt:655-687` `bootRestoreVideo()`: `applied_before=true` ⇒ SKIP без записи; иначе один `setVideo60Fps`
+  за загрузку (`videoBootAttempted`), лог `VIDEO_BOOT: pref=on applied_before=… result=… ms=… action=skip|install`.
+- `AppPerformance.kt:720-800` `bootRestoreJit(secondPass)`: маршрут 1 (persist `persist.sys.dalvik.vm.usejit`, пишется в
+  `setAutoOptimize` `:252-262`) → `JIT_PERSIST_PROBE: supported=true|false`, `JIT_BOOT: match|restored_from_persist|deferred|unsupported`;
+  маршрут 2 — три команды `setprop usejit/usejitprofiles` + `ctl.restart zygote` при `uptime<120 с`, метка `files/jit_boot_attempt`,
+  через 20 с `JIT_VERIFY: runtime_after=… zygote_pid_before/after result=OK|FAILED`; watchdog — `verifyJitOnly` (getprop, без записи).
+
+**B — лог**
+- B1: `writeSummary()` убран из тика; таблица → `LOG_SUMMARY_ROW` в `app.log`, в выжимку только шапка + 5 действий.
+- B2: `setThreadOp(null)` после `← execute` (`AdbClient.kt:330-338`) ⇒ `op=` есть в итоговой строке.
+- B3: `LogKit.traceAdb` пишет под тегом `CENTRAL_AdbClient`, кольцо `jobRing` (40 строк) + `failJobTrace` при `rc!=0`
+  ⇒ `ADB_TRACE_REPLAY` с полным hex/ASCII; `ADB_TRACE_SUPPRESSED … rc=`.
+- B4: `flushOps` — не чаще 2 с, запись ВНУТРИ `synchronized(lock)`, принудительно в `heartbeat`/`[ERROR]`/`onDestroy`.
+- B5: скрипт печатает `VIA=bind|nenhum|install`, регулярка `IGNORE_CASE` ⇒ `HVAC_PROBE … via=bind`.
+
+**C/D**
+- C1: `heavy = (n % 5 == 0)` — TTL+HVAC+видео+JIT только каждый 5-й тик ⇒ ≈10 команд/10 мин; яркость read-first (`ScreenBrightness.kt:161-176`).
+- C2: `ttlRuleCounts()` вернул `-1` ⇒ `TTL: SKIP (unknown, channel down)`, заливки нет.
+- D1: `MEDIA_PID_BEFORE/AFTER` — один `pidof media.swcodec` с обеих сторон (было три против одного ⇒ `MEDIA_WAIT_TICKS=0`).
+- D2: `OP_SUMMARY … steps=<ok>/<N> ok= partial= failed= total=` (`ToolsBackend.kt:216-223`).
+
+**CI:** `42002436101` failure (дубль `isAutoOptimizeEnabled`) → `42004017024` success (артефакт 13403369333) →
+`42005750488` success, артефакт **13405077055**, zip **177 079 438 Б**, APK **215 509 471 Б**, `> Task :app:testDebugUnitTest` в логе,
+`BUILD SUCCESSFUL in 4m 14s`. Отчёт — `REPORT_iter33b.md`.

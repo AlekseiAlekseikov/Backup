@@ -206,14 +206,17 @@ LogKit.opSummary(op, toggle.pref, res.statusWire.uppercase(), okSteps, partialSt
 
 | что | значение |
 |---|---|
-| прогон | **42004017024** (`push`, `de67be0`) — **success** |
+| прогон (финальный) | **42005750488** (`push`, `455678e`) — **success** |
 | conclusion | `success`, шаг `Gradle build (debug)` — success |
-| артефакт | **13403369333** (`app-debug`) |
-| zip | **177 079 317 Б** |
-| APK внутри | **215 403 953 Б** (`apk/debug/app-debug.apk`) |
-| подтверждение теста | `> Task :app:testDebugUnitTest` → `> Task :app:assembleDebug` → `BUILD SUCCESSFUL in 4m 16s` (лог job `127166098252`, строки 254895/254898/254902) |
+| артефакт | **13405077055** (`app-debug`) |
+| zip | **177 079 438 Б** |
+| APK внутри | **215 509 471 Б** (`apk/debug/app-debug.apk`) |
+| подтверждение теста | `> Task :app:testDebugUnitTest` → `> Task :app:assembleDebug` → `BUILD SUCCESSFUL in 4m 14s` (лог job `127171921131`, строки 254895/254898/254902) |
 
-Числа отличаются от прошлой сборки 1.0.53 (`41996706107`: zip 177 067 555 Б, APK 215 383 361 Б) — это ожидаемо: версия та же, код изменён (мандат, часть G). Разница +11 762 Б zip / +20 592 Б APK.
+Промежуточный прогон **42004017024** (`de67be0`) — тоже success, артефакт `13403369333`, zip 177 079 317 Б / APK 215 403 953 Б; он отличался только отсутствием строки `restored_from_persist`, поэтому финальные числа — из `42005750488`.
+
+Числа отличаются от прошлой сборки 1.0.53 (`41996706107`: zip 177 067 555 Б, APK 215 383 361 Б) — это нормально по мандату: версия та же, код изменён. Разница с прошлой сборкой: **+11 883 Б** zip / **+174 098 Б** APK.
+Предыдущий неудачный прогон этой итерации: `42002436101` (`14dbf68`) — `:app:compileDebugKotlin` FAILED, `Conflicting overloads` на `AppPerformance.kt:64` (дубль `isAutoOptimizeEnabled`), исправлено `de67be0`.
 
 Предыдущий прогон `42002436101` (коммит `14dbf68`) — **failure**, `:app:compileDebugKotlin`: `Conflicting overloads` на `AppPerformance.kt:64` (мой новый `private fun isAutoOptimizeEnabled` дублировал существующий публичный). Исправлено коммитом `de67be0`.
 
