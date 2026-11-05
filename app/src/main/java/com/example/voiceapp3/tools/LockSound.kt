@@ -961,7 +961,7 @@ object LockSound {
      *
      * Список путей, которые приложение само смонтировало, лежит в `files/locksound_mounts.txt`
      * (по строке на путь). Снимаем ровно то, что в нём, и только если путь проходит [isOurLockPath].
-     * Чужие маунты и /system/etc/avas/** не трогаем никогда: при выключенном тумблере приложение
+     * Чужие маунты и /system/etc/avas/… не трогаем никогда: при выключенном тумблере приложение
      * не делает с системой ничего.
      */
     private fun restoreSystemLockSoundBind(ctx: Context) {
@@ -997,7 +997,7 @@ object LockSound {
 
     /**
      * iter33h A1.5 — единственный разрешённый путь: ровно `/vendor/etc/carlock/<файл>.wav`.
-     * Всё остальное (в том числе `/system/etc/avas/**`) — `SKIP reason=path_not_ours`.
+     * Всё остальное (в том числе `/system/etc/avas/…`) — `SKIP reason=path_not_ours`.
      */
     internal fun isOurLockPath(path: String): Boolean {
         if (!path.startsWith("/vendor/etc/carlock/")) return false

@@ -438,25 +438,8 @@ object StatusIcons {
         }
     }
 
-    /**
-     * F1 (чистая нормализация, покрыта тестом `TempFormatTest`) — ровно правила референса
-     * `TempStepperService.i(int)`: int −550…700 ⇒ /10, иначе −45…65 как есть; валидный
-     * диапазон наружной −55…70 °C. Float берётся как есть (тоже с проверкой диапазона).
-     */
-    internal fun envOutsideToCelsius(fRaw: Float?, iRaw: Int?): Float? {
-        if (fRaw != null && !fRaw.isNaN() && fRaw > -55f && fRaw < 70f) return fRaw
-        if (iRaw == null) return null
-        val v = when {
-            iRaw > -550 && iRaw < 700 -> iRaw / 10.0f
-            iRaw >= -45 && iRaw <= 65 -> iRaw.toFloat()
-            else -> return null
-        }
-        return if (v > -55f && v < 70f) v else null
-    }
-
-    /** F1/F2: единый формат наружной — `%.1f` (и `н/д`, если значения нет). */
-    internal fun formatOutsideTempC(v: Float?): String =
-        if (v == null) "н/д" else String.format(Locale.US, "%.1f", v)
+    // F1: нормализация и формат наружной вынесены в OutsideTemp.kt
+    // (`envOutsideToCelsius` / `formatOutsideTempC`) — их проверяет `TempFormatTest`.
 
     /**
      * F1.3 (iter33h) — read-only действие «Температуры: разведка».
@@ -999,23 +982,22 @@ object StatusIcons {
 
     // ─── HVAC digital (флаги persist.sys.hvacdigital.*) ───
     /**
-     * Цифровая индикация климата в статус-баре — включает соответствующую
-     * цифровую плашку плагина GeelyAutoSystemUIPlugin через setprop:
-     *   persist.sys.hvacdigital.batt / .temp / .temp_ext
+     * Цифровая индикация климата в статус-баре — плашка плагина GeelyAutoSystemUIPlugin.
      *
-     * Плагин монтируется AppPerformance.setVideo60Fps НЕ занимается — плагин
-     * лежит в assets/GeelyAutoSystemUIPlugin-digital.apk и его bind-mount /
-     * подмена APK делает отдельная функция (здесь только переключатель флагов).
+     * iter33h E1: `persist.sys.hvacdigital.temp` (уставка климата) приложением НЕ пишется —
+     * плагин читает её сам через CarPropertyManager; значения приложение даёт только для
+     * `batt` и наружной (`exttemp`), см. pushHvacDigitalPropsIfEnabled.
+     * F2: ключ наружной — ОДИН (`exttemp`), поэтому списков «оба свойства» больше нет.
      */
     fun sysPropFor(pref: String): String = when (pref) {
         PREF_HVAC_BATT -> SYS_HVAC_BATT
-        PREF_HVAC_TEMP -> SYS_HVAC_TEMP
-        PREF_HVAC_EXT_TEMP -> SYS_HVAC_EXT_TEMP_EXT  // primary = старый плагин
+        PREF_HVAC_EXT_TEMP -> SYS_HVAC_EXT_EXTTEMP
+        // PREF_HVAC_TEMP: ключа нет — см. E1, значение уставки приложение не публикует.
         else -> ""
     }
 
-    /** Все свойства внешней температуры, которые надо выставлять одновременно. */
-    private val SYS_HVAC_EXT_ALL = arrayOf(SYS_HVAC_EXT_TEMP_EXT, SYS_HVAC_EXT_EXTTEMP)
+    /** Все свойства внешней температуры, которые надо выставлять одновременно — одно. */
+    private val SYS_HVAC_EXT_ALL = arrayOf(SYS_HVAC_EXT_EXTTEMP)
 
     @JvmStatic fun setHvacDigital(ctx: Context, pref: String, value: Boolean): ToolsResult {
         val t0 = android.os.SystemClock.uptimeMillis()
