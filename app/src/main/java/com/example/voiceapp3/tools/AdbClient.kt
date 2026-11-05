@@ -198,6 +198,66 @@ object AdbClient {
     }
     private val state = AtomicReference(ChannelState.IDLE)
 
+    /**
+     * iter33h B1 — автомат «есть ли root» для UI и для фильтра привилегированных команд.
+     *
+     * `UNKNOWN → PROBING → ROOT | SHELL_NO_ROOT`. Привилегированную команду разрешено
+     * запускать только в [RootState.ROOT]; в [RootState.SHELL_NO_ROOT] — ни одной записи.
+     * Проверка — ОДНА дешёвая read-only команда `id` (без `su`, без записи в adb-props),
+     * не чаще раза в 60 с. Один переход = одна строка `ADB_STATE`.
+     */
+    enum class RootState { UNKNOWN, PROBING, ROOT, SHELL_NO_ROOT }
+
+    private val rootState = AtomicReference(RootState.UNKNOWN)
+    private val rootProbeAt = java.util.concurrent.atomic.AtomicLong(0L)
+    private const val ROOT_PROBE_INTERVAL_MS = 60_000L
+    private val rootRestoreDone = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** Колбэк «root вернулся» — один проход восстановления (`bootrestore pass=1`). */
+    @Volatile
+    var onRootRestored: (() -> Unit)? = null
+
+    fun currentRootState(): RootState = rootState.get()
+
+    /** Единственный фильтр для вызывающих: привилегированное — только в [RootState.ROOT]. */
+    fun isPrivilegedAllowed(): Boolean = rootState.get() == RootState.ROOT
+
+    /** Переход состояния: одна строка на переход, повторы молчат. */
+    private fun transitionRootState(to: RootState, reason: String) {
+        val from = rootState.getAndSet(to)
+        if (from == to) return
+        val probe = if (to == RootState.PROBING) "probe=id" else "probe=id"
+        AppLog.i(TAG, "ADB_STATE from=$from to=$to reason=$reason $probe")
+        if (to == RootState.ROOT && from != RootState.ROOT) {
+            // B1.6: ровно один проход восстановления на возврат root.
+            if (rootRestoreDone.compareAndSet(false, true)) {
+                AppLog.i(TAG, "ROOT_RESTORED bootrestore pass=1 begin")
+                runCatching { onRootRestored?.invoke() }
+                    .onFailure { AppLog.w(TAG, "ROOT_RESTORED bootrestore pass=1 threw: ${it.message}") }
+            }
+        }
+        if (to != RootState.ROOT) rootRestoreDone.set(false)
+    }
+
+    /**
+     * B1.2/B1.3: перепроверка состояния канала ОДНОЙ read-only командой `id`, не чаще 60 с.
+     * Вызывается из watchdog'а и после потери канала. В `ROOT` ничего не делает.
+     */
+    fun probeRootState(reason: String) {
+        if (rootState.get() == RootState.ROOT) return
+        val now = android.os.SystemClock.elapsedRealtime()
+        val last = rootProbeAt.get()
+        if (last != 0L && now - last < ROOT_PROBE_INTERVAL_MS) return
+        if (!rootProbeAt.compareAndSet(last, now)) return
+        transitionRootState(RootState.PROBING, reason)
+        val out = runCatching { execute("id", 5000, expectRoot = false) }.getOrDefault(Pair(1, "")).second
+        if (isRootUid(out)) {
+            transitionRootState(RootState.ROOT, "probe_ok")
+        } else {
+            transitionRootState(RootState.SHELL_NO_ROOT, if (out.isBlank()) "no_channel" else "shell_uid")
+        }
+    }
+
     /** Ленивый старт потока. Идёмпотентен. */
     @Synchronized
     fun start() {
@@ -1066,6 +1126,7 @@ object AdbClient {
     private fun channelUp(p: Probe) {
         workingPort.set(ADB_PORT_DEFAULT)
         state.set(ChannelState.ROOT_5555)
+        transitionRootState(RootState.ROOT, "channel_up")
         AppLog.i(TAG, "ADB_SELFTEST: port=5555 ok uid=0 dt=${p.dt}ms ctx=${p.ctx.ifEmpty { "-" }}")
         logAdbPortReadback(ADB_PORT_DEFAULT)
         logInitDiagnostics()
@@ -1513,8 +1574,17 @@ object AdbClient {
         return true
     }
 
+    /**
+     * iter33h B1.5 — один понятный текст для UI вместо `BLOCKED/PARTIAL`, когда канала нет.
+     * Root-функции: климат-плагин, TTL, звук замка, видео.
+     */
+    fun noRootUiText(): String =
+        "Нет root-канала: переподключите ADB на ПК (ADB AppControl → root) или перезагрузите ГУ. " +
+            "Функции, которым нужен root: климат-плагин, TTL, звук замка, видео"
+
     private fun fallbackNoRoot(reason: String) {
         state.set(ChannelState.NO_ROOT_SH)
+        transitionRootState(RootState.SHELL_NO_ROOT, "fallback:${reason.take(24)}")
         AppLog.e(TAG, "ADB ИТОГ = NO_ROOT ($reason). Команды пойдут через Runtime.sh uid=1000 (root не гарантирован).")
     }
 
@@ -1566,6 +1636,8 @@ object AdbClient {
                 // iter24 P0.3: альтернативного порта нет — переключение портов = миграция.
                 // IOException на 5555 означает, что канал умер: честно сообщаем и уходим в NO_ROOT.
                 state.compareAndSet(ChannelState.ROOT_5555, ChannelState.NO_ROOT_SH)
+                // iter33h B1.4: причина в лог — одна строка на переход (см. transitionRootState).
+                transitionRootState(RootState.SHELL_NO_ROOT, "channel_dropped")
                 val msg = "ERR_ADB_IO: ${e.message} (port 5555 dropped, channel closed)"
                 AppLog.e(TAG, "VERIFY EXEC port=$port rc=1 expectRoot=$expectRoot cmd=${shortCmd} → FAILED ($msg)")
                 return Pair(1, msg)

@@ -760,8 +760,11 @@ object LockSound {
                 if (f.exists()) applySystemLockSoundBind(ctx, f)
             }
         } else {
-            // Если выключено — на всякий случай убираем чужой bind mount.
-            runCatching { restoreSystemLockSoundBind(ctx) }
+            // iter33h A1.4: при выключенном тумблере приложение не трогает систему.
+            // Единственное исключение — снять СВОИ маунты, список которых оно само записало
+            // в files/locksound_mounts.txt, и только в /vendor/etc/carlock/.
+            AppLog.i(ctx, TAG, "LOCKSOUND_BOOT enabled=false action=none")
+            if (readOurMounts(ctx).isNotEmpty()) runCatching { restoreSystemLockSoundBind(ctx) }
         }
         if (unlockEnabled) {
             // Звук открытия — наш проигрыватель (не OEM-механизм), просто пишем путь
@@ -851,11 +854,12 @@ object LockSound {
 
                 val bindScript = """
                     SELINUX_BEFORE=${'$'}(getenforce 2>/dev/null)
-                    AUDIOSRV_PID_BEFORE=${'$'}(pidof audioserver 2>/dev/null)
                     MOUNTED_COUNT=0
                     if [ -s '$stagePath' ]; then
                         STAGE_INODE=${'$'}(stat -c '%i' '$stagePath' 2>/dev/null)
-                        for f in /vendor/etc/carlock/*.wav /system/etc/avas/sound_type_*/*.wav; do
+                        # iter33h A1: ТОЛЬКО /vendor/etc/carlock. /system/etc/avas/** — звуковая
+                        # подсистема машины (задний ход/скорость), приложение её не трогает.
+                        for f in /vendor/etc/carlock/*.wav; do
                             if [ -f "${"$"}f" ]; then
                                 for _i in 1 2 3 4; do
                                     grep -F " ${"$"}f " /proc/mounts >/dev/null 2>&1 || break
@@ -873,16 +877,25 @@ object LockSound {
                             fi
                         done
                     fi
-                    killall -9 audioserver 2>/dev/null || true
-                    pkill -9 -f avas 2>/dev/null || true
-                    sleep 2
-                    AUDIOSRV_PID_AFTER=${'$'}(pidof audioserver 2>/dev/null)
+                    # iter33h A1.2/A1.3: killall -9 audioserver и pkill -9 -f avas УДАЛЕНЫ
+                    # навсегда. Подмена файла в /vendor/etc/carlock/ не требует перезапуска
+                    # аудиоподсистемы; если звук не подхватился — применится после перезагрузки ГУ.
                     SELINUX_AFTER=${'$'}(getenforce 2>/dev/null)
                     echo SELINUX_BEFORE=${'$'}SELINUX_BEFORE SELINUX_AFTER=${'$'}SELINUX_AFTER
-                    echo AUDIOSRV_PID_BEFORE=${'$'}AUDIOSRV_PID_BEFORE AUDIOSRV_PID_AFTER=${'$'}AUDIOSRV_PID_AFTER
                     echo MOUNTS_COUNT=${'$'}(grep carlock /proc/mounts | wc -l)
                     echo MOUNTED_OK_COUNT=${'$'}MOUNTED_COUNT
                 """.trimIndent()
+                // iter33h A1.5: перед любой записью маунта — проверка пути. Скрипт трогает только
+                // /vendor/etc/carlock/*.wav; если глоб вдруг вернёт что-то другое, это отсекается здесь.
+                val glideTargets = runCatching {
+                    AdbClient.execute("ls -1 /vendor/etc/carlock/*.wav 2>/dev/null", 6000, expectRoot = false).second
+                }.getOrDefault("").lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.toList()
+                val notOurs = glideTargets.filter { !isOurLockPath(it) }
+                if (notOurs.isNotEmpty()) {
+                    AppLog.i(ctx, TAG, "LOCKSOUND_BIND SKIP reason=path_not_ours paths=${notOurs.joinToString(",")}")
+                    recordBindFailure("path_not_ours: ${notOurs.first()}", appCtx, deterministic = true)
+                    return@post
+                }
                 val bindRes = AdbClient.execute(bindScript, 20000)
                 AppLog.i(ctx, TAG, "lockSound bind rc=${bindRes.first}: ${bindRes.second.replace('\n', ' ').take(500)}")
 
@@ -896,7 +909,15 @@ object LockSound {
                 if (ok) {
                     bindFailCount = 0
                     lastBindFailReason = null
-                    AppLog.i(ctx, TAG, "VERIFY lockSound: SUCCESS (MOUNTED_OK_COUNT present)")
+                    // iter33h A1.4: запоминаем СВОИ пути, чтобы уметь снять только их.
+                    val mounted = bindRes.second.lineSequence().map { it.trim() }
+                        .filter { it.startsWith("MOUNTED_OK:") }
+                        .map { it.removePrefix("MOUNTED_OK:") }
+                        .filter { isOurLockPath(it) }
+                        .toList()
+                    writeOurMounts(ctx, mounted)
+                    AppLog.i(ctx, TAG, "VERIFY lockSound: SUCCESS (MOUNTED_OK_COUNT present) " +
+                        "paths=${mounted.joinToString(",")} (звук применится сразу либо после перезагрузки ГУ)")
                 } else {
                     val reason = if (bindRes.second.contains("ERR_ROOT_CHANNEL_UNAVAILABLE")) "root unavailable"
                                  else if (bindRes.second.contains("Permission denied")) "Permission denied"
@@ -935,26 +956,65 @@ object LockSound {
         // TODO: показать нотификацию/Toast пользователю с причиной (след. итерация)
     }
 
+    /**
+     * iter33h A1.4 — снятие ТОЛЬКО своих маунтов.
+     *
+     * Список путей, которые приложение само смонтировало, лежит в `files/locksound_mounts.txt`
+     * (по строке на путь). Снимаем ровно то, что в нём, и только если путь проходит [isOurLockPath].
+     * Чужие маунты и /system/etc/avas/** не трогаем никогда: при выключенном тумблере приложение
+     * не делает с системой ничего.
+     */
     private fun restoreSystemLockSoundBind(ctx: Context) {
         soundExecutor.execute {
             try {
-                val script = """
-                    for f in /vendor/etc/carlock/*.wav /system/etc/avas/sound_type_*/*.wav; do
-                        for _i in 1 2 3 4; do
-                            grep -F " ${"$" + "f"} " /proc/mounts >/dev/null 2>&1 || break
-                            umount "${"$" + "f"}" 2>/dev/null || umount -l "${"$" + "f"}" 2>/dev/null || true
-                        done
-                    done
-                    killall -9 audioserver 2>/dev/null || true
-                    pkill -9 -f avas 2>/dev/null || true
-                    echo "MOUNTS_LEFT=${'$'}(grep carlock /proc/mounts | wc -l)"
-                """.trimIndent()
-                val res = AdbClient.execute(script, 20000)
-                AppLog.i(ctx, TAG, "restoreSystemLockSoundBind [exitCode=${res.first}]: ${res.second.trim()}")
+                val ours = readOurMounts(ctx)
+                val checked = ours.filter { isOurLockPath(it) }
+                val skipped = ours - checked.toSet()
+                if (skipped.isNotEmpty()) {
+                    AppLog.i(ctx, TAG, "LOCKSOUND_UNMOUNT SKIP reason=path_not_ours paths=" + skipped.joinToString(","))
+                }
+                if (checked.isEmpty()) {
+                    writeOurMounts(ctx, emptyList())
+                    AppLog.i(ctx, TAG, "LOCKSOUND_BOOT enabled=false action=none (своих маунтов нет)")
+                    return@execute
+                }
+                val sb = StringBuilder("UNMOUNTED=0\n")
+                for (p in checked) {
+                    sb.append("if grep -qF ' ").append(p).append(" ' /proc/mounts; then ")
+                    sb.append("umount ").append(p).append(" 2>/dev/null || umount -l ").append(p)
+                    sb.append(" 2>/dev/null || true; UNMOUNTED=\$((UNMOUNTED+1)); echo UNMOUNTED_OK:")
+                    sb.append(p).append("; fi\n")
+                }
+                sb.append("echo \"MOUNTS_LEFT=\$(grep carlock /proc/mounts | wc -l) UNMOUNTED=\$UNMOUNTED\"\n")
+                val res = AdbClient.execute(sb.toString(), 20000)
+                AppLog.i(ctx, TAG, "LOCKSOUND_UNMOUNT [exitCode=${res.first}]: " + res.second.trim())
+                if (res.first == 0) writeOurMounts(ctx, emptyList())
             } catch (t: Throwable) {
                 AppLog.w(ctx, TAG, "restoreSystemLockSoundBind error: ${t.message}")
             }
         }
+    }
+
+    /**
+     * iter33h A1.5 — единственный разрешённый путь: ровно `/vendor/etc/carlock/<файл>.wav`.
+     * Всё остальное (в том числе `/system/etc/avas/**`) — `SKIP reason=path_not_ours`.
+     */
+    internal fun isOurLockPath(path: String): Boolean {
+        if (!path.startsWith("/vendor/etc/carlock/")) return false
+        val name = path.removePrefix("/vendor/etc/carlock/")
+        if (name.isEmpty() || name.contains('/')) return false
+        if (!name.endsWith(".wav")) return false
+        return name.length > 4
+    }
+
+    private fun mountsFile(ctx: Context): File = File(ctx.applicationContext.filesDir, "locksound_mounts.txt")
+
+    private fun readOurMounts(ctx: Context): List<String> =
+        runCatching { mountsFile(ctx).readLines().map { it.trim() }.filter { it.isNotEmpty() } }
+            .getOrDefault(emptyList())
+
+    private fun writeOurMounts(ctx: Context, paths: List<String>) {
+        runCatching { mountsFile(ctx).writeText(paths.joinToString("\n")) }
     }
 
     fun discoverWavFiles(): List<File> {

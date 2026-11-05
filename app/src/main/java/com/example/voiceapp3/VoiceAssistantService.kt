@@ -433,7 +433,11 @@ class VoiceAssistantService : Service() {
      * Всё пишущее — исключительно по клику пользователя (обработчики тумблеров).
      */
     private val settingsWatchdog = object : Runnable {
+        // iter33h B1.3: раз в 60 с — ОДНА read-only проверка `id`, не чаще (внутри есть троттлинг).
         override fun run() {
+            // iter33h B1.3: перепроверка root-канала — одна `id`, не чаще раза в 60 с.
+            runCatching { com.example.voiceapp3.tools.AdbClient.probeRootState("watchdog") }
+
             val app = this@VoiceAssistantService
             val n = ++watchdogCycle
             // P1: тик watchdog'а только планируется с main, сама работа — на BgWorker.

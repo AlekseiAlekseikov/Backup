@@ -7,3 +7,8 @@ local.properties
 .gradle/
 build/
 app/.cxx/
+
+# iter33h I4: бинарные артефакты не в git (см. artifacts/)
+*.apk
+*.idsig
+!app/src/main/res/raw/*.apk

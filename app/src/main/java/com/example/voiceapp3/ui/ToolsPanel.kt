@@ -776,7 +776,7 @@ class ToolsPanel(
             soundButton("Проверить TTL", 1) { runDevCommand("iptables -t mangle -L POSTROUTING -v -n") },
             soundButton("Белый список Keep-Alive", 1) { runDevCommand("dumpsys deviceidle whitelist") },
             soundButton("Статус JIT & Модель", 1) { runDevCommand("getprop | grep -E \"dalvik.vm.usejit|ro.product.model\"") },
-            soundButton("Файлы звуков", 1) { runDevCommand("ls -la /vendor/etc/carlock/ /system/etc/avas/") },
+            soundButton("Файлы звуков", 1) { runDevCommand("ls -la /vendor/etc/carlock/") },
             soundButton("Процессы", 1) { runDevCommand("ps -ef | grep -E \"mediacodec|voiceapp3\"") },
         )
         devOutView = monoBox(devCmdOutput, "#85e89d", 240f)

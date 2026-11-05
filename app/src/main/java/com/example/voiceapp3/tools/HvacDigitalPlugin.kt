@@ -13,7 +13,6 @@ import java.io.FileOutputStream
 object HvacDigitalPlugin {
     private const val TAG = "CENTRAL_HvacDigitalPlugin"
     /** iter33b A1: ключ префа с uptime прошлой boot-попытки (защита от повтора при рестарте процесса). */
-    const val PREF_BOOT_INSTALL_UPTIME = "hvac_boot_install_uptime"
     private const val STAGE_DIR = "/data/local/hvac-digital"
     private const val STAGE_APK = "$STAGE_DIR/sysui.apk"
     private const val OEM_PKG = "com.flyme.auto.systemuiplugin"
@@ -23,6 +22,42 @@ object HvacDigitalPlugin {
 
     /** iter33 A3.4: SystemUI перезапускается не чаще одного раза за процесс приложения. */
     @Volatile private var sysuiKillDone = false
+    /** iter33h B2: префы гейта по bootTag и его результат. */
+    private const val PREF_BOOT_INSTALL_BOOTTAG = "hvac_boot_tag_v2"
+    private const val PREF_BOOT_INSTALL_RESULT = "hvac_boot_result_v2"
+    private const val RESULT_ROOT_FAIL = "ROOT_FAIL"
+
+    /** iter33h B2: решение boot-гейта (чистая функция, покрыта тестом). */
+    enum class BootGate { RUN, SKIP }
+
+    /**
+     * iter33h B2.3 — «одна попытка на загрузку» по тегу загрузки.
+     *
+     * • другая загрузка ⇒ `RUN` (в т.ч. пустой тег в файле — первая загрузка с этой версией);
+     * • та же загрузка + прошлая попытка `OK`/`FAILED` ⇒ `SKIP`;
+     * • та же загрузка + провал по отсутствию root (`ROOT_FAIL`) ⇒ `RUN` (после возврата root).
+     */
+    fun bootGateDecision(storedTag: String, currentTag: String, lastResult: String): BootGate {
+        if (storedTag.isBlank() || currentTag.isBlank()) return BootGate.RUN
+        if (storedTag.trim() != currentTag.trim()) return BootGate.RUN
+        if (lastResult.trim() == RESULT_ROOT_FAIL) return BootGate.RUN
+        if (lastResult.isBlank()) return BootGate.RUN
+        return BootGate.SKIP
+    }
+
+    /** iter33h B2.1: тег текущей загрузки (кэш на процесс, как в JIT). */
+    @Volatile private var bootTagCache: String? = null
+
+    fun currentBootTag(): String {
+        bootTagCache?.let { return it }
+        val id = runCatching { java.io.File("/proc/sys/kernel/random/boot_id").readText().trim() }
+            .getOrDefault("")
+        val tag = if (id.isNotEmpty()) id
+                  else JitBootMark.epochTag(System.currentTimeMillis() - android.os.SystemClock.elapsedRealtime())
+        bootTagCache = tag
+        return tag
+    }
+
     /** iter33b A1: сколько раз за процесс перезапускали SystemUI — для поля `kill=` в `HVAC_BOOT`. */
     @Volatile private var sysuiKillCount = 0
 
@@ -400,13 +435,19 @@ object HvacDigitalPlugin {
             AppLog.i(TAG, "HVAC_BOOT: skip (attempt already made this boot)")
             return false
         }
-        val up = android.os.SystemClock.elapsedRealtime()
-        val prevUp = Prefs2.getLong(app, PREF_BOOT_INSTALL_UPTIME, 0L)
-        if (prevUp > 0 && up > prevUp && up - prevUp < 5 * 60_000L) {
-            AppLog.i(TAG, "HVAC_BOOT: skip (process restart, prev_uptime_ms=$prevUp now_ms=$up)")
+        // iter33h B2: гейт «одна попытка на загрузку» — по bootTag, НЕ по uptime.
+        // Прежний `prev_uptime_ms` застревал и любая загрузка считалась рестартом процесса.
+        val bootTag = currentBootTag()
+        val storedTag = Prefs2.getString(app, PREF_BOOT_INSTALL_BOOTTAG, "") ?: ""
+        val lastResult = Prefs2.getString(app, PREF_BOOT_INSTALL_RESULT, "") ?: ""
+        if (bootGateDecision(storedTag, bootTag, lastResult) == BootGate.SKIP) {
+            AppLog.i(TAG, "HVAC_BOOT: skip reason=same_boot_done boot_tag=$bootTag last=$lastResult")
             return false
         }
-        Prefs2.putLong(app, PREF_BOOT_INSTALL_UPTIME, up)
+        if (storedTag.isNotEmpty() && storedTag == bootTag && lastResult == RESULT_ROOT_FAIL) {
+            AppLog.i(TAG, "HVAC_BOOT: retry reason=root_back boot_tag=$bootTag")
+        }
+        // «Попытка сделана» ставится ПОСЛЕ реального выполнения (B2.2), см. ниже.
 
         val st = runCatching { checkStatus(app) }.getOrNull()
         if (st == null) {
@@ -419,7 +460,7 @@ object HvacDigitalPlugin {
             return false
         }
 
-        val reason = if (prevUp == 0L) "first_boot" else "not_mounted"
+        val reason = if (storedTag.isEmpty()) "first_boot" else "not_mounted"
         val killsBefore = sysuiKillCount
         val t0 = android.os.SystemClock.uptimeMillis()
         val r = runCatching { enable(app) }.getOrNull()
@@ -427,8 +468,20 @@ object HvacDigitalPlugin {
         val ok = r != null && r.steps.isNotEmpty() &&
             r.steps.none { it.status == ToolsStep.Status.FAILED || it.status == ToolsStep.Status.BLOCKED }
         val kill = if (sysuiKillCount > killsBefore) 1 else 0
-        AppLog.i(TAG, "HVAC_BOOT: attempt=1 reason=$reason kill=$kill result=${if (ok) "OK" else "FAILED"} ms=$dt")
-        if (!ok) AppLog.i(TAG, "HVAC_BOOT: повторов не будет — включите тумблер вручную (это ожидаемо)")
+        // B2.2: результат фиксируется после выполнения; провал по root попыткой не считается.
+        val rootFail = !com.example.voiceapp3.tools.AdbClient.isPrivilegedAllowed() ||
+            (r?.steps?.any { it.actual?.contains("ERR_ROOT_CHANNEL_UNAVAILABLE") == true } == true)
+        val storedResult = when {
+            ok -> "OK"
+            rootFail -> RESULT_ROOT_FAIL
+            else -> "FAILED"
+        }
+        Prefs2.putString(app, PREF_BOOT_INSTALL_BOOTTAG, bootTag)
+        Prefs2.putString(app, PREF_BOOT_INSTALL_RESULT, storedResult)
+        AppLog.i(TAG, "HVAC_BOOT: attempt=1 reason=$reason kill=$kill result=${if (ok) "OK" else "FAILED"} " +
+            "stored=$storedResult boot_tag=$bootTag ms=$dt")
+        if (!ok) AppLog.i(TAG, "HVAC_BOOT: повторов в этой загрузке нет — включите тумблер вручную (это ожидаемо)")
+        if (rootFail) bootInstallDone.set(false)   // после возврата root — повтор разрешён (B2.2)
         return ok
     }
 

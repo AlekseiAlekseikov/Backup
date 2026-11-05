@@ -38,10 +38,12 @@ val roadcastClientLib = file("src/main/jniLibs/arm64-v8a/libroadcast_client.so")
 // приложение писало его в файл-лог при старте (владелец видит точную сборку).
 val gitSha: String by lazy {
     try {
+        // iter33h H1.7: в CI checkout бывает shallow/без .git — тогда SHA не выдумываем.
         val p = ProcessBuilder("git", "rev-parse", "--short=7", "HEAD")
             .directory(rootProject.projectDir)
             .redirectErrorStream(true).start()
-        p.inputStream.bufferedReader().readText().trim().also { p.waitFor() }
+        val out = p.inputStream.bufferedReader().readText().trim().also { p.waitFor() }
+        if (out.matches(Regex("[0-9a-f]{7,40}"))) out else "unknown"
     } catch (_: Throwable) { "unknown" }
 }
 
@@ -57,8 +59,8 @@ android {
         applicationId = "com.example.voiceapp3"
         minSdk = 28
         targetSdk = 32
-        versionCode = 53
-        versionName = "1.0.53"
+        versionCode = 54
+        versionName = "1.0.54"
 
         buildConfigField("String", "APP_UPDATE_MANIFEST_URL", "\"$appUpdateManifestUrl\"")
         buildConfigField("String", "CHARGE_CONTROL_MANIFEST_URL", "\"$chargeControlManifestUrl\"")
