@@ -17,7 +17,11 @@ class App : Application() {
         AppLog.init(this)
         // Явная строка версии — чтобы владелец мгновенно видел в логе, какая
         // сборка запущена (без гаданий по размеру APK).
-        AppLog.i("App", "BUILD: versionCode=${BuildConfig.VERSION_CODE} versionName=${BuildConfig.VERSION_NAME} commit=${BuildConfig.GIT_COMMIT}")
+        // iter33h H1.7: настоящий SHA сборки (7 знаков) и номер прогона CI; если SHA нет —
+        // "unknown" (чужой/старый не печатаем).
+        val commit = BuildConfig.GIT_COMMIT.take(7).ifBlank { "unknown" }
+        AppLog.i("App", "BUILD: versionCode=${BuildConfig.VERSION_CODE} versionName=${BuildConfig.VERSION_NAME} " +
+            "commit=$commit ci_run=${BuildConfig.CI_RUN}")
         // iter25 P0-F: явная отметка «безопасной» сборки — в 1.0.46 старт писал в mt_gpio
         // (пин 151) и гасил USB на машине. Теперь в sysfs/USB-узлы приложение не пишет.
         AppLog.i("App", "USB_GUARD: iter25 — запись в mt_gpio отключена (1.0.46 гасила USB), sysfs/USB не трогаем")

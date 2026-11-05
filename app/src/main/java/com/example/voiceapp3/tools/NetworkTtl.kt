@@ -70,6 +70,10 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
             else line.substringBefore('=') to line.substring(eq+1).trim()
         }.toMap()
 
+    /** iter33h G1.5: одна строка результата клика — `TTL_RESULT …` (если скрипт её напечатал). */
+    private fun ttlResultLine(out: String): String =
+        out.lineSequence().firstOrNull { it.startsWith("TTL_RESULT ") }?.trim().orEmpty()
+
     private fun parseVerifyResult(expected: Boolean, out: String): Pair<ToolsStep.Status, String> {
         val kv = parseKv(out)
         val v4 = kv["TTL_V4"]?.trim()
@@ -114,6 +118,8 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
             noTarget  -> "iptables target 'TTL' не поддерживается ядром (модуль отсутствует)"
             expected && ttlVerdict == "MISMATCH" -> "wire TTL mismatch (real=$ttlReal, expected=65)"
             expected && ttlVerdict == "INDIRECT" -> "wire TTL не снят с провода (счётчики подросли, но ttl N в tcpdump не попал) → непрямое подтверждение"
+            // iter33h G1.2: если правила нет — это FAILED, а не «применено частично».
+            expected && ttlRuleEarly.isBlank() && !v4Ok -> "rule_not_installed: правила TTL в mangle/POSTROUTING нет (TTL_V4=$v4)"
             expected && ttlVerdict == "UNVERIFIED" -> "wire TTL не измерен (real=UNKNOWN${if (ttlRuleEarly.isNotBlank()) ", правило $ttlRuleEarly" else ""}): tcpdump не дал ttl N и счётчики не растут"
             !v4Ok     -> "TTL_V4 mismatch (expected=${if (expected) 1 else 0}, got=$v4 verify=$v4Verify)"
             !v6Ok     -> "TTL_V6 mismatch (expected=${if (expected) 1 else 0}, got=$v6 verify=$v6Verify)"
@@ -124,6 +130,9 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
             hasNoRoot -> ToolsStep.Status.BLOCKED
             hasPerm || noTarget -> ToolsStep.Status.FAILED
             expected && ttlVerdict == "MISMATCH" -> ToolsStep.Status.FAILED
+            // iter33h G1.2: правило отсутствует ⇒ FAILED (PARTIAL — только когда правило есть,
+            // а проводное значение не измерено).
+            expected && ttlRuleEarly.isBlank() && !v4Ok -> ToolsStep.Status.FAILED
             expected && ttlVerdict == "INDIRECT" -> ToolsStep.Status.PARTIAL
             else -> ToolsStep.Status.PARTIAL
         }

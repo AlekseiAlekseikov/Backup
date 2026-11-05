@@ -37,6 +37,13 @@ object LogKit {
     private const val ADB_TAG = "CENTRAL_AdbClient"
     /** iter33b B3.2: сколько строк текущей команды держим для повтора при провале. */
     private const val JOB_RING = 40
+    /** H1.1: рукопожатий построчно — не больше трёх за процесс. */
+    private const val HANDSHAKE_PER_PROCESS = 3
+    private const val HANDSHAKE_KIND = "ADB_HANDSHAKE"
+    /** H1.3: полный hex в `ADB_TRACE_REPLAY` — не больше трёх строк. */
+    private const val REPLAY_MAX = 3
+    /** H1.4: поля, вырезаемые из `last=` в `_SUPPRESSED`. */
+    private val REDACT_FIELDS = listOf("hex", "hex4", "ascii", "sum", "calc")
 
     /** Один `run` на процесс: 8 hex из nanoTime (не криптография — просто метка сеанса). */
     val run: String = java.lang.Long.toHexString(System.nanoTime() and 0xFFFFFFFFL).padStart(8, '0')
@@ -370,8 +377,20 @@ object LogKit {
      *     с hex и ASCII, независимо от лимита [TRACE_PER_SESSION]. Именно отсутствие
      *     hex при новом сбое было главной претензией к свёрнутой трассировке.
      */
-    fun traceAdb(kind: String, line: () -> String) {
-        val text = line()
+    /**
+     * H1.3 (iter33h): обычная трасса печатает КРАТКУЮ форму без `hex=`, `hex4=`, `ascii=`,
+     * `sum=`, `calc=`; полная форма с hex уходит только в [jobRing] и печатается исключительно
+     * в `ADB_TRACE_REPLAY` при `rc != 0` (не более [REPLAY_MAX] строк).
+     */
+    fun traceAdb(kind: String, brief: String, full: String) {
+        traceAdbInternal(kind, brief, full)
+    }
+
+    fun traceAdb(kind: String, line: () -> String) = traceAdbInternal(kind, null, null, line)
+
+    private fun traceAdbInternal(kind: String, briefIn: String?, fullIn: String?, line: (() -> String)? = null) {
+        val text = fullIn ?: line!!()
+        val brief = briefIn ?: redactTrace(text)
         var write = false
         synchronized(lock) {
             if (jobRing.size >= JOB_RING) jobRing.removeFirst()
@@ -385,7 +404,59 @@ object LogKit {
                 traceLast[kind] = text
             }
         }
-        if (write) AppLog.d(ADB_TAG, text) else flushSuppressed(force = false)
+        if (write) AppLog.d(ADB_TAG, brief) else {
+            synchronized(lock) { traceLast[kind] = redactTrace(text) }
+            flushSuppressed(force = false)
+        }
+    }
+
+    /**
+     * H1.1 (iter33h): рукопожатие — ОДНА строка на соединение и только для первых
+     * [HANDSHAKE_PER_PROCESS] соединений за процесс; далее счётчик в `_SUPPRESSED`.
+     */
+    fun traceHandshake(line: () -> String) {
+        var write = false
+        synchronized(lock) {
+            val seen = traceSeen[HANDSHAKE_KIND] ?: 0
+            if (seen < HANDSHAKE_PER_PROCESS) {
+                traceSeen[HANDSHAKE_KIND] = seen + 1
+                write = true
+            } else traceSuppressed[HANDSHAKE_KIND] = (traceSuppressed[HANDSHAKE_KIND] ?: 0) + 1
+        }
+        if (write) AppLog.d(ADB_TAG, line()) else flushSuppressed(force = false)
+    }
+
+    /** H1.5: строка не чаще [perProcess] раз за процесс; дальше — счётчик в `_SUPPRESSED`. */
+    fun limited(kind: String, perProcess: Int, line: () -> String) {
+        val key = "LIMITED:" + kind
+        var write = false
+        synchronized(lock) {
+            val seen = traceSeen[key] ?: 0
+            if (seen < perProcess) {
+                traceSeen[key] = seen + 1
+                write = true
+            } else traceSuppressed[key] = (traceSuppressed[key] ?: 0) + 1
+        }
+        if (write) AppLog.i("CENTRAL_Trace", line()) else flushSuppressed(force = false)
+    }
+
+    /** Событие было, но печатать его не нужно — учитываем в счётчике подавления (не молча). */
+    fun suppressed(kind: String) {
+        synchronized(lock) { traceSuppressed[kind] = (traceSuppressed[kind] ?: 0) + 1 }
+        flushSuppressed(force = false)
+    }
+
+    /**
+     * H1.4 (iter33h): `redactTrace` — вырезает из строки трассы поля `hex=`, `hex4=`,
+     * `ascii=`, `sum=`, `calc=` перед записью в `_SUPPRESSED … last=`.
+     * Покрыто тестом `RedactTraceTest`.
+     */
+    fun redactTrace(text: String): String {
+        var out = text
+        for (field in REDACT_FIELDS) {
+            out = Regex(" ?" + Regex.escape(field) + "=\\S*").replace(out, "")
+        }
+        return out
     }
 
     /** Начало команды: чистое кольцо, флаг провала снят. */
@@ -408,8 +479,9 @@ object LogKit {
             jobFailed = true
             jobRing.toList()
         }
-        AppLog.d(ADB_TAG, "ADB_TRACE_REPLAY rc=$rc why=${kv(why)} n=${lines.size} (провал: трассировка не подавляется)")
-        for (l in lines) AppLog.d(ADB_TAG, l)
+        AppLog.d(ADB_TAG, "ADB_TRACE_REPLAY rc=$rc why=${kv(why)} n=${lines.size} shown=${minOf(lines.size, REPLAY_MAX)} (провал: трассировка не подавляется)")
+        // H1.3: полный hex — ТОЛЬКО здесь и не более REPLAY_MAX строк.
+        for (l in lines.takeLast(REPLAY_MAX)) AppLog.d(ADB_TAG, l)
     }
 
     /**

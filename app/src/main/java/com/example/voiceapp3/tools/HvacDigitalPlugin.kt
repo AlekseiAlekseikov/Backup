@@ -17,6 +17,16 @@ object HvacDigitalPlugin {
     private const val STAGE_APK = "$STAGE_DIR/sysui.apk"
     private const val OEM_PKG = "com.flyme.auto.systemuiplugin"
 
+    /**
+     * iter33h D1.1 — ЕДИНСТВЕННЫЙ предикат «маунт плагина есть»: без учёта регистра, обе формы
+     * имени. Используется в checkStatus (pre/post_check), в скриптах umount и в HVAC_PROBE.
+     *
+     * Почему: прежний `grep -F systemuiplugin` регистрозависим, а путь в /proc/mounts —
+     * `GeelyAutoSystemUIPlugin`. Итог: umount не выполнялся ни разу, RESTORE_OK печатался
+     * всегда, а checkStatus (искал без учёта регистра) находил маунт и ронял post_check.
+     */
+    internal const val MOUNT_GREP = "grep -i -E 'systemuiplugin|GeelyAutoSystemUIPlugin'"
+
     /** iter33 C3: последнее известное состояние монтирования (для свёртки одинаковых строк). */
     @Volatile private var lastMountState: Boolean? = null
 
@@ -112,10 +122,10 @@ object HvacDigitalPlugin {
         }
 
         val (mRc, mOut) = try {
-            AdbClient.shellLocal("grep -F GeelyAutoSystemUIPlugin /proc/mounts 2>&1; echo RC=\$?", 6000)
+            AdbClient.shellLocal("$MOUNT_GREP /proc/mounts 2>&1; echo RC=\$?", 6000)
         } catch (t: Throwable) { Pair(1, "EXC:${t.message}") }
         val mountCandidates = mOut.lineSequence()
-            .filter { it.contains("GeelyAutoSystemUIPlugin") && it.contains("/system/") && it.split(" ").size >= 3 }
+            .filter { isOurMountLine(it) }
             .toList()
         if (mountCandidates.isNotEmpty()) {
             mounted = true
@@ -328,7 +338,7 @@ object HvacDigitalPlugin {
               echo "###STAGE name=sysui status=SKIP reason=no_apk_change"
             fi
 
-            PROPS="batt:@@(getprop persist.sys.hvacdigital.batt),temp:@@(getprop persist.sys.hvacdigital.temp),exttemp:@@(getprop persist.sys.hvacdigital.temp_ext)"
+            PROPS="batt:@@(getprop persist.sys.hvacdigital.batt),exttemp:@@(getprop persist.sys.hvacdigital.exttemp)"
             echo "PROPS=@@PROPS"
             # iter33b B5: итоговый VIA — ЯВНО, одной строкой. Раньше такого echo не было вовсе,
             # и `HVAC_PROBE … via=?` врал: регулярка в Kotlin ждала "VIA=", которого скрипт не печатал.
@@ -485,6 +495,29 @@ object HvacDigitalPlugin {
         return ok
     }
 
+    /**
+     * D1.5 — чистые функции разбора `/proc/mounts` (покрыты тестом на реальной строке из лога).
+     * Строка маунта: `<dev> <mountpoint> <fstype> <opts> 0 0`.
+     */
+    internal fun isOurMountLine(line: String): Boolean {
+        val parts = line.trim().split(" ")
+        if (parts.size < 3) return false
+        val mp = parts[1]
+        return mp.contains("/system/") &&
+            (mp.contains("systemuiplugin", true) || mp.contains("GeelyAutoSystemUIPlugin", true))
+    }
+
+    /** Первая подходящая строка маунта (или пустая) — то, что печатает checkStatus. */
+    internal fun firstOurMountLine(mounts: String): String =
+        mounts.lineSequence().firstOrNull { isOurMountLine(it) }?.trim().orEmpty()
+
+    /** Сколько маунтов плагина осталось в выводе /proc/mounts. */
+    internal fun countOurMounts(mounts: String): Int = mounts.lineSequence().count { isOurMountLine(it) }
+
+    /** `UMOUNT_COUNT=N` из вывода скрипта. */
+    internal fun umountCountOf(out: String): Int =
+        Regex("UMOUNT_COUNT=(\\d+)").find(out)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+
     /** Read-only сверка inode: staging-файл (источник bind) и цель монтирования. */
     private fun inodeMatchesStage(targetPath: String?): Boolean {
         if (targetPath.isNullOrEmpty()) return false
@@ -519,7 +552,7 @@ object HvacDigitalPlugin {
             SYSUI_PID_AFTER=${'$'}(pidof com.android.systemui)
             SELINUX_AFTER=${'$'}(getenforce 2>/dev/null)
             echo SELINUX_BEFORE=${'$'}SELINUX_BEFORE SELINUX_AFTER=${'$'}SELINUX_AFTER SYSUI_PID_BEFORE=${'$'}SYSUI_PID_BEFORE SYSUI_PID_AFTER=${'$'}SYSUI_PID_AFTER
-            if grep -F GeelyAutoSystemUIPlugin /proc/mounts >/dev/null 2>&1; then echo REVERTED_FAIL; else echo REVERTED_OK; fi
+            if $MOUNT_GREP /proc/mounts >/dev/null 2>&1; then echo REVERTED_FAIL; else echo REVERTED_OK; fi
         """.trimIndent()
         val (rc, out) = AdbClient.execute(script, 25000)
         AppLog.i(TAG, "disable script rc=$rc out=${out.take(500)}")
@@ -563,7 +596,7 @@ object HvacDigitalPlugin {
             echo "PM_PATH=$(pm path $OEM_PKG 2>&1 | tr '\n' ' ')"
             echo "PM_LIST=$(pm list packages -f 2>/dev/null | grep -i flyme | tr '\n' ' ')"
             echo "SYS_APK=$(ls -1 /system/app/*/*.apk /system/priv-app/*/*.apk 2>/dev/null | grep -i -E 'systemuiplugin|GeelyAutoSystemUIPlugin' | tr '\n' ' ')"
-            echo "MOUNTS=$(grep -F systemuiplugin /proc/mounts 2>/dev/null | tr '\n' ' ' || echo NOMOUNT)"
+            echo "MOUNTS=$($MOUNT_GREP /proc/mounts 2>/dev/null | tr '\n' ' ' || echo NOMOUNT)"
             echo "VIA=$(getprop persist.sys.hvacdigital.via)"
         """.trimIndent()
         val (dRc, dOut) = try { AdbClient.shellLocal(diagCmd, 8000) } catch (t: Throwable) { Pair(1, "EXC:${t.message}") }
@@ -609,10 +642,12 @@ object HvacDigitalPlugin {
             val D = "$"
             val script = """
 id
-for MNT in ${D}(grep -F systemuiplugin /proc/mounts 2>/dev/null | awk '{print ${D}2}'); do
+UMOUNT_COUNT=0
+for MNT in ${D}($MOUNT_GREP /proc/mounts 2>/dev/null | awk '{print ${D}2}'); do
   echo "UMOUNT stale: ${D}MNT"
-  umount "${D}MNT" 2>&1 || umount -l "${D}MNT" 2>&1 || echo "UMOUNT_FAIL ${D}MNT"
+  if umount "${D}MNT" 2>&1 || umount -l "${D}MNT" 2>&1; then UMOUNT_COUNT=${D}((UMOUNT_COUNT+1)); echo "UMOUNT_OK ${D}MNT"; else echo "UMOUNT_FAIL ${D}MNT"; fi
 done
+echo "UMOUNT_COUNT=${D}UMOUNT_COUNT"
 SYSUI_PID_BEFORE=${D}(pidof com.android.systemui)
 echo "SYSUI_PID_BEFORE=${D}SYSUI_PID_BEFORE"
 kill ${D}SYSUI_PID_BEFORE 2>/dev/null || true
@@ -622,19 +657,24 @@ echo "SYSUI_WAIT_TICKS=${D}_k"
 echo "SYSUI_PID_AFTER=${D}(pidof com.android.systemui)"
 echo "PM_PATH_AFTER=${D}(pm path $OEM_PKG 2>/dev/null | sed 's/^package://' | tr '
 ' ' ')"
-if grep -F systemuiplugin /proc/mounts >/dev/null 2>&1; then echo RESTORE_STALE_MOUNT; else echo RESTORE_OK; fi
+if $MOUNT_GREP /proc/mounts >/dev/null 2>&1; then echo RESTORE_STALE_MOUNT; else echo RESTORE_OK; fi
 """.trimIndent()
             val (rRc, rOut) = AdbClient.execute(script, 25000)
             restoreOut = rOut
-            restoreOk = rRc == 0 && rOut.contains("RESTORE_OK") && !rOut.contains("RESTORE_STALE_MOUNT")
             AppLog.i(TAG, "restoreSystemUi script rc=$rRc out=${rOut.take(800)}")
             steps += stepOf("restore", "umount + kill systemui",
-                if (restoreOk) ToolsStep.Status.OK else ToolsStep.Status.FAILED,
-                expected = "RESTORE_OK", actual = "rc=$rRc last=${rOut.lineSequence().lastOrNull()}", stdout = rOut)
+                if (rRc == 0) ToolsStep.Status.OK else ToolsStep.Status.FAILED,
+                expected = "rc=0",
+                actual = "rc=$rRc umount_count=" + umountCountOf(rOut), stdout = rOut)
         }
 
         // 4) post_check: BLOCKED, если root не было (не FAILED — мы просто не проверяли).
         val post = checkStatus(ctx)
+        // D1.2: единственный источник истины — фактический маунт ПОСЛЕ восстановления.
+        restoreOk = haveRoot && !post.overlayMounted
+        AppLog.i(TAG, "RESTORE_RESULT mount_before=${if (pre.overlayMounted) "есть" else "нет"} " +
+            "mount_after=${if (post.overlayMounted) "есть" else "нет"} " +
+            "umount_count=${umountCountOf(restoreOut)} root=$haveRoot")
         val postStatus = when {
             !haveRoot -> ToolsStep.Status.BLOCKED
             !post.overlayMounted && post.mountReason != "err" -> ToolsStep.Status.OK
@@ -659,8 +699,8 @@ if grep -F systemuiplugin /proc/mounts >/dev/null 2>&1; then echo RESTORE_STALE_
 
     private fun propsLine(): String = runCatching {
         val (_, o) = AdbClient.shellLocal(
-            "echo batt:$(getprop persist.sys.hvacdigital.batt),temp:$(getprop persist.sys.hvacdigital.temp)," +
-                "exttemp:$(getprop persist.sys.hvacdigital.temp_ext)", 3000)
+            "echo batt:$(getprop persist.sys.hvacdigital.batt)," +
+                "exttemp:$(getprop persist.sys.hvacdigital.exttemp)", 3000)
         o.trim().ifEmpty { "-" }
     }.getOrDefault("-")
 

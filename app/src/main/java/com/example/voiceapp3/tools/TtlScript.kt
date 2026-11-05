@@ -22,13 +22,23 @@ internal object TtlScript {
         val enableBit = if (enable) "1" else "0"
         return """
 set +e
-echo '=== TTL_SCRIPT start enable=${D}enableBit ==='
+# iter33h G1.1: ENABLE — это ЗНАЧЕНИЕ (0|1), подставленное из Kotlin. Прежний `$enableBit`
+# уходил в шелл как пустая переменная, и `iptables -A ... --ttl-set 65` не выполнялся ни разу.
+ENABLE=@ENABLE_VALUE@
+echo '=== TTL_SCRIPT start enable='${D}ENABLE' ==='
 # --- determine outgoing iface / src ---
 OUT_IFACE=${D}(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if(${D}i=="dev") {print ${D}(i+1); exit}}')
 SRC_IP=${D}(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if(${D}i=="src") {print ${D}(i+1); exit}}')
 [ -z "${D}OUT_IFACE" ] && OUT_IFACE=${D}(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if(${D}i=="dev"){print ${D}(i+1); exit}}' | head -1)
 IFACE_ARG="${D}{OUT_IFACE:-any}"
 echo OUT_IFACE=${D}OUT_IFACE SRC_IP=${D}SRC_IP IFACE_ARG=${D}IFACE_ARG
+if [ -z "${D}OUT_IFACE" ] || [ -z "${D}SRC_IP" ]; then
+  if command -v ip >/dev/null 2>&1; then
+    echo ROUTE_SRC=none reason=no_default_route
+  else
+    echo ROUTE_SRC=none reason=no_ip_binary
+  fi
+fi
 # --- resolve tcpdump + timeout binaries ---
 TCPDUMP_BIN=""
 TIMEOUT_BIN=""
@@ -60,7 +70,7 @@ V6_EXIST=0
 V4_EXIST=${D}(iptables -t mangle -S POSTROUTING 2>/dev/null | grep -c -- '--ttl-set')
 V6_EXIST=${D}(ip6tables -t mangle -S POSTROUTING 2>/dev/null | grep -c -- '--hl-set')
 echo TTL_V4_EXIST=${D}V4_EXIST TTL_V6_EXIST=${D}V6_EXIST
-if [ "${D}enableBit" = "1" ]; then
+if [ "${D}ENABLE" = "1" ]; then
   if [ "${D}V4_EXIST" -lt 1 ] 2>/dev/null; then
     echo "APPENDING iptables TTL --ttl-set 65"
     iptables -w 5 -t mangle -A POSTROUTING -j TTL --ttl-set 65 2>&1 || echo IPTV4_FAIL=${D}?
@@ -213,7 +223,10 @@ fi
 BEFORE_N=${D}RULE_TTL; [ -z "${D}BEFORE_N" ] && BEFORE_N=none
 AFTER_N=${D}RULE_TTL_AFTER; [ -z "${D}AFTER_N" ] && AFTER_N=none
 echo "TTL_CHECK: before=${D}BEFORE_N after=${D}AFTER_N rc=${D}VC4 rule_ttl=${D}RULE_SHOW real=${D}REAL_SHOW expected=${D}EXPECTED src=${D}{SRC_IP:-unknown} dst=1.1.1.1 iface=${D}IFACE_ARG method=${D}METHOD reason=${D}REASON hl_wire=${D}HL_REAL ARROW ${D}VERDICT"
+# iter33h G1.5: одна сводка на клик — сразу видно правило/верификацию/провод.
+WIRE_V4=${D}{TTL_REAL:-UNKNOWN}
+echo "TTL_RESULT rule_v4=${D}{BEFORE_N} rule_v6=${D}{RULE_HL_AFTER:-none} verify_v4=${D}VERIFY_V4 verify_v6=${D}VERIFY_V6 wire_v4=${D}WIRE_V4 enable=${D}ENABLE"
 echo '=== TTL_SCRIPT end ==='
-""".trimIndent().replace("ARROW", "\u2192")
+""".trimIndent().replace("ARROW", "\u2192").replace("@ENABLE_VALUE@", enableBit)
     }
 }

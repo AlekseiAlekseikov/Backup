@@ -279,8 +279,10 @@ enum class Choice(
                 val f = appContext.getSharedPreferences(Prefs.FILE, Context.MODE_PRIVATE)
                 val p = try { f.javaClass.getMethod("getFilePath").invoke(f)?.toString() } catch (_: Throwable) { null }
                     ?: "/data/data/${appContext.packageName}/shared_prefs/${Prefs.FILE}.xml"
-                AppLog.i("CENTRAL_ToolsBackend",
-                    "PREF TRACE: write file=$p key=${toggle.pref} value=$value actual=$actual thread=${Thread.currentThread().name}")
+                // H1.5: не более 5 строк на ключ за процесс (дальше — счётчик в _SUPPRESSED).
+                LogKit.limited("PREF_TRACE:${toggle.pref}", 5) {
+                    "PREF TRACE: write file=$p key=${toggle.pref} value=$value actual=$actual thread=${Thread.currentThread().name}"
+                }
             }
             (actual == value.toString()) to actual
         }
@@ -973,6 +975,13 @@ enum class Choice(
             // iter21 §2: RESTORE шторки SystemUI (umount кривого плагина + kill systemui).
             "hvac_restore_btn" -> {
                 return restoreHvac()
+            }
+            // iter33h F1.3: read-only «Температуры: разведка» — один проход, ничего не пишем.
+            "tempProbe_btn" -> {
+                BgWorker.assertNotMain("ToolsBackend.tempProbe")
+                val res = StatusIcons.tempProbe(appContext)
+                AppLog.logAction(appContext, "status.tempProbe", res)
+                return res
             }
             "lockSoundVol" -> {
                 val v = intValue(value)

@@ -65,6 +65,10 @@ android {
         buildConfigField("String", "APP_UPDATE_MANIFEST_URL", "\"$appUpdateManifestUrl\"")
         buildConfigField("String", "CHARGE_CONTROL_MANIFEST_URL", "\"$chargeControlManifestUrl\"")
         buildConfigField("String", "GIT_COMMIT", "\"$gitSha\"")
+        // iter33h H1.7: номер прогона CI. В GitHub Actions он есть в env (GITHUB_RUN_ID),
+        // workflow не правим — читаем переменную окружения прямо в Gradle.
+        // Локально/без CI — "unknown" (чужой номер не печатаем).
+        buildConfigField("String", "CI_RUN", "\"${System.getenv("GITHUB_RUN_ID") ?: "unknown"}\"")
 
         ndk {
             abiFilters += "arm64-v8a"

@@ -50,23 +50,18 @@ object StatusIcons {
     const val PREF_WIFI = "status_icon_wifi"
 
     /** Цифровая индикация в статус-баре (плагин GeelyAutoSystemUIPlugin-digital.apk).
-     *  Флаги — persist.sys.hvacdigital.{batt,temp,temp_ext} (0/1). */
+     *  Значения пишем только для batt/exttemp (%.1f) и via — см. pushHvacDigitalPropsIfEnabled. */
     const val PREF_HVAC_BATT = "hvacdigital_batt"
     const val PREF_HVAC_TEMP = "hvacdigital_temp"
     const val PREF_HVAC_EXT_TEMP = "hvacdigital_temp_ext"
     private const val SYS_HVAC_BATT = "persist.sys.hvacdigital.batt"
-    private const val SYS_HVAC_TEMP = "persist.sys.hvacdigital.temp"
-    // §3 регрессия exttemp/temp_ext: на устройстве владельца установлен плагин
-    // com.flyme.auto.systemuiplugin, который слушает `persist.sys.hvacdigital.temp_ext`
-    // (см. строки 469/471/473 голоса и log «setprop persist.sys.hvacdigital.temp_ext»).
-    // В новых версиях CentralEXAuto (w0/x7.java, ah.java, u5.java) фигурирует имя
-    // `persist.sys.hvacdigital.exttemp`. Для совместимости с ОБЕИМИ версиями плагина —
-    // пишем В ОБА свойства сразу; при чтении наружной температуры в readTempScan пробуем
-    // оба, предпочитая то, которое установлено.
-    private const val SYS_HVAC_EXT_TEMP_EXT = "persist.sys.hvacdigital.temp_ext"   // старый плагин (на устройстве)
-    private const val SYS_HVAC_EXT_EXTTEMP = "persist.sys.hvacdigital.exttemp"    // новый CentralEXAuto v3.3.9+
-    @Deprecated("Use SYS_HVAC_EXT_TEMP_EXT/SYS_HVAC_EXT_EXTTEMP explicitly; kept for sysPropFor mapping")
-    private const val SYS_HVAC_EXT = SYS_HVAC_EXT_TEMP_EXT
+    // E1 (iter33h): `persist.sys.hvacdigital.temp` приложением БОЛЬШЕ НЕ ПИШЕТСЯ.
+    // Уставку климата плагин читает сам (HvacVehicleTempWidget.getPropertyId() → HVAC_TEMPERATURE_SET),
+    // а наше «значение» уходило в слот климата поверх стандартной полоски.
+    // F2: ключ наружной — ОДИН (`persist.sys.hvacdigital.exttemp`), как в референсе
+    // (w0/x7.java:142, w0/ah.java:17, w0/u5.java:27); `temp_ext` больше не пишем.
+    private const val SYS_HVAC_VIA = "persist.sys.hvacdigital.via"                // round-trip самого приложения
+    private const val SYS_HVAC_EXT_EXTTEMP = "persist.sys.hvacdigital.exttemp"    // F2: единственный ключ наружной
 
     // iter22 §1: канал и ранги ОДИН-В-ОДИН как в CEX w0/kg#j: единый канал
     // "central_ex_status_temp", IMPORTANCE_LOW, setShowBadge(false);
@@ -100,6 +95,23 @@ object StatusIcons {
     // Раньше константа называлась «салон» и в расчёте применялось (raw-80)/2 — это давало
     // мусор; правильная нормализация: float как есть, иначе int/10.
     private const val PROP_AC_AMBIENT_TEMP = 0x2140A377
+    /** F1: AC_AMBIENT_TEMP_INVALID — только диагностика (в UI не показываем). */
+    private const val PROP_AC_AMBIENT_INVALID = 0x2140A376
+    /**
+     * F1 (поправка владельца 05.11: «наружную ищем в референсе»).
+     * Референс CentralEXAuto 3.3.9, `com.geely.hvacstepperv2.TempStepperService`:
+     *   `getFloatProperty(291505923, area)` → 291505923 == 0x11600703 == ENV_OUTSIDE_TEMPERATURE,
+     *   зоны перебираются в порядке `f1286d0 = {0, 1, 4, 7}`, валидный диапазон −55…+70,
+     *   int-ветка: −550…700 ⇒ /10, иначе −45…65 как есть; печать `%.1f`.
+     * Приоритет запрета «0x11600703 не читать» снят этим решением владельца.
+     */
+    private const val PROP_ENV_OUTSIDE_TEMP = 0x11600703
+    /** Зоны ENV_OUTSIDE_TEMPERATURE — порядок референса (TempStepperService.f1286d0). */
+    private val ENV_OUTSIDE_AREAS = intArrayOf(0, 1, 4, 7)
+    /** HVAC_TEMPERATURE_CURRENT — id из референса (`TempStepperService.i/g`), зоны {1,4,0,7}. */
+    private const val PROP_HVAC_TEMP_CURRENT = 0x15600502
+    /** HVAC_TEMPERATURE_SET — 0x15600503 из VHAL-дампа, areas=[49, 68]. */
+    private const val PROP_HVAC_TEMP_SET = 0x15600503
     // Резервные ID — ТОЛЬКО для строки лога TEMP_CANDS, автопереключения нет.
     private const val PROP_TEMP_RESERVE_1 = 0x2160A6E9
     private const val PROP_TEMP_RESERVE_2 = 0x2140A673
@@ -371,25 +383,151 @@ object StatusIcons {
     }
 
     /**
-     * iter23 P1: источник наружной температуры — 0x2140A377 (решение владельца по логу 1.0.44:
-     * реальные 9.2 °C при raw=92). Резервные 0x2160A6E9 / 0x2140A673 пишутся ТОЛЬКО в лог.
-     * 0x11600703 не читается вовсе — это заглушка прошивки (25.0).
+     * F1 (iter33h): источник наружной температуры — ENV_OUTSIDE_TEMPERATURE `0x11600703` с area,
+     * как в референсе (`TempStepperService.i(int)` / `g()`): float → иначе int (−550…700 ⇒ /10,
+     * иначе −45…65 как есть), зоны {0,1,4,7}, валидный диапазон −55…+70, печать `%.1f`.
+     * AC_AMBIENT_TEMP (0x2140A377) и AC_AMBIENT_TEMP_INVALID (0x2140A376) — ТОЛЬКО диагностика.
      */
     private fun readTempScan(): Float? {
         val m = cpm ?: run { AppLog.w(TAG, "TEMP: no CarPropertyManager"); return null }
-        val (main, mainRaw) = readTempProp(m, PROP_AC_AMBIENT_TEMP, 0)
-        val (r1, r1Raw) = readTempProp(m, PROP_TEMP_RESERVE_1, 0)
-        val (r2, r2Raw) = readTempProp(m, PROP_TEMP_RESERVE_2, 0)
-        val fmt = { v: Float? -> v?.let { String.format(Locale.US, "%.1f", it) } ?: "n/a" }
-        val src = if (main != null) "A377" else "none"
-        AppLog.i(TAG, "TEMP_CANDS: A377=${fmt(main)} A673=${fmt(r2)} A6E9=${fmt(r1)} src=$src")
-        if (main == null) {
-            AppLog.w(TAG, "TEMP: A377 недоступен (raw/$mainRaw; A673/$r2Raw; A6E9/$r1Raw) — значение с экрана не убираем")
-            return null
+        // 1) наружная — ровно как в референсе: зоны {0,1,4,7}, float → int.
+        var outside: Float? = null
+        var outsideArea = -1
+        for (a in ENV_OUTSIDE_AREAS) {
+            val v = readEnvOutsideProp(m, a)
+            if (v != null) { outside = v; outsideArea = a; break }
         }
-        tempSource = "HAL 0x2140A377@0"
-        AppLog.i(TAG, "Temp HAL=%.1f → UI=%.1f°C (src=0x2140A377@0, raw=$mainRaw)".format(main, main))
-        return main
+        if (outside != null && outsideArea >= 0) {
+            tempSource = "HAL 0x11600703@0x%x".format(outsideArea)
+            AppLog.i(TAG, "Exterior OK (ENV_OUTSIDE_TEMPERATURE) area=0x%x → %.1f°C".format(outsideArea, outside))
+        } else {
+            tempSource = "none"
+            AppLog.w(TAG, "TEMP: ENV_OUTSIDE_TEMPERATURE (0x11600703) недоступен во всех зонах " +
+                ENV_OUTSIDE_AREAS.joinToString(",") { "0x%x".format(it) } + " — показываем н/д")
+        }
+        // 2) диагностика: ambient + INVALID + резервные ID. В UI не идут.
+        val (amb, ambRaw) = readTempProp(m, PROP_AC_AMBIENT_TEMP, 0)
+        val inv = try { m.getIntProperty(PROP_AC_AMBIENT_INVALID, 0) } catch (e: Exception) { null }
+        val (r1, _) = readTempProp(m, PROP_TEMP_RESERVE_1, 0)
+        val (r2, _) = readTempProp(m, PROP_TEMP_RESERVE_2, 0)
+        val fmt = { v: Float? -> v?.let { String.format(Locale.US, "%.1f", it) } ?: "н/д" }
+        // TEMP_CANDS — одна строка на цикл опроса (H1: без повторов).
+        AppLog.i(TAG, "TEMP_CANDS: A377=${fmt(amb)} A673=${fmt(r2)} A6E9=${fmt(r1)} " +
+            "env_outside=${fmt(outside)} area=0x%x src=%s".format(outsideArea, tempSource))
+        AppLog.i(TAG, "TEMP_SRC ambient=${fmt(amb)} invalid=${inv ?: "н/д"} env_outside=${fmt(outside)} " +
+            "ambient_raw=$ambRaw")
+        return outside
+    }
+
+    /**
+     * F1: чтение ENV_OUTSIDE_TEMPERATURE с area — порт референса
+     * (`TempStepperService.i(int)`, dex: `getFloatProperty(291505923, area)`, затем
+     * `getIntProperty(291505923, area)`).
+     */
+    private fun readEnvOutsideProp(m: android.car.hardware.property.CarPropertyManager, area: Int): Float? {
+        try {
+            val f = m.getFloatProperty(PROP_ENV_OUTSIDE_TEMP, area)
+            envOutsideToCelsius(f, null)?.let { return it }
+        } catch (e: Exception) {
+            // int-only проп — норма, идём в int-ветку
+        }
+        return try {
+            envOutsideToCelsius(null, m.getIntProperty(PROP_ENV_OUTSIDE_TEMP, area))
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /**
+     * F1 (чистая нормализация, покрыта тестом `TempFormatTest`) — ровно правила референса
+     * `TempStepperService.i(int)`: int −550…700 ⇒ /10, иначе −45…65 как есть; валидный
+     * диапазон наружной −55…70 °C. Float берётся как есть (тоже с проверкой диапазона).
+     */
+    internal fun envOutsideToCelsius(fRaw: Float?, iRaw: Int?): Float? {
+        if (fRaw != null && !fRaw.isNaN() && fRaw > -55f && fRaw < 70f) return fRaw
+        if (iRaw == null) return null
+        val v = when {
+            iRaw > -550 && iRaw < 700 -> iRaw / 10.0f
+            iRaw >= -45 && iRaw <= 65 -> iRaw.toFloat()
+            else -> return null
+        }
+        return if (v > -55f && v < 70f) v else null
+    }
+
+    /** F1/F2: единый формат наружной — `%.1f` (и `н/д`, если значения нет). */
+    internal fun formatOutsideTempC(v: Float?): String =
+        if (v == null) "н/д" else String.format(Locale.US, "%.1f", v)
+
+    /**
+     * F1.3 (iter33h) — read-only действие «Температуры: разведка».
+     *
+     * Один проход, ничего не пишем: по строке на свойство, формат
+     * `TEMP_PROBE hex=0x… name=… area=… value=… err=<none|ExceptionName>`.
+     *
+     * ID взяты ТОЛЬКО из фактов, а не из головы:
+     *  • `0x11600703` ENV_OUTSIDE_TEMPERATURE — VHAL-дамп `uploads/vhal-dump.txt` (FLOAT, areas=[0], 25.0)
+     *    и референс `TempStepperService.i(int)` (`getFloatProperty(291505923, area)`);
+     *  • `0x2140A377` / `0x2140A376` — тот же дамп (INT32, 95 / INVALID=1), только диагностика;
+     *  • `0x15600503` HVAC_TEMPERATURE_SET, areas [49, 68] — тот же дамп;
+     *  • `0x15600502` — из референса (`TempStepperService`, «Sensor cabina OK (HVAC_TEMPERATURE_CURRENT)
+     *    area=0x%x»), зоны референса {1,4,0,7}.
+     * Свойства, для которых ID нет ни в дампе, ни в референсе (AC_INSIDE_TEMP_INVALID,
+     * HVAC_IN_OUT_TEMP, HU_ENVIRONMENTAL_TEMP, TEMPERATURE_STATE), печатаются с `err=no_id` —
+     * придумывать hex запрещено.
+     */
+    fun tempProbe(ctx: android.content.Context): ToolsResult {
+        val m = cpm ?: run {
+            val t = android.os.SystemClock.elapsedRealtime()
+            return ToolsResult("status.tempProbe", "Температуры: разведка", listOf(
+                ToolsStep("probe", "TEMP_PROBE", t, t, 1, stderr = "нет CarPropertyManager (сервис не подключён)",
+                    status = ToolsStep.Status.BLOCKED)))
+        }
+        val steps = ArrayList<ToolsStep>()
+        fun probeFloat(hex: String, name: String, propId: Int, areas: IntArray) {
+            for (a in areas) {
+                val t = android.os.SystemClock.elapsedRealtime()
+                var value = "н/д"
+                var err = "none"
+                try {
+                    val f = m.getFloatProperty(propId, a)
+                    value = if (f.isNaN()) "н/д" else String.format(Locale.US, "%.1f", f)
+                } catch (e: Exception) {
+                    err = e.javaClass.simpleName
+                    try {
+                        val iv = m.getIntProperty(propId, a)
+                        value = iv.toString()
+                        err = "none(int)"
+                    } catch (e2: Exception) {
+                        err = e.javaClass.simpleName
+                    }
+                }
+                val line = "TEMP_PROBE hex=$hex name=$name area=0x%x value=$value err=$err".format(a)
+                AppLog.i(TAG, line)
+                steps.add(ToolsStep("probe", line, t, t, if (err == "none") 0 else 1, stdout = line,
+                    status = ToolsStep.Status.OK))
+            }
+        }
+        fun noId(name: String) {
+            val t = android.os.SystemClock.elapsedRealtime()
+            val line = "TEMP_PROBE hex=n/a name=$name area=n/a value=н/д err=no_id"
+            AppLog.w(TAG, line)
+            steps.add(ToolsStep("probe", line, t, t, 1, stderr = "no_id", stdout = line,
+                status = ToolsStep.Status.OK))
+        }
+        probeFloat("0x11600703", "ENV_OUTSIDE_TEMPERATURE", PROP_ENV_OUTSIDE_TEMP, ENV_OUTSIDE_AREAS)
+        probeFloat("0x2140A377", "AC_AMBIENT_TEMP", PROP_AC_AMBIENT_TEMP, intArrayOf(0))
+        probeFloat("0x2140A376", "AC_AMBIENT_TEMP_INVALID", PROP_AC_AMBIENT_INVALID, intArrayOf(0))
+        probeFloat("0x15600502", "AC_INSIDE_TEMP(HVAC_TEMPERATURE_CURRENT)", PROP_HVAC_TEMP_CURRENT, intArrayOf(1, 4, 0, 7))
+        noId("AC_INSIDE_TEMP_INVALID")
+        noId("HVAC_IN_OUT_TEMP")
+        noId("HU_ENVIRONMENTAL_TEMP")
+        noId("TEMPERATURE_STATE")
+        probeFloat("0x15600503", "HVAC_TEMPERATURE_SET", PROP_HVAC_TEMP_SET, intArrayOf(49))
+        probeFloat("0x15600503", "HVAC_TEMPERATURE_SET", PROP_HVAC_TEMP_SET, intArrayOf(68))
+        val t = android.os.SystemClock.elapsedRealtime()
+        val hint = "Сравните с приборкой. Если число отличается — нажмите «Отправить» (уйдёт в отчёт)"
+        steps.add(ToolsStep("hint", hint, t, t, 0, stdout = hint, status = ToolsStep.Status.OK))
+        return ToolsResult("status.tempProbe", "Температуры: разведка", steps)
     }
 
     /** PendingIntent для клика по батарее/температуре → наше приложение, сразу вкладка «Телеметрия». */
@@ -624,7 +762,9 @@ object StatusIcons {
             lastIconGeom = key
             AppLog.i(TAG, msg() + " (изменилось)")
         } else {
-            LogKit.trace("ICON_GEOM") { msg() }
+            // H1.5: та же геометрия — строку не печатаем, только счётчик подавления
+            // (одна сводка в минуту, без молчаливой потери).
+            LogKit.suppressed("ICON_GEOM")
         }
     }
 
@@ -705,6 +845,7 @@ object StatusIcons {
             val t = readTempScan().also { reads++ }
             // iter22 §2: число показываем ВСЕГДА, если хоть раз его прочитали
             // (аналогично OEM-панели "10°C"). "--" только при полном отсутствии данных.
+            // F1: подмены на ambient нет — если наружная не читается, честно «н/д».
             val display: Float? = t ?: lastTempC
             if (display != null) {
                 val tStr = fmtOneDecimal(display)
@@ -724,12 +865,12 @@ object StatusIcons {
                 tempStr = "$sign$tStr°"; tempVal = display; tempHas = true
                 lastTempC = display; lastExtTempC = display
             } else {
-                val icon = makeTextIconCex(app, "--", "", Color.WHITE, kind = "temp")
+                val icon = makeTextIconCex(app, "н/д", "", Color.WHITE, kind = "temp")
                 postNotif(app, NOTIF_TEMP, ICON_ID_TEMP, RANK_TEMP,
-                    "Снаружи --°C", "нет данных от VHAL", "StatusIcon_OutsideTemperature", icon,
+                    "Снаружи н/д", "ENV_OUTSIDE_TEMPERATURE недоступен", "StatusIcon_OutsideTemperature", icon,
                     telemetryPi(app, NOTIF_TEMP))
-                tempStr = "--°"; tempHas = true
-                AppLog.w(TAG, "TEMP: no data yet → \"--\" shown")
+                tempStr = "н/д"; tempHas = true
+                AppLog.w(TAG, "TEMP: no data yet → \"н/д\" shown")
             }
         } else { cancel(app, NOTIF_TEMP); AppLog.d(TAG, "TEMP: toggle=off") }
 
@@ -758,10 +899,8 @@ object StatusIcons {
         } else cancel(app, NOTIF_WIFI)
 
 
-        // iter16: после каждого tick проталкиваем РЕАЛЬНЫЕ значения в
-        // persist.sys.hvacdigital.{batt,temp,exttemp,temp_ext}, если соответствующий
-        // тогл включён. Плагин ожидает значения ("98.1", "22.0", "9.7"), а не 0/1 —
-        // поэтому форматируем до одного знака после запятой, batt и temp — с .1f.
+        // iter33h E1: проталкиваем только batt и exttemp (значения %.1f) + via.
+        // `persist.sys.hvacdigital.temp` не пишем: уставку климата плагин читает сам.
         // Если значение ещё не прочитано (первый tick) — не пишем ничего (пропускаем).
         pushHvacDigitalPropsIfEnabled(app)
         return reads
@@ -774,6 +913,14 @@ object StatusIcons {
      */
     /** iter33 B5: последняя отправленная комбинация — setprop только при изменении. */
     @Volatile private var lastPushedHvac: String = ""
+    /** H1: `HVACDIGITAL_PUSH skip reason=unchanged` — не чаще одного раза в 5 минут. */
+    @Volatile private var lastPushSkipLogAtMs: Long = 0L
+    private val PUSH_SKIP_LOG_EVERY_MS = 5 * 60_000L
+
+    /** `via` — round-trip значение, которое пишет само приложение (AdbClient, `persist.sys.hvacdigital.via`). */
+    private fun lastViaForLog(): String = try {
+        Runtime.getRuntime().exec(arrayOf("getprop", SYS_HVAC_VIA)).inputStream.bufferedReader().readText().trim()
+    } catch (t: Throwable) { "н/д" }
 
     private fun pushHvacDigitalPropsIfEnabled(app: Context) {
         val p = prefs(app)
@@ -783,27 +930,33 @@ object StatusIcons {
         val battOn = p.getBoolean(PREF_HVAC_BATT, false)
         val bv = if (battOn) fmt(lastBattPct) ?: return else "0"
         sb.append("setprop $SYS_HVAC_BATT $bv; ")
-        // temp (внутренний климат)
-        val tempOn = p.getBoolean(PREF_HVAC_TEMP, false)
-        val tv = if (tempOn) fmt(lastTempC) ?: return else "0"
-        sb.append("setprop $SYS_HVAC_TEMP $tv; ")
-        // ext_temp — пишем в ОБА свойства (старый и новый плагин)
+        // E1.1 (iter33h): setprop persist.sys.hvacdigital.temp УБРАН. Уставку климата плагин
+        // читает сам (com.flyme.auto.hvacapi.widget.HvacVehicleTempWidget.getPropertyId() →
+        // 358614275 == HVAC_TEMPERATURE_SET, area=1), а наше «значение» уходило в слот климата
+        // и ложилось поверх стандартной полоски.
+        // E1.2: строке состояния нужны от приложения exttemp (наружная, %.1f) и batt;
+        // F2: ключ наружной — ОДИН (`exttemp`), `temp_ext` больше не пишем.
         val extOn = p.getBoolean(PREF_HVAC_EXT_TEMP, false)
         val ev = if (extOn) fmt(lastExtTempC) ?: return else "0"
-        sb.append("setprop $SYS_HVAC_EXT_TEMP_EXT $ev; setprop $SYS_HVAC_EXT_EXTTEMP $ev; ")
+        sb.append("setprop $SYS_HVAC_EXT_EXTTEMP $ev; ")
         // iter33 B5: dirty-флаг. Раньше setprop уходил каждые 15 с «на всякий случай»
         // (44 записи за 10 минут). Теперь — только когда значение реально изменилось.
-        val fingerprint = "batt=" + bv + " temp=" + tv + " ext=" + ev
+        val fingerprint = "batt=" + bv + " ext=" + ev
         if (fingerprint == lastPushedHvac) {
-            AppLog.d(TAG, "HVACDIGITAL_PUSH skip reason=unchanged " + fingerprint)
+            // H1: не чаще одного раза в 5 минут.
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (now - lastPushSkipLogAtMs >= PUSH_SKIP_LOG_EVERY_MS) {
+                lastPushSkipLogAtMs = now
+                AppLog.d(TAG, "HVACDIGITAL_PUSH skip reason=unchanged " + fingerprint)
+            }
             return
         }
-        // verify echo
-        sb.append("echo batt=\$(getprop $SYS_HVAC_BATT) temp=\$(getprop $SYS_HVAC_TEMP) ext_temp=\$(getprop $SYS_HVAC_EXT_TEMP_EXT) exttemp=\$(getprop $SYS_HVAC_EXT_EXTTEMP)")
+        // verify echo — без `temp` (E4: в логе прогона не должно быть temp=)
+        sb.append("echo batt=\$(getprop $SYS_HVAC_BATT) exttemp=\$(getprop $SYS_HVAC_EXT_EXTTEMP) via=\$(getprop $SYS_HVAC_VIA)")
         try {
             val (rc, out) = AdbClient.execute(sb.toString(), 5000)
             if (rc == 0) lastPushedHvac = fingerprint
-            AppLog.i(TAG, "HVACDIGITAL_PUSH rc=$rc batt=$bv temp=$tv exttemp=$ev out=${out.replace('\n',' ').take(200)}")
+            AppLog.i(TAG, "HVACDIGITAL_PUSH rc=$rc batt=$bv exttemp=$ev via=${lastViaForLog()} out=${out.replace('\n',' ').take(200)}")
         } catch (t: Throwable) {
             AppLog.w(TAG, "HVACDIGITAL_PUSH failed: ${t.message}")
         }

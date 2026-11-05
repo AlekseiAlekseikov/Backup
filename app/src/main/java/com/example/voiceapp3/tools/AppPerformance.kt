@@ -697,7 +697,8 @@ object AppPerformance {
     /** iter33f B2: рамки повторов при `UNKNOWN` — не больше 3 раз по 10 с (окно ≤ 60 с). */
     /** iter33g B1: bootTag загрузки, в которой цикл сверки уже выполнялся. */
     private const val JIT_VERIFY_CYCLE_FILE = "jit_verify_cycle"
-    private const val JIT_VERIFY_RETRY_MAX = 3
+    /** iter33h I2: 3 попытки, 2 паузы по 10 с (между ними). Имя — по ревью iter33g. */
+    private const val JIT_VERIFY_ATTEMPTS_MAX = 3
     private const val JIT_VERIFY_RETRY_DELAY_MS = 10_000L
     /** iter33c C1: окно, в котором перезапуск zygote РАЗРЕШЁН (было имя «late start» — наоборот по смыслу). */
     private const val JIT_ZYGOTE_WINDOW_MS = 120_000L
@@ -910,15 +911,21 @@ object AppPerformance {
      *  2. иначе `bootEpoch = System.currentTimeMillis() - elapsedRealtime()` (секунды) —
      *     для него в [JitBootMark.sameLoad] работает допуск ±60 с.
      */
+    /** iter33h I3: тег загрузки не меняется в пределах процесса — кэшируем. */
+    @Volatile private var bootTagCache: String? = null
+
     private fun currentBootTag(): String {
+        bootTagCache?.let { return it }
         val id = runCatching { File("/proc/sys/kernel/random/boot_id").readText().trim() }
             .getOrDefault("")
-        if (id.isNotEmpty()) return id
+        if (id.isNotEmpty()) { bootTagCache = id; return id }
         // iter33e B: формат fallback-тега задаётся ТОЛЬКО в JitBootMark (epochTag) — здесь
         // никаких строковых литералов, иначе `sameLoad` снова перестанет его узнавать.
         // Передаём МИЛЛИСЕКУНДЫ: перевод в секунды — внутри epochTag.
         val epochMs = System.currentTimeMillis() - android.os.SystemClock.elapsedRealtime()
-        return JitBootMark.epochTag(epochMs)
+        val tag = JitBootMark.epochTag(epochMs)
+        bootTagCache = tag
+        return tag
     }
 
     /**
@@ -1047,7 +1054,12 @@ object AppPerformance {
         // но не true»; решение о слове принимает JitBootMark (покрыто тестом).
         val reasonWord = JitBootMark.outcomeReason(outcome, runtime, persist)
         val reason = if (reasonWord.isEmpty()) "" else " reason=$reasonWord"
-        AppLog.i(TAG, "JIT_VERIFY: runtime_after=${kvE(runtime)} persist=${kvE(persist)} source=after_restart " +
+        // iter33h I1: `source=after_restart` — ТОЛЬКО на первой попытке; повторы печатаются
+        // как `JIT_VERIFY: retry attempt=N …` без `source=` (иначе по логу не отличить
+        // первую сверку от повтора, и критерий приёмки «одна строка на сверку» невыполним).
+        val srcField = if (attempt == 0) " source=after_restart" else ""
+        val lineName = if (attempt == 0) "JIT_VERIFY" else "JIT_VERIFY: retry"
+        AppLog.i(TAG, "$lineName runtime_after=${kvE(runtime)} persist=${kvE(persist)}$srcField " +
             "result=${outcome.name}$reason boot_tag=$bootTag attempt=${attempt + 1}")
         when (outcome) {
             JitBootMark.VerifyOutcome.OK -> {
@@ -1063,9 +1075,11 @@ object AppPerformance {
                 jitVerifyScheduled.set(false)
             }
             JitBootMark.VerifyOutcome.UNKNOWN -> {
-                if (attempt + 1 >= JIT_VERIFY_RETRY_MAX) {
-                    AppLog.i(TAG, "JIT_VERIFY: result=UNKNOWN retries=$JIT_VERIFY_RETRY_MAX reason=no_channel " +
-                        "boot_tag=$bootTag (намерение оставлено следующему старту)")
+                if (attempt + 1 >= JIT_VERIFY_ATTEMPTS_MAX) {
+                    // iter33h I2: «3 попытки, 2 паузы по 10 с» — словами ревью.
+                    AppLog.i(TAG, "JIT_VERIFY: result=UNKNOWN attempts=$JIT_VERIFY_ATTEMPTS_MAX " +
+                        "pauses=${JIT_VERIFY_ATTEMPTS_MAX - 1} delay_ms=$JIT_VERIFY_RETRY_DELAY_MS " +
+                        "reason=no_channel boot_tag=$bootTag (намерение оставлено следующему старту)")
                     restorePendingIntent(app, claimed)
                     jitVerifyScheduled.set(false)
                 } else {

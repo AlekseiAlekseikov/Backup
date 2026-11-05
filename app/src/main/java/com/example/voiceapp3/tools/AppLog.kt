@@ -256,11 +256,70 @@ object AppLog {
         if (thrown != null) Log.e(TAG_BASE, "flushEarly: ${thrown.message}")
     }
 
+    // ─── H1.6 (iter33h): жёсткий бюджет файла-лога ───────────────────────────────────────
+    /** Лимит: 150 КБ за 10 минут. */
+    private const val BUDGET_BYTES = 150 * 1024L
+    private const val BUDGET_WINDOW_MS = 10 * 60_000L
+    /** В режиме trim — одна сводка в минуту. */
+    private const val TRIM_SUMMARY_MS = 60_000L
+
+    private var budgetWindowStartMs = 0L
+    private var budgetBytes = 0L
+    private var budgetTrim = false
+    private var budgetDropped = 0L
+    private var budgetLastSummaryMs = 0L
+
+    /**
+     * Решение по строке: писать или свернуть.
+     * Возвращает `true`, если строку пишем. При превышении бюджета один раз печатает
+     * `LOG_BUDGET exceeded=… action=trim` и переходит на одну строку-сводку в минуту.
+     * [len] — длина строки в байтах UTF-8.
+     */
+    private fun budgetAllow(len: Int): Boolean {
+        val now = android.os.SystemClock.elapsedRealtime()
+        synchronized(lock) {
+            if (budgetWindowStartMs == 0L) budgetWindowStartMs = now
+            if (now - budgetWindowStartMs > BUDGET_WINDOW_MS) {
+                budgetWindowStartMs = now
+                budgetBytes = 0L
+                budgetTrim = false
+                budgetDropped = 0L
+            }
+            if (!budgetTrim) {
+                budgetBytes += len
+                if (budgetBytes > BUDGET_BYTES) {
+                    budgetTrim = true
+                    budgetLastSummaryMs = 0L
+                    budgetNotice = "LOG_BUDGET exceeded=$budgetBytes action=trim window=10min limit=${BUDGET_BYTES}"
+                    return true     // сама строка-уведомление пишется этим вызовом
+                }
+                return true
+            }
+            budgetDropped++
+            if (now - budgetLastSummaryMs >= TRIM_SUMMARY_MS) {
+                budgetLastSummaryMs = now
+                budgetNotice = "LOG_BUDGET action=trim dropped=$budgetDropped bytes=$budgetBytes (сводка раз в минуту)"
+                return true
+            }
+            return false
+        }
+    }
+
+    /** Строка-уведомление бюджета, подменяющая очередную запись. */
+    @Volatile private var budgetNotice: String? = null
+
     /** Прямая запись строки в файл (только после init). */
     private fun writeRaw(lvl: String, tag: String, msg: String, th: Throwable?) {
         val c = ctx ?: return
         var thrown: Throwable? = null
-        val line = formatLine(lvl, tag, msg, null)
+        var line = formatLine(lvl, tag, msg, null)
+        // H1.6: бюджет считается по уже сформированной строке; уведомление бюджета
+        // подменяет собой очередную запись (порядок важен: сначала budgetAllow).
+        val allowed = budgetAllow(line.toByteArray(Charsets.UTF_8).size)
+        val notice = budgetNotice
+        budgetNotice = null
+        if (notice != null) line = formatLine("INFO", "CENTRAL_LogBudget", notice, null)
+        else if (!allowed) return
         // iter16: собираем "шапку" (BUILD/App INIT) — пишем её в начало каждого
         // нового/повёрнутого файла, чтобы после ротации версия не терялась.
         if (isHeaderLine(tag, msg)) {

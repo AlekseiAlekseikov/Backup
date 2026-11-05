@@ -95,8 +95,8 @@ object AdbClient {
     private const val RETRY_AFTER_MS = 60_000L    // отложенный ретрай (мандат §6)
     // iter30 P0-E: свойства, которые приложение пишет само (round-trip без смены смысла)
     private const val PROP_BATT = "persist.sys.hvacdigital.batt"
-    private const val PROP_TEMP = "persist.sys.hvacdigital.temp"
-    private const val PROP_EXT_TEMP = "persist.sys.hvacdigital.temp_ext"
+    // iter33h F2: ключ наружной — ОДИН (`exttemp`), как в референсе; `temp_ext` не используем.
+    private const val PROP_EXT_TEMP = "persist.sys.hvacdigital.exttemp"
     private const val PROP_VIA = "persist.sys.hvacdigital.via"
 
     /**
@@ -376,6 +376,8 @@ object AdbClient {
             LogKit.setThreadOp(job.op)
             // iter33b B3.2: кольцо трассировки ЭТОЙ команды — при провале печатается целиком.
             LogKit.beginJobTrace()
+            // iter33h H1.2: счётчик checksum_skipped живёт в границах команды.
+            resetChecksumSkip()
             val out = try {
                 runCommand(job.cmd, job.timeoutMs, job.expectRoot)
             } catch (t: Throwable) {
@@ -391,6 +393,8 @@ object AdbClient {
                 // iter33 A1: rc — НАСТОЯЩИЙ код возврата команды на устройстве (а не «канал ответил»).
                 AppLog.d(TAG, "← execute dt=${dt}ms rc=${out.first} len=${out.second.length} port=${workingPort.get()} state=${state.get()} cmd=${job.cmd.replace('\n', ' ').take(120)}")
                 LogKit.noteJobRc(out.first)
+                // iter33h H1.2: итог по пропущенным контрольным суммам — одной строкой на команду.
+                reportChecksumSkip()
                 // iter33b B3.2: провал — повтор трассировки ЭТОЙ команды (hex+ASCII), пока op ещё жив.
                 if (out.first != 0) LogKit.failJobTrace(out.first, "rc")
             } finally {
@@ -977,11 +981,12 @@ object AdbClient {
         val match = got == unique
         AppLog.i(TAG, "EXEC_PROP key=diag sent=$unique got=${got.ifEmpty { "(empty)" }} match=$match rc=$rc out=${out.replace("\n", " ").take(120)} err=${err.replace("\n", " ").take(120)}")
         if (match) ok++
-        // 2) три HVAC-свойства: round-trip текущего значения.
+        // 2) два HVAC-свойства: round-trip текущего значения.
+        // iter33h E1: `persist.sys.hvacdigital.temp` приложение больше не пишет (уставку климата
+        // плагин читает сам), поэтому round-trip по нему убран — проверяем batt и exttemp.
         for ((key, prop) in listOf(
             "batt" to PROP_BATT,
-            "temp" to PROP_TEMP,
-            "ext_temp" to PROP_EXT_TEMP,
+            "exttemp" to PROP_EXT_TEMP,
         )) {
             val cur = runShellFallback("getprop $prop", 2000).trim()
             if (cur.isEmpty()) {
@@ -1011,6 +1016,22 @@ object AdbClient {
         } else {
             AppLog.i(TAG, "EXEC_PROP via=app skipped reason=propwrite_denied")
         }
+    }
+
+    /** H1.2: `checksum_skipped` — не более одной строки на команду. */
+    @Volatile private var checksumSkippedLogged = false
+    @Volatile private var checksumSkippedCount = 0
+
+    /** H1.2: сброс перед командой; итог — `checksum_skipped total=N` (если было больше одного). */
+    private fun resetChecksumSkip() {
+        checksumSkippedLogged = false
+        checksumSkippedCount = 0
+    }
+
+    private fun reportChecksumSkip() {
+        if (checksumSkippedCount > 0) AppLog.d(TAG, "ADB_RX note=checksum_skipped total=${checksumSkippedCount + 1}")
+        checksumSkippedCount = 0
+        checksumSkippedLogged = false
     }
 
     /** sh-команда с РАЗДЕЛЬНЫМИ stdout и stderr (мандат §5 требует err=… в логе). */
@@ -1196,10 +1217,13 @@ object AdbClient {
         val payload = "$banner\u0000".toByteArray(StandardCharsets.UTF_8)
         val hdrHex = msgHeaderHex(CNXN, version, maxData, payload)
         writeMsg(os, CNXN, version, maxData, payload)
-        // iter33 C3: первые 20 на сеанс — построчно, дальше ADB_TRACE_SUPPRESSED со счётчиком.
-        LogKit.traceAdb("ADB_TX") {
-            "ADB_TX cmd=CNXN arg0=0x${"%08x".format(version)} arg1=$maxData variant=$variant len=${payload.size} hex4=${hex4Of(CNXN)} ascii=${asciiOf(CNXN)} sum=${checksumFor(payload)} hex=$hdrHex"
-        }
+        // H1.1: одна строка на соединение, только первые 3 соединения за процесс.
+        LogKit.traceHandshake { "ADB_HANDSHAKE ok=1 maxdata=$maxData ver=0x${"%08x".format(version)} banner=${banner.take(24)} variant=$variant" }
+        // H1.3: краткая форма — без hex4/ascii/sum/hex (полная уходит только в REPLAY).
+        LogKit.traceAdb(
+            "ADB_TX",
+            "ADB_TX cmd=CNXN arg0=0x${"%08x".format(version)} arg1=$maxData variant=$variant len=${payload.size}",
+            "ADB_TX cmd=CNXN arg0=0x${"%08x".format(version)} arg1=$maxData variant=$variant len=${payload.size} hex4=${hex4Of(CNXN)} ascii=${asciiOf(CNXN)} sum=${checksumFor(payload)} hex=$hdrHex")
         var authSteps = 0
         while (true) {
             val left = deadline - System.currentTimeMillis()
@@ -1210,9 +1234,10 @@ object AdbClient {
                 AppLog.e(TAG, "ADB_RX attempt=$attempt variant=$variant cmd=silent hex=(none) dt=${System.currentTimeMillis() - tMsg}ms err=${e.javaClass.simpleName}")
                 return "silent (${e.javaClass.simpleName})"
             }
-            LogKit.traceAdb("ADB_RX") {
-                "ADB_RX attempt=$attempt variant=$variant cmd=${cmdName(msg.cmd)} hex4=${hex4Of(msg.cmd)} ascii=${asciiOf(msg.cmd)} arg0=0x${"%08x".format(msg.arg0)} arg1=${msg.arg1} len=${msg.payload.size} hex=${hexOf(msg.payload, minOf(24, msg.payload.size))} dt=${System.currentTimeMillis() - tMsg}ms"
-            }
+            LogKit.traceAdb(
+                "ADB_RX",
+                "ADB_RX attempt=$attempt variant=$variant cmd=${cmdName(msg.cmd)} arg0=0x${"%08x".format(msg.arg0)} arg1=${msg.arg1} len=${msg.payload.size} dt=${System.currentTimeMillis() - tMsg}ms",
+                "ADB_RX attempt=$attempt variant=$variant cmd=${cmdName(msg.cmd)} hex4=${hex4Of(msg.cmd)} ascii=${asciiOf(msg.cmd)} arg0=0x${"%08x".format(msg.arg0)} arg1=${msg.arg1} len=${msg.payload.size} hex=${hexOf(msg.payload, minOf(24, msg.payload.size))} dt=${System.currentTimeMillis() - tMsg}ms")
             when (msg.cmd) {
                 CNXN -> {
                     val bannerRx = try { String(msg.payload, Charsets.UTF_8).trim() } catch (_: Throwable) { "" }
@@ -1866,7 +1891,14 @@ object AdbClient {
         // iter32 §1а.1: прошивка ГУ присылает data_check = 0 при len > 0 (в т.ч. на CNXN len=112).
         // Нулевая сумма — валидна ВСЕГДА; строгая проверка остаётся для ненулевой.
         if (sum == 0) {
-            if (s != 0) AppLog.d(TAG, "ADB_RX note=checksum_skipped len=$len sum=0 calc=$s cmd=${asciiOf(cmd)}")
+            // H1.2: ОДНА строка на команду (не на каждый пакет): первая — с деталями,
+            // остальные только увеличивают счётчик, итог печатается по завершении команды.
+            if (s != 0) {
+                if (!checksumSkippedLogged) {
+                    checksumSkippedLogged = true
+                    AppLog.d(TAG, "ADB_RX note=checksum_skipped first=1 len=$len sum=0 calc=$s cmd=${asciiOf(cmd)}")
+                } else checksumSkippedCount++
+            }
         } else {
             check(s == sum) { "Bad ADB checksum ($s vs $sum) cmd=${asciiOf(cmd)} len=$len" }
         }

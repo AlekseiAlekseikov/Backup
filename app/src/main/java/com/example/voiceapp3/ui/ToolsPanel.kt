@@ -278,6 +278,13 @@ class ToolsPanel(
         addDiv()
         // iter22 §3 + §4: страховка на случай VIA=nenhum — снять битый bind-mount
         // плагина и перезапустить SystemUI. РЕФЕРЕНС: w0/o#c (umount в цикле + kill sysui).
+        // iter33h F1.3: read-only разведка температур (9 свойств, по строке TEMP_PROBE на свойство).
+        addOneShot("tempProbe_btn", "Температуры: разведка",
+            "Один проход без записи: ENV_OUTSIDE_TEMPERATURE, AC_AMBIENT_TEMP(+INVALID), AC_INSIDE_TEMP, " +
+                "HVAC_IN_OUT_TEMP, HU_ENVIRONMENTAL_TEMP, TEMPERATURE_STATE, HVAC_TEMPERATURE_SET[49/68]. " +
+                "Сравните с приборкой; если число отличается — «Отправить» (уйдёт в отчёт).",
+            "tempProbe_btn")
+        addDiv()
         addOneShot("hvac_restore_btn", "Вернуть панель SystemUI",
             "Снимет зависший bind-mount плагина, перезапустит SystemUI и проверит /proc/mounts. Нажимайте, если шторка Системы чёрная или не открывается.",
             "hvacdigital.plugin.restore")
