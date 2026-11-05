@@ -28,6 +28,28 @@ object JitBootMark {
     /** Допуск для `bootEpoch`-тегов (мс). */
     const val DEFAULT_TOLERANCE_MS = 60_000L
 
+    /**
+     * iter33e B: префикс fallback-тега. Формат задаётся ТОЛЬКО здесь —
+     * `AppPerformance.currentBootTag()` обязан возвращать [epochTag], строковых литералов
+     * формата вне этого объекта быть не должно.
+     *
+     * Почему это было дефектом: `currentBootTag()` возвращал `"epoch1700000000"`, а `sameLoad`
+     * делал `tag.toLongOrNull()` ⇒ `null` ⇒ `false`. Допуск ±60 с не работал НИКОГДА, и на
+     * прошивке без читаемого `boot_id` опознание загрузки не срабатывало вовсе.
+     */
+    const val EPOCH_PREFIX = "epoch"
+
+    /**
+     * Тег из epoch-времени в МИЛЛИСЕКУНДАХ (`System.currentTimeMillis() - elapsedRealtime()`).
+     * В самом теге — СЕКУНДЫ (короче и не зависит от точности часов).
+     * Единицы важны: допуск [DEFAULT_TOLERANCE_MS] задан в мс, сравнение идёт в секундах —
+     * иначе ±60 000 «мс» превращались бы в ±16 часов и «другая загрузка» считалась бы своей.
+     */
+    fun epochTag(epochMs: Long): String = EPOCH_PREFIX + (epochMs / 1000L)
+
+    fun stripEpochPrefix(tag: String): String =
+        if (tag.startsWith(EPOCH_PREFIX)) tag.removePrefix(EPOCH_PREFIX) else tag
+
     /** Метка в новом формате. `uptimeMs` пишется для диагностики (в опознании не участвует). */
     fun format(tag: String, uptimeMs: Long): String = "$tag:$uptimeMs"
 
@@ -53,15 +75,37 @@ object JitBootMark {
         val tag = m.substring(0, sep).trim()
         if (tag.isEmpty()) return false
         if (tag == cur) return true
-        val a = tag.toLongOrNull() ?: return false
-        val b = cur.toLongOrNull() ?: return false
-        return kotlin.math.abs(a - b) <= toleranceMs
+        // iter33e B: сравнение идёт по «голому» значению с ОБЕИХ сторон, поэтому допуск
+        // работает и для `epoch…`, и для меток вида `epoch…:40000` этой итерации.
+        // Для boot_id (UUID-подобная строка с дефисами) toLongOrNull даёт null ⇒ разные загрузки.
+        val a = stripEpochPrefix(tag).toLongOrNull() ?: return false
+        val b = stripEpochPrefix(cur).toLongOrNull() ?: return false
+        // Тег хранит СЕКУНДЫ ⇒ допуск переводим в секунды (значение и смысл ±60 с сохранены).
+        val toleranceSec = (toleranceMs / 1000L).coerceAtLeast(1L)
+        return kotlin.math.abs(a - b) <= toleranceSec
     }
 
     /** Старый формат (число без `:`) — его надо переписать в новый (A2). */
     fun isLegacy(marker: String): Boolean {
         val m = marker.trim()
         return m.isNotEmpty() && m.lastIndexOf(':') < 0 && m.toLongOrNull() != null
+    }
+
+    /** iter33e A6: что делать с файлом-намерением `jit_pending_verify`. */
+    enum class PendingDecision { NONE, STALE, VERIFY }
+
+    /**
+     * Классификация намерения сверки после перезапуска zygote.
+     *  • [PendingDecision.NONE]   — файла нет (или пуст): делать нечего;
+     *  • [PendingDecision.STALE]  — намерение от ДРУГОЙ загрузки: удалить, `reason=pending_stale`;
+     *  • [PendingDecision.VERIFY] — намерение этой загрузки: прочитать `getprop` и напечатать итог.
+     *
+     * Использует ту же [sameLoad], что и guard маршрута 2 — второй копии логики нет.
+     */
+    fun pendingDecision(pending: String, currentTag: String): PendingDecision = when {
+        pending.isBlank() -> PendingDecision.NONE
+        sameLoad(pending, currentTag) -> PendingDecision.VERIFY
+        else -> PendingDecision.STALE
     }
 
     /** Uptime из метки, если он там есть (для лога), иначе -1. */

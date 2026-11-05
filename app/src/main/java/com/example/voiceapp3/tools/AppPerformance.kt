@@ -684,6 +684,10 @@ object AppPerformance {
     private const val PROP_USEJIT_PROFILES = "dalvik.vm.usejitprofiles"
     private const val PROP_PERSIST_USEJIT = "persist.sys.dalvik.vm.usejit"
     private const val JIT_BOOT_MARKER = "jit_boot_attempt"
+    /** iter33e A2: намерение «после перезапуска zygote нужно сверить runtime». */
+    private const val JIT_PENDING_FILE = "jit_pending_verify"
+    /** iter33e A4: bootTag, для которого положительный `JIT_PROBE` уже напечатан. */
+    private const val JIT_VERIFIED_FILE = "jit_verified"
     /** iter33c C1: окно, в котором перезапуск zygote РАЗРЕШЁН (было имя «late start» — наоборот по смыслу). */
     private const val JIT_ZYGOTE_WINDOW_MS = 120_000L
 
@@ -755,11 +759,13 @@ object AppPerformance {
             persist = jitProps().second
             backfilled = true
         }
-        val persistPresent = persistBefore.isNotEmpty()
+        // iter33e C1: `persist_present` убран — он дублировал `persist_before`. Теперь два разных
+        // факта и явный признак дозаписи: что было ДО и что стало ПОСЛЕ.
         val persistBeforeWire = if (persistBefore.isEmpty()) "empty" else LogKit.kv(persistBefore)
+        val persistAfterWire = if (persist.isEmpty()) "empty" else LogKit.kv(persist)
         val backfillWire = if (backfilled) "yes" else "no"
-        val probeCommon = "persist_before=$persistBeforeWire persist_present=$persistPresent backfill=$backfillWire " +
-            "runtime=$runtime persist=$persist"
+        val probeCommon = "persist_before=$persistBeforeWire persist_after=$persistAfterWire " +
+            "backfill=$backfillWire runtime=$runtime"
 
         if (runtime == desired) {
             // ── B1: честная строка ───────────────────────────────────────────────
@@ -816,12 +822,25 @@ object AppPerformance {
         // Метка этой попытки: идентификатор загрузки + uptime (A2).
         runCatching { markerFile.writeText(JitBootMark.format(bootTag, up)) }
 
+        // ── iter33e A1/A5: порядок строго «метка → лог → вызов» ──────────────
+        // Метка `jit_boot_attempt` уже записана выше (до этой точки) — поэтому после рестарта
+        // `same_load=true` и повторной попытки в этой загрузке не будет.
+        // Наш процесс — потомок zygote: после `ctl.restart zygote` он умирает, поэтому строка
+        // ПРО ПОПЫТКУ должна попасть на диск ДО вызова, иначе доказательства не останется.
+        AppLog.i(TAG, "JIT_BOOT: zygote_restart intent=pending boot_tag=$bootTag uptime_ms=$up " +
+            "marker=$JIT_BOOT_MARKER")
+        // Оба файла синхронно: `AppLog.i` → enqueueOrWrite → writeRaw (FileWriter+flush+close под
+        // synchronized, без очереди), `flushOpsNow` — выжимка.
+        runCatching { File(app.filesDir, JIT_PENDING_FILE).writeText(JitBootMark.format(bootTag, up)) }
+        LogKit.flushOpsNow()
+
         // Ровно три команды, без svc wifi / umount /data/app / sleep.
         val pidBefore = runCatching {
             AdbClient.execute("pidof zygote; pidof zygote64", 4000, expectRoot = false).second.trim()
         }.getOrDefault("")
         val (rc, out) = runSuCommand(
             "setprop $PROP_USEJIT true; setprop $PROP_USEJIT_PROFILES true; setprop ctl.restart zygote")
+        // Может не успеть: строка-доказательство уже выше (A1).
         AppLog.i(TAG, "JIT_BOOT: pref=on desired=true runtime_before=$runtime action=setprop+zygote " +
             "uptime_ms=$up marker=$JIT_BOOT_MARKER rc=$rc out=${LogKit.kv(out.take(120))}")
 
@@ -878,20 +897,71 @@ object AppPerformance {
         val id = runCatching { File("/proc/sys/kernel/random/boot_id").readText().trim() }
             .getOrDefault("")
         if (id.isNotEmpty()) return id
-        val epochSec = (System.currentTimeMillis() - android.os.SystemClock.elapsedRealtime()) / 1000L
-        return "epoch$epochSec"
+        // iter33e B: формат fallback-тега задаётся ТОЛЬКО в JitBootMark (epochTag) — здесь
+        // никаких строковых литералов, иначе `sameLoad` снова перестанет его узнавать.
+        // Передаём МИЛЛИСЕКУНДЫ: перевод в секунды — внутри epochTag.
+        val epochMs = System.currentTimeMillis() - android.os.SystemClock.elapsedRealtime()
+        return JitBootMark.epochTag(epochMs)
     }
 
     /**
-     * Watchdog: ТОЛЬКО сверка `getprop`, без записи. Вызывается не чаще раза в 5 тиков
+     * iter33e A2/A3 — сверка ПОСЛЕ перезапуска zygote.
+     *
+     * Зачем: наш процесс — потомок zygote, поэтому после `ctl.restart zygote` ни `postDelayed(20 c)`,
+     * ни второй проход boot-ветки не наступают (сервис поднимается по `START_STICKY` с `intent == null`,
+     * а boot-ветка требует extra). Значит сверка должна жить на САМОМ старте сервиса.
+     *
+     * Вызывается из `VoiceAssistantService.onCreate` и `onStartCommand` ДО проверки
+     * `EXTRA_BOOT_RESTORE`. Работа — на `BgWorker`, главный поток не участвует.
+     * Ничего не пишет в систему: только читает `getprop` и удаляет свой файл-намерение.
+     */
+    fun checkPendingZygoteVerify(context: Context) {
+        val app = context.applicationContext
+        val pending = runCatching { File(app.filesDir, JIT_PENDING_FILE).readText().trim() }.getOrDefault("")
+        val bootTag = currentBootTag()
+        when (JitBootMark.pendingDecision(pending, bootTag)) {
+            JitBootMark.PendingDecision.NONE -> Unit
+            JitBootMark.PendingDecision.STALE -> {
+                runCatching { File(app.filesDir, JIT_PENDING_FILE).delete() }
+                AppLog.i(TAG, "JIT_VERIFY: skip reason=pending_stale pending=${LogKit.kv(pending)} boot_tag=$bootTag")
+            }
+            JitBootMark.PendingDecision.VERIFY -> BgWorker.post("AppPerformance.jitVerifyAfterRestart") {
+                val (runtime, persist) = jitProps()
+                val ok = runtime == "true"
+                AppLog.i(TAG, "JIT_VERIFY: runtime_after=$runtime persist=$persist source=after_restart " +
+                    "result=${if (ok) "OK" else "FAILED"} boot_tag=$bootTag")
+                if (ok) {
+                    // A3: этот факт печатается ЗДЕСЬ (второй проход после рестарта не наступает).
+                    AppLog.i(TAG, "JIT_BOOT: match_after_zygote runtime=$runtime persist=$persist " +
+                        "(поднят перезапуском zygote в этой загрузке)")
+                }
+                runCatching { File(app.filesDir, JIT_PENDING_FILE).delete() }
+            }
+        }
+    }
+
+    /**
+     * Watchdog: ТОЛЬКО сверка `getprop`, без записи в систему. Вызывается не чаще раза в 5 тиков
      * (см. `VoiceAssistantService.settingsWatchdog`).
+     *
+     * iter33e A4: при успехе печатается ОДНА положительная строка за загрузку — иначе по логу
+     * нельзя ответить «JIT поднят», видно только молчание. Флаг хранится в `files/jit_verified`
+     * (не в памяти: процесс перезапускается). Это свой файл приложения, не системное свойство.
      */
     fun verifyJitOnly(context: Context) {
         val app = context.applicationContext
         if (!isAutoOptimizeEnabled(app)) return
         val (runtime, persist) = jitProps()
-        if (runtime == "true") return
-        AppLog.i(TAG, "JIT_PROBE: runtime=$runtime persist=$persist desired=true (read-only, без записи)")
+        if (runtime != "true") {
+            AppLog.i(TAG, "JIT_PROBE: runtime=$runtime persist=$persist desired=true (read-only, без записи)")
+            return
+        }
+        val tagNow = currentBootTag()
+        val verifiedFile = File(app.filesDir, JIT_VERIFIED_FILE)
+        val seen = runCatching { verifiedFile.readText().trim() }.getOrDefault("")
+        if (seen == tagNow) return
+        runCatching { verifiedFile.writeText(tagNow) }
+        AppLog.i(TAG, "JIT_PROBE: runtime=true persist=$persist (уже поднят, read-only) boot_tag=$tagNow")
     }
 
     private fun runSuCommand(command: String): ExecResult {

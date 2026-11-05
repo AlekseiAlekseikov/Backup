@@ -6,10 +6,12 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * iter33d A4 — регресс-тесты опознания загрузки для метки `jit_boot_attempt`.
+ * iter33d A4 / iter33e A6+B — регресс-тесты опознания загрузки и намерения сверки.
  *
- * Главный тест — [differentBootDoesNotBlock]: именно он ловит дефект третьей пересборки,
- * где `prev in 1..up` выдавало метку прошлой загрузки за попытку в текущей.
+ * Главный тест — [differentBootDoesNotBlock]: он ловит дефект третьей пересборки,
+ * где «метка не больше uptime» выдавалось за попытку в текущей загрузке.
+ * Тесты epoch-допуска гоняют ТОЛЬКО прод-функции ([JitBootMark.epochTag], [JitBootMark.format]) —
+ * голых чисел в тестах нет, иначе проверялось бы не то, что производит `currentBootTag()`.
  */
 class JitBootMarkTest {
 
@@ -17,8 +19,7 @@ class JitBootMarkTest {
     @Test
     fun differentBootDoesNotBlock() {
         assertFalse(JitBootMark.sameLoad("boot-A:40000", "boot-B"))
-        // «Было» при этом же входе: prev=40000 в диапазоне 1..up=55000 ⇒ SKIP. «Стало»: попытка разрешена.
-        assertFalse(JitBootMark.sameLoad(JitBootMark.format("boot-A", 40_000), "boot-B", ))
+        assertFalse(JitBootMark.sameLoad(JitBootMark.format("boot-A", 40_000), "boot-B"))
     }
 
     // 2. Та же загрузка — попытка уже была.
@@ -28,11 +29,14 @@ class JitBootMarkTest {
         assertTrue(JitBootMark.sameLoad(JitBootMark.format("boot-A", 40_000), "boot-A"))
     }
 
-    // 3. Та же загрузка и БОЛЬШИЙ uptime — всё равно «попытка была» (второй проход через 30 с).
+    // 3. iter33e C2: опознание НЕ зависит от uptime — проверяем оба направления:
+    //    метка с меньшим uptime (10 с) при текущем 55 с и наоборот.
     @Test
-    fun sameBootHigherUptimeStillBlocks() {
-        assertTrue(JitBootMark.sameLoad("boot-A:40000", "boot-A"))
-        assertEquals(40_000L, JitBootMark.uptimeOf("boot-A:40000"))
+    fun sameBootIgnoresUptime() {
+        assertTrue(JitBootMark.sameLoad(JitBootMark.format("boot-A", 10_000), "boot-A"))   // меньше
+        assertTrue(JitBootMark.sameLoad(JitBootMark.format("boot-A", 55_000), "boot-A"))   // больше
+        assertTrue(JitBootMark.sameLoad(JitBootMark.format("boot-A", 10_000), "boot-A"))
+        assertEquals(10_000L, JitBootMark.uptimeOf(JitBootMark.format("boot-A", 10_000)))
     }
 
     // 4. Старый формат (число без `:`) — консервативно «эта загрузка», плюс признак legacy.
@@ -44,36 +48,80 @@ class JitBootMarkTest {
         assertEquals(40_000L, JitBootMark.uptimeOf("40000"))
     }
 
-    // 5. Пустое/мусорное — не падает, результат ОПРЕДЕЛЁН (описан в отчёте):
-    //    нет тега или он не разбирается ⇒ «попытки не было» (false, попытка разрешена);
-    //    тег разобрался и совпал с текущим ⇒ true, даже если uptime в метке мусорный —
-    //    для опознания загрузки uptime не нужен, он только для диагностики.
+    // 5. Пустое/мусорное — не падает, результат определён (см. «Честные пробелы» в отчёте).
     @Test
     fun emptyOrGarbageIsNotSameLoad() {
         for (m in listOf("", "   ", ":", ":40000", "abc", "boot-A", "::")) {
             assertFalse("метка '$m'", JitBootMark.sameLoad(m, "boot-A"))
         }
-        assertFalse(JitBootMark.sameLoad("boot-A:1", ""))          // нет текущего тега — опознать нельзя
+        assertFalse(JitBootMark.sameLoad("boot-A:1", ""))
         assertFalse(JitBootMark.isLegacy("abc"))
         assertFalse(JitBootMark.isLegacy("boot-A:"))
-        // Тег совпал — это та же загрузка, чем бы ни был хвост после ':'.
         assertTrue(JitBootMark.sameLoad("boot-A:", "boot-A"))
         assertTrue(JitBootMark.sameLoad("boot-A:not-a-number", "boot-A"))
         assertEquals(-1L, JitBootMark.uptimeOf("boot-A:"))
     }
 
-    // 6. epoch-теги: допуск ±60 с.
+    // 6. iter33e B: epoch-допуск проверяется ПРОД-функциями (epochTag + format), не голыми числами.
     @Test
     fun epochTolerance() {
-        val bootEpoch = 1_700_000_000_000L
-        // Подвод часов на 30 с — всё ещё та же загрузка.
-        assertTrue(JitBootMark.sameLoad("${bootEpoch}:40000", "${bootEpoch + 30_000}"))
-        assertTrue(JitBootMark.sameLoad("${bootEpoch}:40000", "${bootEpoch - 30_000}"))
-        // Разница 5 минут — уже другая загрузка.
-        assertFalse(JitBootMark.sameLoad("${bootEpoch}:40000", "${bootEpoch + 300_000}"))
+        // t — в миллисекундах, как `System.currentTimeMillis() - elapsedRealtime()` в проде.
+        val t = 1_700_000_000_000L
+        // ±30 с — та же загрузка (подвод часов/NTP не ломает опознание).
+        assertTrue(JitBootMark.sameLoad(JitBootMark.format(JitBootMark.epochTag(t), 40_000),
+            JitBootMark.epochTag(t + 30_000)))
+        assertTrue(JitBootMark.sameLoad(JitBootMark.format(JitBootMark.epochTag(t), 40_000),
+            JitBootMark.epochTag(t - 30_000)))
+        // 5 минут — уже другая загрузка (300 000 мс = 300 с > допуска 60 с).
+        assertFalse(JitBootMark.sameLoad(JitBootMark.format(JitBootMark.epochTag(t), 40_000),
+            JitBootMark.epochTag(t + 300_000)))
+        assertFalse(JitBootMark.sameLoad(JitBootMark.format(JitBootMark.epochTag(t), 40_000),
+            JitBootMark.epochTag(t + 90_000)))
+        // boot_id-тег и epoch-тег — разные пространства имён.
+        assertFalse(JitBootMark.sameLoad(JitBootMark.format(JitBootMark.epochTag(t), 40_000), "boot-A"))
         // Допуск можно сузить явно.
-        assertFalse(JitBootMark.sameLoad("${bootEpoch}:40000", "${bootEpoch + 30_000}", toleranceMs = 1_000L))
-        // Числовой тег против boot_id-тега — разные пространства имён ⇒ другая загрузка.
-        assertFalse(JitBootMark.sameLoad("boot-A:40000", "$bootEpoch"))
+        assertFalse(JitBootMark.sameLoad(JitBootMark.format(JitBootMark.epochTag(t), 40_000),
+            JitBootMark.epochTag(t + 30_000), toleranceMs = 1_000L))
+    }
+
+    // 6b. iter33e B: формат epoch-тега — прод-функция, префикс снимается и значение парсится.
+    @Test
+    fun epochTagFormatIsProductionLike() {
+        val tag = JitBootMark.epochTag(1_700_000_000_000L)
+        assertTrue(tag.startsWith(JitBootMark.EPOCH_PREFIX))
+        assertEquals("1700000000", JitBootMark.stripEpochPrefix(tag))
+        assertTrue(JitBootMark.stripEpochPrefix(tag).toLongOrNull() != null)
+        // boot_id-тег префикса не имеет и не портится.
+        assertEquals("boot-A", JitBootMark.stripEpochPrefix("boot-A"))
+        // Старая метка `epoch…:40000` этой итерации тоже распознаётся.
+        assertTrue(JitBootMark.sameLoad(JitBootMark.format(tag, 40_000), tag))
+    }
+
+    // 7. iter33e A6: классификация намерения сверки после перезапуска zygote.
+    @Test
+    fun pendingDecisionNoneWhenEmpty() {
+        assertEquals(JitBootMark.PendingDecision.NONE, JitBootMark.pendingDecision("", "boot-A"))
+        assertEquals(JitBootMark.PendingDecision.NONE, JitBootMark.pendingDecision("   ", "boot-A"))
+    }
+
+    @Test
+    fun pendingDecisionStaleForOtherBoot() {
+        val other = JitBootMark.format("boot-OLD", 40_000)
+        assertEquals(JitBootMark.PendingDecision.STALE, JitBootMark.pendingDecision(other, "boot-NEW"))
+        // epoch-намерение прошлой загрузки (разница 5 минут) тоже STALE.
+        assertEquals(JitBootMark.PendingDecision.STALE,
+            JitBootMark.pendingDecision(JitBootMark.format(JitBootMark.epochTag(1_700_000_000_000L), 40_000),
+                JitBootMark.epochTag(1_700_000_300_000L)))
+    }
+
+    @Test
+    fun pendingDecisionVerifyForSameBoot() {
+        assertEquals(JitBootMark.PendingDecision.VERIFY,
+            JitBootMark.pendingDecision(JitBootMark.format("boot-A", 40_000), "boot-A"))
+        assertEquals(JitBootMark.PendingDecision.VERIFY,
+            JitBootMark.pendingDecision(JitBootMark.format(JitBootMark.epochTag(1_700_000_000_000L), 40_000),
+                JitBootMark.epochTag(1_700_000_030_000L)))
+        // legacy-намерение (число без ':') — консервативно VERIFY.
+        assertEquals(JitBootMark.PendingDecision.VERIFY, JitBootMark.pendingDecision("40000", "boot-A"))
     }
 }

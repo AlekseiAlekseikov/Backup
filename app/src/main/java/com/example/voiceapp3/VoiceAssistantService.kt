@@ -260,6 +260,10 @@ class VoiceAssistantService : Service() {
         OverlayPermission.ensure(this)
         checkAndRequestPermissions()
         startForegroundService()
+        // iter33e A2: сверка «JIT после перезапуска zygote». Вызывается на КАЖДОМ старте и
+        // ВЫШЕ проверки EXTRA_BOOT_RESTORE — START_STICKY-рестарт приходит с intent == null
+        // и boot-ветку не проходит. Внутри — только чтение getprop на BgWorker.
+        runCatching { AppPerformance.checkPendingZygoteVerify(this) }
         // iter26 B.1/B.4: AdbClient нужен Context для Settings.Global.ADB_ENABLED и для
         // флага «диагноз один раз за загрузку» (boot_id) в prefs.
         runCatching { com.example.voiceapp3.tools.AdbClient.attachContext(this) }
@@ -339,6 +343,9 @@ class VoiceAssistantService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForegroundService()
+        // iter33e A2: та же сверка и здесь — на случай, если процесс жив, а сервис перезапущен
+        // (onCreate тогда не вызывался). Стоит ВЫШЕ проверки extra (см. ниже).
+        runCatching { AppPerformance.checkPendingZygoteVerify(this) }
         /* Boot-ветка: BootReceiver помечает запуск — возвращаем сохранённую
            яркость (порт w() с boot-события; при обычном старте из приложения
            шаг не выполняется, чтобы не перебивать яркость штатной панели). */
