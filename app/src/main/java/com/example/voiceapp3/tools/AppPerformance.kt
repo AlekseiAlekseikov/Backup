@@ -247,6 +247,19 @@ object AppPerformance {
                 echo USEJIT_AFTER=${'$'}USEJIT_AFTER
                 echo ZYGOTE_RESTARTED=${'$'}([ "${'$'}ZYGOTE_PID_BEFORE" != "${'$'}ZYGOTE_PID_AFTER" ] && echo YES || echo NO)
             """.trimIndent()
+
+            // ── iter33b A2б, маршрут 1: свой persist-дублёр ─────────────────────────
+            // Зачем: `setprop dalvik.vm.usejit` живёт до ребута. Persist-значение читается
+            // инициализацией свойств при загрузке, и некоторые вендорские сборки поднимают
+            // из него runtime-значение — тогда JIT восстанавливается БЕЗ перезапуска zygote.
+            // Это НЕ adb-свойства (запрет владельца — `persist.adb.tcp.port` и порты).
+            // Добавлена РОВНО ОДНА persist-запись — `persist.sys.dalvik.vm.usejit`; других нет.
+            val persistRet = runSuCommand(
+                "setprop persist.sys.dalvik.vm.usejit $valStr; " +
+                    "echo JIT_PERSIST_READBACK=\$(getprop persist.sys.dalvik.vm.usejit)")
+            AppLog.i(TAG, "JIT_PERSIST_SET desired=$valStr readback=" +
+                (parseTag(persistRet.output, "JIT_PERSIST_READBACK") ?: "?"))
+
             val t0 = System.currentTimeMillis()
             val ret = runSuCommand(script)
             val t1 = System.currentTimeMillis()
@@ -461,7 +474,10 @@ object AppPerformance {
                 val mountScript = """
                     SELINUX_BEFORE=${'$'}(getenforce 2>/dev/null)
                     echo SELINUX_BEFORE=${'$'}SELINUX_BEFORE
-                    MEDIA_PID_BEFORE=${'$'}(pidof media.swcodec 2>/dev/null; pidof mediacodec 2>/dev/null; pidof android.hardware.media.omx 2>/dev/null)
+                    # iter33b D1: РОВНО один список pid с ОБЕИХ сторон. Было: в BEFORE — три
+                    # `pidof`, в сравнении — один media.swcodec ⇒ строки не совпадали никогда,
+                    # цикл выходил сразу (MEDIA_WAIT_TICKS=0), ожидание было фиктивным.
+                    MEDIA_PID_BEFORE=${'$'}(pidof media.swcodec 2>/dev/null)
                     echo MEDIA_PID_BEFORE=${'$'}MEDIA_PID_BEFORE
                     _n=0; while grep -F " $TARGET_VCODEC_PATH " /proc/mounts >/dev/null 2>&1 && [ ${'$'}_n -lt 12 ]; do
                       umount $TARGET_VCODEC_PATH 2>/dev/null || umount -l $TARGET_VCODEC_PATH 2>/dev/null || break
@@ -475,7 +491,7 @@ object AppPerformance {
                     _t=0
                     while [ "$(pidof media.swcodec 2>/dev/null)" = "${'$'}MEDIA_PID_BEFORE" ] && [ ${'$'}_t -lt 10 ]; do sleep 0.5; _t=${'$'}((${'$'}_t+1)); done
                     echo "MEDIA_WAIT_TICKS=${'$'}_t"
-                    MEDIA_PID_AFTER=${'$'}(pidof media.swcodec 2>/dev/null; pidof mediacodec 2>/dev/null; pidof android.hardware.media.omx 2>/dev/null)
+                    MEDIA_PID_AFTER=${'$'}(pidof media.swcodec 2>/dev/null)
                     echo MEDIA_PID_AFTER=${'$'}MEDIA_PID_AFTER
                     echo "SRC_INODE=${'$'}(stat -c %i $STAGING_VCODEC_PATH 2>/dev/null)"
                     echo "TGT_INODE=${'$'}(stat -c %i $TARGET_VCODEC_PATH 2>/dev/null)"
@@ -617,6 +633,180 @@ object AppPerformance {
      * используется AdbClient (локальный ADB сокет 127.0.0.1:5555 с adbd в
      * режиме root) — единый путь выполнения команд с правами root.
      */
+    // ═══════════════ iter33b A2а: видео на boot (одна попытка) ═══════════════
+
+    /** Одна boot-попытка на процесс (отдельный счётчик от HVAC и от JIT). */
+    private val videoBootAttempted = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /**
+     * iter33b A2а — приведение «Видео 60 fps» в соответствие с тумблером после ребута.
+     *
+     * `mount --bind` на `/vendor/lib/libvcodecdrv.so` ребут не переживает: тумблер «включён»,
+     * а подмены нет. Раньше на boot вызывался только [verifyVideoOnly] (чтение) и владелец
+     * видел в логе `not applied (boot/watchdog, no action)` — то есть эффекта нет и не будет.
+     *
+     * Правила (все — из мандата iter33b):
+     *  1. pref выключен ⇒ ничего, одна строка `VIDEO_BOOT: pref=off`;
+     *  2. [isVideoApplied] == true ⇒ `SKIP (already applied)`, ноль пишущих команд;
+     *  3. иначе — полный [setVideo60Fps] РОВНО ОДИН раз за загрузку (флаг [videoBootAttempted]);
+     *  4. `ctl.restart mediacodec` допустим только внутри этой единственной попытки;
+     *  5. в watchdog'е остаётся только [verifyVideoOnly] — без записи.
+     */
+    fun bootRestoreVideo(context: Context) {
+        BgWorker.assertNotMain("AppPerformance.bootRestoreVideo")
+        val app = context.applicationContext
+        val t0 = android.os.SystemClock.uptimeMillis()
+        if (!isVideo60FpsEnabled(app)) {
+            LogKit.stateVideo(false)
+            AppLog.i(TAG, "VIDEO_BOOT: pref=off (no attempt)")
+            return
+        }
+        val appliedBefore = isVideoApplied()
+        if (appliedBefore) {
+            LogKit.stateVideo(true)
+            AppLog.i(TAG, "VIDEO_BOOT: pref=on applied_before=true result=OK ms=" +
+                (android.os.SystemClock.uptimeMillis() - t0) + " action=skip")
+            return
+        }
+        if (!videoBootAttempted.compareAndSet(false, true)) {
+            AppLog.i(TAG, "VIDEO_BOOT: skip (attempt already made this boot)")
+            return
+        }
+        val r = runCatching { setVideo60Fps(app, true) }.getOrNull()
+        val dt = android.os.SystemClock.uptimeMillis() - t0
+        val ok = r != null && r.steps.isNotEmpty() &&
+            r.steps.none { it.status == ToolsStep.Status.FAILED || it.status == ToolsStep.Status.BLOCKED }
+        LogKit.stateVideo(ok)
+        AppLog.i(TAG, "VIDEO_BOOT: pref=on applied_before=false result=${if (ok) "OK" else "FAILED"} ms=$dt action=install")
+        if (!ok) AppLog.i(TAG, "VIDEO_BOOT: повторов не будет — тумблер «видео 60 fps» можно нажать вручную")
+    }
+
+    // ═══════════════ iter33b A2б: JIT после перезагрузки ═══════════════
+
+    private const val PROP_USEJIT = "dalvik.vm.usejit"
+    private const val PROP_USEJIT_PROFILES = "dalvik.vm.usejitprofiles"
+    private const val PROP_PERSIST_USEJIT = "persist.sys.dalvik.vm.usejit"
+    private const val JIT_BOOT_MARKER = "jit_boot_attempt"
+    private const val JIT_LATE_START_MS = 120_000L
+    private const val JIT_ATTEMPT_GUARD_MS = 600_000L
+
+    private val jitBootAttempted = java.util.concurrent.atomic.AtomicBoolean(false)
+
+
+    /** Один короткий read-only вызов: runtime + persist-дублёр (две строки). */
+    private fun jitProps(): Pair<String, String> {
+        val (_, out) = runCatching {
+            AdbClient.execute(
+                "echo RT=\$(getprop $PROP_USEJIT); echo PS=\$(getprop $PROP_PERSIST_USEJIT)",
+                5000, expectRoot = false)
+        }.getOrDefault(Pair(1, ""))
+        return Pair(
+            Regex("RT=([^\\n]*)").find(out)?.groupValues?.get(1)?.trim().orEmpty(),
+            Regex("PS=([^\\n]*)").find(out)?.groupValues?.get(1)?.trim().orEmpty()
+        )
+    }
+
+    /**
+     * iter33b A2б — восстановление JIT после ребута. Вызывается ТОЛЬКО из boot-ветки
+     * ([EXTRA_BOOT_RESTORE]) и только дважды за загрузку: сразу и через 30 с (`secondPass=true`).
+     * Из watchdog'а — никогда (там [verifyJitOnly], только чтение).
+     *
+     * Маршрут 1 — persist-дублёр (без перезапусков): runtime уже равен желаемому либо прошивка
+     *             поднимает runtime из `persist.sys.dalvik.vm.usejit`.
+     * Маршрут 2 — один `ctl.restart zygote`, только при `uptime < 120 с`, реальном расхождении
+     *             `getprop` и отсутствии попытки в этой загрузке (метка `files/jit_boot_attempt`).
+     * Маршрут 3 — честный отказ: `JIT_BOOT: unsupported`.
+     */
+    fun bootRestoreJit(context: Context, secondPass: Boolean = false) {
+        BgWorker.assertNotMain("AppPerformance.bootRestoreJit")
+        val app = context.applicationContext
+        // Тумблер выключен — JIT не наш, ничего не читаем и не пишем.
+        if (!isAutoOptimizeEnabled(app)) {
+            if (!secondPass) AppLog.i(TAG, "JIT_BOOT: pref=off (no attempt)")
+            return
+        }
+        val desired = "true"
+        val (runtime, persist) = jitProps()
+
+        if (runtime == desired) {
+            AppLog.i(TAG, "JIT_BOOT: match runtime=$runtime persist=$persist (ноль пишущих команд)")
+            return
+        }
+        // маршрут 1
+        if (persist == desired) {
+            if (!secondPass) {
+                AppLog.i(TAG, "JIT_PERSIST_PROBE: supported=unknown runtime=$runtime persist=$persist " +
+                    "action=read_again_in_30s")
+                return
+            }
+            AppLog.i(TAG, "JIT_PERSIST_PROBE: supported=false runtime=$runtime persist=$persist " +
+                "reason=runtime_not_raised_from_persist")
+        } else {
+            AppLog.i(TAG, "JIT_PERSIST_PROBE: supported=false runtime=$runtime persist=$persist " +
+                "reason=persist_differs")
+        }
+
+        // маршрут 2
+        val up = android.os.SystemClock.elapsedRealtime()
+        if (up >= JIT_LATE_START_MS) {
+            AppLog.i(TAG, "JIT_BOOT: deferred reason=late_start uptime_ms=$up (перезапуск zygote на этой стадии запрещён)")
+            return
+        }
+        val marker = File(app.filesDir, JIT_BOOT_MARKER)
+        val prev = runCatching { marker.readText().trim().toLong() }.getOrDefault(0L)
+        // prev < up ⇒ попытка была в ЭТОЙ загрузке (uptime монотонен); после ребута uptime меньше.
+        if (prev in 1..up && up - prev < JIT_ATTEMPT_GUARD_MS) {
+            AppLog.i(TAG, "JIT_BOOT: skip reason=attempt_guard prev_uptime_ms=$prev now_ms=$up")
+            return
+        }
+        if (!jitBootAttempted.compareAndSet(false, true)) {
+            AppLog.i(TAG, "JIT_BOOT: skip reason=attempt_guard_process")
+            return
+        }
+        runCatching { marker.writeText(up.toString()) }
+
+        // Ровно три команды, без svc wifi / umount / data-app / sleep.
+        val pidBefore = runCatching {
+            AdbClient.execute("pidof zygote; pidof zygote64", 4000, expectRoot = false).second.trim()
+        }.getOrDefault("")
+        val (rc, out) = runSuCommand(
+            "setprop $PROP_USEJIT true; setprop $PROP_USEJIT_PROFILES true; setprop ctl.restart zygote")
+        AppLog.i(TAG, "JIT_BOOT: pref=on desired=true runtime_before=$runtime action=setprop+zygote " +
+            "uptime_ms=$up marker=$JIT_BOOT_MARKER rc=$rc out=${LogKit.kv(out.take(120))}")
+
+        // Не блокируя поток: через 20 с — сверка результата (JIT_VERIFY).
+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            BgWorker.post("AppPerformance.jitVerify") {
+                val (rt, ps) = jitProps()
+                val pidAfter = runCatching {
+                    AdbClient.execute("pidof zygote; pidof zygote64", 4000, expectRoot = false).second.trim()
+                }.getOrDefault("")
+                AppLog.i(TAG, "JIT_VERIFY: runtime_after=$rt persist=$ps " +
+                    "zygote_pid_before=${LogKit.kv(pidBefore)} zygote_pid_after=${LogKit.kv(pidAfter)} " +
+                    "result=${if (rt == desired) "OK" else "FAILED"}")
+                if (rt != desired) {
+                    AppLog.i(TAG, "JIT_BOOT: unsupported (прошивка не даёт восстановить JIT без zygote) — " +
+                        "пометка в интерфейсе: «применится после перезагрузки, включите заново»")
+                }
+            }
+        }, 20_000L)
+    }
+
+    /**
+     * Watchdog: ТОЛЬКО сверка `getprop`, без записи. Вызывается не чаще раза в 5 тиков
+     * (см. `VoiceAssistantService.settingsWatchdog`).
+     */
+    fun verifyJitOnly(context: Context) {
+        val app = context.applicationContext
+        if (!isAutoOptimizeEnabled(app)) return
+        val (runtime, persist) = jitProps()
+        if (runtime == "true") return
+        AppLog.i(TAG, "JIT_PROBE: runtime=$runtime persist=$persist desired=true (read-only, без записи)")
+    }
+
+    private fun isAutoOptimizeEnabled(context: Context): Boolean =
+        runCatching { getPrefs(context).getBoolean(PREF_PERF_AUTO_OPTIMIZE, false) }.getOrDefault(false)
+
     private fun runSuCommand(command: String): ExecResult {
         return try {
             val (code, out) = AdbClient.execute(command, 30000)

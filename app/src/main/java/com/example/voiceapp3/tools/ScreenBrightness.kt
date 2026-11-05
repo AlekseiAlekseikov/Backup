@@ -161,10 +161,15 @@ object ScreenBrightness {
     fun restoreIfEnabled(ctx: Context) {
         if (!Prefs2.getBoolean(ctx, PREF_REMEMBER, false)) return
         val lvl = Prefs2.cps(ctx).getInt(bucketPref(ctx), -1)
-        if (lvl in MIN_LEVEL..MAX_LEVEL) {
-            writeSystemInt(ctx, SETTINGS_KEY, lvl); writeSysfs(lvl); writeProp(lvl)
-            AppLog.d(TAG, "restoreIfEnabled: $lvl for ${bucketPref(ctx)}")
-        }
+        if (lvl !in MIN_LEVEL..MAX_LEVEL) return
+        // iter33b: сначала ЧИТАЕМ. Раньше каждый тик watchdog'а писал три значения
+        // (settings put + sysfs + setprop) и печатал два VERIFY — даже когда всё уже равно.
+        // Теперь при совпадении — ни одной записи, ни одной строки (бюджет C1/H: ≈1 exec/min).
+        val settingsOk = readSystem(ctx, SETTINGS_KEY) == lvl
+        val sysfsOk = readSysfs() == lvl
+        if (settingsOk && sysfsOk) return
+        writeSystemInt(ctx, SETTINGS_KEY, lvl); writeSysfs(lvl); writeProp(lvl)
+        AppLog.d(TAG, "restoreIfEnabled: $lvl for ${bucketPref(ctx)} (было расхождение: settings=$settingsOk sysfs=$sysfsOk)")
     }
 
     fun syncOnContext(ctx: Context) {

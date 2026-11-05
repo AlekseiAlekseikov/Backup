@@ -361,10 +361,24 @@ class VoiceAssistantService : Service() {
                         WindowDoors.initCarService(app)
                     }
                 }
+                // read-only проба плагина (watchdog-логика, ничего не пишет).
                 runCatching { StatusIcons.bootRestoreHvacDigital(app) }
-                // iter33 B1.1: setVideo60Fps — ТОЛЬКО из обработчика клика. На буте лишь
-                // читаем состояние и честно пишем, применено ли (без umount/mount/restart/sleep).
+                // iter33b A1: ОДНА попытка установки плагина на загрузку — иначе после ребута
+                // `mount --bind` не восстановлен и цифр в статус-баре нет до первого клика.
+                runCatching { StatusIcons.bootInstallHvacDigital(app) }
+                // iter33 B1.1: чтение состояния видео без записи.
                 runCatching { AppPerformance.verifyVideoOnly(app) }
+                // iter33b A2а: одна попытка привести «Видео 60 fps» в соответствие с тумблером
+                // (mount --bind ребут не переживает). При уже применённом — SKIP и ноль записи.
+                runCatching { AppPerformance.bootRestoreVideo(app) }
+                // iter33b A2б: JIT после ребута — маршрут 1 (persist-дублёр) → маршрут 2 (zygote) → отказ.
+                runCatching { AppPerformance.bootRestoreJit(app, secondPass = false) }
+                // Второе чтение через 30 с: zygote мог подняться уже ПОСЛЕ нашей записи persist.
+                handler.postDelayed({
+                    BgWorker.post("VoiceAssistant.jitSecondPass") {
+                        runCatching { AppPerformance.bootRestoreJit(app, secondPass = true) }
+                    }
+                }, 30_000L)
                 runCatching { AppPerformance.applyKeepAliveOnBoot(app) }
                 runCatching { NetworkTtl.registerNetworkReceiver(app) }
                 AppLog.i(TAG, "bootRestore complete (BgWorker)")
@@ -420,18 +434,31 @@ class VoiceAssistantService : Service() {
                     val t0 = android.os.SystemClock.uptimeMillis()
                     var actions = 0
                     LogKit.cycleStart(n)
-                    // Сеть: read-only проверка, заливка ТОЛЬКО если правила нет (B4).
-                    runCatching { NetworkTtl.bootRestore(app) }.onSuccess { actions++ }
-                    // Плагин климата: только checkStatus, без записи (B2).
-                    runCatching { StatusIcons.bootRestoreHvacDigital(app) }.onSuccess { actions++ }
-                    // Яркость: идемпотентно, пишет только при реальном расхождении.
+                    // ── iter33b C1: тяжёлые опросы (TTL / HVAC / видео / JIT) — РАЗ В 5 ТИКОВ ──
+                    // По коду один тик в покое стоил 3–4 ADB-команды (ttlRuleCounts 1 +
+                    // checkStatus 2 + isVideoApplied 1) ⇒ 30–40 команд за 10 минут при цели ≤30.
+                    // Теперь: 5 команд каждые 5 минут ⇒ ≈10 команд за 10 минут в покое.
+                    // Реакция на события остаётся мгновенной: смена сети (NetworkTtl.registerNetworkReceiver)
+                    // и клик по тумблеру опрашивают сразу, а не ждут тика.
+                    val heavy = (n % 5 == 0)
+                    if (heavy) {
+                        // Сеть: read-only проверка, заливка ТОЛЬКО если правила нет (B4/C2).
+                        runCatching { NetworkTtl.bootRestore(app) }.onSuccess { actions++ }
+                        // Плагин климата: только checkStatus, без записи (B2).
+                        runCatching { StatusIcons.bootRestoreHvacDigital(app) }.onSuccess { actions++ }
+                        // Видео 60 fps: setVideo60Fps здесь НЕ вызывается вообще (B1).
+                        runCatching { AppPerformance.verifyVideoOnly(app) }.onSuccess { actions++ }
+                        // JIT: только сверка getprop, без записи (iter33b A2б).
+                        runCatching { AppPerformance.verifyJitOnly(app) }.onSuccess { actions++ }
+                    }
+                    // Яркость: идемпотентно и локально (settings/sysfs/setprop), ADB не тратит.
                     runCatching { ScreenBrightness.restoreIfEnabled(app) }.onSuccess { actions++ }
-                    // Видео 60 fps: setVideo60Fps здесь НЕ вызывается вообще (B1).
-                    runCatching { AppPerformance.verifyVideoOnly(app) }.onSuccess { actions++ }
                     // Звук замка: не гоняем файл каждый тик (B3) — только проверка состояния.
                     LogKit.cycleSummary(n, actions, 0, android.os.SystemClock.uptimeMillis() - t0)
                     LogKit.heartbeat()
-                    LogKit.writeSummary()
+                    // iter33b B1.1: writeSummary() из тика УБРАН. Он добавлял LOG_SUMMARY +
+                    // до 20 строк таблицы в буфер выжимки (200 строк) каждую минуту и вытеснял
+                    // настоящие OP_SUMMARY. Осталось: onDestroy сервиса (ниже).
                 }
             }
             handler.postDelayed(this, SETTINGS_WATCHDOG_MS)
@@ -445,6 +472,8 @@ class VoiceAssistantService : Service() {
         Log.i(TAG, "Service destroying")
         // iter33 C7: выжимка сеанса в app.log и app.ops.log при выходе.
         runCatching { LogKit.writeSummary() }
+        // iter33b B4: принудительная запись выжимки (в тике она теперь отложенная).
+        runCatching { LogKit.flushOpsNow() }
         cleanup()
         super.onDestroy()
     }

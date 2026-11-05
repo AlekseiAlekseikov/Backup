@@ -312,20 +312,30 @@ object AdbClient {
         while (true) {
             val job = try { queue.take() } catch (_: InterruptedException) { return }
             val t0 = SystemClock.uptimeMillis()
-            // iter33 C4: op действия, породившего команду, действует на весь путь её выполнения
+            // iter33 C4: op действия, породившего команду, действует на весь путь её выполнения.
             LogKit.setThreadOp(job.op)
+            // iter33b B3.2: кольцо трассировки ЭТОЙ команды — при провале печатается целиком.
+            LogKit.beginJobTrace()
             val out = try {
                 runCommand(job.cmd, job.timeoutMs, job.expectRoot)
             } catch (t: Throwable) {
                 Log.e(TAG, "runCommand error", t)
                 Pair(1, "ERR_EXEC: ${t.javaClass.simpleName}: ${t.message}")
-            } finally {
-                LogKit.setThreadOp(null)
             }
             val dt = SystemClock.uptimeMillis() - t0
             LogKit.countExec()
-            // iter33 A1: rc — НАСТОЯЩИЙ код возврата команды на устройстве (а не «канал ответил»).
-            AppLog.d(TAG, "← execute dt=${dt}ms rc=${out.first} len=${out.second.length} port=${workingPort.get()} state=${state.get()} cmd=${job.cmd.replace('\n', ' ').take(120)}")
+            // iter33b B2: сброс op — ПОСЛЕ строки «← execute». Было: setThreadOp(null) в `finally`
+            // вокруг runCommand, поэтому в итоговой строке op= уже отсутствовал, и `grep "op=<id>"`
+            // не показывал, чем команда закончилась.
+            try {
+                // iter33 A1: rc — НАСТОЯЩИЙ код возврата команды на устройстве (а не «канал ответил»).
+                AppLog.d(TAG, "← execute dt=${dt}ms rc=${out.first} len=${out.second.length} port=${workingPort.get()} state=${state.get()} cmd=${job.cmd.replace('\n', ' ').take(120)}")
+                LogKit.noteJobRc(out.first)
+                // iter33b B3.2: провал — повтор трассировки ЭТОЙ команды (hex+ASCII), пока op ещё жив.
+                if (out.first != 0) LogKit.failJobTrace(out.first, "rc")
+            } finally {
+                LogKit.setThreadOp(null)
+            }
             try {
                 Handler(Looper.getMainLooper()).post { job.onResult(out) }
             } catch (_: Throwable) { job.onResult(out) }
@@ -1126,7 +1136,7 @@ object AdbClient {
         val hdrHex = msgHeaderHex(CNXN, version, maxData, payload)
         writeMsg(os, CNXN, version, maxData, payload)
         // iter33 C3: первые 20 на сеанс — построчно, дальше ADB_TRACE_SUPPRESSED со счётчиком.
-        LogKit.trace("ADB_TX") {
+        LogKit.traceAdb("ADB_TX") {
             "ADB_TX cmd=CNXN arg0=0x${"%08x".format(version)} arg1=$maxData variant=$variant len=${payload.size} hex4=${hex4Of(CNXN)} ascii=${asciiOf(CNXN)} sum=${checksumFor(payload)} hex=$hdrHex"
         }
         var authSteps = 0
@@ -1139,7 +1149,7 @@ object AdbClient {
                 AppLog.e(TAG, "ADB_RX attempt=$attempt variant=$variant cmd=silent hex=(none) dt=${System.currentTimeMillis() - tMsg}ms err=${e.javaClass.simpleName}")
                 return "silent (${e.javaClass.simpleName})"
             }
-            LogKit.trace("ADB_RX") {
+            LogKit.traceAdb("ADB_RX") {
                 "ADB_RX attempt=$attempt variant=$variant cmd=${cmdName(msg.cmd)} hex4=${hex4Of(msg.cmd)} ascii=${asciiOf(msg.cmd)} arg0=0x${"%08x".format(msg.arg0)} arg1=${msg.arg1} len=${msg.payload.size} hex=${hexOf(msg.payload, minOf(24, msg.payload.size))} dt=${System.currentTimeMillis() - tMsg}ms"
             }
             when (msg.cmd) {
@@ -1694,7 +1704,7 @@ object AdbClient {
             // iter33 C3: первые 20 строк на сеанс построчно, дальше — ADB_TRACE_SUPPRESSED со счётчиком.
             val firstForHost = host != channelLoggedHost
             if (firstForHost) channelLoggedHost = host
-            LogKit.trace("ADB_CHANNEL") {
+            LogKit.traceAdb("ADB_CHANNEL") {
                 "ADB_CHANNEL host=$host port=$port variant=$effVariant${if (firstForHost) " (канал по адресу из ADB_DEST)" else ""}"
             }
             s.connect(InetSocketAddress(host, port), connectTimeoutMs)

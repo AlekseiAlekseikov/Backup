@@ -213,8 +213,14 @@ enum class Choice(
         val res = LogKit.withOp(op) { setImpl(toggle, value) }
         val dur = android.os.SystemClock.uptimeMillis() - t0
         emitOpSteps(op, res)
-        val okSteps = res.steps.count { it.status == ToolsStep.Status.OK || it.status == ToolsStep.Status.PARTIAL }
-        LogKit.opSummary(op, toggle.pref, res.statusWire.uppercase(), okSteps, res.steps.size, dur, res.summary)
+        // iter33b D2: PARTIAL больше не засчитывается как успех — иначе `steps=2/2` стояло
+        // рядом с `result=PARTIAL` и переставало быть метрикой. Старое поле steps= сохранено,
+        // рядом печатаются ok= / partial= / failed= / total=.
+        val okSteps = res.steps.count { it.status == ToolsStep.Status.OK }
+        val partialSteps = res.steps.count { it.status == ToolsStep.Status.PARTIAL }
+        val failedSteps = res.steps.count { it.status == ToolsStep.Status.FAILED || it.status == ToolsStep.Status.BLOCKED }
+        LogKit.opSummary(op, toggle.pref, res.statusWire.uppercase(), okSteps, partialSteps, failedSteps,
+            res.steps.size, dur, res.summary)
         LogKit.heartbeatStateRefresh()
         return res
     }

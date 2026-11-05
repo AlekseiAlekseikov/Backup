@@ -936,6 +936,29 @@ object StatusIcons {
      * один раз за процесс). Здесь — `checkStatus` (pm path + /proc/mounts, без записи) и,
      * если не смонтировано, ОДНА строка в лог. Автоповторов нет.
      */
+    /**
+     * iter33b A1 — boot-вход установки плагина климата. Вызывается ТОЛЬКО из boot-ветки
+     * ([EXTRA_BOOT_RESTORE]), не из watchdog'а и не по таймеру.
+     *
+     * Здесь только проверка «тумблер включён»; все предохранители (одна попытка за загрузку,
+     * read-first по mount+inode, отсутствие повторов) — внутри [HvacDigitalPlugin.bootInstall].
+     */
+    @JvmStatic fun bootInstallHvacDigital(ctx: Context) {
+        val app = ctx.applicationContext
+        val p = prefs(app)
+        val anyOn = p.getBoolean(PREF_HVAC_BATT, false) ||
+                   p.getBoolean(PREF_HVAC_TEMP, false) ||
+                   p.getBoolean(PREF_HVAC_EXT_TEMP, false)
+        if (!anyOn) {
+            AppLog.i(TAG, "HVAC_BOOT: skip (toggle off)")
+            return
+        }
+        BgWorker.post("StatusIcons.hvacdigital.bootinstall") {
+            runCatching { HvacDigitalPlugin.bootInstall(app) }
+                .onFailure { AppLog.w(TAG, "HVAC_BOOT: bootInstall threw", it) }
+        }
+    }
+
     @JvmStatic fun bootRestoreHvacDigital(ctx: Context) {
         val app = ctx.applicationContext
         val p = prefs(app)

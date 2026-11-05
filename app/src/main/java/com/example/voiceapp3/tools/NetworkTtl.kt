@@ -242,6 +242,12 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
         // iter33 B4: сначала ОДНА короткая read-only проверка. Если правило уже стоит —
         // ноль записи (раньше каждый тик заливался скрипт чанками: `rm -f` + `cat >>`×7 + chmod + sh).
         val (cnt4, cnt6) = ttlRuleCounts()
+        // iter33b C2: (-1,-1) — «канал не ответил», а НЕ «правила нет». Раньше при включённом
+        // тумблере это уходило в полную заливку скрипта чанками на каждом тике. Теперь — SKIP.
+        if (cnt4 < 0 || cnt6 < 0) {
+            AppLog.i(TAG, "TTL: SKIP (unknown, channel down) v4=$cnt4 v6=$cnt6")
+            return
+        }
         if (!active) {
             if (cnt4 == 0 && cnt6 == 0) {
                 AppLog.i(TAG, "TTL: SKIP (rule absent, toggle off) v4=$cnt4 v6=$cnt6")

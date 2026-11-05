@@ -12,6 +12,8 @@ import java.io.FileOutputStream
  */
 object HvacDigitalPlugin {
     private const val TAG = "CENTRAL_HvacDigitalPlugin"
+    /** iter33b A1: ключ префа с uptime прошлой boot-попытки (защита от повтора при рестарте процесса). */
+    const val PREF_BOOT_INSTALL_UPTIME = "hvac_boot_install_uptime"
     private const val STAGE_DIR = "/data/local/hvac-digital"
     private const val STAGE_APK = "$STAGE_DIR/sysui.apk"
     private const val OEM_PKG = "com.flyme.auto.systemuiplugin"
@@ -21,9 +23,13 @@ object HvacDigitalPlugin {
 
     /** iter33 A3.4: SystemUI перезапускается не чаще одного раза за процесс приложения. */
     @Volatile private var sysuiKillDone = false
+    /** iter33b A1: сколько раз за процесс перезапускали SystemUI — для поля `kill=` в `HVAC_BOOT`. */
+    @Volatile private var sysuiKillCount = 0
 
     /** iter33 B2: enable() — только по клику и один раз за процесс (watchdog сюда не ходит). */
     @Volatile private var enableDoneThisProcess = false
+    /** iter33b A1: одна boot-попытка на процесс. */
+    private val bootInstallDone = java.util.concurrent.atomic.AtomicBoolean(false)
 
     data class Status(
         val oemPluginInstalled: Boolean,
@@ -191,6 +197,7 @@ object HvacDigitalPlugin {
               echo "###STAGE name=check status=OK reason=pm_path:@@PM_PATH"
             else
               echo "###STAGE name=check status=FAILED reason=sem_fonte"
+              echo "VIA=nenhum"
               echo "HVAC_DIGITAL_FALHOU"
               exit 1
             fi
@@ -216,6 +223,7 @@ object HvacDigitalPlugin {
                 case "@@PM_AFTER" in
                   /data/app/*)
                     echo "HVAC_UNSHADOW: before=@@PM_PATH after=@@PM_AFTER via=@@VIA_UNSHADOW result=FAILED"
+                    echo "VIA=install"
                     echo "###STAGE name=unshadow status=FAILED reason=pm_path:@@PM_AFTER"
                     echo "HVAC_DIGITAL_FALHOU"
                     exit 2
@@ -260,6 +268,7 @@ object HvacDigitalPlugin {
               else
                 echo "###STAGE name=bind status=FAILED reason=mounted:@@MOUNTED inode:@@SRC_INODE/@@TGT_INODE"
                 setprop persist.sys.hvacdigital.via nenhum 2>/dev/null || true
+                echo "VIA=nenhum"
                 echo "HVAC_DIGITAL_FALHOU"
                 exit 3
               fi
@@ -282,6 +291,12 @@ object HvacDigitalPlugin {
 
             PROPS="batt:@@(getprop persist.sys.hvacdigital.batt),temp:@@(getprop persist.sys.hvacdigital.temp),exttemp:@@(getprop persist.sys.hvacdigital.temp_ext)"
             echo "PROPS=@@PROPS"
+            # iter33b B5: итоговый VIA — ЯВНО, одной строкой. Раньше такого echo не было вовсе,
+            # и `HVAC_PROBE … via=?` врал: регулярка в Kotlin ждала "VIA=", которого скрипт не печатал.
+            case "@@PM_AFTER" in
+              /data/app/*) echo "VIA=install" ;;
+              *) echo "VIA=bind" ;;
+            esac
             echo "HVAC_DIGITAL_OK"
             [ "@@MOUNTED" = "1" ] || exit 4
             exit 0
@@ -292,7 +307,8 @@ object HvacDigitalPlugin {
         LogKit.scriptTrace("hvac_enable", out)
         // Мандат iter22 §4: вердикт VIA/PM_PATH/SELINUX — ОБЯЗАТЕЛЬНО в лог,
         // иначе по логу сборки не видно, почему панель не встала.
-        val via = Regex("VIA=([a-z]+)").find(out)?.groupValues?.get(1) ?: "?"
+        // iter33b B5.2: IGNORE_CASE — регистр в выводе скрипта больше не решает судьбу строки.
+        val via = Regex("VIA=([A-Za-z]+)", RegexOption.IGNORE_CASE).find(out)?.groupValues?.get(1) ?: "?"
         val viaPrev = Regex("VIA_PREV=([^\\n]*)").find(out)?.groupValues?.get(1)?.trim().orEmpty()
         val pmPath = Regex("PM_PATH=([^\\n]*)").find(out)?.groupValues?.get(1)?.trim().orEmpty()
         val selinuxPair = Regex("SELINUX_BEFORE=([^ ]*) SELINUX_AFTER=([^\\n]*)").find(out)
@@ -337,13 +353,81 @@ object HvacDigitalPlugin {
         }
         AppLog.i(TAG, "HVAC_RESULT: $hvacResult reason=via:$via mount:$mountOk inode:$inodeMatch rc:$rc")
         if (hvacResult == "OK") enableDoneThisProcess = true
-        if (out.contains("SYSUI_PID_BEFORE=")) { sysuiKillDone = true; LogKit.countSysuiKill() }
+        if (out.contains("SYSUI_PID_BEFORE=")) { sysuiKillDone = true; sysuiKillCount++; LogKit.countSysuiKill() }
         steps += stepOf("activate", "cp+chcon+mount", activateStatus,
             expected = "HVAC_DIGITAL_OK + inode match", actual = reason, stdout = out)
         val post = checkStatus(ctx)
         steps += stepOf("post_check", "grep mounts", if (post.overlayMounted) ToolsStep.Status.OK else ToolsStep.Status.PARTIAL,
             expected = "mounted", actual = "mounted=${post.overlayMounted}", stdout = post.mountLine)
         return ToolsResult("hvacdigital.plugin.enable", "Цифровой климат", steps)
+    }
+
+    /**
+     * iter33b A1 — ОДНА попытка установки плагина на загрузку ГУ.
+     *
+     * Почему вообще: `mount --bind` ребут не переживает, а `enable` вызывался только по клику
+     * (`StatusIcons.setHvacDigital`), boot-ветка после iter33 B2 только читала ⇒ после каждой
+     * перезагрузки цифры в статус-баре отсутствовали до первого щелчка тумблером.
+     *
+     * Предохранители (все три обязательны):
+     *  1. один раз за загрузку — атомарный флаг [bootInstallDone] + метка uptime в префах:
+     *     если с прошлой попытки прошло < 5 минут по uptime, это рестарт процесса, а не ребут;
+     *  2. только если реально нужно — сначала [checkStatus]; смонтировано и исходник/цель
+     *     совпали по inode ⇒ выход БЕЗ единой пишущей команды;
+     *  3. никаких таймеров — вызывается только из boot-ветки ([EXTRA_BOOT_RESTORE]), не из watchdog.
+     *
+     * Результат — ровно одна строка `HVAC_BOOT: attempt=1 reason=… kill=0|1 result=… ms=…`.
+     * При `result=FAILED` повторов нет ни в этом процессе, ни по расписанию: владелец повторит кликом.
+     */
+    fun bootInstall(ctx: Context): Boolean {
+        val app = ctx.applicationContext
+        if (!bootInstallDone.compareAndSet(false, true)) {
+            AppLog.i(TAG, "HVAC_BOOT: skip (attempt already made this boot)")
+            return false
+        }
+        val up = android.os.SystemClock.elapsedRealtime()
+        val prevUp = Prefs2.getLong(app, PREF_BOOT_INSTALL_UPTIME, 0L)
+        if (prevUp > 0 && up > prevUp && up - prevUp < 5 * 60_000L) {
+            AppLog.i(TAG, "HVAC_BOOT: skip (process restart, prev_uptime_ms=$prevUp now_ms=$up)")
+            return false
+        }
+        Prefs2.putLong(app, PREF_BOOT_INSTALL_UPTIME, up)
+
+        val st = runCatching { checkStatus(app) }.getOrNull()
+        if (st == null) {
+            AppLog.w(TAG, "HVAC_BOOT: skip (checkStatus threw — состояние неизвестно, ничего не пишем)")
+            return false
+        }
+        if (st.overlayMounted && inodeMatchesStage(st.oemPkgPath)) {
+            LogKit.stateHvac("mounted")
+            AppLog.i(TAG, "HVAC_BOOT: skip (already mounted) pm_path=${st.oemPkgPath ?: "?"} inode=match")
+            return false
+        }
+
+        val reason = if (prevUp == 0L) "first_boot" else "not_mounted"
+        val killsBefore = sysuiKillCount
+        val t0 = android.os.SystemClock.uptimeMillis()
+        val r = runCatching { enable(app) }.getOrNull()
+        val dt = android.os.SystemClock.uptimeMillis() - t0
+        val ok = r != null && r.steps.isNotEmpty() &&
+            r.steps.none { it.status == ToolsStep.Status.FAILED || it.status == ToolsStep.Status.BLOCKED }
+        val kill = if (sysuiKillCount > killsBefore) 1 else 0
+        AppLog.i(TAG, "HVAC_BOOT: attempt=1 reason=$reason kill=$kill result=${if (ok) "OK" else "FAILED"} ms=$dt")
+        if (!ok) AppLog.i(TAG, "HVAC_BOOT: повторов не будет — включите тумблер вручную (это ожидаемо)")
+        return ok
+    }
+
+    /** Read-only сверка inode: staging-файл (источник bind) и цель монтирования. */
+    private fun inodeMatchesStage(targetPath: String?): Boolean {
+        if (targetPath.isNullOrEmpty()) return false
+        val out = runCatching {
+            AdbClient.shellLocal(
+                "echo SRC=\$(stat -c '%i' $STAGE_APK 2>/dev/null); " +
+                    "echo TGT=\$(stat -c '%i' $targetPath 2>/dev/null)", 5000).second
+        }.getOrDefault("")
+        val src = Regex("SRC=([0-9]+)").find(out)?.groupValues?.get(1)
+        val tgt = Regex("TGT=([0-9]+)").find(out)?.groupValues?.get(1)
+        return src != null && src == tgt && src != "0"
     }
 
     fun disable(ctx: Context): ToolsResult {

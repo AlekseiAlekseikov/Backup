@@ -31,6 +31,12 @@ object LogKit {
     private const val OPS_MAX_LINES = 200
     private const val TRACE_PER_SESSION = 20
     private const val CONN_WINDOW_MS = 60_000L
+    /** iter33b B4: файл выжимки пишется не на каждый маркер, а не чаще 1 раза в 2 с. */
+    private const val OPS_FLUSH_MIN_MS = 2_000L
+    /** iter33b B3.1: прежний тег, под которым ADB-трассировку ищут все прежние грепы. */
+    private const val ADB_TAG = "CENTRAL_AdbClient"
+    /** iter33b B3.2: сколько строк текущей команды держим для повтора при провале. */
+    private const val JOB_RING = 40
 
     /** Один `run` на процесс: 8 hex из nanoTime (не криптография — просто метка сеанса). */
     val run: String = java.lang.Long.toHexString(System.nanoTime() and 0xFFFFFFFFL).padStart(8, '0')
@@ -59,6 +65,14 @@ object LogKit {
     private val traceSuppressed = HashMap<String, Int>()
     private val traceLast = HashMap<String, String>()
     @Volatile private var lastSuppressedFlushMs = 0L
+    /** iter33b B4: отложенная запись выжимки. */
+    @Volatile private var lastOpsFlushMs = 0L
+    @Volatile private var opsDirty = false
+    /** iter33b B3.2: строки ТЕКУЩЕЙ команды — при провале печатаются целиком. */
+    private val jobRing = ArrayDeque<String>(JOB_RING)
+    @Volatile private var jobFailed = false
+    /** iter33b B3.3: rc последней команды — попадает в `ADB_TRACE_SUPPRESSED … last=… rc=…`. */
+    @Volatile private var lastJobRc = 0
 
     // ── кольца для LOG_SUMMARY ──
     private class OpRec(val time: String, val action: String, val result: String, val reason: String)
@@ -80,21 +94,37 @@ object LogKit {
         return File(d, OPS_NAME)
     }
 
-    /** Перезапись выжимки целиком (≤ [OPS_MAX_LINES] строк) — так проще держать лимит. */
-    private fun flushOps() {
+    /**
+     * Перезапись выжимки целиком (≤ [OPS_MAX_LINES] строк) — так проще держать лимит.
+     *
+     * iter33b B4: было — `f.writeText(все 200 строк)` на КАЖДЫЙ маркер, и сам `writeText`
+     * стоял ВНЕ `synchronized(lock)` (четыре `CENTRAL_Bg-N` могли порвать файл).
+     * Стало — не чаще одного раза в [OPS_FLUSH_MIN_MS] мс, а сама запись внутри лока.
+     * Принудительно: [heartbeat], [errorSeen], [writeSummary], [flushOpsNow] (onDestroy).
+     */
+    private fun flushOps(force: Boolean = false) {
         val f = opsFile() ?: return
-        runCatching {
-            val text = synchronized(lock) { opsLines.joinToString("\n") + "\n" }
-            f.writeText(text)
+        val now = SystemClock.uptimeMillis()
+        synchronized(lock) {
+            if (!force && now - lastOpsFlushMs < OPS_FLUSH_MIN_MS) {
+                opsDirty = true
+                return
+            }
+            lastOpsFlushMs = now
+            opsDirty = false
+            runCatching { f.writeText(opsLines.joinToString("\n") + "\n") }
         }
     }
+
+    /** Немедленная запись выжимки (onDestroy: терять последние строки нельзя). */
+    fun flushOpsNow() = flushOps(force = true)
 
     private fun ops(line: String) {
         synchronized(lock) {
             opsLines.addLast(line)
             while (opsLines.size > OPS_MAX_LINES) opsLines.removeFirst()
         }
-        flushOps()
+        flushOps(force = false)
     }
 
     /** Строка-маркер: идёт и в `app.log` (как факт), и в выжимку `app.ops.log`. */
@@ -177,7 +207,7 @@ object LogKit {
                 "LOG_INDEX=эта шпаргалка " +
                 "OP_START=начало действия(op/cat/action/src) " +
                 "OP_STEP=шаг действия(step/status/expect/got) " +
-                "OP_SUMMARY=итог действия(ровно одна строка) " +
+                "OP_SUMMARY=итог действия(ровно одна строка; ok/partial/failed/total) " +
                 "CYCLE_START/CYCLE_SUMMARY=тик watchdog " +
                 "HEARTBEAT=состояние раз в 60с " +
                 "HVAC_PROBE/HVAC_RESULT=плагин климата " +
@@ -196,8 +226,15 @@ object LogKit {
                expect: String, got: String, ms: Long) =
         marker("OP_STEP op=$op step=$step/$total name=$name status=$status expect=${kv(expect)} got=${kv(got)} ms=$ms")
 
-    fun opSummary(op: String, action: String, result: String, okSteps: Int, total: Int, durMs: Long, reason: String) {
-        marker("OP_SUMMARY op=$op action=$action result=$result steps=$okSteps/$total dur=$durMs reason=${kv(reason)}")
+    /**
+     * iter33b D2: `PARTIAL` больше не считается успехом в `steps=`.
+     * Старое поле `steps=<ok>/<N>` оставлено (чтобы прежние выжимки читались),
+     * рядом появились `ok=`, `partial=`, `failed=`, `total=`.
+     */
+    fun opSummary(op: String, action: String, result: String, okSteps: Int, partialSteps: Int,
+                  failedSteps: Int, total: Int, durMs: Long, reason: String) {
+        marker("OP_SUMMARY op=$op action=$action result=$result steps=$okSteps/$total " +
+            "ok=$okSteps partial=$partialSteps failed=$failedSteps total=$total dur=$durMs reason=${kv(reason)}")
         synchronized(lock) {
             opRing.addLast(OpRec(df.format(Date()), action, result, reason))
             while (opRing.size > 20) opRing.removeFirst()
@@ -255,24 +292,38 @@ object LogKit {
                 "sysuiKills=${sysuiKills.get()} codecRestarts=${codecRestarts.get()}"
         )
         flushSuppressed(force = true)
+        flushOps(force = true)
     }
 
-    /** Таблица последних действий + последние ошибки (кнопка диагностики и onDestroy). */
+    /**
+     * Выжимка сеанса: вызывается ТОЛЬКО из `onDestroy` сервиса (iter33b B1 — из тика
+     * watchdog'а вызов убран) и из пункта диагностики, если он появится в коде.
+     *
+     * iter33b B1.3: таблица действий пишется в `app.log` (`AppLog.marker`), а НЕ в кольцо
+     * выжимки — раньше 20 строк таблицы каждую минуту вытесняли настоящие `OP_SUMMARY`
+     * из буфера на 200 строк, и `app.ops.log` переставал быть выжимкой.
+     * В `app.ops.log` остаётся шапка `LOG_SUMMARY run=… ops=… failed=…` + не более 5 действий.
+     */
     fun writeSummary() {
-        val opsTotal = opRing.size
-        val failed = opRing.count { it.result != "OK" }
-        marker("LOG_SUMMARY run=$run ops=$opsTotal failed=$failed")
+        // Снимок колец — ОДНИМ synchronized: локальные val нельзя присваивать внутри лямбды.
+        val snap = synchronized(lock) { opRing.toList() to errRing.toList() }
+        val rows = snap.first
+        val errs = snap.second
+        val failed = rows.count { it.result != "OK" }
+        marker("LOG_SUMMARY run=$run ops=${rows.size} failed=$failed")
+        var i = 0
+        for (r in rows) {
+            i++
+            AppLog.marker("  LOG_SUMMARY_ROW #%02d %s %-10s %-8s %s"
+                .format(i, r.time, r.action.take(10), r.result, kv(r.reason)))
+        }
+        for (e in errs) AppLog.marker("  LOG_SUMMARY_ERR ${kv(e)}")
         synchronized(lock) {
-            var i = 0
-            for (r in opRing) {
-                i++
-                ops("  #%02d %s %-10s %-8s %s".format(i, r.time, r.action.take(10), r.result, kv(r.reason)))
-            }
-            if (errRing.isNotEmpty()) {
-                ops("  -- последние ошибки --")
-                for (e in errRing) ops("  [ERROR] ${kv(e)}")
+            for (r in rows.takeLast(5)) {
+                ops("  #${r.time} ${r.action.take(12)} ${r.result} ${kv(r.reason)}")
             }
         }
+        flushOps(force = true)
     }
 
     /** Кольцо ошибок: вызывается из AppLog.e, чтобы `LOG_SUMMARY` их показывал. */
@@ -281,14 +332,68 @@ object LogKit {
             errRing.addLast("$tag: $msg")
             while (errRing.size > 5) errRing.removeFirst()
         }
+        // iter33b B4: на любой [ERROR] выжимка пишется немедленно, без 2-секундной задержки.
+        flushOps(force = true)
     }
 
     // ───────────────────────── подавление шума (C3) ─────────────────────────
 
     /**
+     * iter33b B3.1/B3.2: трассировка ADB — отдельный вход, потому что у неё два отличия
+     * от [trace]:
+     *  1. тег остаётся прежним `CENTRAL_AdbClient` (по нему разбирали логи 1.0.50–1.0.52);
+     *  2. строки текущей команды копятся в кольце [JOB_RING], и если команда кончилась
+     *     `rc != 0`, исключением или таймаутом ([failJobTrace]) — печатаются ЦЕЛИКОМ,
+     *     с hex и ASCII, независимо от лимита [TRACE_PER_SESSION]. Именно отсутствие
+     *     hex при новом сбое было главной претензией к свёрнутой трассировке.
+     */
+    fun traceAdb(kind: String, line: () -> String) {
+        val text = line()
+        var write = false
+        synchronized(lock) {
+            if (jobRing.size >= JOB_RING) jobRing.removeFirst()
+            jobRing.addLast(text)
+            val seen = traceSeen[kind] ?: 0
+            if (seen < TRACE_PER_SESSION || jobFailed) {
+                traceSeen[kind] = seen + 1
+                write = true
+            } else {
+                traceSuppressed[kind] = (traceSuppressed[kind] ?: 0) + 1
+                traceLast[kind] = text
+            }
+        }
+        if (write) AppLog.d(ADB_TAG, text) else flushSuppressed(force = false)
+    }
+
+    /** Начало команды: чистое кольцо, флаг провала снят. */
+    fun beginJobTrace() {
+        synchronized(lock) {
+            jobRing.clear()
+            jobFailed = false
+        }
+    }
+
+    /** rc последней команды — уходит в `ADB_TRACE_SUPPRESSED … rc=`. */
+    fun noteJobRc(rc: Int) { lastJobRc = rc }
+
+    /**
+     * Команда провалилась (rc != 0 / исключение / таймаут / обрыв рукопожатия):
+     * её `ADB_TX`/`ADB_RX` печатаются повторно и целиком — подавление на провал не действует.
+     */
+    fun failJobTrace(rc: Int, why: String) {
+        val lines = synchronized(lock) {
+            jobFailed = true
+            jobRing.toList()
+        }
+        AppLog.d(ADB_TAG, "ADB_TRACE_REPLAY rc=$rc why=${kv(why)} n=${lines.size} (провал: трассировка не подавляется)")
+        for (l in lines) AppLog.d(ADB_TAG, l)
+    }
+
+    /**
      * `trace` — пишет строку только первые [TRACE_PER_SESSION] раз на сеанс для данного вида,
      * дальше считает и раз в минуту выдаёт ОДНУ строку `ADB_TRACE_SUPPRESSED n=… last=…`.
      * Так шум сворачивается ЯВНО (со счётчиком), а не молча (C3, запрет «удалять строки молча»).
+     * Для ADB-трассировки используйте [traceAdb] (B3) — у неё прежний тег и защита hex при сбое.
      */
     fun trace(kind: String, line: () -> String) {
         synchronized(lock) {
@@ -318,7 +423,7 @@ object LogKit {
             s to last
         }
         if (snapshot.first.isEmpty()) return
-        marker("ADB_TRACE_SUPPRESSED n=${snapshot.first} last=${kv(snapshot.second.take(200))}")
+        marker("ADB_TRACE_SUPPRESSED n=${snapshot.first} rc=$lastJobRc last=${kv(snapshot.second.take(200))}")
     }
 
     /** Значение для `key=value`-лога: без пробелов и переводов строк. */
