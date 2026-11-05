@@ -149,7 +149,45 @@ class JitBootMarkTest {
         // Канал не ответил — это НЕ FAILED: намерение сжигать нельзя.
         assertEquals(JitBootMark.VerifyOutcome.UNKNOWN,
             JitBootMark.verifyOutcome("", ""))
-        assertEquals(JitBootMark.VerifyOutcome.UNKNOWN,
+        // БЫЛО (до iter33g, ошибочное ожидание):
+        //   assertEquals(JitBootMark.VerifyOutcome.UNKNOWN, JitBootMark.verifyOutcome("", "true"))
+        // СТАЛО: persist пришёл из того же ответа, значит канал ответил — это честный FAILED
+        // (маршрут 3), а не «канала нет». Тест изменён вместе с правилом, а не подогнан под него:
+        // именно эта строка и была дефектом `verifyOutcome`.
+        assertEquals(JitBootMark.VerifyOutcome.FAILED,
             JitBootMark.verifyOutcome("", "true"))
+    }
+
+    // 10. iter33g A1: пустой runtime при непустом persist — определённый отказ, не «канал молчит».
+    @Test
+    fun verifyOutcomeEmptyRuntimeWithPersistIsFailed() {
+        assertEquals(JitBootMark.VerifyOutcome.FAILED,
+            JitBootMark.verifyOutcome("", "1"))
+        assertEquals(JitBootMark.VerifyOutcome.FAILED,
+            JitBootMark.verifyOutcome("", "false"))
+    }
+
+    // 11. iter33g A2: у двух видов FAILED разные `reason`.
+    @Test
+    fun verifyOutcomeFailedKeepsRuntimeReason() {
+        val notTrue = JitBootMark.VerifyOutcome.FAILED
+        assertEquals("runtime_not_true", JitBootMark.outcomeReason(notTrue, "false", "true"))
+        assertEquals("runtime_empty", JitBootMark.outcomeReason(notTrue, "", "true"))
+        assertEquals("no_channel", JitBootMark.outcomeReason(JitBootMark.VerifyOutcome.UNKNOWN, "", ""))
+        assertEquals("", JitBootMark.outcomeReason(JitBootMark.VerifyOutcome.OK, "true", "true"))
+    }
+
+    // 12. iter33g B1/B2: счётчик цикла блокирует повтор в ТОЙ ЖЕ загрузке и не мешает новой.
+    @Test
+    fun cycleDecisionSkipsOnlySameBoot() {
+        val t = 1_700_000_000_000L
+        // Файла ещё нет — цикл разрешён.
+        assertEquals(JitBootMark.CycleDecision.RUN, JitBootMark.cycleDecision("", JitBootMark.epochTag(t)))
+        // Тот же bootTag — цикл в этой загрузке уже был.
+        assertEquals(JitBootMark.CycleDecision.SKIP,
+            JitBootMark.cycleDecision(JitBootMark.epochTag(t), JitBootMark.epochTag(t)))
+        // Другая загрузка (через 5 минут) — счётчик не блокирует.
+        assertEquals(JitBootMark.CycleDecision.RUN,
+            JitBootMark.cycleDecision(JitBootMark.epochTag(t), JitBootMark.epochTag(t + 300_000)))
     }
 }

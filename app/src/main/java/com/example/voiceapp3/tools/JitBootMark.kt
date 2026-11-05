@@ -109,22 +109,57 @@ object JitBootMark {
     }
 
     /**
-     * iter33f A3/B1 — три исхода сверки после перезапуска zygote.
+     * iter33f A3/B1 + iter33g A1 — три исхода сверки после перезапуска zygote.
      *
      * • [VerifyOutcome.OK]      — `runtime == "true"` (JIT поднят);
-     * • [VerifyOutcome.FAILED]  — `runtime` прочитан, но не `true` (ответ определённый);
-     * • [VerifyOutcome.UNKNOWN] — `runtime` пуст: канал не ответил. Это НЕ провал: намерение
+     * • [VerifyOutcome.FAILED]  — ответ определённый: либо `runtime` прочитан и не `true`,
+     *   либо `runtime` пуст, но `persist` прочитан (канал ответил, свойство пустое — маршрут 3);
+     * • [VerifyOutcome.UNKNOWN] — ОБЕ строки пусты: канала нет. Это НЕ провал: намерение
      *   нельзя сжигать, иначе в логе останется ложный `FAILED` там, где нужна определённость.
      *
-     * `persist` в решении не участвует — он остаётся в подписи, чтобы обе величины читались
-     * из одного места и не приходилось звать `jitProps()` ради лога.
+     * Правило решения — в [verifyOutcome] (там `persist` участвует), слово для лога — в [outcomeReason].
      */
     enum class VerifyOutcome { OK, FAILED, UNKNOWN }
 
+    /**
+     * iter33g A1 — четыре ветви вместо трёх.
+     *
+     * `runtime` и `persist` приходят из ОДНОГО вызова `jitProps()` (одна ADB-команда, две строки
+     * ответа), поэтому непустой `persist` — это доказательство, что канал ответил. Пустой `runtime`
+     * при непустом `persist` — определённый факт «свойство пустое, JIT не поднят» (маршрут 3),
+     * а не «канала нет». Именно поэтому `persist` обязан участвовать в решении.
+     */
     fun verifyOutcome(runtime: String, persist: String): VerifyOutcome = when {
         runtime == "true" -> VerifyOutcome.OK
-        runtime.isEmpty() -> VerifyOutcome.UNKNOWN
-        else -> VerifyOutcome.FAILED
+        runtime.isNotEmpty() -> VerifyOutcome.FAILED      // ответ есть, JIT не поднят
+        persist.isNotEmpty() -> VerifyOutcome.FAILED      // канал ответил (persist прочитан), runtime пуст
+        else -> VerifyOutcome.UNKNOWN                     // обе строки пусты ⇒ канала нет
+    }
+
+    /**
+     * iter33g A2 — причина для лога, взаимоисключающая и проверяемая тестом:
+     * `runtime_not_true` (свойство читается, но не `true`), `runtime_empty` (прошивка не даёт),
+     * `no_channel` (канал молчит), `""` для `OK`.
+     */
+    fun outcomeReason(outcome: VerifyOutcome, runtime: String, persist: String): String = when {
+        outcome == VerifyOutcome.UNKNOWN -> "no_channel"
+        outcome == VerifyOutcome.FAILED && runtime.isEmpty() -> "runtime_empty"
+        outcome == VerifyOutcome.FAILED -> "runtime_not_true"
+        else -> ""
+    }
+
+    /** iter33g B1 — разрешён ли ещё один цикл сверки в этой загрузке. */
+    enum class CycleDecision { RUN, SKIP }
+
+    /**
+     * iter33g B1/B2: в файле `jit_verify_cycle` лежит `bootTag` загрузки, в которой цикл сверки
+     * уже был. Тот же тег ⇒ `SKIP` (повторный цикл в этой загрузке запрещён), другой тег ⇒ `RUN`
+     * (новая загрузка счётчик не блокирует). Пустой файл ⇒ `RUN`.
+     */
+    fun cycleDecision(stored: String, currentTag: String): CycleDecision = when {
+        stored.isBlank() -> CycleDecision.RUN
+        sameLoad(stored.trim(), currentTag.trim()) -> CycleDecision.SKIP
+        else -> CycleDecision.RUN
     }
 
     /** Uptime из метки, если он там есть (для лога), иначе -1. */

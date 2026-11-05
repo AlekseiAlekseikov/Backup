@@ -695,6 +695,8 @@ object AppPerformance {
      */
     private const val PROCESSING_SUFFIX = ".processing"
     /** iter33f B2: рамки повторов при `UNKNOWN` — не больше 3 раз по 10 с (окно ≤ 60 с). */
+    /** iter33g B1: bootTag загрузки, в которой цикл сверки уже выполнялся. */
+    private const val JIT_VERIFY_CYCLE_FILE = "jit_verify_cycle"
     private const val JIT_VERIFY_RETRY_MAX = 3
     private const val JIT_VERIFY_RETRY_DELAY_MS = 10_000L
     /** iter33c C1: окно, в котором перезапуск zygote РАЗРЕШЁН (было имя «late start» — наоборот по смыслу). */
@@ -708,6 +710,12 @@ object AppPerformance {
      * `JIT_VERIFY: claim taken reason=already_scheduled` вместо молчаливого выхода.
      */
     private val jitVerifyScheduled = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /**
+     * iter33g C2: `claim none` печатаем один раз за процесс — при обычном открытии приложения
+     * `onCreate` + `onStartCommand` давали две одинаковые строки шума.
+     */
+    private val saidNoClaim = java.util.concurrent.atomic.AtomicBoolean(false)
 
 
     /**
@@ -944,8 +952,24 @@ object AppPerformance {
                 jitVerifyScheduled.set(false)
                 AppLog.i(TAG, "JIT_VERIFY: skip reason=pending_stale pending=${kvE(pending)} boot_tag=$bootTag")
             }
-            JitBootMark.PendingDecision.VERIFY -> BgWorker.post("AppPerformance.jitVerifyAfterRestart") {
-                verifyClaimedAfterRestart(app, claimed, bootTag, 0)
+            JitBootMark.PendingDecision.VERIFY -> {
+                // iter33g B1: не больше одного цикла сверки за загрузку. Файл `jit_verify_cycle`
+                // хранит bootTag той загрузки, где цикл уже был; запись — ДО запуска сверки,
+                // иначе падение процесса повторило бы цикл.
+                val cycleFile = File(app.filesDir, JIT_VERIFY_CYCLE_FILE)
+                val storedCycle = runCatching { cycleFile.readText().trim() }.getOrDefault("")
+                if (JitBootMark.cycleDecision(storedCycle, bootTag) == JitBootMark.CycleDecision.SKIP) {
+                    AppLog.i(TAG, "JIT_VERIFY: skip reason=already_this_boot boot_tag=$bootTag " +
+                        "(цикл сверки в этой загрузке уже был)")
+                    // Намерение не теряем и `.processing` не оставляем — возвращаем на место.
+                    restorePendingIntent(app, claimed)
+                    jitVerifyScheduled.set(false)
+                    return
+                }
+                runCatching { cycleFile.writeText(bootTag) }
+                BgWorker.post("AppPerformance.jitVerifyAfterRestart") {
+                    verifyClaimedAfterRestart(app, claimed, bootTag, 0)
+                }
             }
         }
     }
@@ -989,7 +1013,9 @@ object AppPerformance {
             }
             // Захватывать нечего: файла-намерения нет вовсе (обычный старт из приложения).
             // Это НЕ `claim taken` — «забран другим вызовом» и «нечего забирать» разные факты.
-            AppLog.i(TAG, "JIT_VERIFY: claim none boot_tag=$bootTag")
+            if (saidNoClaim.compareAndSet(false, true)) {
+                AppLog.i(TAG, "JIT_VERIFY: claim none boot_tag=$bootTag")
+            }
             return null
         }
         jitVerifyScheduled.set(true)
@@ -1017,11 +1043,10 @@ object AppPerformance {
     private fun verifyClaimedAfterRestart(app: Context, claimed: File, bootTag: String, attempt: Int) {
         val (runtime, persist) = jitProps()   // единственное действие повтора: чтение getprop
         val outcome = JitBootMark.verifyOutcome(runtime, persist)
-        val reason = when (outcome) {
-            JitBootMark.VerifyOutcome.OK -> ""
-            JitBootMark.VerifyOutcome.FAILED -> " reason=runtime_not_true"
-            JitBootMark.VerifyOutcome.UNKNOWN -> " reason=no_channel"
-        }
+        // iter33g A2: две разные причины у FAILED — «прошивка не даёт» и «свойство читается,
+        // но не true»; решение о слове принимает JitBootMark (покрыто тестом).
+        val reasonWord = JitBootMark.outcomeReason(outcome, runtime, persist)
+        val reason = if (reasonWord.isEmpty()) "" else " reason=$reasonWord"
         AppLog.i(TAG, "JIT_VERIFY: runtime_after=${kvE(runtime)} persist=${kvE(persist)} source=after_restart " +
             "result=${outcome.name}$reason boot_tag=$bootTag attempt=${attempt + 1}")
         when (outcome) {
