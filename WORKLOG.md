@@ -471,3 +471,34 @@
 **CI:** `42002436101` failure (дубль `isAutoOptimizeEnabled`) → `42004017024` success (артефакт 13403369333) →
 `42005750488` success, артефакт **13405077055**, zip **177 079 438 Б**, APK **215 509 471 Б**, `> Task :app:testDebugUnitTest` в логе,
 `BUILD SUCCESSFUL in 4m 14s`. Отчёт — `REPORT_iter33b.md`.
+
+## iter33c — 1.0.53 (вторая пересборка, версия та же), ветка `fix/v2`
+
+База `c252ecf`. Коммиты: `edaebae` (правки), `29f18ec` (`testLogging`).
+Рабочая папка `work9` оказалась обрезанной (пропал `.git`) → работа продолжена в свежем клоне `/home/user/work10`.
+
+**A — вердикт плагина климата**
+- Новый `tools/HvacVerdict.kt` — ЧИСТЫЙ разбор (без Android): `parse()` читает `###STAGE name=bind status=OK|SKIP|FAILED`
+  (`reason=inode_match:<n>`), отдельные `^SRC_INODE=`/`^TGT_INODE=`, итоговую строку `^VIA=…$` (якоря обязательны)
+  и служебное `unshadow_via=`; `statusOf()` — статус шага (`mountOk` + bind OK|SKIP ⇒ OK, PARTIAL только без вердикта bind).
+- `HvacDigitalPlugin.kt`: скрипт печатает `TGT_INODE=` отдельной строкой (`:249`, `:265`), служебное поле
+  `HVAC_UNSHADOW: … unshadow_via=…` (`:224`, `:232`); разбор заменён на `HvacVerdict` (`:313-355`);
+  в `HVAC VERDICT:` добавлены `unshadow_via=` и `bind_stage=`.
+- `app/src/test/.../HvacVerdictTest.kt` — 6 тестов (успех с `via=pm_uninstall` внутри, провал затмения,
+  подчёркивание в служебном поле, мусор, SKIP, BLOCKED/FAILED).
+- `app/build.gradle.kts:224-233` — `testLogging(passed,failed,skipped)`: имена и число тестов в логе CI.
+
+**B — JIT**
+- `AppPerformance.kt`: `attemptInThisLoad()` (`:845`) → `JIT_BOOT: match_after_zygote` вместо ложного
+  `restored_from_persist` (`:742-760`); `persist_present=` во всех ветках `JIT_PERSIST_PROBE`;
+  `jitPersistBackfill()` (`:833`) пишет единственную разрешённую persist-запись и по клику (`reason=toggle`),
+  и на boot (`reason=boot_backfill`); маршрут 2 (`ctl.restart zygote`) — ТОЛЬКО на `secondPass` (`:772-777`),
+  поэтому за загрузку ровно один перезапуск и он после установки плагина.
+
+**C**
+- `JIT_LATE_START_MS` → `JIT_ZYGOTE_WINDOW_MS` (`:688`), `reason=late_start` → `reason=outside_window` (`:779`).
+- `LogKit.kt:112-141` — `scheduleTailFlush()`: хвост выжимки сбрасывается через 2 с, а не ждёт `HEARTBEAT` (60 с).
+
+**CI:** `42018524877` (`edaebae`) success — артефакт 13410374029, zip 177 080 461 Б / APK 215 519 395 Б;
+`42020153399` (`29f18ec`) success — артефакт **13411367824**, zip **177 080 524 Б**, APK **215 519 395 Б**,
+`BUILD SUCCESSFUL in 2m 59s`, **10 тестов PASSED** (6 × HvacVerdictTest + 4 × ScriptChunkerTest). Отчёт — `REPORT_iter33c.md`.
