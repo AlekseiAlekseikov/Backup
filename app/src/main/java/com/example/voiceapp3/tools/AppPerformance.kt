@@ -987,7 +987,9 @@ object AppPerformance {
                 AppLog.i(TAG, "JIT_VERIFY: claim ok reason=leftover boot_tag=$bootTag pending=${kvE(left)}")
                 return claimed
             }
-            AppLog.i(TAG, "JIT_VERIFY: claim taken boot_tag=$bootTag pending=empty")
+            // Захватывать нечего: файла-намерения нет вовсе (обычный старт из приложения).
+            // Это НЕ `claim taken` — «забран другим вызовом» и «нечего забирать» разные факты.
+            AppLog.i(TAG, "JIT_VERIFY: claim none boot_tag=$bootTag")
             return null
         }
         jitVerifyScheduled.set(true)
