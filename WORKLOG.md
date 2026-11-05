@@ -502,3 +502,31 @@
 **CI:** `42018524877` (`edaebae`) success — артефакт 13410374029, zip 177 080 461 Б / APK 215 519 395 Б;
 `42020153399` (`29f18ec`) success — артефакт **13411367824**, zip **177 080 524 Б**, APK **215 519 395 Б**,
 `BUILD SUCCESSFUL in 2m 59s`, **10 тестов PASSED** (6 × HvacVerdictTest + 4 × ScriptChunkerTest). Отчёт — `REPORT_iter33c.md`.
+
+## iter33d — 1.0.53 (третья пересборка, версия та же), ветка `fix/v2`
+
+База `bf8ceb2`, коммит `1bde92f`.
+
+**A — метка загрузки (главная функциональная правка)**
+- Новый `tools/JitBootMark.kt` (чистый Kotlin, без Android): `format(tag, uptime)` → `"<tag>:<uptimeMs>"`,
+  `sameLoad(marker, currentTag, tolerance=60_000)` — legacy-число без `:` ⇒ true; совпадение тега ⇒ true;
+  числовые (epoch) теги ⇒ `abs(a-b) <= 60 c`; всё остальное ⇒ false. `isLegacy`, `uptimeOf`.
+- `AppPerformance.kt:877` `currentBootTag()`: `/proc/sys/kernel/random/boot_id`, иначе
+  `"epoch" + (currentTimeMillis - elapsedRealtime)/1000`.
+- `AppPerformance.kt:733` — строка `JIT_BOOT: attempt_marker boot_tag=… same_load=… uptime_ms=… marker=…`
+  на каждом проходе; `:737-741` — legacy-метка переписывается (`action=rewrite`).
+- Guard маршрута 2 (`:807`) и `attemptInThisLoad` (`:866`) используют ОДНУ функцию `JitBootMark.sameLoad`.
+  Удалены `JIT_ATTEMPT_GUARD_MS`, арифметика по разнице uptime и вторая копия эвристики.
+- `app/src/test/.../JitBootMarkTest.kt` — 6 тестов (разные загрузки не блокируют, та же загрузка,
+  больший uptime, legacy, мусор, epoch-допуск).
+
+**B** — `LogKit.kt:136` хвост выжимки уходит в `BgWorker.postDelayed` (`BgWorker.kt:92`, планировщик `:39`);
+`Handler`/`Looper` из `LogKit` удалены (в файле остался только комментарий). Максимум одна задача в очереди.
+
+**C** — `AppPerformance.kt:750-761`: `persistBefore` снимается ДО дозаписи; во всех четырёх ветках пробы
+печатаются `persist_before=`, `persist_present=`, `backfill=`.
+
+**CI:** прогон **42023172917** (`1bde92f`) — success, джоба `127230879289`, `BUILD SUCCESSFUL in 2m 42s`,
+**16 тестов PASSED / 0 FAILED**; артефакт **13412982735**: `zip` **177 081 062 Б**,
+`apk/debug/app-debug.apk` **215 418 521 Б**, `logs/manifest-merger-debug-report.txt` **105 294 Б**.
+Отчёт — `REPORT_iter33d.md`.
