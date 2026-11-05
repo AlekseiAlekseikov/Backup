@@ -1002,9 +1002,8 @@ object AdbClient {
         propWriteOk = ok >= 1
         AppLog.i(TAG, "EXEC_PROP keys=ok=$ok/3 propwrite=${if (propWriteOk) "ok" else "denied"}")
 
-        // 3) Ветка мандата: при праве записи включить плагин через `via=app`.
-        //    Не перетираем уже выставленное состояние монтирования (install/bind) — им управляет
-        //    HvacDigitalPlugin, который в этой итерации трогать запрещено (§7 мандата).
+        // 3) Состояние установки плагина (install/bind) read-only: им управляет HvacDigitalPlugin,
+        //    который в этой итерации трогать запрещено (§7 мандата). Своё значение не пишем.
         // iter33i P0-a.3: `persist.sys.hvacdigital.via` — механизм установки плагина
         // (`bind`/`install`, референс `w0/o.java:73`). Своё значение («app», маршрутная пилюля)
         // туда НЕ пишем: чужой prop не наш. Только чтение — для диагностики.

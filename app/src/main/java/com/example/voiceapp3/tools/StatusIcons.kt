@@ -56,10 +56,10 @@ object StatusIcons {
     const val PREF_HVAC_EXT_TEMP = "hvacdigital_temp_ext"
     // iter33i P0-a: имена берём из HvacDigitalProps (один источник истины), значения не пишем.
     private const val SYS_HVAC_BATT = HvacDigitalProps.PROP_BATT
-    // E1 (iter33h): `persist.sys.hvacdigital.temp` приложением БОЛЬШЕ НЕ ПИШЕТСЯ.
-    // Уставку климата плагин читает сам (HvacVehicleTempWidget.getPropertyId() → HVAC_TEMPERATURE_SET),
-    // а наше «значение» уходило в слот климата поверх стандартной полоски.
-    // F2: ключ наружной — ОДИН (`persist.sys.hvacdigital.exttemp`), как в референсе
+    // iter33i P0-a: в `persist.sys.hvacdigital.temp` уходит ФЛАГ `0|1` (режим цифрового слота),
+    // как у референса (w0/x7.java:137-147). Значение уставки туда не пишется — его плагин читает
+    // сам (`HvacVehicleTempWidget.getPropertyId() → 358614275`, area 1).
+    // Ключ наружной — ОДИН (`persist.sys.hvacdigital.exttemp`), как в референсе
     // (w0/x7.java:142, w0/ah.java:17, w0/u5.java:27); `temp_ext` больше не пишем.
     private const val SYS_HVAC_VIA = HvacDigitalProps.PROP_VIA                    // только ЧТЕНИЕ (диагностика)
     private const val SYS_HVAC_EXT_EXTTEMP = HvacDigitalProps.PROP_EXT              // F2: единственный ключ наружной
