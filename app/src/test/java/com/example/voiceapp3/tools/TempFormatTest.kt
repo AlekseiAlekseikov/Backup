@@ -26,7 +26,8 @@ class TempFormatTest {
         assertEquals(25.0f, envOutsideToCelsius(25.0f, null)!!, 0.001f)
         assertEquals(9.5f, envOutsideToCelsius(null, 95)!!, 0.001f)   // 95 при факте ~9.5 °C
         assertEquals(5.5f, envOutsideToCelsius(null, 55)!!, 0.001f)   // −550…700 ⇒ /10
-        assertEquals(-3.0f, envOutsideToCelsius(null, -3)!!, 0.001f)  // −45…65 как есть
+        assertEquals(-3.0f, envOutsideToCelsius(null, -30)!!, 0.001f)  // −550…700 ⇒ /10
+        assertEquals(20.0f, envOutsideToCelsius(null, 200)!!, 0.001f)  // 200 ⇒ 20.0 °C — валидно
     }
 
     // 3. Мусор/вне диапазона — значения нет (никаких подстановок из ambient).
@@ -34,7 +35,8 @@ class TempFormatTest {
     fun rejectsOutOfRange() {
         assertNull(envOutsideToCelsius(99.0f, null))
         assertNull(envOutsideToCelsius(null, 5000))
-        assertNull(envOutsideToCelsius(null, 200))
+        assertNull(envOutsideToCelsius(null, 800))   // 800: ни −550…700, ни −45…65
+        assertNull(envOutsideToCelsius(null, -600))  // −600: ниже нижней границы обеих ветвей
         assertNull(envOutsideToCelsius(Float.NaN, null))
         assertNull(envOutsideToCelsius(null, null))
     }

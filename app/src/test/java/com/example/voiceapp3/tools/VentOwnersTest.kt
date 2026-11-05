@@ -44,11 +44,14 @@ class VentOwnersTest {
     //    «парная» дверь становится владельцем.
     @Test
     fun legacyKeepsDoorToWindowSync() {
+        // Для legacy-окна карта DOOR_TO_WINDOW связывает с ним ОБЕ двери (0x1 и 0x4) —
+        // именно этот случай прежняя синхронизация держала открытым.
+        val legacyMap = mapOf(0x1 to 0x11, 0x4 to 0x11)
         val legacy = com.example.voiceapp3.tools.ventOwnersAfterClose(
             door = 0x1, window = 0x11,
             owners = setOf(0x1),
             doorStates = mapOf(0x1 to false, 0x4 to true),
-            doorToWindow = doorToWindow,
+            doorToWindow = legacyMap,
             legacy = true,
         )
         assertEquals(setOf(0x4), legacy)
@@ -56,7 +59,7 @@ class VentOwnersTest {
             door = 0x1, window = 0x11,
             owners = setOf(0x1),
             doorStates = mapOf(0x1 to false, 0x4 to true),
-            doorToWindow = doorToWindow,
+            doorToWindow = legacyMap,
             legacy = false,
         )
         assertFalse("не-legacy окно не должно получать владельца из карты", modern.contains(0x4))
