@@ -631,3 +631,38 @@
   комментарий из `avas/**`) и `42080288285` (неверные ожидания в трёх тестах); зелёный прогон
   **`42082578996`** (head `77191bc`), артефакт **`13442117857`**: zip **177 100 457 Б** ·
   apk **215 465 513 Б** · manifest-отчёт **105 294 Б**.
+
+## iter33i — 1.0.54 fix1 (props = флаги `0|1`, tempProbe по реальным ID, плагин без полоски)
+
+База `b355c45`; коммиты `25344d2` (код) и `3b30ba6` (комментарии props). Версия не менялась
+(`versionCode = 54`, `versionName = "1.0.54"`).
+
+- P0-a: семантика props доказана цитатами — референс пишет ФЛАГИ `0|1`
+  (`w0/x7.java:137-147`), читает их плагин референса (его APK CEX валидирует по этим строкам,
+  `w0/ah.java:17`, сброс — `w0/u5.java:27,342`); наш плагин их НЕ читает (0 вхождений
+  `hvacdigital` в 2714 записях `res/raw`-APK). Записи приведены 1:1 к референсу:
+  `HvacDigitalProps.flagsCommand` (`tools/HvacDigitalProps.kt:42-47`), вызов —
+  `StatusIcons.kt:896-930`; было `setprop …temp 9.5` (`67c7213^:StatusIcons.kt:789`).
+- P0-a.3: `via` в чужой prop не пишем — `AdbClient.kt:1005-1015` (только `getprop`); в
+  `setprop` остаются `bind`/`nenhum` mount-скрипта (`HvacDigitalPlugin.kt:316,319`).
+- P0-a.4: `HvacDigitalPropsTest` (5 тестов) — «состояние → строка setprop».
+- P0-b: причина наложения — В КОДЕ ПЛАГИНА, не в props: `updateTextStyle()` принудительно
+  показывал полоску (`HvacVehicleTempWidget.java:455-465`, `:700-706`), а цифра
+  (`updateDigitalTemp`, `:436-453`) висит в том же слоте раскладки (`widget_vehicle_temp.xml:11-12`).
+  Смали пропатчен (`{v0,v1}`→`{v0,v2}`, `{p1,v1}`→`{p1,p2}`, 0x8 = GONE), APK пересобран
+  apktool 2.9.3 + zipalign + apksigner (platform-ключ, тот же cert `c8a2e9bc…`), заменён
+  `app/src/main/res/raw/geely_auto_systemui_plugin_digital.apk`; stock-копия и подписанный APK —
+  в `/home/user/artifacts/`. Размеры: APK 18 276 066 Б (было столько же), `classes.dex`
+  6 799 536 → 6 799 912, `resources.arsc` 3 934 708 (без изменений). Runtime не проверен — скрин за владельцем.
+- P1: `tempProbe` переписан на таблицу `tools/TempProbeTable.kt` (10 свойств, 18 строк):
+  `AC_INSIDE_TEMP 0x2140A379`, `AC_INSIDE_TEMP_INVALID 0x2140A378`, `HVAC_IN_OUT_TEMP 0x2140101D`,
+  `HU_ENVIRONMENTAL_TEMP 0x21404515`, `TEMPERATURE_STATE 0x2140A267`, отдельная строка
+  `HVAC_TEMPERATURE_CURRENT 0x15600502` {1,4,0,7}, `ZONED_TEMP_SETPOINT 0x15600503` {1,49,68};
+  `noId()` удалён; `TempProbeTableTest` (7 тестов) сверяет hex↔id↔имя с `ex2_carprops.csv`.
+- P2: комментарии-«заглушки» вычищены (`StatusIcons.kt:83`, `:117-118`); кнопка →
+  «Тест звука открытия» (`ui/ToolsPanel.kt:795`); вторая фикстура `/system/priv-app/…` в
+  `MountParseTest` (`:50-64`).
+- CI: прогон **`42090458736`** (head `3b30ba6`) — success, **56 PASSED / 0 FAILED**, артефакт
+  **`13445912750`**: zip **176 999 349 Б** · apk **215 470 097 Б** · manifest-отчёт **105 294 Б**.
+  Прогон `42089523005` (`25344d2`) — `cancelled` (вытеснен новым push).
+- Открытые вопросы владельцу: маршрутная пилюля (оставить в своём UI/убрать) и скрин слота климата.
