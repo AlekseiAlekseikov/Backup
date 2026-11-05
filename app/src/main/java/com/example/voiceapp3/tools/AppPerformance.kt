@@ -346,6 +346,33 @@ object AppPerformance {
     /**
      * Оптимизация видео (1080p 60fps) через staging vcodec642.so и bind mount поверх /vendor/lib/libvcodecdrv.so
      */
+    /**
+     * iter33 B1.2: read-only проверка «уже применено?». Одна короткая команда:
+     * строка в `/proc/mounts` + сверка inode источника и цели.
+     * Ни umount, ни mount, ни `ctl.restart`, ни `sleep` здесь нет.
+     */
+    fun isVideoApplied(): Boolean = runCatching {
+        val (_, out) = AdbClient.execute(
+            "M=\$(grep -F \" $TARGET_VCODEC_PATH \" /proc/mounts 2>/dev/null | head -n1); " +
+                "echo MOUNT_LINE=\$M; " +
+                "echo SRC_INODE=\$(stat -c '%i' $STAGING_VCODEC_PATH 2>/dev/null); " +
+                "echo TGT_INODE=\$(stat -c '%i' $TARGET_VCODEC_PATH 2>/dev/null)", 4000, expectRoot = false)
+        val src = parseTag(out, "SRC_INODE")
+        val tgt = parseTag(out, "TGT_INODE")
+        // MOUNT_LINE=<строка /proc/mounts> — пустое значение значит «не смонтировано».
+        val mountLine = Regex("MOUNT_LINE=([^\\n]*)").find(out)?.groupValues?.get(1)?.trim().orEmpty()
+        mountLine.contains(TARGET_VCODEC_PATH) && src != null && src == tgt && src != "0"
+    }.getOrDefault(false)
+
+    /** Только диагностика (watchdog/бут): никаких изменений в системе. */
+    fun verifyVideoOnly(context: Context) {
+        if (!isVideo60FpsEnabled(context)) { LogKit.stateVideo(false); return }
+        val applied = isVideoApplied()
+        LogKit.stateVideo(applied)
+        if (applied) AppLog.i(TAG, "video_codec_swap: SKIP (already applied) — watchdog ничего не делает")
+        else AppLog.i(TAG, "video_codec_swap: not applied (boot/watchdog, no action) — включите тумблер «видео 60 fps» по клику")
+    }
+
     fun setVideo60Fps(context: Context, enabled: Boolean): ToolsResult {
         BgWorker.assertNotMain("AppPerformance.setVideo60Fps")
         val steps = mutableListOf<ToolsStep>()
@@ -369,6 +396,21 @@ object AppPerformance {
             )
 
             if (enabled) {
+                // iter33 B1.2: идемпотентность ДО любого действия. Совпали inode и строка
+                // в /proc/mounts ⇒ ни umount, ни mount, ни `ctl.restart`, ни `sleep`.
+                if (isVideoApplied()) {
+                    AppLog.i(TAG, "video_codec_swap: SKIP (already applied) — mount на месте, inode совпал")
+                    steps.add(ToolsStep(
+                        step = "video_codec_swap",
+                        command = "grep /proc/mounts + stat -c %i (read-only)",
+                        startedAtMs = now, finishedAtMs = System.currentTimeMillis(),
+                        exitCode = 0, stdout = "already applied: mount present, SRC_INODE == TGT_INODE",
+                        expected = "SRC_INODE==TGT_INODE", actual = "equal",
+                        status = ToolsStep.Status.OK))
+                    LogKit.stateVideo(true)
+                    return ToolsResult(action = "settings.perfVideo",
+                        title = "Оптимизация видео (1080p 60fps)", steps = steps)
+                }
                 // 1. Извлечь ассет в кэш приложения
                 val cacheFile = File(context.cacheDir, "vcodec_stage.so")
                 try {
@@ -427,8 +469,12 @@ object AppPerformance {
                     done
                     mount --bind $STAGING_VCODEC_PATH $TARGET_VCODEC_PATH 2>&1 || echo FAILBIND
                     if grep -F " $TARGET_VCODEC_PATH " /proc/mounts >/dev/null 2>&1; then echo MOUNT_PRESENT=1; else echo MOUNT_PRESENT=0; fi
+                    # iter33 B1.3: `ctl.restart` — только по клику (сюда watchdog больше не ходит).
                     setprop ctl.restart $RESTART_SERVICE_NAME 2>/dev/null || true
-                    sleep 3
+                    # iter33 B1.3: вместо `sleep 3` — ждём смены PID в цикле, бюджет 5 с.
+                    _t=0
+                    while [ "$(pidof media.swcodec 2>/dev/null)" = "${'$'}MEDIA_PID_BEFORE" ] && [ ${'$'}_t -lt 10 ]; do sleep 0.5; _t=${'$'}((${'$'}_t+1)); done
+                    echo "MEDIA_WAIT_TICKS=${'$'}_t"
                     MEDIA_PID_AFTER=${'$'}(pidof media.swcodec 2>/dev/null; pidof mediacodec 2>/dev/null; pidof android.hardware.media.omx 2>/dev/null)
                     echo MEDIA_PID_AFTER=${'$'}MEDIA_PID_AFTER
                     echo "SRC_INODE=${'$'}(stat -c %i $STAGING_VCODEC_PATH 2>/dev/null)"
@@ -464,6 +510,7 @@ object AppPerformance {
                     else -> "SRC_INODE=$src TGT_INODE=$tgt MOUNT_PRESENT=$mountPresent"
                 }
                 AppLog.i(TAG, "VERIFY video_codec_swap: $mountStatus ($mountReason)")
+                if (mountStatus == ToolsStep.Status.OK) LogKit.countCodecRestart()
 
                 steps.add(
                     ToolsStep(

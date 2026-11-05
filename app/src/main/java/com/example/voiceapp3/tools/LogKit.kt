@@ -1,0 +1,329 @@
+package com.example.voiceapp3.tools
+
+import android.content.Context
+import android.os.SystemClock
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.ArrayDeque
+import java.util.Date
+import java.util.Locale
+
+/**
+ * iter33 (1.0.53) — структурированный лог: маркеры, контекст `run/op/cycle`, выжимка
+ * `app.ops.log`, счётчики и подавление шума.
+ *
+ * Зачем отдельный объект, а не AppLog:
+ *  • AppLog — «сырьё» (`app.log`), он не должен знать ни про какие маркеры;
+ *  • здесь живёт ВСЯ политика (C1–C8 мандата), чтобы её можно было менять, не трогая писатель;
+ *  • писатель остался ОДИН (AppLog.writeRaw, synchronized) — требование C8.2 соблюдено:
+ *    строки не перемешиваются между `CENTRAL_Bg-N`.
+ *
+ * Файлы:
+ *  • `app.log`     — рабочий лог (шум свёрнут, см. [trace]);
+ *  • `app.ops.log` — выжимка: только маркеры (`SESSION_*`, `LOG_INDEX`, `OP_*`, `CYCLE_*`,
+ *    `HEARTBEAT`, `HVAC_*`, `SCRIPT_TRACE`, `LOG_SUMMARY`, все `[ERROR]`/`[WARN]` и `RU:`).
+ *
+ * ВАЖНО: логирование не выполняет ни одной ADB-команды и не открывает ни одного соединения (C8.5).
+ */
+object LogKit {
+    const val VER = "1.0.53"
+    const val OPS_NAME = "app.ops.log"
+    private const val OPS_MAX_LINES = 200
+    private const val TRACE_PER_SESSION = 20
+    private const val CONN_WINDOW_MS = 60_000L
+
+    /** Один `run` на процесс: 8 hex из nanoTime (не криптография — просто метка сеанса). */
+    val run: String = java.lang.Long.toHexString(System.nanoTime() and 0xFFFFFFFFL).padStart(8, '0')
+
+    private val df = SimpleDateFormat("HH:mm:ss", Locale.US)
+    private val lock = Any()
+    private val opsLines = ArrayDeque<String>(OPS_MAX_LINES)
+
+    @Volatile private var dir: File? = null
+    @Volatile private var appCtx: Context? = null
+    private val tlOp = ThreadLocal<String?>()
+    private val tlCycle = ThreadLocal<Int>()
+
+    // ── счётчики для HEARTBEAT ──
+    private val execCount = java.util.concurrent.atomic.AtomicInteger(0)
+    private val connCount = java.util.concurrent.atomic.AtomicInteger(0)
+    private val sysuiKills = java.util.concurrent.atomic.AtomicInteger(0)
+    private val codecRestarts = java.util.concurrent.atomic.AtomicInteger(0)
+    @Volatile private var lastBeatMs = 0L
+    @Volatile private var hvacState = "unknown"
+    @Volatile private var ttlState = "unknown"
+    @Volatile private var videoState = "unknown"
+
+    // ── подавление шума (C3) ──
+    private val traceSeen = HashMap<String, Int>()
+    private val traceSuppressed = HashMap<String, Int>()
+    private val traceLast = HashMap<String, String>()
+    @Volatile private var lastSuppressedFlushMs = 0L
+
+    // ── кольца для LOG_SUMMARY ──
+    private class OpRec(val time: String, val action: String, val result: String, val reason: String)
+    private val opRing = ArrayDeque<OpRec>(20)
+    private val errRing = ArrayDeque<String>(5)
+
+    // ───────────────────────── init ─────────────────────────
+
+    /** Вызывается из AppLog.init: тот же каталог, что у `app.log`. */
+    fun attach(ctx: Context, logDir: File) {
+        dir = logDir
+        appCtx = ctx.applicationContext
+        sessionStart(ctx)
+    }
+
+    private fun opsFile(): File? {
+        val d = dir ?: return null
+        runCatching { if (!d.exists()) d.mkdirs() }
+        return File(d, OPS_NAME)
+    }
+
+    /** Перезапись выжимки целиком (≤ [OPS_MAX_LINES] строк) — так проще держать лимит. */
+    private fun flushOps() {
+        val f = opsFile() ?: return
+        runCatching {
+            val text = synchronized(lock) { opsLines.joinToString("\n") + "\n" }
+            f.writeText(text)
+        }
+    }
+
+    private fun ops(line: String) {
+        synchronized(lock) {
+            opsLines.addLast(line)
+            while (opsLines.size > OPS_MAX_LINES) opsLines.removeFirst()
+        }
+        flushOps()
+    }
+
+    /** Строка-маркер: идёт и в `app.log` (как факт), и в выжимку `app.ops.log`. */
+    private fun marker(line: String) {
+        AppLog.marker(line)
+        ops(line)
+    }
+
+    /**
+     * iter33 C6: разбор `###STAGE name=… status=…` из вывода скрипта.
+     * Печатает `SCRIPT_TRACE script=… stages=N failed=<name>:<reason>` и по строке на шаг.
+     * Сырой вывод скрипта при этом сохраняется целиком (ничего не выбрасываем).
+     */
+    fun scriptTrace(script: String, rawOut: String) {
+        val stages = Regex("###STAGE name=([A-Za-z0-9_]+) status=([A-Za-z]+)(?: reason=([^\\n]*))?")
+            .findAll(rawOut).map { m ->
+                Triple(m.groupValues[1], m.groupValues[2].uppercase(), m.groupValues[3].trim())
+            }.toList()
+        if (stages.isEmpty()) {
+            marker("SCRIPT_TRACE script=$script stages=0 failed=none (маркеров ###STAGE в выводе нет — старый скрипт или канал не дошёл)")
+            return
+        }
+        val failed = stages.firstOrNull { it.second == "FAILED" }
+        val failedText = failed?.let { "${it.first}:${it.third.ifEmpty { "?" }}" } ?: "none"
+        marker("SCRIPT_TRACE script=$script stages=${stages.size} failed=${kv(failedText)}")
+        stages.forEachIndexed { i, st ->
+            marker("  STAGE ${i + 1}/${stages.size} ${st.first.padEnd(10)} ${st.second.padEnd(7)} ${kv(st.third.ifEmpty { "-" })}")
+        }
+        val ruText = if (failed != null)
+            "Скрипт $script остановился на шаге «${failed.first}»: ${failed.third.ifEmpty { "причина не указана" }}. Всё, что было до него, выполнено; этот шаг — причина, по которой цифры не появились."
+        else
+            "Скрипт $script прошёл все ${stages.size} шагов без провалов: причина отсутствия цифр — не в скрипте, смотрите шаги после него."
+        ru(ruText)
+    }
+
+    // ───────────────────────── контекст ─────────────────────────
+
+    fun currentOp(): String? = tlOp.get()
+    fun currentCycle(): Int? = tlCycle.get()
+
+    /** Суффикс контекста для каждой строки `app.log` (C4): `run=… op=… cycle=…`. */
+    fun ctxSuffix(): String {
+        val op = tlOp.get()
+        val cy = tlCycle.get()
+        val sb = StringBuilder(" run=")
+        sb.append(run)
+        if (op != null) sb.append(" op=").append(op)
+        if (cy != null) sb.append(" cycle=").append(cy)
+        return sb.toString()
+    }
+
+    /** Выполнить блок с выставленным `op=` (контекст держится на потоке, но передаётся явно). */
+    fun <T> withOp(op: String, block: () -> T): T {
+        val prev = tlOp.get()
+        tlOp.set(op)
+        try { return block() } finally { tlOp.set(prev) }
+    }
+
+    fun setThreadOp(op: String?) { tlOp.set(op) }
+
+    fun <T> withCycle(n: Int, block: () -> T): T {
+        val prev = tlCycle.get()
+        tlCycle.set(n)
+        try { return block() } finally { tlCycle.set(prev) }
+    }
+
+    fun newOpId(): String =
+        java.lang.Long.toHexString((System.nanoTime() xor (System.currentTimeMillis() shl 4)) and 0xFFFFFFFFL)
+            .padStart(8, '0')
+
+    // ───────────────────────── SESSION (C2) ─────────────────────────
+
+    private fun sessionStart(ctx: Context) {
+        val dev = runCatching { android.os.Build.MODEL + "/" + android.os.Build.BOARD }.getOrDefault("unknown")
+        val up = SystemClock.uptimeMillis()
+        marker("SESSION_START run=$run ver=$VER dev=$dev uptime=$up")
+        marker(
+            "LOG_INDEX " +
+                "SESSION_START=старт сеанса(run/ver/dev) " +
+                "LOG_INDEX=эта шпаргалка " +
+                "OP_START=начало действия(op/cat/action/src) " +
+                "OP_STEP=шаг действия(step/status/expect/got) " +
+                "OP_SUMMARY=итог действия(ровно одна строка) " +
+                "CYCLE_START/CYCLE_SUMMARY=тик watchdog " +
+                "HEARTBEAT=состояние раз в 60с " +
+                "HVAC_PROBE/HVAC_RESULT=плагин климата " +
+                "SCRIPT_TRACE=разбор шагов скрипта " +
+                "LOG_SUMMARY=таблица последних действий " +
+                "RU:=пояснение по-русски после машинной строки"
+        )
+    }
+
+    // ───────────────────────── OP/CYCLE маркеры ─────────────────────────
+
+    fun opStart(op: String, cat: String, action: String, src: String) =
+        marker("OP_START op=$op cat=$cat action=$action src=$src")
+
+    fun opStep(op: String, step: Int, total: Int, name: String, status: String,
+               expect: String, got: String, ms: Long) =
+        marker("OP_STEP op=$op step=$step/$total name=$name status=$status expect=${kv(expect)} got=${kv(got)} ms=$ms")
+
+    fun opSummary(op: String, action: String, result: String, okSteps: Int, total: Int, durMs: Long, reason: String) {
+        marker("OP_SUMMARY op=$op action=$action result=$result steps=$okSteps/$total dur=$durMs reason=${kv(reason)}")
+        synchronized(lock) {
+            opRing.addLast(OpRec(df.format(Date()), action, result, reason))
+            while (opRing.size > 20) opRing.removeFirst()
+        }
+    }
+
+    fun cycleStart(n: Int) = marker("CYCLE_START n=$n reason=watchdog")
+
+    fun cycleSummary(n: Int, actions: Int, exec: Int, durMs: Long) =
+        marker("CYCLE_SUMMARY n=$n actions=$actions exec=$exec dur=$durMs")
+
+    // ───────────────────────── RU: (C5) ─────────────────────────
+
+    /** Пояснение по-русски: пишется в ОБА файла сразу после машинной строки. */
+    fun ru(text: String) {
+        AppLog.marker("RU: $text")
+        ops("RU: $text")
+    }
+
+    // ───────────────────────── HEARTBEAT / LOG_SUMMARY ─────────────────────────
+
+    fun countExec() { execCount.incrementAndGet() }
+    fun countConn() { connCount.incrementAndGet() }
+    fun countSysuiKill() { sysuiKills.incrementAndGet() }
+    fun countCodecRestart() { codecRestarts.incrementAndGet() }
+
+    fun stateHvac(v: String) { hvacState = v }
+    fun stateTtl(on: Boolean) { ttlState = if (on) "on" else "off" }
+    fun stateVideo(on: Boolean) { videoState = if (on) "on" else "off" }
+
+    /**
+     * Обновить состояние для `HEARTBEAT` по префам (без единой ADB-команды, C8.5).
+     * Вызывается после каждого действия пользователя и на каждом тике watchdog'а.
+     */
+    fun heartbeatStateRefresh() {
+        val c = appCtx ?: return
+        runCatching {
+            stateTtl(Prefs2.getBoolean(c, "ttl_65_ativo", false))
+            stateVideo(Prefs2.getBoolean(c, "perf_video_60fps", false))
+        }
+    }
+
+    /** Раз в 60 с: одна строка вместо восьми грепов (C7). */
+    fun heartbeat() {
+        val now = SystemClock.uptimeMillis()
+        val win = if (lastBeatMs == 0L) 60_000L else (now - lastBeatMs).coerceAtLeast(1L)
+        lastBeatMs = now
+        val exec = execCount.getAndSet(0)
+        val conn = connCount.getAndSet(0)
+        val perMinExec = if (win in 1..599_999L) Math.round(exec * 60_000.0 / win) else exec
+        val perMinConn = if (win in 1..599_999L) Math.round(conn * 60_000.0 / win) else conn
+        marker(
+            "HEARTBEAT uptime=${now / 1000} exec/min=$perMinExec conn/min=$perMinConn " +
+                "hvac=$hvacState ttl=$ttlState video=$videoState " +
+                "sysuiKills=${sysuiKills.get()} codecRestarts=${codecRestarts.get()}"
+        )
+        flushSuppressed(force = true)
+    }
+
+    /** Таблица последних действий + последние ошибки (кнопка диагностики и onDestroy). */
+    fun writeSummary() {
+        val opsTotal = opRing.size
+        val failed = opRing.count { it.result != "OK" }
+        marker("LOG_SUMMARY run=$run ops=$opsTotal failed=$failed")
+        synchronized(lock) {
+            var i = 0
+            for (r in opRing) {
+                i++
+                ops("  #%02d %s %-10s %-8s %s".format(i, r.time, r.action.take(10), r.result, kv(r.reason)))
+            }
+            if (errRing.isNotEmpty()) {
+                ops("  -- последние ошибки --")
+                for (e in errRing) ops("  [ERROR] ${kv(e)}")
+            }
+        }
+    }
+
+    /** Кольцо ошибок: вызывается из AppLog.e, чтобы `LOG_SUMMARY` их показывал. */
+    fun errorSeen(tag: String, msg: String) {
+        synchronized(lock) {
+            errRing.addLast("$tag: $msg")
+            while (errRing.size > 5) errRing.removeFirst()
+        }
+    }
+
+    // ───────────────────────── подавление шума (C3) ─────────────────────────
+
+    /**
+     * `trace` — пишет строку только первые [TRACE_PER_SESSION] раз на сеанс для данного вида,
+     * дальше считает и раз в минуту выдаёт ОДНУ строку `ADB_TRACE_SUPPRESSED n=… last=…`.
+     * Так шум сворачивается ЯВНО (со счётчиком), а не молча (C3, запрет «удалять строки молча»).
+     */
+    fun trace(kind: String, line: () -> String) {
+        synchronized(lock) {
+            val seen = traceSeen[kind] ?: 0
+            if (seen < TRACE_PER_SESSION) {
+                traceSeen[kind] = seen + 1
+                AppLog.d("CENTRAL_Trace", line())
+                return
+            }
+            traceSuppressed[kind] = (traceSuppressed[kind] ?: 0) + 1
+            traceLast[kind] = line()
+        }
+        flushSuppressed(force = false)
+    }
+
+    /** Раз в минуту — сводка подавленного. */
+    fun flushSuppressed(force: Boolean) {
+        val now = SystemClock.uptimeMillis()
+        if (!force && now - lastSuppressedFlushMs < CONN_WINDOW_MS && traceSuppressed.isEmpty()) return
+        if (!force && now - lastSuppressedFlushMs < CONN_WINDOW_MS) return
+        lastSuppressedFlushMs = now
+        val snapshot = synchronized(lock) {
+            val s = traceSuppressed.entries.joinToString(",") { "${it.key}=${it.value}" }
+            val last = traceLast.entries.joinToString(",") { "${it.key}:${it.value}" }
+            traceSuppressed.clear()
+            traceLast.clear()
+            s to last
+        }
+        if (snapshot.first.isEmpty()) return
+        marker("ADB_TRACE_SUPPRESSED n=${snapshot.first} last=${kv(snapshot.second.take(200))}")
+    }
+
+    /** Значение для `key=value`-лога: без пробелов и переводов строк. */
+    fun kv(s: String): String {
+        val t = s.replace('\n', '_').replace('\r', '_').replace(' ', '_')
+        return if (t.isEmpty()) "-" else t.take(180)
+    }
+}

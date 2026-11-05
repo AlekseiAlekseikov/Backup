@@ -16,6 +16,15 @@ object HvacDigitalPlugin {
     private const val STAGE_APK = "$STAGE_DIR/sysui.apk"
     private const val OEM_PKG = "com.flyme.auto.systemuiplugin"
 
+    /** iter33 C3: последнее известное состояние монтирования (для свёртки одинаковых строк). */
+    @Volatile private var lastMountState: Boolean? = null
+
+    /** iter33 A3.4: SystemUI перезапускается не чаще одного раза за процесс приложения. */
+    @Volatile private var sysuiKillDone = false
+
+    /** iter33 B2: enable() — только по клику и один раз за процесс (watchdog сюда не ходит). */
+    @Volatile private var enableDoneThisProcess = false
+
     data class Status(
         val oemPluginInstalled: Boolean,
         val overlayMounted: Boolean,
@@ -76,7 +85,14 @@ object HvacDigitalPlugin {
         } else {
             mountReason = "nomount"
         }
-        AppLog.i(TAG, "checkStatus mounts mounted=$mounted reason=$mountReason line=${mountLine.take(160)}")
+        // iter33 C3: 35 одинаковых строк за 10 минут не нужны — пишем при смене состояния
+        // (это факт), остальное считаем и показываем в HEARTBEAT/ADB_TRACE_SUPPRESSED.
+        if (lastMountState != mounted) {
+            lastMountState = mounted
+            AppLog.i(TAG, "checkStatus mounts mounted=$mounted reason=$mountReason line=${mountLine.take(160)} (изменилось)")
+        } else {
+            LogKit.trace("HVAC_MOUNT") { "checkStatus mounts mounted=$mounted reason=$mountReason" }
+        }
 
         val oemInstalled = try { ctx.packageManager.getPackageInfo(OEM_PKG, 0); true } catch (_: Exception) { false }
         val shadowed = oemPath?.contains("/data/app/") == true
@@ -146,133 +162,134 @@ object HvacDigitalPlugin {
             stdout = "extracted")
         if (!extracted) return ToolsResult("hvacdigital.plugin.enable", "Цифровой климат", steps)
 
-        val tmp = tmpFile.absolutePath.replace("'", "'\\''")
-        val D = "$" // shell dollar escape (${D}NAME → $NAME)
-        BgWorker.assertNotMain("HvacDigitalPlugin.enable")
-        // РЕФЕРЕНС: w0/o#c (case 9) — скрипт применения плагина из CentralWatchdogService.
-        // Порядок эталона: SEM_FONTE → SEM_ALVO → pm install -r -g (план А) →
-        // при неудаче bind-mount (план Б, «Plano B: sobrepor o APK de fábrica») →
-        // вердикт по факту `pm path`: */data/app/* ⇒ VIA=install, иначе bind-проверка
-        // `grep -F " $_P " /proc/mounts` + совпадение `stat -c '%d:%i'` ⇒ VIA=bind,
-        // иначе NAO_VINGOU / VIA=nenhum. Маркер /data/local/tmp/fixes/hvac_em_bind.
-        // РЕФЕРЕНС: setenforce 0 перед работами, chcon u:object_r:system_app_file:s0,
-        // umount в цикле `for _i in 1 2 3 4 5 6` с `umount || umount -l`.
-        // Наше дополнение (iter21): идемпотентность — если bind уже стоит и inode
-        // совпадает, ничего не переустанавливаем и SystemUI не перезапускаем.
+        // iter33 A3/B2: повторный enable в том же процессе — только чтение состояния.
+        if (enableDoneThisProcess) {
+            val st = checkStatus(ctx)
+            if (st.overlayMounted) {
+                AppLog.i(TAG, "HVAC_PROBE pm_path=${st.oemPkgPath ?: "?"} mounted=true src_inode=- tgt_inode=- " +
+                    "selinux=${selinux()} via=none rc=0 props=${propsLine()} (enable уже выполнен в этом процессе)")
+                AppLog.i(TAG, "HVAC_RESULT: OK reason=already_enabled_this_process")
+                return ToolsResult("hvacdigital.plugin.enable", "Цифровой климат", steps)
+            }
+        }
+        val killAllowed = if (sysuiKillDone) 0 else 1
         val script = """
             id
-            SELINUX_BEFORE=${D}(getenforce 2>/dev/null)
-            setenforce 0 2>/dev/null || true
-            _RC=1
-            NEED_RESTART=0
-            mkdir -p $STAGE_DIR
-            cp -f '$tmp' $STAGE_APK 2>/dev/null || echo CP_FALHOU
+            echo "###STAGE name=check status=BEGIN"
+            SELINUX=@@(getenforce 2>/dev/null)
+            echo "SELINUX=@@SELINUX"
+            PM_PATH=@@(pm path $OEM_PKG 2>/dev/null | sed 's/^package://' | head -n1)
+            echo "PM_PATH=@@PM_PATH"
+            mkdir -p $STAGE_DIR 2>/dev/null
+            cp -f '%APKSRC%' $STAGE_APK 2>/dev/null || echo CP_FAILED
             chown root:root $STAGE_APK 2>/dev/null || true
             chmod 644 $STAGE_APK 2>/dev/null || true
-            if [ ! -f $STAGE_APK ]; then
-              echo SEM_FONTE
+            chcon u:object_r:system_app_file:s0 $STAGE_APK 2>/dev/null || echo CHCON_FAILED
+            SRC_INODE=@@(stat -c '%i' $STAGE_APK 2>/dev/null)
+            echo "SRC_INODE=@@SRC_INODE"
+            if [ -s $STAGE_APK ]; then
+              echo "###STAGE name=check status=OK reason=pm_path:@@PM_PATH"
             else
-              _DST=${D}(pm path $OEM_PKG 2>/dev/null | sed 's/^package://')
-              if [ -z "${D}_DST" ]; then
-                echo SEM_ALVO
+              echo "###STAGE name=check status=FAILED reason=sem_fonte"
+              echo "HVAC_DIGITAL_FALHOU"
+              exit 1
+            fi
+
+            # ---------- A3: снять «затмение» установкой (/data/app → /system) ----------
+            VIA_UNSHADOW=none
+            case "@@PM_PATH" in
+              /data/app/*)
+                echo "###STAGE name=unshadow status=BEGIN"
+                U1=@@(pm uninstall $OEM_PKG 2>&1)
+                echo "UNSHADOW_TRY1=@@U1"
+                PM2=@@(pm path $OEM_PKG 2>/dev/null | sed 's/^package://' | head -n1)
+                PM_AFTER=@@PM2
+                VIA_UNSHADOW=pm_uninstall
+                case "@@PM2" in
+                  /data/app/*)
+                    U2=@@(pm uninstall-system-updates $OEM_PKG 2>&1 || cmd package uninstall-system-updates $OEM_PKG 2>&1)
+                    echo "UNSHADOW_TRY2=@@U2"
+                    PM_AFTER=@@(pm path $OEM_PKG 2>/dev/null | sed 's/^package://' | head -n1)
+                    VIA_UNSHADOW=uninstall_system_updates
+                    ;;
+                esac
+                case "@@PM_AFTER" in
+                  /data/app/*)
+                    echo "HVAC_UNSHADOW: before=@@PM_PATH after=@@PM_AFTER via=@@VIA_UNSHADOW result=FAILED"
+                    echo "###STAGE name=unshadow status=FAILED reason=pm_path:@@PM_AFTER"
+                    echo "HVAC_DIGITAL_FALHOU"
+                    exit 2
+                    ;;
+                  *)
+                    echo "HVAC_UNSHADOW: before=@@PM_PATH after=@@PM_AFTER via=@@VIA_UNSHADOW result=OK"
+                    echo "###STAGE name=unshadow status=OK reason=pm_path:@@PM_AFTER"
+                    ;;
+                esac
+                ;;
+              *)
+                echo "###STAGE name=unshadow status=SKIP reason=not_shadowed"
+                PM_AFTER=@@PM_PATH
+                ;;
+            esac
+
+            # ---------- bind-mount (идемпотентно) ----------
+            TGT=@@(pm path $OEM_PKG 2>/dev/null | sed 's/^package://' | head -n1)
+            [ -z "@@TGT" ] && TGT=@@PM_AFTER
+            TGT_INODE=@@(stat -c '%i' "@@TGT" 2>/dev/null)
+            MOUNTED=0
+            grep -F " @@TGT " /proc/mounts >/dev/null 2>&1 && MOUNTED=1
+            APK_REPLACED=0
+            if [ "@@MOUNTED" = "1" ] && [ -n "@@SRC_INODE" ] && [ "@@SRC_INODE" = "@@TGT_INODE" ]; then
+              echo "###STAGE name=bind status=SKIP reason=already_mounted_inode_match"
+            else
+              echo "###STAGE name=bind status=BEGIN"
+              _i=0
+              while grep -F " @@TGT " /proc/mounts >/dev/null 2>&1 && [ @@_i -lt 6 ]; do
+                umount "@@TGT" 2>/dev/null || umount -l "@@TGT" 2>/dev/null || break
+                _i=@@((_i+1))
+              done
+              mount --bind $STAGE_APK "@@TGT" 2>/dev/null || echo BIND_FAILED
+              restorecon -v "@@TGT" 2>/dev/null || true
+              TGT_INODE=@@(stat -c '%i' "@@TGT" 2>/dev/null)
+              MOUNTED=0
+              grep -F " @@TGT " /proc/mounts >/dev/null 2>&1 && MOUNTED=1
+              if [ "@@MOUNTED" = "1" ] && [ "@@SRC_INODE" = "@@TGT_INODE" ]; then
+                APK_REPLACED=1
+                echo "###STAGE name=bind status=OK reason=inode_match:@@SRC_INODE"
+                setprop persist.sys.hvacdigital.via bind 2>/dev/null || true
               else
-                echo "DST=${D}_DST"
-                SRC_INODE_PRE=${D}(stat -c '%i' $STAGE_APK 2>/dev/null)
-                TGT_INODE_PRE=${D}(stat -c '%i' ${D}_DST 2>/dev/null)
-                if [ "${D}SRC_INODE_PRE" = "${D}TGT_INODE_PRE" ] && grep -F " ${D}_DST " /proc/mounts >/dev/null 2>&1; then
-                  echo "ALREADY_MOUNTED (idempotent)"
-                  VIA=bind
-                  _RC=0
-                else
-                  # --- РЕФЕРЕНС w0/o#c: VIA_FORCADA — если в прошлый раз сработал bind,
-                  # pm install ПРОПУСКАЕТСЯ (иначе установка «затенит» /system и плагин
-                  # перестанет подхватываться SystemUI после перезагрузки).
-                  _VIA_PREV=${D}(getprop persist.sys.hvacdigital.via 2>/dev/null)
-                  echo "VIA_PREV=${D}_VIA_PREV"
-                  if [ "${D}_VIA_PREV" = "bind" ]; then
-                    echo "VIA_FORCADA=bind — pulando o pm install"
-                    _FALHOU=1
-                  else
-                    # --- План А эталона: штатная установка APK ---
-                    _OUT=${D}(pm install -r -g $STAGE_APK 2>&1 | tail -n1)
-                    echo "PM=${D}_OUT"
-                    case "${D}_OUT" in
-                      *Success*) _FALHOU=0 ;;
-                      *)         _FALHOU=1 ;;
-                    esac
-                  fi
-                  # --- План Б эталона: bind поверх заводского APK ---
-                  if [ "${D}_FALHOU" != "0" ]; then
-                    chown root:root $STAGE_APK 2>/dev/null || true
-                    chmod 644 $STAGE_APK 2>/dev/null || true
-                    chcon u:object_r:system_app_file:s0 $STAGE_APK 2>/dev/null || echo CHCON_FALHOU
-                    for _i in 1 2 3 4 5 6; do
-                      grep -F " ${D}_DST " /proc/mounts >/dev/null 2>&1 || break
-                      umount "${D}_DST" 2>/dev/null || umount -l "${D}_DST" 2>/dev/null || true
-                    done
-                    mount --bind $STAGE_APK "${D}_DST" 2>/dev/null || echo BIND_FALHOU
-                    restorecon -v "${D}_DST" 2>/dev/null || true
-                    NEED_RESTART=1
-                  fi
-                  # --- Вердикт по фактическому pm path (как в эталоне) ---
-                  _P=${D}(pm path $OEM_PKG 2>/dev/null | sed 's/^package://')
-                  echo "PM_PATH=${D}_P"
-                  case "${D}_P" in
-                    */data/app/*)
-                      for _i in 1 2 3 4 5 6; do
-                        grep -F " ${D}_DST " /proc/mounts >/dev/null 2>&1 || break
-                        umount "${D}_DST" 2>/dev/null || umount -l "${D}_DST" 2>/dev/null || true
-                      done
-                      setprop persist.sys.hvacdigital.via install 2>/dev/null || true
-                      rm -f /data/local/tmp/fixes/hvac_em_bind 2>/dev/null || true
-                      echo VIA=install
-                      NEED_RESTART=1
-                      _RC=0
-                      ;;
-                    *)
-                      PK_STAT=${D}(stat -c '%d:%i' "${D}_P" 2>/dev/null)
-                      SRC_STAT=${D}(stat -c '%d:%i' $STAGE_APK 2>/dev/null)
-                      MOUNTED=0
-                      grep -F " ${D}_P " /proc/mounts >/dev/null 2>&1 && MOUNTED=1
-                      if [ -n "${D}_P" ] && [ "${D}MOUNTED" = "1" ] && [ "${D}PK_STAT" = "${D}SRC_STAT" ]; then
-                        mkdir -p /data/local/tmp/fixes 2>/dev/null
-                        touch /data/local/tmp/fixes/hvac_em_bind 2>/dev/null || echo MARCADOR_HVAC_FALHOU
-                        setprop persist.sys.hvacdigital.via bind 2>/dev/null || true
-                        echo VIA=bind
-                        _RC=0
-                      else
-                        setprop persist.sys.hvacdigital.via nenhum 2>/dev/null || true
-                        echo NAO_VINGOU
-                        echo VIA=nenhum
-                      fi
-                      ;;
-                  esac
-                fi
+                echo "###STAGE name=bind status=FAILED reason=mounted:@@MOUNTED inode:@@SRC_INODE/@@TGT_INODE"
+                setprop persist.sys.hvacdigital.via nenhum 2>/dev/null || true
+                echo "HVAC_DIGITAL_FALHOU"
+                exit 3
               fi
             fi
-            rm -rf /data/dalvik-cache/*/*GeelyAutoSystemUIPlugin* 2>/dev/null || true
-            rm -rf /data/dalvik-cache/*/*systemuiplugin* 2>/dev/null || true
-            if [ "${D}NEED_RESTART" = "1" ]; then
-              SYSUI_PID_BEFORE=${D}(pidof com.android.systemui)
-              echo "SYSUI_PID_BEFORE=${D}SYSUI_PID_BEFORE"
-              kill ${D}SYSUI_PID_BEFORE 2>/dev/null || true
-              sleep 3
-              echo "SYSUI_PID_AFTER=${D}(pidof com.android.systemui)"
+
+            # ---------- SystemUI: только если APK реально заменён и не чаще раза за процесс ----------
+            if [ "@@APK_REPLACED" = "1" ] && [ "$killAllowed" = "1" ]; then
+              echo "###STAGE name=sysui status=BEGIN"
+              SYSUI_PID_BEFORE=@@(pidof com.android.systemui)
+              echo "SYSUI_PID_BEFORE=@@SYSUI_PID_BEFORE"
+              kill @@SYSUI_PID_BEFORE 2>/dev/null || true
+              _k=0
+              while [ -n "@@(pidof com.android.systemui)" ] && [ @@_k -lt 10 ]; do sleep 0.5; _k=@@((_k+1)); done
+              echo "SYSUI_PID_AFTER=@@(pidof com.android.systemui) waited_ticks=@@_k"
+              echo "###STAGE name=sysui status=OK reason=restarted"
             else
-              echo "SYSUI_RESTART_SKIPPED (no change)"
+              echo "SYSUI_RESTART_SKIPPED (APK_REPLACED=@@APK_REPLACED killAllowed=$killAllowed)"
+              echo "###STAGE name=sysui status=SKIP reason=no_apk_change"
             fi
-            SELINUX_AFTER=${D}(getenforce 2>/dev/null)
-            echo "SELINUX_BEFORE=${D}SELINUX_BEFORE SELINUX_AFTER=${D}SELINUX_AFTER"
-            SRC_INODE=${D}(stat -c '%i' $STAGE_APK 2>/dev/null)
-            _DSTP=${D}(pm path $OEM_PKG 2>/dev/null | sed 's/^package://')
-            TGT_INODE=${D}(stat -c '%i' "${D}_DSTP" 2>/dev/null)
-            echo "SRC_INODE=${D}SRC_INODE TGT_INODE=${D}TGT_INODE"
-            echo "VIA_VERDICT=${D}VIA NEED_RESTART=${D}NEED_RESTART"
-            if [ "${D}_RC" = "0" ]; then echo HVAC_DIGITAL_OK; else echo HVAC_DIGITAL_FALHOU; fi
-            [ "${D}_RC" = "0" ]
-        """.trimIndent()
+
+            PROPS="batt:@@(getprop persist.sys.hvacdigital.batt),temp:@@(getprop persist.sys.hvacdigital.temp),exttemp:@@(getprop persist.sys.hvacdigital.temp_ext)"
+            echo "PROPS=@@PROPS"
+            echo "HVAC_DIGITAL_OK"
+            [ "@@MOUNTED" = "1" ] || exit 4
+            exit 0
+        """.trimIndent().replace("@@", "$").replace("%APKSRC%", tmpFile.absolutePath)
         val (rc, out) = AdbClient.executeScript("hvac_enable", script, 40000)
         AppLog.i(TAG, "enable script rc=$rc out=${out.take(1500)}")
+        // iter33 C6: разбор шагов скрипта (###STAGE) — видно, ГДЕ встало, без чтения простыни.
+        LogKit.scriptTrace("hvac_enable", out)
         // Мандат iter22 §4: вердикт VIA/PM_PATH/SELINUX — ОБЯЗАТЕЛЬНО в лог,
         // иначе по логу сборки не видно, почему панель не встала.
         val via = Regex("VIA=([a-z]+)").find(out)?.groupValues?.get(1) ?: "?"
@@ -301,6 +318,26 @@ object HvacDigitalPlugin {
         }
         val reason = "rc=$rc VIA=$via PM_PATH=$pmPath inode=$inodeMatch mount=$mountOk"
         AppLog.i(TAG, "VERIFY hvacdigital.enable: $activateStatus ($reason)")
+        // iter33 A5: одна строка на попытку — по ней владелец сразу видит, где стоит.
+        val unshadowLine = Regex("HVAC_UNSHADOW: ([^\\n]*)").find(out)?.groupValues?.get(1)?.trim()
+        val probeSrc = Regex("SRC_INODE=(\\d+)").find(out)?.groupValues?.get(1) ?: "-"
+        val probeTgt = Regex("TGT_INODE=(\\d+)").find(out)?.groupValues?.get(1) ?: "-"
+        val probeSel = Regex("SELINUX=([A-Za-z]+)").find(out)?.groupValues?.get(1) ?: "?"
+        val probeProps = Regex("PROPS=([^\\n]*)").find(out)?.groupValues?.get(1)?.trim() ?: "-"
+        val probePath = pmPath.ifEmpty { status0.oemPkgPath ?: "?" }
+        val probeMounted = out.contains("mounted=true") || postMountedHint(out)
+        AppLog.i(TAG, "HVAC_PROBE pm_path=$probePath mounted=$probeMounted src_inode=$probeSrc tgt_inode=$probeTgt " +
+            "selinux=$probeSel via=$via rc=$rc props=$probeProps")
+        if (unshadowLine != null) AppLog.i(TAG, "HVAC_UNSHADOW_DETAIL: $unshadowLine")
+        LogKit.stateHvac(if (probeMounted) "mounted" else "not")
+        val hvacResult = when (activateStatus) {
+            ToolsStep.Status.OK -> "OK"
+            ToolsStep.Status.PARTIAL -> "PARTIAL"
+            else -> "FAILED"
+        }
+        AppLog.i(TAG, "HVAC_RESULT: $hvacResult reason=via:$via mount:$mountOk inode:$inodeMatch rc:$rc")
+        if (hvacResult == "OK") enableDoneThisProcess = true
+        if (out.contains("SYSUI_PID_BEFORE=")) { sysuiKillDone = true; LogKit.countSysuiKill() }
         steps += stepOf("activate", "cp+chcon+mount", activateStatus,
             expected = "HVAC_DIGITAL_OK + inode match", actual = reason, stdout = out)
         val post = checkStatus(ctx)
@@ -324,7 +361,9 @@ object HvacDigitalPlugin {
             umount '$dst' 2>/dev/null || true
             SYSUI_PID_BEFORE=${'$'}(pidof com.android.systemui)
             kill ${'$'}SYSUI_PID_BEFORE 2>/dev/null || true
-            sleep 3
+            _k=0
+            while [ -n "${'$'}(pidof com.android.systemui)" ] && [ ${'$'}_k -lt 10 ]; do sleep 0.5; _k=${'$'}((${'$'}_k+1)); done
+            echo "SYSUI_WAIT_TICKS=${'$'}_k"
             SYSUI_PID_AFTER=${'$'}(pidof com.android.systemui)
             SELINUX_AFTER=${'$'}(getenforce 2>/dev/null)
             echo SELINUX_BEFORE=${'$'}SELINUX_BEFORE SELINUX_AFTER=${'$'}SELINUX_AFTER SYSUI_PID_BEFORE=${'$'}SYSUI_PID_BEFORE SYSUI_PID_AFTER=${'$'}SYSUI_PID_AFTER
@@ -454,6 +493,22 @@ if grep -F systemuiplugin /proc/mounts >/dev/null 2>&1; then echo RESTORE_STALE_
         AppLog.i(TAG, "VERIFY hvacdigital.restore: restoreOk=$restoreOk uninstallRc=$uninstallRc postMounted=${post.overlayMounted}")
         return ToolsResult("hvacdigital.plugin.restore", "Вернуть панель SystemUI", steps)
     }
+
+    /** Монтирование по выводу скрипта: `###STAGE name=bind status=OK|SKIP reason=already…`. */
+    private fun postMountedHint(out: String): Boolean =
+        out.contains("###STAGE name=bind status=OK") || out.contains("already_mounted_inode_match")
+
+    private fun selinux(): String = runCatching {
+        val (_, o) = AdbClient.shellLocal("getenforce 2>/dev/null", 3000)
+        o.trim().ifEmpty { "?" }
+    }.getOrDefault("?")
+
+    private fun propsLine(): String = runCatching {
+        val (_, o) = AdbClient.shellLocal(
+            "echo batt:$(getprop persist.sys.hvacdigital.batt),temp:$(getprop persist.sys.hvacdigital.temp)," +
+                "exttemp:$(getprop persist.sys.hvacdigital.temp_ext)", 3000)
+        o.trim().ifEmpty { "-" }
+    }.getOrDefault("-")
 
     private fun stepOf(step: String, command: String, status: ToolsStep.Status,
                        expected: String = "", actual: String = "", stdout: String = ""): ToolsStep {

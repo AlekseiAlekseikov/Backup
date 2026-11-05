@@ -446,7 +446,14 @@ object StatusIcons {
         n.extras.putInt("flag_status_icon_specific_width", 0)
         try {
             nm.notify(notifId, n)
-            AppLog.i(TAG, "KmIconProbe: postStatusIcon $describe notifId=$notifId iconId=$iconId rank=$rank text=\"$text\"")
+            // iter33 C3: полная строка — только при смене того, что реально отрисовано.
+            val probeKey = describe + "|" + rank + "|" + text
+            if (probeKey != lastKmIconProbe) {
+                lastKmIconProbe = probeKey
+                AppLog.i(TAG, "KmIconProbe: postStatusIcon $describe notifId=$notifId iconId=$iconId rank=$rank text=\"$text\" (изменилось)")
+            } else {
+                LogKit.trace("ICON_POST") { "KmIconProbe: postStatusIcon $describe notifId=$notifId rank=$rank text=\"$text\"" }
+            }
         } catch (t: Throwable) { AppLog.e(TAG, "notify $notifId err", t) }
     }
 
@@ -528,10 +535,14 @@ object StatusIcons {
         // iter22 (ревью §2.1): фактическая геометрия в лог — по ней сразу видно, рисует ли
         // вендорный плагин битмап в intrinsic-размере или масштабирует его сам.
         val dens = ctx.resources.displayMetrics.density
-        AppLog.i(TAG, "ICON_GEOM: kind=${kind.ifEmpty { main + suffix }} w=${bmpW}px h=${bmpH}px " +
+        // iter33 C3: геометрия пишется, только когда она ИЗМЕНИЛАСЬ (это факт); одинаковые
+        // повторы считаются и сворачиваются в ADB_TRACE_SUPPRESSED n=ICON_GEOM=…
+        logIconGeom(kind.ifEmpty { main + suffix } + ":" + bmpW + "x" + bmpH) {
+            "ICON_GEOM: kind=${kind.ifEmpty { main + suffix }} w=${bmpW}px h=${bmpH}px " +
                 "(w=${"%.1f".format(bmpW / dens)}dp h=${"%.1f".format(bmpH / dens)}dp) " +
                 "glyph=${"%.1f".format((fm.descent - fm.ascent) / dens)}dp " +
-                "textSize=${"%.1f".format(mainSize)} suffix=$suffix padH=${padHDp}dp gap=${GAP_DP}dp keepNum=$keepNum")
+                "textSize=${"%.1f".format(mainSize)} suffix=$suffix padH=${padHDp}dp gap=${GAP_DP}dp keepNum=$keepNum"
+        }
         return Icon.createWithBitmap(bmp)
     }
 
@@ -588,10 +599,12 @@ object StatusIcons {
             p.alpha = 0xFF
         }
         val dens = ctx.resources.displayMetrics.density
-        AppLog.i(TAG, "ICON_GEOM: kind=wifi w=${bmpW}px h=${bmpH}px " +
+        logIconGeom("wifi:" + bmpW + "x" + bmpH + ":lvl" + level) {
+            "ICON_GEOM: kind=wifi w=${bmpW}px h=${bmpH}px " +
                 "(w=${"%.1f".format(bmpW / dens)}dp h=${"%.1f".format(bmpH / dens)}dp) " +
                 "glyph=${"%.1f".format(glyphPx / dens)}dp level=$level padH=${PAD_H_DP}dp " +
-                "fit=${"%.2f".format(fit)} textSize=${"%.1f".format(textPx / dens)}dp")
+                "fit=${"%.2f".format(fit)} textSize=${"%.1f".format(textPx / dens)}dp"
+        }
         return Icon.createWithBitmap(bmp)
     }
 
@@ -600,6 +613,21 @@ object StatusIcons {
     }
 
     // ─── Public API (совместимый с существующими callers) ───
+    /** iter33 C3: последние записанные значения — чтобы не повторять одинаковые строки. */
+    @Volatile private var lastExtTempPrefValue: Boolean? = null
+    @Volatile private var lastKmIconProbe: String = ""
+    @Volatile private var lastIconGeom: String = ""
+
+    /** iter33 C3: подробная строка геометрии — только при изменении отрисованного. */
+    private fun logIconGeom(key: String, msg: () -> String) {
+        if (lastIconGeom != key) {
+            lastIconGeom = key
+            AppLog.i(TAG, msg() + " (изменилось)")
+        } else {
+            LogKit.trace("ICON_GEOM") { msg() }
+        }
+    }
+
     @JvmStatic fun syncAll(ctx: Context) {
         BgWorker.assertNotMain("StatusIcons.syncAll")
         // P-фикс: если один syncAll уже работает — второй не запускаем (гонка
@@ -620,11 +648,14 @@ object StatusIcons {
             // iter23 P4: метрика тика — раз в минуту пишем, сколько занял опрос VHAL.
             lastTickLogMs = dt
             val now = android.os.SystemClock.uptimeMillis()
-            if (now - lastTickLogAtMs > 60_000L) {
+            // iter33 C3: подробный TICK — только при нарушении бюджета (overdue) либо первые
+            // 20 раз на сеанс; остальное считается и видно в HEARTBEAT (exec/min) и в
+            // `ADB_TRACE_SUPPRESSED n=TICK=…`. Факт «тик был» не теряется — он в счётчике.
+            if (now - lastTickLogAtMs > 60_000L || dt > 100) {
                 lastTickLogAtMs = now
                 AppLog.i(TAG, "TICK: dt=${dt}ms reads=$reads overdue=${dt > 100}")
             } else {
-                AppLog.d(TAG, "TICK: dt=${dt}ms reads=$reads")
+                LogKit.trace("TICK") { "TICK: dt=${dt}ms reads=$reads overdue=false" }
             }
         }
     }
@@ -640,7 +671,14 @@ object StatusIcons {
         // (чтобы понять, кто пишет false между тиками).
         val pf = prefs(app)
         val pPath = "/data/data/${app.packageName}/shared_prefs/voiceapp3.xml"
-        AppLog.i(TAG, "PREF TRACE: read  file=$pPath key=$PREF_EXT_TEMP value=$showTemp seq=$seq thread=${Thread.currentThread().name}")
+        // iter33 C3: полная трассировка префа — ТОЛЬКО при смене значения (это и есть факт),
+        // одинаковые чтения считаются и сворачиваются в ADB_TRACE_SUPPRESSED.
+        if (showTemp != lastExtTempPrefValue) {
+            lastExtTempPrefValue = showTemp
+            AppLog.i(TAG, "PREF TRACE: read  file=$pPath key=$PREF_EXT_TEMP value=$showTemp seq=$seq thread=${Thread.currentThread().name} (изменилось)")
+        } else {
+            LogKit.trace("PREF_TRACE") { "PREF TRACE: read key=$PREF_EXT_TEMP value=$showTemp seq=$seq" }
+        }
 
         var battStr: String? = null; var battPct: Float? = null; var battHas = false
         var tempStr: String? = null; var tempVal: Float? = null; var tempHas = false
@@ -734,6 +772,9 @@ object StatusIcons {
      * для строкового плагина SystemUI. Пишет ЗНАЧЕНИЯ, а не 0/1; если тогл выключен — 0.
      * Работает на BgWorker (вызывается из syncAllImpl, который уже на BgWorker).
      */
+    /** iter33 B5: последняя отправленная комбинация — setprop только при изменении. */
+    @Volatile private var lastPushedHvac: String = ""
+
     private fun pushHvacDigitalPropsIfEnabled(app: Context) {
         val p = prefs(app)
         val sb = StringBuilder()
@@ -750,10 +791,18 @@ object StatusIcons {
         val extOn = p.getBoolean(PREF_HVAC_EXT_TEMP, false)
         val ev = if (extOn) fmt(lastExtTempC) ?: return else "0"
         sb.append("setprop $SYS_HVAC_EXT_TEMP_EXT $ev; setprop $SYS_HVAC_EXT_EXTTEMP $ev; ")
+        // iter33 B5: dirty-флаг. Раньше setprop уходил каждые 15 с «на всякий случай»
+        // (44 записи за 10 минут). Теперь — только когда значение реально изменилось.
+        val fingerprint = "batt=" + bv + " temp=" + tv + " ext=" + ev
+        if (fingerprint == lastPushedHvac) {
+            AppLog.d(TAG, "HVACDIGITAL_PUSH skip reason=unchanged " + fingerprint)
+            return
+        }
         // verify echo
         sb.append("echo batt=\$(getprop $SYS_HVAC_BATT) temp=\$(getprop $SYS_HVAC_TEMP) ext_temp=\$(getprop $SYS_HVAC_EXT_TEMP_EXT) exttemp=\$(getprop $SYS_HVAC_EXT_EXTTEMP)")
         try {
             val (rc, out) = AdbClient.execute(sb.toString(), 5000)
+            if (rc == 0) lastPushedHvac = fingerprint
             AppLog.i(TAG, "HVACDIGITAL_PUSH rc=$rc batt=$bv temp=$tv exttemp=$ev out=${out.replace('\n',' ').take(200)}")
         } catch (t: Throwable) {
             AppLog.w(TAG, "HVACDIGITAL_PUSH failed: ${t.message}")
@@ -821,27 +870,48 @@ object StatusIcons {
         // iter16: при ВКЛЮЧЕНИИ любого из трёх тоглов — пытаемся заинсталлить плагин
         // (mount --bind на OEM com.flyme.auto.systemuiplugin). Плагин уже лежит в
         // app/src/main/res/raw/geely_auto_systemui_plugin_digital.apk (18 МБ).
+        // iter33 A2: статус тумблера ВЫВОДИТСЯ из установки плагина. Раньше здесь стоял
+        // захардкоженный ToolsStep.Status.OK — из-за него панель показывала «SUCCESS»,
+        // хотя рядом в логе было `VERIFY hvacdigital.enable: FAILED (rc=0 VIA=? PM_PATH= …)`.
         var installNote = "plugin-not-invoked"
+        var pluginStatus: ToolsStep.Status? = null
+        var pluginReason = "plugin-not-invoked"
         if (value) {
-            try {
-                val r = HvacDigitalPlugin.enable(ctx)
-                installNote = "plugin.enable invoked (steps=${r.steps.size} lastStatus=${r.steps.lastOrNull()?.status})"
-                AppLog.i(TAG, "HVACDIGITAL: plugin.enable -> $installNote")
+            val r = try {
+                HvacDigitalPlugin.enable(ctx)
             } catch (t: Throwable) {
-                installNote = "plugin.enable err: ${t.message}"
                 AppLog.w(TAG, "HVACDIGITAL: plugin.enable failed", t)
+                null
             }
+            pluginStatus = when {
+                r == null -> ToolsStep.Status.FAILED
+                r.steps.isEmpty() -> ToolsStep.Status.FAILED
+                r.steps.any { it.status == ToolsStep.Status.FAILED } -> ToolsStep.Status.FAILED
+                r.steps.any { it.status == ToolsStep.Status.BLOCKED } -> ToolsStep.Status.BLOCKED
+                r.steps.all { it.status == ToolsStep.Status.OK } -> ToolsStep.Status.OK
+                else -> ToolsStep.Status.PARTIAL
+            }
+            pluginReason = r?.summary ?: "enable бросил исключение"
+            val cnt = r?.steps?.size ?: 0
+            installNote = "plugin.enable steps=" + cnt + " status=" + pluginStatus +
+                " reason=" + pluginReason.take(120)
+            AppLog.i(TAG, "HVACDIGITAL: plugin.enable -> $installNote")
         }
         // Сразу же проталкиваем текущие значения (а не 0/1) — на случай, если пользователь
         // включил тогл после того, как syncAll уже прочитал данные.
         BgWorker.post("StatusIcons.hvacdigital.push") { pushHvacDigitalPropsIfEnabled(ctx.applicationContext) }
+        // iter33 A2: хардкод Status.OK удалён — статус берётся из результата enable().
+        val finalStatus = pluginStatus ?: ToolsStep.Status.OK
         val step = ToolsStep(
             step = "hvacdigital.$pref",
             command = "prefs.put($pref=$value) + push values + $installNote",
             startedAtMs = t0, finishedAtMs = android.os.SystemClock.uptimeMillis(),
-            exitCode = 0, stdout = installNote, stderr = "",
-            expected = "$pref=$value", actual = "$pref=$value (values pushed on next tick)",
-            status = ToolsStep.Status.OK
+            exitCode = if (finalStatus == ToolsStep.Status.OK || finalStatus == ToolsStep.Status.PARTIAL) 0 else 1,
+            stdout = installNote,
+            stderr = if (finalStatus == ToolsStep.Status.OK) "" else pluginReason.take(300),
+            expected = if (value) "плагин смонтирован (mounted=true)" else "$pref=false",
+            actual = "$pref=$value; $installNote",
+            status = finalStatus
         )
         AppLog.i(TAG, "VERIFY hvacdigital toggle $pref=$value: $installNote")
         return ToolsResult(
@@ -854,36 +924,41 @@ object StatusIcons {
     @JvmStatic fun getHvacDigital(ctx: Context, pref: String): Boolean =
         prefs(ctx).getBoolean(pref, false)
 
+    /**
+     * iter33 B2: в watchdog'е — ТОЛЬКО чтение состояния.
+     *
+     * Что было (1.0.52): каждые 60 с вызывался `HvacDigitalPlugin.enable` (17 раз за 10 минут),
+     * а внутри — `setenforce 0`, `kill SystemUI` (SYSUI_PID_BEFORE=1174 → AFTER=20740),
+     * чистка dalvik-cache и `pm install`. Плюс сброс свойств в 0 через setprop — цифры
+     * в статус-баре гасились каждую минуту.
+     *
+     * Что стало: плагин ставится ТОЛЬКО по клику (setHvacDigital → HvacDigitalPlugin.enable,
+     * один раз за процесс). Здесь — `checkStatus` (pm path + /proc/mounts, без записи) и,
+     * если не смонтировано, ОДНА строка в лог. Автоповторов нет.
+     */
     @JvmStatic fun bootRestoreHvacDigital(ctx: Context) {
         val app = ctx.applicationContext
-        // iter16: при буте, если хоть один тогл включен — пытаемся подмонтировать плагин
-        // (после ребута bind-mount слетает, надо переустановить).
         val p = prefs(app)
         val anyOn = p.getBoolean(PREF_HVAC_BATT, false) ||
                    p.getBoolean(PREF_HVAC_TEMP, false) ||
                    p.getBoolean(PREF_HVAC_EXT_TEMP, false)
-        if (anyOn) {
-            BgWorker.post("StatusIcons.hvacdigital.boot-install") {
-                try {
-                    val r = HvacDigitalPlugin.enable(app)
-                    AppLog.i(TAG, "HVACDIGITAL_BOOT: plugin.enable -> steps=${r.steps.size} last=${r.steps.lastOrNull()?.status} mountLine=${r.steps.lastOrNull()?.stdout?.take(200)}")
-                } catch (t: Throwable) {
-                    AppLog.w(TAG, "HVACDIGITAL_BOOT: plugin.enable failed", t)
-                }
+        if (!anyOn) return
+        BgWorker.post("StatusIcons.hvacdigital.probe") {
+            val st = runCatching { HvacDigitalPlugin.checkStatus(app) }.getOrNull()
+            if (st == null) {
+                AppLog.w(TAG, "HVAC_PROBE: checkStatus threw (watchdog, no action)")
+                return@post
             }
-        }
-        // Значения протолкнутся на первом tick (startPeriodicSync в BootReceiver) —
-        // до tick'а у нас ещё нет batt/temp значений. Пишем 0 как старт.
-        val sb = StringBuilder()
-        for (sp in listOf(SYS_HVAC_BATT, SYS_HVAC_TEMP, SYS_HVAC_EXT_TEMP_EXT, SYS_HVAC_EXT_EXTTEMP)) {
-            sb.append("setprop $sp 0; ")
-        }
-        sb.append("echo reset_all_hvacdigital")
-        try {
-            val (_, out) = AdbClient.execute(sb.toString(), 3000)
-            AppLog.i(TAG, "HVACDIGITAL_BOOT: reset props -> ${out.replace('\n',' ').take(200)}")
-        } catch (t: Throwable) {
-            AppLog.w(TAG, "HVACDIGITAL_BOOT: reset failed: ${t.message}")
+            if (st.overlayMounted) {
+                LogKit.stateHvac("mounted")
+                AppLog.i(TAG, "HVAC_PROBE pm_path=" + (st.oemPkgPath ?: "?") +
+                    " mounted=true src_inode=- tgt_inode=- selinux=- via=bind rc=- props=- (watchdog, read-only)")
+            } else {
+                LogKit.stateHvac("not")
+                AppLog.i(TAG, "HVAC_PROBE: not mounted (watchdog, no action) pm_path=" + (st.oemPkgPath ?: "?") +
+                    " mounted=false reason=" + st.mountReason + " shadowed=" + st.shadowedByInstall)
+                AppLog.i(TAG, "HVAC_RESULT: PARTIAL reason=not_mounted_no_action_in_watchdog")
+            }
         }
     }
 }

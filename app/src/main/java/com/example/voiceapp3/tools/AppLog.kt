@@ -36,7 +36,9 @@ import java.util.Locale
 object AppLog {
     private const val TAG_BASE = "CENTRAL"
     private const val LOG_NAME = "voiceapp3.log"
-    private const val MAX = 2L * 1024 * 1024
+    // iter33 C8.4: 16 МБ и ДВА архива (app.log.1, app.log.2) — старые вытесняются.
+    private const val MAX = 16L * 1024 * 1024
+    private const val MAX_ARCHIVES = 2
     private const val EARLY_CAP = 512
     private val df = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
     private val lock = Any()
@@ -92,6 +94,8 @@ object AppLog {
                     "thread=${Thread.currentThread().name} file=$primaryPath intDir=${intDir.absolutePath}", null)
                 flushEarly()
                 inited = true
+                // iter33: выжимка app.ops.log + SESSION_START/LOG_INDEX в обоих файлах.
+                runCatching { LogKit.attach(appCtx, primary.parentFile ?: appCtx.filesDir) }
                 Log.i(TAG_BASE, "AppLog.init path=$primaryPath ok=true")
             } catch (t: Throwable) {
                 initErr = t
@@ -157,11 +161,27 @@ object AppLog {
             .replace('\n', ' ').trim().ifEmpty { "(empty)" }
     } catch (t: Throwable) { "(cmd err: ${t.message})" }
 
+    /**
+     * iter33 C8.1: строка-маркер (`OP_*`, `SESSION_*`, `HEARTBEAT`, …) — пишется тем же
+     * единственным синхронизированным писателем, что и всё остальное, поэтому строки
+     * разных потоков не перемешиваются. Уровень INFO, тег CENTRAL_Mark.
+     */
+    @JvmStatic
+    fun marker(line: String) {
+        Log.i("CENTRAL_Mark", line)
+        enqueueOrWrite("INFO", "CENTRAL_Mark", line, null)
+    }
+
     // ───────────── обычные уровни ─────────────
     // Все методы не требуют Context (используют сохранённый из init).
     @JvmStatic fun i(tag: String, m: String) { Log.i(tag, m); enqueueOrWrite("INFO", tag, m, null) }
     @JvmStatic fun w(tag: String, m: String, th: Throwable? = null) { Log.w(tag, m, th); enqueueOrWrite("WARN", tag, m, th) }
-    @JvmStatic fun e(tag: String, m: String, th: Throwable? = null) { Log.e(tag, m, th); enqueueOrWrite("ERROR", tag, m, th) }
+    @JvmStatic fun e(tag: String, m: String, th: Throwable? = null) {
+        Log.e(tag, m, th)
+        // iter33 C7: ошибки попадают в кольцо для LOG_SUMMARY (и никогда не подавляются).
+        runCatching { LogKit.errorSeen(tag, m) }
+        enqueueOrWrite("ERROR", tag, m, th)
+    }
     @JvmStatic fun d(tag: String, m: String) { Log.d(tag, m); enqueueOrWrite("DEBUG", tag, m, null) }
 
     // Совместимость со старыми вызовами, где передавали Context — игнорируем c.
@@ -283,7 +303,12 @@ object AppLog {
         val now = android.os.SystemClock.uptimeMillis()
         val dt = now - processStartUptimeMs
         val tname = Thread.currentThread().name.take(14)
-        return "[${df.format(Date())}] [+${dt}ms] [$tname] [$lvl] [$tag] $msg"
+        // iter33 C4: сквозной контекст `run=`/`op=`/`cycle=` в КАЖДОЙ строке.
+        // В маркерах эти поля уже есть — второй раз не добавляем.
+        val ctx = try {
+            if (msg.contains(" run=")) "" else LogKit.ctxSuffix()
+        } catch (_: Throwable) { "" }
+        return "[${df.format(Date())}] [+${dt}ms] [$tname] [$lvl] [$tag] $msg$ctx"
     }
 
     /** Синхронная запись строки в файл — БЕЗ Logcat и без очереди (для UEH:
@@ -370,8 +395,17 @@ object AppLog {
 
     private fun rotateIfNeeded(f: File) {
         if (f.exists() && f.length() > MAX) {
-            val bak = File(f.parentFile, "${f.name}.bak")
-            runCatching { if (bak.exists()) bak.delete(); f.renameTo(bak) }
+            // iter33 C8.4: сдвигаем .1 → .2, текущий → .1; архивов не больше MAX_ARCHIVES.
+            runCatching {
+                val parent = f.parentFile
+                for (i in MAX_ARCHIVES downTo 1) {
+                    val cur = File(parent, "${f.name}.$i")
+                    if (!cur.exists()) continue
+                    if (i == MAX_ARCHIVES) { cur.delete(); continue }
+                    cur.renameTo(File(parent, "${f.name}.${i + 1}"))
+                }
+                f.renameTo(File(parent, "${f.name}.1"))
+            }
             // Новый файл: пишем шапку в начало, чтобы после ротации версия не
             // терялась (iter16: жалоба владельца на потерянный BUILD после
             // ротации в логе, начинающемся с +34376мс).
@@ -391,6 +425,9 @@ object AppLog {
             catch (_: Throwable) { null }
         }
     }
+
+    /** iter33: каталог рабочего лога — в нём же живёт выжимка `app.ops.log`. */
+    @JvmStatic fun dirOf(c: Context): File = pickFile(c).parentFile ?: c.filesDir
 
     /** Путь к активному файлу лога (для UI/debug). */
     @JvmStatic fun logPath(): String = primaryPath

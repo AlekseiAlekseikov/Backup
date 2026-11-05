@@ -827,7 +827,12 @@ object LockSound {
                     echo STAGE_SIZE=${'$'}(stat -c '%s' '$stagePath' 2>/dev/null)
                     echo STAGE_INODE=${'$'}(stat -c '%i' '$stagePath' 2>/dev/null)
                 """.trimIndent()
-                val copyRes = AdbClient.execute(copyScript, 30000)
+                // iter33 B3: 286 КБ base64 одной командой не лезли в лимит payload 4096
+                // (`ERR_ADB_TOO_LONG: cmd_len=286595 > 4096`) и звук не вставал никогда.
+                // Теперь — тот же исправленный executeScript (base64-чанки, A0).
+                val copyRes = if (copyScript.toByteArray(Charsets.UTF_8).size > 3500)
+                    AdbClient.executeScript("lock_wav", copyScript, 40000)
+                else AdbClient.execute(copyScript, 30000)
                 AppLog.i(ctx, TAG, "lockSound copy rc=${copyRes.first}: ${copyRes.second.replace('\n', ' ').take(400)}")
                 if (copyRes.first != 0) {
                     recordBindFailure("copy failed rc=${copyRes.first} out=${copyRes.second.take(200)}", appCtx,

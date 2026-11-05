@@ -1,6 +1,7 @@
 package com.example.voiceapp3
 
 import com.example.voiceapp3.tools.Prefs2
+import com.example.voiceapp3.tools.LogKit
 
 import android.Manifest
 import android.annotation.SuppressLint
@@ -361,11 +362,9 @@ class VoiceAssistantService : Service() {
                     }
                 }
                 runCatching { StatusIcons.bootRestoreHvacDigital(app) }
-                runCatching {
-                    if (AppPerformance.isVideo60FpsEnabled(app)) {
-                        AppPerformance.setVideo60Fps(app, true)
-                    }
-                }
+                // iter33 B1.1: setVideo60Fps — ТОЛЬКО из обработчика клика. На буте лишь
+                // читаем состояние и честно пишем, применено ли (без umount/mount/restart/sleep).
+                runCatching { AppPerformance.verifyVideoOnly(app) }
                 runCatching { AppPerformance.applyKeepAliveOnBoot(app) }
                 runCatching { NetworkTtl.registerNetworkReceiver(app) }
                 AppLog.i(TAG, "bootRestore complete (BgWorker)")
@@ -395,27 +394,57 @@ class VoiceAssistantService : Service() {
      * процесса или длительной стоянки какой-то флаг остался включённым в prefs,
      * но эффект не применён в системе — переприменяем. Не выдаёт ошибки пользователю.
      */
+    /**
+     * iter33 B1/B2/B3 — watchdog БОЛЬШЕ НЕ ДЕЛАЕТ тяжёлую работу.
+     *
+     * Что было в 1.0.52 (каждые 60 с, всё подряд):
+     *   • `AppPerformance.setVideo60Fps` → `umount`×12 + `mount --bind` + `setprop ctl.restart mediacodec`
+     *     + `sleep 3` — медиакодек (media.swcodec) перезапускался каждую минуту под работающим
+     *     видеопотоком ⇒ «CarPlay заикается, ViperFX отваливается» (13 перезапусков за 10 минут);
+     *   • `StatusIcons.bootRestoreHvacDigital` → `HvacDigitalPlugin.enable` → `setenforce 0`,
+     *     `kill SystemUI` (PID 1174 → 20740), `rm -rf /data/dalvik-cache/*` ⇒ система
+     *     перезапускала SystemUI каждую минуту;
+     *   • `LockSound.onBootOrWatchdog` → повторная заливка звука;
+     *   • `NetworkTtl.bootRestore` → заливка скрипта чанками при уже существующем правиле.
+     *
+     * Что стало: только (1) чтение состояния, (2) одна строка `CYCLE_SUMMARY`, (3) `HEARTBEAT`.
+     * Всё пишущее — исключительно по клику пользователя (обработчики тумблеров).
+     */
     private val settingsWatchdog = object : Runnable {
         override fun run() {
             val app = this@VoiceAssistantService
+            val n = ++watchdogCycle
             // P1: тик watchdog'а только планируется с main, сама работа — на BgWorker.
             BgWorker.post("VoiceAssistant.watchdog") {
-                runCatching { NetworkTtl.bootRestore(app) }
-                runCatching { LockSound.onBootOrWatchdog(app) }
-                runCatching { StatusIcons.bootRestoreHvacDigital(app) }
-                runCatching { ScreenBrightness.restoreIfEnabled(app) }
-                runCatching {
-                    if (AppPerformance.isVideo60FpsEnabled(app)) {
-                        AppPerformance.setVideo60Fps(app, true)
-                    }
+                LogKit.withCycle(n) {
+                    val t0 = android.os.SystemClock.uptimeMillis()
+                    var actions = 0
+                    LogKit.cycleStart(n)
+                    // Сеть: read-only проверка, заливка ТОЛЬКО если правила нет (B4).
+                    runCatching { NetworkTtl.bootRestore(app) }.onSuccess { actions++ }
+                    // Плагин климата: только checkStatus, без записи (B2).
+                    runCatching { StatusIcons.bootRestoreHvacDigital(app) }.onSuccess { actions++ }
+                    // Яркость: идемпотентно, пишет только при реальном расхождении.
+                    runCatching { ScreenBrightness.restoreIfEnabled(app) }.onSuccess { actions++ }
+                    // Видео 60 fps: setVideo60Fps здесь НЕ вызывается вообще (B1).
+                    runCatching { AppPerformance.verifyVideoOnly(app) }.onSuccess { actions++ }
+                    // Звук замка: не гоняем файл каждый тик (B3) — только проверка состояния.
+                    LogKit.cycleSummary(n, actions, 0, android.os.SystemClock.uptimeMillis() - t0)
+                    LogKit.heartbeat()
+                    LogKit.writeSummary()
                 }
             }
             handler.postDelayed(this, SETTINGS_WATCHDOG_MS)
         }
     }
 
+    /** Номер тика watchdog'а — сквозной `cycle=` в логе (C4). */
+    private var watchdogCycle = 0
+
     override fun onDestroy() {
         Log.i(TAG, "Service destroying")
+        // iter33 C7: выжимка сеанса в app.log и app.ops.log при выходе.
+        runCatching { LogKit.writeSummary() }
         cleanup()
         super.onDestroy()
     }

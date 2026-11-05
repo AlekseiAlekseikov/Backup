@@ -197,8 +197,65 @@ enum class Choice(
     fun choiceValue(choice: Choice): String =
         prefs().getString(choice.pref, choice.default) ?: choice.default
 
-    /** Запись переключателя: persist → живой эффект → readback → результат. */
+    /**
+     * Запись переключателя: persist → живой эффект → readback → результат.
+     *
+     * iter33 C2/C4/C5: здесь же — единственная точка входа для действий пользователя, поэтому
+     * именно тут рождается `op`, и он едет через [LogKit.withOp] во ВСЕ строки, которые действие
+     * породит (включая ADB_*, `VERIFY EXEC`, `← execute`). Без этого `grep "op=…" app.log`
+     * не собрал бы цепочку «клик → ADB → итог».
+     */
     fun set(toggle: Toggle, value: Boolean): ToolsResult {
+        val op = LogKit.newOpId()
+        val cat = toggleCat(toggle)
+        LogKit.opStart(op, cat, toggle.pref, "click")
+        val t0 = android.os.SystemClock.uptimeMillis()
+        val res = LogKit.withOp(op) { setImpl(toggle, value) }
+        val dur = android.os.SystemClock.uptimeMillis() - t0
+        emitOpSteps(op, res)
+        val okSteps = res.steps.count { it.status == ToolsStep.Status.OK || it.status == ToolsStep.Status.PARTIAL }
+        LogKit.opSummary(op, toggle.pref, res.statusWire.uppercase(), okSteps, res.steps.size, dur, res.summary)
+        LogKit.heartbeatStateRefresh()
+        return res
+    }
+
+    /** Категория действия для `OP_START cat=` (C2). */
+    private fun toggleCat(t: Toggle): String = when (t) {
+        Toggle.HVAC_DIGITAL_BATT, Toggle.HVAC_DIGITAL_TEMP, Toggle.HVAC_DIGITAL_EXT_TEMP -> "HVAC"
+        Toggle.TTL_65 -> "TTL"
+        Toggle.PERF_VIDEO, Toggle.PERF_JIT -> "VIDEO"
+        Toggle.WINDOW_DRIVER_ON_DOOR, Toggle.WINDOW_OPPOSITE_ON_DOOR -> "WIN"
+        Toggle.LOCK_SOUND, Toggle.UNLOCK_SOUND -> "LOCK"
+        else -> "UI"
+    }
+
+    /** Разбор [ToolsResult] в `OP_STEP` + `RU:` — правило C5 (что произошло / что значит / что делать). */
+    private fun emitOpSteps(op: String, res: ToolsResult) {
+        val total = res.steps.size
+        res.steps.forEachIndexed { i, st ->
+            LogKit.opStep(op, i + 1, total, st.step, st.status.wire,
+                st.expected.ifEmpty { "-" }, st.actual.ifEmpty { st.stdout.take(60).ifEmpty { "-" } },
+                (st.finishedAtMs - st.startedAtMs).coerceAtLeast(0))
+            LogKit.ru(ruText(i + 1, total, st))
+        }
+    }
+
+    private fun ruText(i: Int, total: Int, st: ToolsStep): String {
+        val head = "Шаг " + i + " из " + total + " (" + st.step + ")"
+        return when (st.status) {
+            ToolsStep.Status.OK ->
+                "$head выполнен: ожидали ${st.expected.ifEmpty { "применения" }}, получили ${st.actual.ifEmpty { "то же" }}. Это значит, что значение применено и подтверждено чтением."
+            ToolsStep.Status.PARTIAL ->
+                "$head выполнен частично: ожидали ${st.expected.ifEmpty { "подтверждения" }}, получили ${st.actual.ifEmpty { "неполное подтверждение" }}. Значение, скорее всего, применилось, но проверка не сошлась — повторите действие, и если не поможет, смотрите сырой вывод шага в app.log."
+            ToolsStep.Status.BLOCKED ->
+                "$head невозможен сейчас: ${st.stderr.ifEmpty { st.actual }.ifEmpty { "нет зависимости" }}. Ничего не сломано, но без этой зависимости шаг не выполнится — нужен root-канал (порт 5555) или отсутствующая зависимость."
+            ToolsStep.Status.FAILED ->
+                "$head не выполнен: ${st.stderr.ifEmpty { st.actual }.ifEmpty { "команда вернула ошибку" }}. Ожидали ${st.expected.ifEmpty { "успех" }}. Причина — в машинной строке выше; сырой вывод шага сохранён целиком в app.log."
+            else -> head
+        }
+    }
+
+    private fun setImpl(toggle: Toggle, value: Boolean): ToolsResult {
         val steps = ArrayList<ToolsStep>(3)
 
         steps += toolsStep(

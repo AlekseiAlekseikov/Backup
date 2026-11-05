@@ -238,13 +238,37 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
     fun bootRestore(context: Context) {
         BgWorker.assertNotMain("NetworkTtl.bootRestore")
         val active = isTtl65Active(context)
-        AppLog.i(TAG, "TTL bootRestore: active=$active")
-        if (!active) return
+        LogKit.stateTtl(active)
+        // iter33 B4: сначала ОДНА короткая read-only проверка. Если правило уже стоит —
+        // ноль записи (раньше каждый тик заливался скрипт чанками: `rm -f` + `cat >>`×7 + chmod + sh).
+        val (cnt4, cnt6) = ttlRuleCounts()
+        if (!active) {
+            if (cnt4 == 0 && cnt6 == 0) {
+                AppLog.i(TAG, "TTL: SKIP (rule absent, toggle off) v4=$cnt4 v6=$cnt6")
+                return
+            }
+            AppLog.i(TAG, "TTL bootRestore: active=false, но правило есть (v4=$cnt4 v6=$cnt6) — снимаю")
+        } else if (cnt4 > 0 && cnt6 > 0) {
+            AppLog.i(TAG, "TTL: SKIP (rule present) v4=$cnt4 v6=$cnt6")
+            return
+        }
         val script = buildScript(true)
         val (rc, out) = AdbClient.executeScript("ttl_script", script, 40000)
         val (status, reason) = parseVerifyResult(true, out)
         AppLog.i(TAG, "VERIFY TTL bootRestore: rc=$rc → $status ($reason)")
     }
+
+    /**
+     * iter33 B4: read-only счётчики правил TTL/HL. Одна ADB-команда, ничего не пишет.
+     * Возвращает (v4_rule_count, v6_rule_count); при недоступности канала — (-1, -1).
+     */
+    fun ttlRuleCounts(): Pair<Int, Int> = runCatching {
+        val (_, out) = AdbClient.execute(
+            "iptables -t mangle -S POSTROUTING 2>/dev/null | grep -c ttl-set; " +
+                "ip6tables -t mangle -S POSTROUTING 2>/dev/null | grep -c hl-set", 5000, expectRoot = false)
+        val nums = out.lineSequence().mapNotNull { it.trim().toIntOrNull() }.toList()
+        Pair(nums.getOrElse(0) { -1 }, nums.getOrElse(1) { -1 })
+    }.getOrDefault(Pair(-1, -1))
 
     /**
      * Регистрация сетевого ресивера: при поднятии/изменении сети пере-проверяем/

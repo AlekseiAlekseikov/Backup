@@ -155,11 +155,16 @@ object AdbClient {
     @Volatile private var ready = false
     private val readyLatch = CountDownLatch(1)
 
+    /**
+     * iter33 C4: `op` едет вместе с заданием — контекст передаётся ПАРАМЕТРОМ через
+     * исполнитель, а не глобальной переменной, чтобы строки разных действий не путались.
+     */
     private data class Job(
         val cmd: String,
         val timeoutMs: Int,
         val expectRoot: Boolean,
-        val onResult: (Pair<Int, String>) -> Unit
+        val onResult: (Pair<Int, String>) -> Unit,
+        val op: String? = LogKit.currentOp()
     )
 
     private val queue = LinkedBlockingQueue<Job>()
@@ -250,58 +255,29 @@ object AdbClient {
      * Возвращает Pair<rc, out>, где out содержит stdout+stderr выполнения.
      */
     fun executeScript(name: String, script: String, timeoutMs: Int = 40000, expectRoot: Boolean = true): Pair<Int, String> {
-        val bytes = script.toByteArray(StandardCharsets.UTF_8)
-        if (bytes.size <= 3500) {
-            // Короткий скрипт — напрямую, без накладных расходов.
-            return execute(script, timeoutMs, expectRoot)
-        }
+        val bytes = ScriptChunker.bytesOf(script)
+        // Короткий скрипт — напрямую (никакой нарезки, значит и риска нет).
+        if (bytes.size <= 3500) return execute(script, timeoutMs, expectRoot)
         val path = "/data/local/tmp/voiceapp3_${name}.sh"
-        val sb = StringBuilder()
-        sb.append("rm -f $path\n")
-        // base64 кодируем весь скрипт в Java, затем льём кусками по 3000 байт (после декода 2250 байт)
-        val b64 = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
-        var pos = 0
-        while (pos < b64.length) {
-            val chunk = b64.substring(pos, minOf(pos + 3000, b64.length))
-            // echo '-n' с base64-чанком, декодируем в файл
-            sb.append("echo '$chunk' | base64 -d >> $path\n")
-            pos += 3000
+        // iter33 A0: ТОЛЬКО base64-чанки (ScriptChunker). Никакого `String(bytes, off, len, UTF_8)`
+        // и никакого heredoc с сырым UTF-8 — именно там рвались многобайтовые символы (+83 байта).
+        // Каждый чанк — ОТДЕЛЬНАЯ ADB-команда (payload ≤ 4096): лить всю заливку одной
+        // командой нельзя, она не пролезет в лимит.
+        val (rcClear, outClear) = execute(ScriptChunker.clearCommand(path), 8000, expectRoot)
+        if (rcClear != 0) return Pair(rcClear, "ERR_SCRIPT_UPLOAD_CLEAR: $outClear")
+        var sent = 0
+        for (c in ScriptChunker.chunks(script)) {
+            val (rcChunk, outChunk) = execute(ScriptChunker.chunkCommand(path, c), 15000, expectRoot)
+            if (rcChunk != 0) return Pair(rcChunk, "ERR_SCRIPT_UPLOAD_CHUNK #$sent: $outChunk")
+            sent++
         }
-        sb.append("chmod 700 $path\n")
-        sb.append("SZ=\$(wc -c < $path); echo \"SCRIPT_BYTES=\$SZ HEAD=\$(head -c 40 $path | tr '\\n' ' ')\"\n")
-        sb.append("if [ \"\$SZ\" != \"${bytes.size}\" ]; then echo \"ERR_SCRIPT_UPLOAD expected=${bytes.size} actual=\$SZ\"; exit 99; fi\n")
-        sb.append("sh $path\n")
-        sb.append("RC=\$?; rm -f $path; exit \$RC\n")
-        val upCmd = sb.toString()
-        if (upCmd.toByteArray(StandardCharsets.UTF_8).size > 3800) {
-            // Слишком большой даже upload-скрипт — грузить в несколько прогонов (append)
-            return executeScriptMultipart(path, script, timeoutMs, expectRoot)
+        val (rc, out) = execute(ScriptChunker.verifyAndRunCommand(path, bytes.size), timeoutMs + 10000, expectRoot)
+        if (out.contains("ERR_SCRIPT_UPLOAD")) {
+            // Предохранитель сработал — это ФАКТ, его надо доставить наверх (A0.2), а не глотать.
+            AppLog.e(TAG, "SCRIPT_UPLOAD FAIL name=$name expect=${bytes.size} rc=$rc out=${out.replace('\n', ' ').take(300)}")
         }
-        return execute(upCmd, timeoutMs + 10000, expectRoot)
-    }
-
-    private fun executeScriptMultipart(path: String, script: String, timeoutMs: Int, expectRoot: Boolean): Pair<Int, String> {
-        // Пошаговая аппанд-запись (для скриптов ~10+ кб, когда upload-команда тоже >3800 байт)
-        val bytes = script.toByteArray(StandardCharsets.UTF_8)
-        val chunkSize = 2000
-        var total = bytes.size.toLong()
-        val (rc0, out0) = execute("rm -f $path; : > $path; echo cleared", 5000, expectRoot)
-        if (rc0 != 0) return Pair(rc0, "ERR_SCRIPT_UPLOAD_CLEAR: $out0")
-        var offset = 0
-        while (offset < bytes.size) {
-            val end = minOf(offset + chunkSize, bytes.size)
-            val chunk = String(bytes, offset, end - offset, StandardCharsets.UTF_8)
-                .replace("'", "'\"'\"'")
-            val (rc1, out1) = execute("cat >> $path <<'CEXCHUNK'\n${chunk}\nCEXCHUNK\n", 5000, expectRoot)
-            if (rc1 != 0) return Pair(rc1, "ERR_SCRIPT_UPLOAD_CHUNK at offset=$offset: $out1")
-            offset = end
-        }
-        val (rc2, out2) = execute(
-            "chmod 700 $path; SZ=\$(wc -c < $path); echo \"SCRIPT_BYTES=\$SZ HEAD=\$(head -c 40 $path | tr '\\n' ' ')\"; " +
-            "if [ \"\$SZ\" != \"${bytes.size}\" ]; then echo \"ERR_SCRIPT_UPLOAD expected=${bytes.size} actual=\$SZ\"; exit 99; fi; " +
-            "sh $path; RC=\$?; rm -f $path; exit \$RC",
-            timeoutMs + 10000, expectRoot)
-        return Pair(rc2, out2)
+        AppLog.i(TAG, "SCRIPT_UPLOAD name=$name bytes=${bytes.size} chunks=$sent rc=$rc")
+        return Pair(rc, out)
     }
 
     /**
@@ -336,14 +312,20 @@ object AdbClient {
         while (true) {
             val job = try { queue.take() } catch (_: InterruptedException) { return }
             val t0 = SystemClock.uptimeMillis()
+            // iter33 C4: op действия, породившего команду, действует на весь путь её выполнения
+            LogKit.setThreadOp(job.op)
             val out = try {
                 runCommand(job.cmd, job.timeoutMs, job.expectRoot)
             } catch (t: Throwable) {
                 Log.e(TAG, "runCommand error", t)
                 Pair(1, "ERR_EXEC: ${t.javaClass.simpleName}: ${t.message}")
+            } finally {
+                LogKit.setThreadOp(null)
             }
             val dt = SystemClock.uptimeMillis() - t0
-            AppLog.d(TAG, "← execute dt=${dt}ms rc=${out.first} len=${out.second.length} port=${workingPort.get()} state=${state.get()}")
+            LogKit.countExec()
+            // iter33 A1: rc — НАСТОЯЩИЙ код возврата команды на устройстве (а не «канал ответил»).
+            AppLog.d(TAG, "← execute dt=${dt}ms rc=${out.first} len=${out.second.length} port=${workingPort.get()} state=${state.get()} cmd=${job.cmd.replace('\n', ' ').take(120)}")
             try {
                 Handler(Looper.getMainLooper()).post { job.onResult(out) }
             } catch (_: Throwable) { job.onResult(out) }
@@ -1044,10 +1026,10 @@ object AdbClient {
         val t0 = SystemClock.uptimeMillis()
         return try {
             // iter30c F4: канал идёт ТЕМ ЖЕ вариантом пакета, которым ответил адрес (ADB_DEST).
-            val out = execAdbSocket(
+            val (probeRc, out) = execAdbSocket(
                 "id; id -Z 2>/dev/null; getenforce 2>/dev/null",
                 ADB_PORT_DEFAULT, PROBE_TOTAL_MS, PROBE_CONNECT_MS, workingVariant,
-            )
+            ).also { AppLog.d(TAG, "ADB_PROBE rc=${it.first} len=${it.second.length}") }
             val dt = SystemClock.uptimeMillis() - t0
             val root = isRootUid(out)
             val ctxLine = out.lineSequence().drop(1).firstOrNull { it.trimStart().startsWith("u:") }.orEmpty().trim()
@@ -1143,7 +1125,10 @@ object AdbClient {
         val payload = "$banner\u0000".toByteArray(StandardCharsets.UTF_8)
         val hdrHex = msgHeaderHex(CNXN, version, maxData, payload)
         writeMsg(os, CNXN, version, maxData, payload)
-        AppLog.i(TAG, "ADB_TX cmd=CNXN arg0=0x${"%08x".format(version)} arg1=$maxData variant=$variant len=${payload.size} hex4=${hex4Of(CNXN)} ascii=${asciiOf(CNXN)} sum=${checksumFor(payload)} hex=$hdrHex")
+        // iter33 C3: первые 20 на сеанс — построчно, дальше ADB_TRACE_SUPPRESSED со счётчиком.
+        LogKit.trace("ADB_TX") {
+            "ADB_TX cmd=CNXN arg0=0x${"%08x".format(version)} arg1=$maxData variant=$variant len=${payload.size} hex4=${hex4Of(CNXN)} ascii=${asciiOf(CNXN)} sum=${checksumFor(payload)} hex=$hdrHex"
+        }
         var authSteps = 0
         while (true) {
             val left = deadline - System.currentTimeMillis()
@@ -1154,7 +1139,9 @@ object AdbClient {
                 AppLog.e(TAG, "ADB_RX attempt=$attempt variant=$variant cmd=silent hex=(none) dt=${System.currentTimeMillis() - tMsg}ms err=${e.javaClass.simpleName}")
                 return "silent (${e.javaClass.simpleName})"
             }
-            AppLog.i(TAG, "ADB_RX attempt=$attempt variant=$variant cmd=${cmdName(msg.cmd)} hex4=${hex4Of(msg.cmd)} ascii=${asciiOf(msg.cmd)} arg0=0x${"%08x".format(msg.arg0)} arg1=${msg.arg1} len=${msg.payload.size} hex=${hexOf(msg.payload, minOf(24, msg.payload.size))} dt=${System.currentTimeMillis() - tMsg}ms")
+            LogKit.trace("ADB_RX") {
+                "ADB_RX attempt=$attempt variant=$variant cmd=${cmdName(msg.cmd)} hex4=${hex4Of(msg.cmd)} ascii=${asciiOf(msg.cmd)} arg0=0x${"%08x".format(msg.arg0)} arg1=${msg.arg1} len=${msg.payload.size} hex=${hexOf(msg.payload, minOf(24, msg.payload.size))} dt=${System.currentTimeMillis() - tMsg}ms"
+            }
             when (msg.cmd) {
                 CNXN -> {
                     val bannerRx = try { String(msg.payload, Charsets.UTF_8).trim() } catch (_: Throwable) { "" }
@@ -1267,7 +1254,7 @@ object AdbClient {
     /** Выполнение на текущем канале (TCP 5555 либо unix-сокет) — для adbFixVerify. */
     private fun runOnChannel(command: String, timeoutMs: Int): String {
         return if (state.get() == ChannelState.ROOT_UNIX) execAdbLocalSocket(command, timeoutMs)
-        else execAdbSocket(command, ADB_PORT_DEFAULT, timeoutMs)
+        else execAdbSocket(command, ADB_PORT_DEFAULT, timeoutMs).second
     }
 
     fun executeSmart(command: String, timeoutMs: Int = 4000): Pair<Int, String> {
@@ -1379,7 +1366,8 @@ object AdbClient {
                 if (m.cmd == CNXN) break
                 if (m.cmd == AUTH) throw IOException("adbd unix: requires AUTH")
             }
-            val payload = ("shell:$command\u0000").toByteArray(StandardCharsets.UTF_8)
+            // iter33 A1: та же обёртка, что и на TCP — unix-канал тоже обязан отдавать настоящий rc.
+            val payload = ("shell:" + wrapForRc(command) + "\u0000").toByteArray(StandardCharsets.UTF_8)
             writeMsg(os, OPEN, 1, 0, payload)
             val out = ByteArrayOutputStream()
             var localId = 0
@@ -1391,7 +1379,12 @@ object AdbClient {
                 when (m.cmd) {
                     OKAY -> localId = m.arg0
                     WRTE -> { out.write(m.payload); writeMsg(os, OKAY, 1, m.arg0, ByteArray(0)) }
-                    CLSE -> { writeMsg(os, CLSE, 1, localId, ByteArray(0)); return out.toString("UTF-8").trim() }
+                    CLSE -> {
+                        writeMsg(os, CLSE, 1, localId, ByteArray(0))
+                        val (rc, body) = splitRc(out.toString("UTF-8"))
+                        lastUnixRc = rc
+                        return body
+                    }
                     else -> {}
                 }
             }
@@ -1405,6 +1398,8 @@ object AdbClient {
 
     /** Context нужен только для Settings.Global (WRITE_SECURE_SETTINGS). */
     @Volatile private var appCtx: android.content.Context? = null
+    /** iter33 A1: код возврата последней unix-команды (канал через LocalSocket). */
+    @Volatile private var lastUnixRc: Int = -1
     fun attachContext(c: android.content.Context) { if (appCtx == null) appCtx = c.applicationContext }
     @Volatile private var toggleTried = false
 
@@ -1542,7 +1537,7 @@ object AdbClient {
                 AppLog.e(TAG, "VERIFY EXEC unix rc=1 cmd=${shortCmd} → FAILED ($msg)")
                 return Pair(1, msg)
             }
-            return classify(0, expectRoot, shortCmd, out, 0)
+            return classify(0, expectRoot, shortCmd, out, lastUnixRc)
         }
 
         if (expectRoot && st != ChannelState.ROOT_5555) {
@@ -1554,7 +1549,7 @@ object AdbClient {
 
         if (st == ChannelState.ROOT_5555) {
             val port = workingPort.get()
-            var out = try {
+            var pair: Pair<Int, String> = try {
                 execAdbSocket(cmd, port, timeoutMs)
             } catch (e: IOException) {
                 AppLog.w(TAG, "VERIFY EXEC port=$port IOE: ${e.javaClass.simpleName}: ${e.message} — retrying alt port")
@@ -1569,7 +1564,7 @@ object AdbClient {
                 AppLog.e(TAG, "VERIFY EXEC port=$port rc=1 expectRoot=$expectRoot cmd=${shortCmd} → FAILED ($msg)")
                 return Pair(1, msg)
             }
-            return classify(port, expectRoot, shortCmd, out, 0)
+            return classify(port, expectRoot, shortCmd, pair.second, pair.first)
         }
 
         // НЕ-root команда и нет ADB — допускается Runtime.sh (от uid=1000, для отладочных команд).
@@ -1579,8 +1574,14 @@ object AdbClient {
 
     private fun classify(port: Int, expectRoot: Boolean, shortCmd: String, out: String, rc: Int): Pair<Int, String> {
         val (failReason, isFail) = classifyOutput(out, expectRoot)
-        val finalRc = if (rc != 0) rc else if (isFail) 1 else 0
-        val verdict = if (finalRc == 0) "SUCCESS" else "FAILED (${failReason ?: "rc=$rc"})"
+        // iter33 A1: rc — настоящий код возврата процесса на ГУ (из маркера __ADB_RC).
+        // rc < 0 = маркер не найден (старый путь/обрыв) — тогда, как раньше, решает эвристика по выводу.
+        val finalRc = when {
+            rc > 0 -> rc
+            rc == 0 -> if (isFail) 1 else 0
+            else -> if (isFail) 1 else 0
+        }
+        val verdict = if (finalRc == 0) "SUCCESS" else "FAILED (${failReason ?: "rc=$finalRc"})"
         val portLabel = if (port == 0) "sh" else port.toString()
         AppLog.i(TAG, "VERIFY EXEC port=$portLabel rc=$finalRc expectRoot=$expectRoot cmd=${shortCmd} → $verdict")
         if (finalRc != 0) {
@@ -1664,8 +1665,9 @@ object AdbClient {
      * и «adbd молчит» в отчёте неотличимы.
      */
     private fun tryProbePort(port: Int, connectTimeoutMs: Int, totalTimeoutMs: Int): Pair<String, String>? = try {
-        val out = execAdbSocket("id", port, totalTimeoutMs, connectTimeoutMs)
-        Pair(out.trim(), out)
+        val (_, rawOut) = execAdbSocket("id", port, totalTimeoutMs, connectTimeoutMs)
+        val out = rawOut.trim()
+        Pair(out, out)
     } catch (e: Throwable) {
         AppLog.e(TAG, "ADB_PROBE port=$port ${e.javaClass.simpleName}: ${e.message} (kind=${classifyProbeError(e)})")
         null
@@ -1675,25 +1677,28 @@ object AdbClient {
      * Низкоуровневое выполнение одной shell-команды через ADB-сокет.
      * Поведение совпадает с kotlinx.coroutines.scheduling.h (порт CentralEXAuto).
      */
-    private fun execAdbSocket(command: String, port: Int, timeoutMs: Int, connectTimeoutMs: Int = PROBE_CONNECT_MS, variant: Int = -1): String {
+    private fun execAdbSocket(command: String, port: Int, timeoutMs: Int, connectTimeoutMs: Int = PROBE_CONNECT_MS, variant: Int = -1): Pair<Int, String> {
         // iter30c F4: по умолчанию — вариант, которым ответил адрес (workingVariant), а не жёсткий 0.
         // Явное значение (-1 = «не задано») остаётся для особых случаев.
         val effVariant = if (variant < 0) workingVariant else variant
-        val payload = ("shell:$command\u0000").toByteArray(StandardCharsets.UTF_8)
+        // iter33 A1: обёртка даёт настоящий `rc` (см. wrapForRc). Длина проверяется ДО обёртки.
+        val wrapped = wrapForRc(command)
+        val payload = ("shell:$wrapped\u0000").toByteArray(StandardCharsets.UTF_8)
         // iter21 §1.3: не валим IllegalArgumentException в общий поток — возвращаем ERR_ADB_TOO_LONG.
         if (payload.size > 4096) {
-            return "ERR_ADB_TOO_LONG: cmd_len=${payload.size} > 4096 (use executeScript for long scripts)"
+            return Pair(1, "ERR_ADB_TOO_LONG: cmd_len=${payload.size} > 4096 (use executeScript for long scripts)")
         }
         val deadline = System.currentTimeMillis() + timeoutMs
         Socket().use { s ->
             val host = workingHost
-            if (host != channelLoggedHost) {
-                channelLoggedHost = host
-                AppLog.i(TAG, "ADB_CHANNEL host=$host port=$port variant=$effVariant (канал по адресу из ADB_DEST)")
-            } else {
-                AppLog.d(TAG, "ADB_CHANNEL host=$host port=$port variant=$effVariant")
+            // iter33 C3: первые 20 строк на сеанс построчно, дальше — ADB_TRACE_SUPPRESSED со счётчиком.
+            val firstForHost = host != channelLoggedHost
+            if (firstForHost) channelLoggedHost = host
+            LogKit.trace("ADB_CHANNEL") {
+                "ADB_CHANNEL host=$host port=$port variant=$effVariant${if (firstForHost) " (канал по адресу из ADB_DEST)" else ""}"
             }
             s.connect(InetSocketAddress(host, port), connectTimeoutMs)
+            LogKit.countConn()
             s.soTimeout = timeoutMs
             val dis = DataInputStream(s.getInputStream())
             val os = s.getOutputStream()
@@ -1718,7 +1723,8 @@ object AdbClient {
                     }
                     CLSE -> {
                         writeMsg(os, CLSE, 1, localId, ByteArray(0))
-                        return out.toString("UTF-8").trim()
+                        // iter33 A1: rc берётся из маркера __ADB_RC, а не «канал ответил = 0».
+                        return splitRc(out.toString("UTF-8"))
                     }
                     AUTH -> { val m="adbd AUTH after OPEN on port $port"; AppLog.e(TAG,"ADB: $m"); portDiagnosticDump(m); throw IOException(m) }
                     else -> Log.d(TAG, "ADB $port rx ${cmdName(msg.cmd)} (ignored)")
@@ -1726,6 +1732,32 @@ object AdbClient {
             }
             throw IOException("ADB command timeout on port $port after ${timeoutMs}ms, got ${out.size()} bytes")
         }
+    }
+
+    /**
+     * iter33 A1: настоящий код возврата.
+     *
+     * По старому протоколу (`shell:<cmd>`, OPEN/WRTE/CLSE без `shell_v2`) код возврата
+     * НЕ приходит — поэтому `rc=0` в 1.0.52 означал только «adbd что-то ответил», а
+     * `exit 99` из предохранителя скрипта был невидим. Выбран путь (а) из мандата:
+     * команда оборачивается в `sh -c '…; echo "__ADB_RC=$?"'`, маркер вырезается из stdout,
+     * а его значение становится `rc`. Плюсы против (б) `shell,v2`: не трогаем рукопожатие
+     * и формат пакетов (запрещено частью D), работает и на TCP-канале, и на unix-сокете.
+     * Минус: одна лишняя строка в выводе, которую мы же и убираем.
+     */
+    private const val RC_MARK = "__ADB_RC="
+
+    private fun wrapForRc(cmd: String): String =
+        "sh -c '" + cmd.replace("'", "'\\''") + "'; echo \"" + RC_MARK + "$?\""
+
+    /** Вырезает маркер и возвращает (rc, очищенный вывод). Без маркера — rc = -1 (неизвестен). */
+    private fun splitRc(raw: String): Pair<Int, String> {
+        val idx = raw.lastIndexOf(RC_MARK)
+        if (idx < 0) return Pair(-1, raw.trim())
+        val tail = raw.substring(idx + RC_MARK.length)
+        val rc = tail.trim().lineSequence().firstOrNull()?.trim()?.toIntOrNull() ?: -1
+        val body = (raw.substring(0, idx)).trimEnd('\n', '\r')
+        return Pair(rc, body.trim())
     }
 
     // ─────────── Protocol ───────────
@@ -1809,7 +1841,7 @@ object AdbClient {
         // Блокируем на рабочем потоке до 8с на каждый.
         for ((c, n) in cmds) {
             try {
-                val r = execAdbSocket(c, port, 3000).replace('\n',' ').trim()
+                val r = execAdbSocket(c, port, 3000).second.replace('\n',' ').trim()
                 AppLog.i(TAG, "ADB diag [$n]: $r")
             } catch (e: Exception) {
                 AppLog.w(TAG, "ADB diag [$n]: ${e.javaClass.simpleName}: ${e.message}")
