@@ -72,10 +72,14 @@ class ScriptChunkerTest {
         }
     }
 
-    /** Старый байтовый разрез — доказательство, что он ломал кириллицу (регресс не вернётся). */
+    /**
+     * Старый байтовый разрез — доказательство, что он ломал кириллицу (регресс не вернётся).
+     * Строка построена ДЕТЕРМИНИРОВАННО: 1999 ASCII-символов, затем кириллица, поэтому
+     * граница 2000 обязательно попадает ВНУТРЬ двухбайтового символа — ровно как в логе 1.0.52.
+     */
     @Test
     fun oldByteSlicingWasBroken() {
-        val script = scriptOfExactly(4962)
+        val script = "a".repeat(1999) + "бвгд".repeat(800) + "\n"
         val bytes = script.toByteArray(StandardCharsets.UTF_8)
         val broken = StringBuilder()
         var off = 0
@@ -85,12 +89,12 @@ class ScriptChunkerTest {
             off = end
         }
         val brokenBytes = broken.toString().toByteArray(StandardCharsets.UTF_8)
-        // либо байты разъехались, либо появился символ-заменитель — как в логе 1.0.52 (+83 байта)
         assertTrue(
             "байтовая нарезка обязана искажать кириллицу (иначе тест бессмыслен)",
             brokenBytes.size != bytes.size || broken.contains('\uFFFD')
         )
-        assertFalse("новый чанкер такого искажения не допускает", reassembleByBase64(script).size != bytes.size)
+        // а новый чанкер (base64) обязан вернуть байт-в-байт
+        assertArrayEquals(bytes, ScriptChunker.decode(ScriptChunker.chunks(script)))
     }
 
     /** Короткий ASCII-скрипт тоже проходит (границ нет, но контракт тот же). */
