@@ -59,7 +59,8 @@ class TtlScriptTest {
             s.contains("reason=no_uplink_no_carplay"))
         // вариант «только со скоупом»: правило всегда с -o
         assertTrue(s.contains("-o \$UPLINK"))
-        assertTrue(s.contains("! -o \$CARPLAY_IF"))
+        // вариант «всё кроме CarPlay»: первый найденный интерфейс CarPlay (CP_FIRST)
+        assertTrue("нет исключения CarPlay в скоупе", s.contains("! -o \$CP_FIRST"))
     }
 
     // 5. Выключение — эталонный цикл 1..5 и generic-удаление; строка TTL_OFF только в OFF.
