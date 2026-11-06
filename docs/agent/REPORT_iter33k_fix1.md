@@ -140,6 +140,7 @@ $ grep -rn "ошибка:" app/src/main/java → 0
 | Прогон | SHA | Итог |
 |---|---|---|
 | `42263967081` | `60c8a0b` | ✅ **success**, **94 PASSED / 0 FAILED**, `BUILD SUCCESSFUL in 4m 18s`, job `128050870657`, артефакт `13525909172` (177 120 961 Б) |
+| `42267658779` | `04910f8` (только доки, код `09c7f87`) | ✅ success, **94 PASSED / 0 FAILED**, job `128063673059` |
 | **`42265910234`** | **`dcf80b1`** (код `09c7f87` + маркер + отчёты) | ✅ **success**, **94 PASSED / 0 FAILED**, `BUILD SUCCESSFUL in 3m 29s`, job `128057633161`, артефакт `13527033977` (177 120 994 Б); `BuildMarkerTest > commitSourceIsHonest PASSED` — маркер `SOURCE_SHA=09c7f87` доходит до `BuildConfig.GIT_COMMIT` |
 
 Логи ключевых тестов (джобы `128050870657` и `128057633161`):
