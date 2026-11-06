@@ -36,20 +36,31 @@ val roadcastClientLib = file("src/main/jniLibs/arm64-v8a/libroadcast_client.so")
 
 // Итерация 12: пробрасываем SHA коммита в BuildConfig.GIT_COMMIT, чтобы
 // приложение писало его в файл-лог при старте (владелец видит точную сборку).
-val gitSha: String by lazy {
-    // iter33j §4.4: SHA берём СНАЧАЛА из окружения CI (GITHUB_SHA есть всегда, .git не нужен),
-    // и только потом из git. Иначе в логе появлялся чужой/старый SHA, а `ci_run=unknown`.
-    // Правило: реальный SHA из CI, иначе честное `unknown` (выдуманный печатать запрещено).
-    val env = System.getenv("GITHUB_SHA")?.trim().orEmpty()
-    if (env.matches(Regex("[0-9a-f]{40}"))) return@lazy env.take(7)
-    try {
-        val p = ProcessBuilder("git", "rev-parse", "--short=7", "HEAD")
-            .directory(rootProject.projectDir)
-            .redirectErrorStream(true).start()
-        val out = p.inputStream.bufferedReader().readText().trim().also { p.waitFor() }
-        // Только если git реально знает HEAD этой сборки (в CI shallow-checkout даёт пусто).
-        if (out.matches(Regex("[0-9a-f]{7,40}"))) out else "unknown"
-    } catch (_: Throwable) { "unknown" }
+/**
+ * iter33k §5.2 — SHA сборки берётся из МАРКЕРА `app/buildinfo.properties`, который агент
+ * обновляет в handoff-коммите. Владелец собирает APK в Android Studio своим ключом, поэтому
+ * `git rev-parse` ЗАПРЕЩЁН: на его машине он печатал чужой SHA (`fc55245`) из старого .git.
+ *
+ * Приоритет: маркер (агент) → `GITHUB_SHA` (Actions) → `local` (честный фоллбэк).
+ */
+val buildInfoFile = file("buildinfo.properties")
+val buildInfo: Properties = Properties().apply {
+    if (buildInfoFile.isFile) buildInfoFile.inputStream().use { load(it) }
+}
+
+val sourceSha: String by lazy {
+    val marker = buildInfo.getProperty("SOURCE_SHA")?.trim().orEmpty()
+    if (marker.matches(Regex("[0-9a-f]{7,40}"))) marker.take(7)
+    else {
+        val env = System.getenv("GITHUB_SHA")?.trim().orEmpty()
+        if (env.matches(Regex("[0-9a-f]{40}"))) env.take(7) else "local"
+    }
+}
+
+val ciRunId: String by lazy {
+    val marker = buildInfo.getProperty("SOURCE_SHA")?.trim().orEmpty()
+    val env = System.getenv("GITHUB_RUN_ID")?.trim().orEmpty()
+    if (env.isNotEmpty()) env else if (marker.isNotEmpty()) "local" else "local"
 }
 
 android {
@@ -64,16 +75,16 @@ android {
         applicationId = "com.example.voiceapp3"
         minSdk = 28
         targetSdk = 32
-        versionCode = 55
-        versionName = "1.0.55"
+        versionCode = 56
+        versionName = "1.0.56"
 
         buildConfigField("String", "APP_UPDATE_MANIFEST_URL", "\"$appUpdateManifestUrl\"")
         buildConfigField("String", "CHARGE_CONTROL_MANIFEST_URL", "\"$chargeControlManifestUrl\"")
-        buildConfigField("String", "GIT_COMMIT", "\"$gitSha\"")
+        buildConfigField("String", "GIT_COMMIT", "\"$sourceSha\"")
         // iter33h H1.7: номер прогона CI. В GitHub Actions он есть в env (GITHUB_RUN_ID),
         // workflow не правим — читаем переменную окружения прямо в Gradle.
         // Локально/без CI — "unknown" (чужой номер не печатаем).
-        buildConfigField("String", "CI_RUN", "\"${System.getenv("GITHUB_RUN_ID") ?: "unknown"}\"")
+        buildConfigField("String", "CI_RUN", "\"$ciRunId\"")
 
         ndk {
             abiFilters += "arm64-v8a"

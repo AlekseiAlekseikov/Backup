@@ -983,6 +983,21 @@ enum class Choice(
                 AppLog.logAction(appContext, "status.tempProbe", res)
                 return res
             }
+            // iter33k §2.2: единственное место, где по клику убивается SystemUI
+            // (с предупреждением «CarPlay и музыка прервутся на ~10 сек»).
+            "hvac_apply_sysui_btn" -> {
+                BgWorker.assertNotMain("ToolsBackend.applySlotsSysui")
+                val res = StatusIcons.applySlotsSystemUi(appContext)
+                AppLog.logAction(appContext, "hvacdigital.applySysui", res)
+                return res
+            }
+            // iter33k §1.1: маунт плагина — отдельной кнопкой, а не из тумблера.
+            "hvac_mount_btn" -> {
+                BgWorker.assertNotMain("ToolsBackend.mountPlugin")
+                val res = HvacDigitalPlugin.enable(appContext)
+                AppLog.logAction(appContext, "hvacdigital.plugin.enable", res)
+                return res
+            }
             "lockSoundVol" -> {
                 val v = intValue(value)
                 return if (v != null) {

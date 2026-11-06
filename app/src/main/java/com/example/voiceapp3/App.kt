@@ -17,9 +17,10 @@ class App : Application() {
         AppLog.init(this)
         // Явная строка версии — чтобы владелец мгновенно видел в логе, какая
         // сборка запущена (без гаданий по размеру APK).
-        // iter33h H1.7: настоящий SHA сборки (7 знаков) и номер прогона CI; если SHA нет —
-        // "unknown" (чужой/старый не печатаем).
-        val commit = BuildConfig.GIT_COMMIT.take(7).ifBlank { "unknown" }
+        // iter33k §5.2: SHA — из маркера `app/buildinfo.properties` (его пишет агент в handoff-коммите),
+        // иначе GITHUB_SHA, иначе честное `local`. `git rev-parse` больше не используется:
+        // на машине владельца он печатал чужой SHA из старого .git.
+        val commit = BuildConfig.GIT_COMMIT.trim().ifBlank { "local" }
         AppLog.i("App", "BUILD: versionCode=${BuildConfig.VERSION_CODE} versionName=${BuildConfig.VERSION_NAME} " +
             "commit=$commit ci_run=${BuildConfig.CI_RUN}")
         // iter25 P0-F: явная отметка «безопасной» сборки — в 1.0.46 старт писал в mt_gpio

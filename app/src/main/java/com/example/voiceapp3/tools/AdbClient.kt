@@ -237,6 +237,31 @@ object AdbClient {
             }
         }
         if (to != RootState.ROOT) rootRestoreDone.set(false)
+        // iter33k §4.1: ЛЮБОЙ переход в SHELL_NO_ROOT — одна попытка восстановления на событие
+        // (`( sleep 1; setprop ctl.restart adbd ) &`, как у референса), затем проба `id`.
+        if (to == RootState.ROOT) rootRecoveryDone.set(false)
+        if (to == RootState.SHELL_NO_ROOT) autoRecoverRoot(reason)
+    }
+
+    /** iter33k §4.1: одна попытка на событие потери; повтор — только по кнопке владельца. */
+    private val rootRecoveryDone = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    private fun autoRecoverRoot(reason: String) {
+        if (!rootRecoveryDone.compareAndSet(false, true)) return
+        Thread {
+            val t0 = android.os.SystemClock.elapsedRealtime()
+            runCatching {
+                execute("( sleep 1; setprop ctl.restart adbd ) >/dev/null 2>&1 &", 6000, expectRoot = false)
+            }
+            Thread.sleep(4000)
+            val out = runCatching { execute("id", 6000, expectRoot = false) }
+                .getOrDefault(Pair(1, "")).second
+            val ok = isRootUid(out)
+            AppLog.i(TAG, "ADB_RECOVERY action=restart_adbd reason=$reason root_before=none " +
+                "root_after=${if (ok) "root" else "none"} result=${if (ok) "OK" else "FAILED"} " +
+                "wait=4000ms probe=id dt=${android.os.SystemClock.elapsedRealtime() - t0}ms")
+            if (ok) transitionRootState(RootState.ROOT, "recovery_ok")
+        }.apply { name = "adb-root-recovery"; isDaemon = true }.start()
     }
 
     /**

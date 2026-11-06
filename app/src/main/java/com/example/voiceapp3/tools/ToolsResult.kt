@@ -95,7 +95,8 @@ data class ToolsResult(
             ok && steps.all { it.status == ToolsStep.Status.OK } -> "применено"
             ok -> "применено частично"
             steps.any { it.status == ToolsStep.Status.BLOCKED } -> blockedReason()
-            else -> steps.last().stderr.ifEmpty { "ошибка: ${steps.last().step}" }
+            // iter33k §6.1: в UI нет красных текстов — нейтральное «не применилось» + шаг.
+            else -> steps.last().stderr.ifEmpty { "не применилось: ${steps.last().step}" }
         }
 
     val statusWire: String

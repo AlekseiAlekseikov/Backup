@@ -791,6 +791,9 @@ object StatusIcons {
     private fun syncAllImpl(app: Context, seq: Int): Int {
         var reads = 0
         ensureCar(app)
+        // iter33k §1.3: тумблеры слотов показывают ФАКТ из getprop, а не память приложения.
+        // Чтение дешёвое и не чаще раза в минуту; при расхождении — строка FLAGS_SYNC.
+        runCatching { HvacFlagsApply.syncFromDevice(app) }
         // iter33j §4.6: при старте CarPropertyManager ещё не поднят — это НЕ ошибка.
         // Вместо `BATT: SOC null` / `TEMP: no CarPropertyManager` на каждом цикле печатаем
         // одну понятную строку не чаще раза в 30 с и ждём готовности (ensureCar уже вызван).
@@ -925,7 +928,20 @@ object StatusIcons {
         Runtime.getRuntime().exec(arrayOf("getprop", SYS_HVAC_VIA)).inputStream.bufferedReader().readText().trim()
     } catch (t: Throwable) { "н/д" }
 
-    private fun pushHvacDigitalPropsIfEnabled(app: Context) {
+    private fun pushHvacDigitalPropsIfEnabled(app: Context, retried: Boolean = false) {
+        // iter33k §6.2: не писать флаги, пока канал не поднят (в логе были ERR_ADB_TIMEOUT на старте).
+        // Ждём готовности один раз с повтором через 5 с; второй раз — честная строка deferred.
+        if (!AdbClient.isPrivilegedAllowed() && AdbClient.currentRootState() != AdbClient.RootState.PROBING) {
+            if (!retried) {
+                AppLog.i(TAG, "HVACDIGITAL_PUSH wait reason=channel_not_ready action=retry_once_in_5s")
+                BgWorker.postDelayed("StatusIcons.hvacdigital.pushRetry", 5000L) {
+                    pushHvacDigitalPropsIfEnabled(app, retried = true)
+                }
+            } else {
+                AppLog.i(TAG, "HVACDIGITAL_PUSH deferred reason=channel_not_ready (повтор уже был)")
+            }
+            return
+        }
         val p = prefs(app)
         // iter33i P0-a: в чужие props уходят ТОЛЬКО флаги 0|1 — ровно как в референсе
         // (`w0/x7.java:137-147`: setprop …temp/batt/exttemp = "1"/"0"). Значения (°C, %) в эти
@@ -1018,56 +1034,35 @@ object StatusIcons {
     /** Все свойства внешней температуры, которые надо выставлять одновременно — одно. */
     private val SYS_HVAC_EXT_ALL = arrayOf(SYS_HVAC_EXT_EXTTEMP)
 
+    /**
+     * iter33k §1 — клик тумблера слота: ТОЛЬКО флаги + apply ([HvacFlagsApply]).
+     *
+     * Никакого `plugin.enable` (маунт + `kill SystemUI`) из тумблера: маунт — отдельная кнопка
+     * «Монтировать плагин» и boot-маршрут. Одна строка лога на клик — `TOGGLE [hvacX] → ON|OFF …`.
+     * Исключений нет: hvacTemp/hvacBatt/hvacExtTemp идут одним и тем же путём.
+     */
     @JvmStatic fun setHvacDigital(ctx: Context, pref: String, value: Boolean): ToolsResult {
         val t0 = android.os.SystemClock.uptimeMillis()
-        Prefs2.putBoolean(ctx, pref, value)
-        // iter16: при ВКЛЮЧЕНИИ любого из трёх тоглов — пытаемся заинсталлить плагин
-        // (mount --bind на OEM com.flyme.auto.systemuiplugin). Плагин уже лежит в
-        // app/src/main/res/raw/geely_auto_systemui_plugin_digital.apk (18 МБ).
-        // iter33 A2: статус тумблера ВЫВОДИТСЯ из установки плагина. Раньше здесь стоял
-        // захардкоженный ToolsStep.Status.OK — из-за него панель показывала «SUCCESS»,
-        // хотя рядом в логе было `VERIFY hvacdigital.enable: FAILED (rc=0 VIA=? PM_PATH= …)`.
-        var installNote = "plugin-not-invoked"
-        var pluginStatus: ToolsStep.Status? = null
-        var pluginReason = "plugin-not-invoked"
-        if (value) {
-            val r = try {
-                HvacDigitalPlugin.enable(ctx)
-            } catch (t: Throwable) {
-                AppLog.w(TAG, "HVACDIGITAL: plugin.enable failed", t)
-                null
-            }
-            pluginStatus = when {
-                r == null -> ToolsStep.Status.FAILED
-                r.steps.isEmpty() -> ToolsStep.Status.FAILED
-                r.steps.any { it.status == ToolsStep.Status.FAILED } -> ToolsStep.Status.FAILED
-                r.steps.any { it.status == ToolsStep.Status.BLOCKED } -> ToolsStep.Status.BLOCKED
-                r.steps.all { it.status == ToolsStep.Status.OK } -> ToolsStep.Status.OK
-                else -> ToolsStep.Status.PARTIAL
-            }
-            pluginReason = r?.summary ?: "enable бросил исключение"
-            val cnt = r?.steps?.size ?: 0
-            installNote = "plugin.enable steps=" + cnt + " status=" + pluginStatus +
-                " reason=" + pluginReason.take(120)
-            AppLog.i(TAG, "HVACDIGITAL: plugin.enable -> $installNote")
+        val line = try {
+            HvacFlagsApply.toggle(ctx, pref, value)
+        } catch (t: Throwable) {
+            AppLog.w(TAG, "TOGGLE failed: ${t.javaClass.simpleName}: ${t.message}")
+            "TOGGLE [${HvacFlagsApply.toggleLabel(pref)}] → ${if (value) "ON" else "OFF"} | " +
+                "flags=? | via=? | apply=plugin_restart result=failed | ✗"
         }
-        // Сразу же проталкиваем текущие значения (а не 0/1) — на случай, если пользователь
-        // включил тогл после того, как syncAll уже прочитал данные.
-        BgWorker.post("StatusIcons.hvacdigital.push") { pushHvacDigitalPropsIfEnabled(ctx.applicationContext) }
-        // iter33 A2: хардкод Status.OK удалён — статус берётся из результата enable().
-        val finalStatus = pluginStatus ?: ToolsStep.Status.OK
+        // Серый/жёлтый статус вместо красного: клик — это команда, а не ошибка.
+        val ok = line.trimEnd().endsWith("✓")
         val step = ToolsStep(
             step = "hvacdigital.$pref",
-            command = "prefs.put($pref=$value) + push values + $installNote",
+            command = "flags(temp,batt,exttemp) + via + kill \$(pidof ${HvacFlagsApply.PLUGIN_PKG})",
             startedAtMs = t0, finishedAtMs = android.os.SystemClock.uptimeMillis(),
-            exitCode = if (finalStatus == ToolsStep.Status.OK || finalStatus == ToolsStep.Status.PARTIAL) 0 else 1,
-            stdout = installNote,
-            stderr = if (finalStatus == ToolsStep.Status.OK) "" else pluginReason.take(300),
-            expected = if (value) "плагин смонтирован (mounted=true)" else "$pref=false",
-            actual = "$pref=$value; $installNote",
-            status = finalStatus
+            exitCode = if (ok) 0 else 1,
+            stdout = line,
+            stderr = "",
+            expected = "TOGGLE … ✓",
+            actual = line,
+            status = if (ok) ToolsStep.Status.OK else ToolsStep.Status.PARTIAL
         )
-        AppLog.i(TAG, "VERIFY hvacdigital toggle $pref=$value: $installNote")
         return ToolsResult(
             action = "hvacdigital",
             title = "Цифровая индикация климата",
@@ -1075,8 +1070,40 @@ object StatusIcons {
         )
     }
 
-    @JvmStatic fun getHvacDigital(ctx: Context, pref: String): Boolean =
-        prefs(ctx).getBoolean(pref, false)
+    /** §2.2 — кнопка «Применить слоты (SystemUI)»: единственное место kill SystemUI. */
+    @JvmStatic fun applySlotsSystemUi(ctx: Context): ToolsResult {
+        val t0 = android.os.SystemClock.uptimeMillis()
+        val result = try { HvacFlagsApply.applySystemUi() } catch (t: Throwable) { "failed" }
+        val ok = result == "ok" || result == "noop"
+        val step = ToolsStep(
+            step = "hvacdigital.applySysui",
+            command = "kill \$(pidof ${HvacFlagsApply.SYSUI_PKG})",
+            startedAtMs = t0, finishedAtMs = android.os.SystemClock.uptimeMillis(),
+            exitCode = if (ok) 0 else 1,
+            stdout = "FLAG_APPLY method=sysui_restart result=$result",
+            stderr = "",
+            expected = "SystemUI перезапущен (CarPlay/музыка прервутся на ~10 с)",
+            actual = "result=$result",
+            status = if (ok) ToolsStep.Status.OK else ToolsStep.Status.PARTIAL
+        )
+        return ToolsResult("hvacdigital.applySysui", "Применить слоты (SystemUI)", listOf(step))
+    }
+
+    /**
+     * §1.3 — состояние тумблера для UI = ФАКТ из `getprop` (кэш последнего чтения),
+     * а не только память приложения. Память — резерв, пока канал ещё не ответил ни разу.
+     */
+    @JvmStatic fun getHvacDigital(ctx: Context, pref: String): Boolean {
+        HvacFlagsApply.cachedFlags?.let { (t, b, e) ->
+            return when (pref) {
+                PREF_HVAC_TEMP -> t
+                PREF_HVAC_BATT -> b
+                PREF_HVAC_EXT_TEMP -> e
+                else -> prefs(ctx).getBoolean(pref, false)
+            }
+        }
+        return prefs(ctx).getBoolean(pref, false)
+    }
 
     /**
      * iter33 B2: в watchdog'е — ТОЛЬКО чтение состояния.
@@ -1086,8 +1113,9 @@ object StatusIcons {
      * чистка dalvik-cache и `pm install`. Плюс сброс свойств в 0 через setprop — цифры
      * в статус-баре гасились каждую минуту.
      *
-     * Что стало: плагин ставится ТОЛЬКО по клику (setHvacDigital → HvacDigitalPlugin.enable,
-     * один раз за процесс). Здесь — `checkStatus` (pm path + /proc/mounts, без записи) и,
+     * Что стало: плагин ставится ТОЛЬКО кнопкой «Монтировать плагин» / boot-маршрутом
+     * (`HvacDigitalPlugin.enable`), а тумблер слота (`setHvacDigital`) в iter33k — это только
+     * флаги + мягкий `kill` процесса плагина. Здесь — `checkStatus` (pm path + /proc/mounts, без записи) и,
      * если не смонтировано, ОДНА строка в лог. Автоповторов нет.
      */
     /**

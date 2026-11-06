@@ -188,7 +188,12 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
             AppLog.w(TAG, "TTL: toggle BLOCKED ($reason). rootChannel state=${AdbClient.currentState()} port=${AdbClient.currentPort()}")
         }
 
-        val expectedStr = if (enabled) "TTL_V4=1 TTL_V6=1 VERIFY=OK/OK wire-real=65" else "TTL_V4=0 TTL_V6=0 VERIFY=FAIL/FAIL"
+        val expectedStr = if (enabled) "TTL_V4=1 TTL_V6=1 VERIFY=OK/OK rules=scoped" else "TTL_V4=0 TTL_V6=0 rules=none"
+        // iter33k §3.4: выключение — эталонное удаление циклом; подтверждаем счётчиками.
+        if (!enabled && !output.contains("TTL_OFF")) {
+            val (c4, c6) = ttlRuleCounts()
+            AppLog.i(TAG, TtlRules.offLine(maxOf(c4, 0), maxOf(c6, 0)))
+        }
         // iter19: печатаем ВСЮ строку TTL_CHECK как есть (не режем reason пробелом),
         // а отдельно достаём поля для структурированного лога. reason между "reason=" и "rule_ttl=" — всё, что внутри.
         val ttlCheckLine = output.lineSequence().firstOrNull { it.startsWith("TTL_CHECK:") } ?: ""
@@ -270,6 +275,9 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
         val script = buildScript(true)
         val (rc, out) = AdbClient.executeScript("ttl_script", script, 40000)
         val (status, reason) = parseVerifyResult(true, out)
+        // iter33k §3.4: одна строка восстановления при загрузке (правила — со скоупом).
+        val after = ttlRuleCounts()
+        AppLog.i(TAG, TtlRules.bootLine(after.first, after.second))
         AppLog.i(TAG, "VERIFY TTL bootRestore: rc=$rc → $status ($reason)")
     }
 

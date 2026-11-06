@@ -593,12 +593,12 @@ class OfflineSheetController(
             // «пауза · 322 МБ из 980 МБ» — скачанное из полного размера
             OfflineMapManager.Phase.PAUSED ->
                 "пауза · $mb МБ из ${fmtTotal(total)}" +
-                    (st.errorText?.let { " · ошибка: $it" } ?: "")
+                    (st.errorText?.let { " · не выполнено: $it" } ?: "")
             // завершено: «980 МБ из 980 МБ · обновлено N дн. назад» — под прах
             // зафиксируется факт; метка времени честная (только из prefs, без фейка)
             OfflineMapManager.Phase.DONE -> "скачан · $mb МБ из ${fmtTotal(total)}" +
                 doneAgoSuffix(def.id) +
-                (st.errorText?.let { " · ошибка: $it" } ?: "")
+                (st.errorText?.let { " · не выполнено: $it" } ?: "")
             OfflineMapManager.Phase.NOT_STARTED -> "не скачан · " + def.sizeHint.removePrefix("≈")
         }
     }
