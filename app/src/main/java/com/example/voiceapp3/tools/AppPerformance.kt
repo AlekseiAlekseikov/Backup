@@ -669,7 +669,8 @@ object AppPerformance {
         BgWorker.assertNotMain("AppPerformance.optimizeAllApps")
         val steps = mutableListOf<ToolsStep>()
         val t = System.currentTimeMillis()
-        AppLog.i(TAG, "JIT_FULL_ROUND start mode=$JIT_FULL_MODE warn="полная компиляция: долго и нагружает ГУ"")
+        AppLog.i(TAG, "JIT_FULL_ROUND start mode=$JIT_FULL_MODE " +
+            "warn=\"полная компиляция: долго и нагружает ГУ\"")
         steps.add(ToolsStep(
             step = "jit_full_warn",
             command = "cmd package compile -m $JIT_FULL_MODE <pkg>",
@@ -775,6 +776,39 @@ object AppPerformance {
             Regex("RT=([^\\n]*)").find(out)?.groupValues?.get(1)?.trim().orEmpty(),
             Regex("PS=([^\\n]*)").find(out)?.groupValues?.get(1)?.trim().orEmpty()
         )
+    }
+
+    /** Одна boot-попытка на процесс (отдельный счётчик от HVAC и от JIT). */
+    private val videoBootAttempted = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /**
+     * Единственная разрешённая persist-запись — `persist.sys.dalvik.vm.usejit`
+     * (правило владельца: только флаги `hvacdigital.*` + этот маркер).
+     * Пишется по клику (`reason=toggle`) и на boot как backfill (`reason=boot_backfill`),
+     * всегда с чтением обратно — без readback строка не доказательство.
+     */
+    private fun jitPersistBackfill(value: String, reason: String): String {
+        val ret = runCatching {
+            runSuCommand("setprop $PROP_PERSIST_USEJIT $value; " +
+                "echo JIT_PERSIST_READBACK=\$(getprop $PROP_PERSIST_USEJIT)")
+        }.getOrNull()
+        val rb = ret?.let { parseTag(it.output, "JIT_PERSIST_READBACK") } ?: "?"
+        AppLog.i(TAG, "JIT_PERSIST_SET desired=$value readback=$rb reason=$reason")
+        return rb
+    }
+
+    /** iter33d A2: идентификатор текущей загрузки (кэш на процесс). */
+    @Volatile private var bootTag: String? = null
+
+    private fun currentBootTag(): String {
+        bootTag?.let { return it }
+        val id = runCatching { File("/proc/sys/kernel/random/boot_id").readText().trim() }
+            .getOrDefault("")
+        if (id.isNotEmpty()) { bootTag = id; return id }
+        val epochMs = System.currentTimeMillis() - android.os.SystemClock.elapsedRealtime()
+        val tag = JitBootMark.epochTag(epochMs)
+        bootTag = tag
+        return tag
     }
 
     /**

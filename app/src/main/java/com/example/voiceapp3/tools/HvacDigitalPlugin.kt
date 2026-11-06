@@ -263,7 +263,7 @@ object HvacDigitalPlugin {
             # Чужой файл не затираем МОЛЧА: сначала сверяем md5 и печатаем CONFLICT.
             SRC_MD5=@@(md5sum '%APKSRC%' 2>/dev/null | awk '{print $1}')
             OLD_MD5=@@(md5sum $STAGE_APK 2>/dev/null | awk '{print $1}')
-            echo "STAGE_MD5 old=${OLD_MD5:-absent} new=@@SRC_MD5 path=$STAGE_APK"
+            echo "STAGE_MD5 old=@@{OLD_MD5:-absent} new=@@SRC_MD5 path=$STAGE_APK"
             if [ -n "@@OLD_MD5" ] && [ "@@OLD_MD5" != "@@SRC_MD5" ]; then
               echo "CONFLICT другой файл, не затираю молча: $STAGE_APK old=@@OLD_MD5 new=@@SRC_MD5 action=replace_by_owner_click"
             fi
