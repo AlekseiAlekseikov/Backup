@@ -666,3 +666,38 @@
   **`13445912750`**: zip **176 999 349 Б** · apk **215 470 097 Б** · manifest-отчёт **105 294 Б**.
   Прогон `42089523005` (`25344d2`) — `cancelled` (вытеснен новым push).
 - Открытые вопросы владельцу: маршрутная пилюля (оставить в своём UI/убрать) и скрин слота климата.
+
+## iter33j — 1.0.55 (плагин референса как есть, честный маунт, температура по эталону, JIT без zygote)
+
+База `3b30ba6` (iter33i). Коммиты: `b767e5f` (основное) → `5dcf60b` (фикс сборки). Версия `55` / `1.0.55`.
+
+- Правило владельца 06.11: в системе ничего не правится. Smali/apktool-патчей в итерации НЕТ; в дереве
+  нет ни `smali`, ни `apktool` (`git ls-files | grep -E "smali|apktool"` → пусто).
+- P0.1: `res/raw/geely_auto_systemui_plugin_digital.apk` заменён на бинарь референса CentralEXAuto
+  (коммит `99c4fe0…`), `sha256 de4b4742…4d24d0fd03`, 18 280 162 Б, md5 `2fa3d11d…`. OEM (1.0.53) и
+  патч iter33i — в `/home/user/artifacts/`.
+- P0.2-P0.5: маунт = свежий umount → `mount --bind` → inode **и** md5 обоих концов → одна строка
+  `HVAC_MOUNT_RESULT mount=… inode_match=… md5_match=… verdict=…` (`HvacDigitalPlugin.kt:329-380`),
+  FAILED при любом расхождении; стейдж `/data/local/hvac-digital/sysui.apk` с `CONFLICT другой файл,
+  не затираю молча` (`:262-278`); опознание по размеру/md5 (`PLUGIN_APK_SIZE`, `:167-176`, `:436-479`);
+  `MountResultTest` — 8 тестов.
+- Флаги слотов не менялись: `HvacDigitalProps.kt:42-47` (1:1 к `w0/x7.java:137-147`).
+- P1 температура: `decodeFlymeTemp (raw−80)/2` (`OutsideTemp.kt:14`), основной источник
+  `AC_AMBIENT_TEMP 0x2140A377`, `ENV_OUTSIDE 0x11600703` — только fallback, `Locale.US`,
+  `AC_AMBIENT_TEMP_INVALID` не гейт (`StatusIcons.kt:397-433`); `TempDecodeTest` — 5 тестов.
+- P1 JIT: `ctl.restart zygote` удалён вообще — `grep -rn "ctl.restart zygote" app/src` → пусто;
+  включение = два `setprop` + persist-маркер + текст «применится после перезагрузки ГУ»
+  (`AppPerformance.kt:213-266`), boot-ветка без zygote (`:824-849`); раунд `JIT_ROUND` по избранным
+  вместо `compile_all_apps` (`:545-583`), полная компиляция — отдельная кнопка с предупреждением;
+  `ctl.restart adbd` (одна попытка + проба `id`, `:598-618`) и `ctl.restart CarplayMonitor` (`:642-662`),
+  кнопки — `ToolsPanel.kt:819-822`, обработчики — `UiBridge.kt:703-724`.
+- BUILD: SHA из `GITHUB_SHA` (CI), иначе git, иначе `unknown` (`app/build.gradle.kts:39-52`).
+- Мусор persist: `PersistCleaner` (`temp_ext` → пусто, числа в флагах → `0`), вызов из `App.kt:42`,
+  `PersistCleanerTest` — 3 теста. VHAL_WAIT вместо `SOC null`/`no CarPropertyManager`;
+  `/proc/uptime` с `2>/dev/null || echo unavailable`.
+- CI: прогон **`42194780607`** (head `5dcf60b`) — success, **72 PASSED / 0 FAILED**, артефакт
+  **`13492735092`**: zip **177 108 547 Б** · apk **215 485 345 Б** · manifest-отчёт **105 294 Б**.
+  Красная попытка этой итерации: `42193578514` (`b767e5f`) — вырезанные хелперы + вложенные кавычки
+  + `${}` в raw-строке; исправлено в `5dcf60b`.
+- Открыто: приёмка трёх слотов и температуры — за владельцем; материалы `РАЗБОР_1.0.54…md` и
+  `voiceapp3-10.log` в окружение не переданы (в отчёте §8).
