@@ -1,12 +1,12 @@
 # REPORT iter33k — 1.0.56
 
 **База:** `9d37799` (1.0.55) · **ветка:** `fix/v2` · **версия:** `versionCode = 56`, `versionName = "1.0.56"`
-**Код итерации:** `704911c` · **buildinfo (маркер):** `704911c` · сборка APK — только в CI (владелец подписывает своим ключом)
+**Код итерации:** `96d22eb` · **buildinfo (маркер):** `96d22eb` · сборка APK — только в CI (владелец подписывает своим ключом)
 
 Приёмка §5 (печатает приложение при старте):
 
 ```
-BUILD: versionCode=56 versionName=1.0.56 commit=704911c ci_run=local
+BUILD: versionCode=56 versionName=1.0.56 commit=96d22eb ci_run=local
 ```
 
 `ci_run=local` — так и должно быть у владельца (нет `GITHUB_RUN_ID`). В CI та же строка даёт `ci_run=<номер прогона>`. `git rev-parse` в сборке больше нет.
@@ -123,7 +123,7 @@ FLAGS_SYNC prefs=temp:0 batt:1 ext:0 fact=temp:1 batt:1 ext:0 action=ui_from_pro
 - `App.kt:21-26` печатает `BUILD: versionCode=… versionName=… commit=… ci_run=…`, пустое значение больше не превращается в `unknown`, а станет `local`.
 - Тест `BuildMarkerTest` (3 проверки) фиксирует `versionCode=56`, `versionName=1.0.56`, допустимый формат `commit`/`ci_run` и читаемость маркера.
 
-Для владельца: сборка в Android Studio без CI-переменных даст `commit=704911c ci_run=local` — ровно то, что в шапке отчёта. Чужой SHA (`fc55245`) больше напечатать неоткуда.
+Для владельца: сборка в Android Studio без CI-переменных даст `commit=96d22eb ci_run=local` — ровно то, что в шапке отчёта. Чужой SHA (`fc55245`) больше напечатать неоткуда.
 
 ---
 
@@ -161,6 +161,51 @@ $ grep -rn "tcpdump" app/src/main/java --include=*.kt          → 0 (в код�
 
 ---
 
-## CI
+## CI — доказательство
 
-_заполняется после прогона_ — таблица с номером прогона, job, PASSED/FAILED, артефактом.
+| Прогон | SHA | Что было | Итог |
+|---|---|---|---|
+| `42248064281` | `ef721f0` | первая сборка итерации | ❌ **FAILED: 1 тест** — `TtlScriptTest > scopedOnlyNoTcpdump` ждал `! -o $CARPLAY_IF`, а скрипт использует `$CP_FIRST` (мой тест, не код). Исправлено в `f903a1e`. |
+| `42249659613` | `f903a1e` | после правки теста | ✅ success, **88 PASSED / 0 FAILED**, `BUILD SUCCESSFUL in 3m 25s`, job `128001064019`, артефакт `13521081145` (177 120 940 Б) |
+| `42251502684` | `704911c` | добавлен `BuildMarkerTest` | ❌ **FAILED: инфраструктура раннера** — `Install CMake 3.22.1` упал с `ZipException: Archive is not a ZIP archive` (`:jni:configureCMakeDebug[arm64-v8a]`). Код не компилировался — не наш дефект; прогон перезапущен следующим коммитом. |
+| **`42252401367`** | **`96d22eb`** | финальный код итерации | ✅ **success**, **91 PASSED / 0 FAILED**, `BUILD SUCCESSFUL in 4m 4s`, job `128010643713`, артефакт `13521099296` (**177 121 097 Б**) |
+
+Доказательство по тестам (лог джобы `128010643713`):
+
+```
+$ grep -c " PASSED$" job.log   → 91
+$ grep -c " FAILED$" job.log   → 0
+BuildMarkerTest > versionIs56 PASSED
+BuildMarkerTest > commitSourceIsHonest PASSED
+BuildMarkerTest > markerFileParsable PASSED
+TtlRulesTest      → 6/6 PASSED   (uplink, carplay, варианты, отсутствие глобального, текст правил, строки)
+HvacFlagsApplyTest→ 7/7 PASSED   (via, flags, parse, TOGGLE-строка, FLAG_APPLY, скрипт apply, applyResult)
+TtlScriptTest     → 6/6 PASSED   (подстановка ENABLE, TTL_RESULT, ROUTE_SRC, только скоуп без tcpdump, снятие правил, вердикт)
+```
+
+Прирост против 1.0.55: было 72 теста, стало 91 (+19: `TtlRulesTest` 6, `HvacFlagsApplyTest` 7, `TtlScriptTest` +3, `BuildMarkerTest` 3).
+
+---
+
+## Что владельцу делать на машине
+
+1. Установить APK (1.0.56) и открыть шторку «Инструменты» → раздел климата.
+2. **Клик по тумблеру слота** («Процент заряда» / «Цифровой климат» / «Цифровая наружная t°») — в `voiceapp3.log` появится ровно одна строка
+   `TOGGLE [hvacBatt] → ON | flags=temp:0 batt:1 ext:0 | via=bind | apply=plugin_restart result=ok | ✓` и ниже `FLAG_APPLY …`.
+   Маунта и перезапуска SystemUI при этом НЕ будет.
+3. Если слот не появился — нажать **«Применить слоты (SystemUI)»** (CarPlay и музыка прервутся на ~10 с). Это единственный «тяжёлый» путь, и он только по кнопке.
+4. **TTL** — включить тумблер и проверить, что CarPlay жив. В логе ожидается:
+   `TTL_NET ifaces=… carplay=… uplink=… v4=0 v6=0`, затем `TTL_TRY variant=uplink scope="-o wlan0" …`, `TTL_SCOPE result=scoped scoped=yes rule="-A POSTROUTING -o wlan0 -j TTL --ttl-set 65"`, а после перезагрузки ГУ — `TTL_BOOT rules_restored=yes v4=1 v6=1 scoped=true`.
+   Выключение — `TTL_OFF v4=0 v6=0 result=OK`.
+5. **Рут** — если канал отвалится, в логе будет ровно одна строка
+   `ADB_RECOVERY action=restart_adbd reason=channel_dropped root_before=none root_after=root result=OK`.
+6. Прислать `voiceapp3.log` — по нему проверю §2.4 (появляется ли слот от мягкого apply).
+
+---
+
+## Открытые пункты на следующую итерацию
+
+1. 🟡 **§2.4:** чем именно применяются слоты — мягким `kill` процесса плагина или только полным перезапуском SystemUI. Нужен лог с машины (`TOGGLE … result=ok` + факт появления слота). Если только SystemUI — зафиксировать в отчёте как штатный путь и, возможно, добавить в кнопку авто-повтор.
+2. 🟡 **Раскладка ≠ скриншот 2** — нужен read-only `adb pull` `SystemUI.apk`/плагина с машины, чтобы сверить «строго как в референсе».
+3. 🟡 **boot-маунт плагина** (`HvacDigitalPlugin.bootInstall`) один раз перезапускает SystemUI при загрузке — принято в iter33b, в этой итерации не менял (мандат: принятое не трогать). Если правило «SystemUI только по кнопке» распространяется и на загрузку — уберу отдельным шагом.
+4. ⛔ Не делалось и не делается: smali-патчи, правки `/system`, `setenforce 0`, `pm install`, `pkill avas`, `ctl.restart zygote`, глобальное правило TTL без скоупа.

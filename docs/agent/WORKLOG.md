@@ -701,3 +701,65 @@
   + `${}` в raw-строке; исправлено в `5dcf60b`.
 - Открыто: приёмка трёх слотов и температуры — за владельцем; материалы `РАЗБОР_1.0.54…md` и
   `voiceapp3-10.log` в окружение не переданы (в отчёте §8).
+
+## 2026-11-06 — iter33k (1.0.56)
+
+**Мандат:** `PROMPT_iter33k_1.0.56.md`. База `9d37799`, ветка `fix/v2`, `versionCode = 56`,
+`versionName = "1.0.56"`. Сборка APK — только CI; владелец подписывает своим ключом.
+
+### Что сделано
+
+- **§1 P0 тумблеры = флаги + мягкий apply.** Новый сервис `HvacFlagsApply.kt`
+  (`toggle`, `viaFor`, `flagsSegment`, `toggleLine`, `applyLine`, `parseFlags`, `pluginRestartScript`,
+  `applyResult`, `applySystemUi`, `readFlagsLine`, `syncFromDevice`). `StatusIcons.setHvacDigital`
+  (`StatusIcons.kt:1044`) больше НЕ вызывает `HvacDigitalPlugin.enable`: одна PUSH трёх флагов + `via`
+  (`HvacDigitalProps.flagsCommand`), затем `kill $(pidof com.flyme.auto.systemuiplugin)` (no-op, если
+  процесса нет). Одна строка лога `TOGGLE [hvacX] → ON|OFF | flags=… | via=bind|nenhum | apply=plugin_restart
+  result=ok|noop|failed | ✓/✗` + `FLAG_APPLY method=plugin_restart …`. UI читает ФАКТ из `getprop`
+  (`getHvacDigital` → `cachedFlags`, выравнивание префов со строкой `FLAGS_SYNC … action=ui_from_props`,
+  вызов из `syncAllImpl`, `StatusIcons.kt:796`).
+- **§2 P0 FLAG_APPLY.** Авто — только процесс плагина. Появились две кнопки: «Монтировать плагин»
+  (`hvac_mount_btn` → `HvacDigitalPlugin.enable`) и «Применить слоты (SystemUI)» (`hvac_apply_sysui_btn` →
+  `StatusIcons.applySlotsSystemUi` → `HvacFlagsApply.applySystemUi`, единственный клик, убивающий SystemUI),
+  обе с предупреждением «CarPlay и музыка прервутся на ~10 сек».
+- **§3 P0 TTL со скоупом.** `TtlScript.kt` переписан: `TTL_NET` (диагностика), выбор варианта
+  `uplink` (`-o <if>`) → `exclude_carplay` (`! -o <carplay>`) → отказ (`variant=none
+  reason=no_uplink_no_carplay`). Глобального правила без скоупа больше нет. Проверка — счётчики
+  `grep -c 'ttl-set 65'`/`'hl-set 65'` (tcpdump удалён, в сводке `wire_v4=not_measured`), вердикт
+  `SCOPED_OK|OFF_OK|CHECK_OWNER`. Выключение — generic-удаление по `iptables -S` + эталонный цикл `1..5`,
+  строка `TTL_OFF v4=0 v6=0 result=OK`. Восстановление при загрузке печатает
+  `TTL_BOOT rules_restored=… v4=… v6=… scoped=true` во всех ветках (`NetworkTtl.kt:271,283,291`).
+  Новый `TtlRules.kt` (чистые функции: `uplinkOf`, `carplayIfaces`, `variants`, `ruleV4/V6`, строки лога).
+- **§4 P1 рут.** `AdbClient.autoRecoverRoot` (`:249`): при переходе в `SHELL_NO_ROOT` — одна попытка
+  `( sleep 1; setprop ctl.restart adbd ) &`, пауза 4 с, повтор `id`, строка
+  `ADB_RECOVERY action=restart_adbd reason=… root_before=none root_after=root|none result=OK|FAILED`.
+  Флаг «одна попытка на событие», зонд 60 с не тронут, `ctl.restart zygote` нет.
+- **§5 P0 сборка.** Новый маркер `app/buildinfo.properties` (`SOURCE_SHA`), приоритет
+  **маркер → `GITHUB_SHA` → `local`**, `ci_run` = `GITHUB_RUN_ID`|`local`
+  (`app/build.gradle.kts:44-65,83,87`). `git rev-parse` удалён полностью (остались только комментарии).
+  `versionCode = 56`, `versionName = "1.0.56"`.
+- **§6 P1 тексты.** `ошибка:` в UI-строках убрано (`ToolsResult.kt:98`, `OfflineSheetController.kt:596,601`),
+  PUSH ждёт канал с одним повтором через 5 с (`StatusIcons.kt:930-940`).
+- **Тесты:** новые `TtlRulesTest` (6), `HvacFlagsApplyTest` (7), `BuildMarkerTest` (3); `TtlScriptTest`
+  переписан под скоуп (6).
+
+### CI
+
+- `42248064281` (`ef721f0`) — FAILED: мой тест ждал `! -o $CARPLAY_IF`, в скрипте `$CP_FIRST` → исправлено.
+- `42249659613` (`f903a1e`) — success, **88 PASSED / 0 FAILED**, артефакт `13521081145` (177 120 940 Б).
+- `42251502684` (`704911c`) — FAILED по инфраструктуре раннера (`Install CMake 3.22.1` →
+  `ZipException: Archive is not a ZIP archive`), код не компилировался.
+- **`42252401367` (`96d22eb`) — success, 91 PASSED / 0 FAILED**, `BUILD SUCCESSFUL in 4m 4s`,
+  job `128010643713`, артефакт `13521099296` (**177 121 097 Б**).
+
+### Отчёт
+
+`docs/agent/REPORT_iter33k.md` — ✅/🟡/❌/⛔ с `файл:строка`, приёмка
+`BUILD: versionCode=56 versionName=1.0.56 commit=96d22eb ci_run=local`.
+
+### Открыто
+
+1. 🟡 §2.4 — применяются ли слоты мягким `kill` плагина или только перезапуском SystemUI (нужен лог владельца).
+2. 🟡 раскладка ≠ скриншот 2 — нужен read-only `adb pull` SystemUI/плагина.
+3. 🟡 boot-маунт плагина (`HvacDigitalPlugin.bootInstall`) один раз перезапускает SystemUI при загрузке —
+   принято в iter33b, в этой итерации не менялось (правило «принятое без мандата не трогать»).
