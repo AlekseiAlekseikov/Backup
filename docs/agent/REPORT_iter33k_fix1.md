@@ -2,11 +2,11 @@
 
 **База:** `68eb22a` (iter33k). **Правка владельца 06.11:** «Нужно сделать точную реализацию референса,
 а не придумывать какие-то кнопки».
-**Код fix1:** `<SHA fix1>` · **buildinfo (маркер):** `<SHA fix1>` · ветка `fix/v2`, версия остаётся
+**Код fix1:** `09c7f87` · **buildinfo (маркер):** `09c7f87` · ветка `fix/v2`, версия остаётся
 `versionCode = 56` / `versionName = "1.0.56"`.
 
 ```
-BUILD: versionCode=56 versionName=1.0.56 commit=<SHA fix1> ci_run=local
+BUILD: versionCode=56 versionName=1.0.56 commit=09c7f87 ci_run=local
 ```
 
 ---
@@ -139,9 +139,10 @@ $ grep -rn "ошибка:" app/src/main/java → 0
 
 | Прогон | SHA | Итог |
 |---|---|---|
-| **`42263967081`** | **`60c8a0b`** | ✅ **success**, **94 PASSED / 0 FAILED**, `BUILD SUCCESSFUL in 4m 18s`, job `128050870657`, артефакт `13525909172` (177 120 961 Б) |
+| `42263967081` | `60c8a0b` | ✅ **success**, **94 PASSED / 0 FAILED**, `BUILD SUCCESSFUL in 4m 18s`, job `128050870657`, артефакт `13525909172` (177 120 961 Б) |
+| **`42265910234`** | **`dcf80b1`** (код `09c7f87` + маркер + отчёты) | ✅ **success**, **94 PASSED / 0 FAILED**, `BUILD SUCCESSFUL in 3m 29s`, job `128057633161`, артефакт `13527033977` (177 120 994 Б); `BuildMarkerTest > commitSourceIsHonest PASSED` — маркер `SOURCE_SHA=09c7f87` доходит до `BuildConfig.GIT_COMMIT` |
 
-Логи ключевых тестов из джобы `128050870657`:
+Логи ключевых тестов (джобы `128050870657` и `128057633161`):
 
 ```
 HvacFlagsApplyTest > recargaScript PASSED
