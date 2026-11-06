@@ -267,6 +267,8 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
         // тумблере это уходило в полную заливку скрипта чанками на каждом тике. Теперь — SKIP.
         if (cnt4 < 0 || cnt6 < 0) {
             AppLog.i(TAG, "TTL: SKIP (unknown, channel down) v4=$cnt4 v6=$cnt6")
+            // iter33k §3.4: строка загрузки печатается и здесь — честно «не восстановлено».
+            AppLog.i(TAG, TtlRules.bootLine(0, 0) + " reason=channel_down")
             return
         }
         if (!active) {
@@ -277,6 +279,8 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
             AppLog.i(TAG, "TTL bootRestore: active=false, но правило есть (v4=$cnt4 v6=$cnt6) — снимаю")
         } else if (cnt4 > 0 && cnt6 > 0) {
             AppLog.i(TAG, "TTL: SKIP (rule present) v4=$cnt4 v6=$cnt6")
+            // iter33k §3.4: правило уже стоит (напр. после перезапуска приложения) — фиксируем факт.
+            AppLog.i(TAG, TtlRules.bootLine(cnt4, cnt6) + " reason=already_present")
             return
         }
         val script = buildScript(true)
