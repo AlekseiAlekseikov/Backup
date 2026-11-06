@@ -767,3 +767,29 @@
 2. 🟡 раскладка ≠ скриншот 2 — нужен read-only `adb pull` SystemUI/плагина.
 3. 🟡 boot-маунт плагина (`HvacDigitalPlugin.bootInstall`) один раз перезапускает SystemUI при загрузке —
    принято в iter33b, в этой итерации не менялось (правило «принятое без мандата не трогать»).
+
+## 2026-11-06 — iter33k **fix1** (1.0.56, до установки)
+
+**Правка владельца:** «Нужно сделать точную реализацию референса, а не придумывать какие-то кнопки».
+Мандат: `PROMPT_iter33k_fix1_1.0.56_fix.md`. Версия остаётся `versionCode = 56`, `versionName = "1.0.56"`.
+
+- **Удалено (моя выдумка):** кнопка «Применить слоты (SystemUI)» (`ToolsPanel.kt`, `ToolsBackend.kt`,
+  `StatusIcons.applySlotsSystemUi`, `HvacFlagsApply.applySystemUi`), «мягкий apply»
+  `pluginRestartScript()` + `PLUGIN_PKG` + `applyResult()` — в дексе референса нет pidof пакета
+  плагина, они его не убивают.
+- **Сделано как в референсе:** `HvacFlagsApply.recargaScript()` — 1:1 с `w0/x7.g("tela")`:
+  `PB=$(pidof com.android.systemui); [ -z "$PB" ] || kill $PB`, до **20 попыток × 500 мс**
+  (таймаут 20 с), проверка смены pid, строки `RECARGA_OK/RECARGA_FAIL … (barra NAO reiniciou)`.
+  Лог клика: `FLAG_APPLY method=bar_recarga tries=… result=ok|fail dt=…ms`, при провале
+  `bar_recarga fail (barra NAO reiniciou) tries=…`, затем `TOGGLE … apply=bar_recarga …`.
+- **Без изменений:** `flagsCommand` (`x7.i`), `via=bind|nenhum`, `FLAGS_SYNC`, кнопка «Монтировать
+  плагин», root/CarPlay-кнопки, TTL со скоупом, авто-восстановление рута, маркер `buildinfo`,
+  отсутствие красных текстов.
+- **Тесты:** `HvacFlagsApplyTest` 7 → 9 (`recargaScript`, `recargaResult`, новый формат `applyLine`),
+  новый `NoApplyButtonTest` (3: нет кнопки, нет kill процесса плагина, recarga — единственный
+  перезапуск панели из клика).
+- **CI:** прогон **`42263967081`** (`60c8a0b`) — success, **94 PASSED / 0 FAILED**,
+  `BUILD SUCCESSFUL in 4m 18s`, job `128050870657`, артефакт `13525909172` (177 120 961 Б).
+- **Отчёт:** `docs/agent/REPORT_iter33k_fix1.md`.
+- **Для владельца:** клик тумблера перезапускает панель, интерфейс мигает несколько секунд —
+  это штатный механизм референса, не дефект. Отдельной кнопки применения нет и не будет.
