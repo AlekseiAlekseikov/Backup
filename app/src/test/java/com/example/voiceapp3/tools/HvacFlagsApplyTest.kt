@@ -6,8 +6,9 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * iter33k §1–§2 — клик тумблера = флаги + мягкий apply плагина, без `plugin.enable`.
- * Тест держит строки лога, `via`, разбор факта из `getprop` и классификацию apply.
+ * iter33k fix1 — клик тумблера = флаги (`x7.i`) + recarga панели (`x7.g("tela")`), как в референсе.
+ * Тест держит строки лога, `via`, разбор факта из `getprop`, recarga-скрипт и отсутствие
+ * собственных механизмов (kill процесса плагина, отдельная кнопка применения).
  */
 class HvacFlagsApplyTest {
 
@@ -52,33 +53,43 @@ class HvacFlagsApplyTest {
         }
     }
 
-    // 5. Строка FLAG_APPLY.
+    // 5. Строка FLAG_APPLY (формат fix1: method=bar_recarga tries=… result=… dt=…ms).
     @Test
     fun applyLine() {
-        assertEquals("FLAG_APPLY method=plugin_restart flags=temp:0 batt:1 ext:0 result=ok",
-            HvacFlagsApply.applyLine("plugin_restart", "temp:0 batt:1 ext:0", "ok"))
-        assertTrue(HvacFlagsApply.applyLine("sysui_restart", "temp:1 batt:0 ext:0", "noop")
-            .startsWith("FLAG_APPLY method=sysui_restart "))
+        assertEquals("FLAG_APPLY method=bar_recarga tries=3 result=ok dt=1620ms",
+            HvacFlagsApply.applyLine("bar_recarga", 3, "ok", 1620L))
+        assertEquals("FLAG_APPLY method=bar_recarga tries=20 result=fail dt=20010ms",
+            HvacFlagsApply.applyLine("bar_recarga", 20, "fail", 20010L))
+        assertEquals("bar_recarga fail (barra NAO reiniciou) tries=20", HvacFlagsApply.recargaFailLine(20))
+        for (l in listOf(
+            HvacFlagsApply.applyLine("bar_recarga", 1, "ok", 520L),
+            HvacFlagsApply.recargaFailLine(20))) {
+            finalAssert { assertFalse(l, l.contains("ошибка")) }
+        }
     }
 
-    // 6. Скрипт мягкого apply: только процесс плагина, SystemUI не трогаем.
+    // 6. Скрипт recarga — 1:1 с референсом `x7.g("tela")`: панель, не плагин.
     @Test
-    fun pluginRestartScript() {
-        val s = HvacFlagsApply.pluginRestartScript()
-        assertTrue(s, s.contains("pidof com.flyme.auto.systemuiplugin"))
-        assertTrue(s, s.contains("APPLY_KILLED="))
-        assertTrue(s, s.contains("APPLY_NOOP="))
-        assertFalse("SystemUI в авто-apply запрещён: $s", s.contains("com.android.systemui"))
+    fun recargaScript() {
+        val s = HvacFlagsApply.recargaScript()
+        assertTrue("нет команды референса:\n$s", s.contains("PB=\$(pidof com.android.systemui)"))
+        assertTrue("нет условного kill ([ -z ] || kill):\n$s", s.contains("[ -z \"\$PB\" ] || kill \$PB"))
+        assertTrue("нет ожидания подъёма", s.contains("sleep 0.5"))
+        assertTrue("нет проверки смены pid", s.contains("[ \"\$PA\" != \"\$PB\" ]"))
+        assertTrue("нет строки успеха", s.contains("RECARGA_OK pid_before="))
+        assertTrue("нет строки провала словами референса", s.contains("barra NAO reiniciou"))
+        assertTrue("ретраи должны быть 20", s.contains("-lt 20"))
+        assertFalse("процесс плагина референс не убивает: $s", s.contains("com.flyme.auto.systemuiplugin"))
         assertFalse("plugin.enable из тумблера запрещён: $s", s.contains("enable"))
     }
 
-    // 7. Классификация результата скрипта.
+    // 7. Разбор вывода recarga.
     @Test
-    fun applyResult() {
-        assertEquals("ok", HvacFlagsApply.applyResult("APPLY_KILLED=1234"))
-        assertEquals("noop", HvacFlagsApply.applyResult("APPLY_NOOP=no_process"))
-        assertEquals("denied", HvacFlagsApply.applyResult("kill: Permission denied"))
-        assertEquals("failed", HvacFlagsApply.applyResult("  "))
+    fun recargaResult() {
+        assertEquals("ok" to 3, HvacFlagsApply.recargaResult("RECARGA_OK pid_before=1174 pid_after=20740 tries=3"))
+        assertEquals("fail" to 20, HvacFlagsApply.recargaResult("RECARGA_FAIL pid_before=1174 pid_after=none tries=20 (barra NAO reiniciou)"))
+        assertEquals("fail" to 0, HvacFlagsApply.recargaResult("ERR_ROOT_CHANNEL_UNAVAILABLE"))
+        assertEquals("fail" to 0, HvacFlagsApply.recargaResult(""))
     }
 
     private fun finalAssert(block: () -> Unit) = block()

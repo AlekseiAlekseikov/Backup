@@ -1035,11 +1035,12 @@ object StatusIcons {
     private val SYS_HVAC_EXT_ALL = arrayOf(SYS_HVAC_EXT_EXTTEMP)
 
     /**
-     * iter33k §1 — клик тумблера слота: ТОЛЬКО флаги + apply ([HvacFlagsApply]).
+     * iter33k fix1 §1 — клик тумблера слота = флаги + recarga панели, ТОЧНО как в референсе
+     * (`w0/x7;->j`: `x7.i()` флаги + `x7.g("tela")` перезапуск SystemUI с ретраями).
      *
-     * Никакого `plugin.enable` (маунт + `kill SystemUI`) из тумблера: маунт — отдельная кнопка
-     * «Монтировать плагин» и boot-маршрут. Одна строка лога на клик — `TOGGLE [hvacX] → ON|OFF …`.
-     * Исключений нет: hvacTemp/hvacBatt/hvacExtTemp идут одним и тем же путём.
+     * Никакого `plugin.enable` (маунт) из тумблера: маунт — отдельная кнопка «Монтировать плагин»
+     * и boot-маршрут. Процесс плагина не убивается никогда (в дексе референса такого нет).
+     * Одна строка лога на клик — `TOGGLE [hvacX] → ON|OFF …`, ниже `FLAG_APPLY method=bar_recarga …`.
      */
     @JvmStatic fun setHvacDigital(ctx: Context, pref: String, value: Boolean): ToolsResult {
         val t0 = android.os.SystemClock.uptimeMillis()
@@ -1054,7 +1055,7 @@ object StatusIcons {
         val ok = line.trimEnd().endsWith("✓")
         val step = ToolsStep(
             step = "hvacdigital.$pref",
-            command = "flags(temp,batt,exttemp) + via + kill \$(pidof ${HvacFlagsApply.PLUGIN_PKG})",
+            command = "flags(temp,batt,exttemp) + via + bar_recarga (kill \$(pidof ${HvacFlagsApply.SYSUI_PKG}))",
             startedAtMs = t0, finishedAtMs = android.os.SystemClock.uptimeMillis(),
             exitCode = if (ok) 0 else 1,
             stdout = line,
@@ -1068,25 +1069,6 @@ object StatusIcons {
             title = "Цифровая индикация климата",
             steps = listOf(step)
         )
-    }
-
-    /** §2.2 — кнопка «Применить слоты (SystemUI)»: единственное место kill SystemUI. */
-    @JvmStatic fun applySlotsSystemUi(ctx: Context): ToolsResult {
-        val t0 = android.os.SystemClock.uptimeMillis()
-        val result = try { HvacFlagsApply.applySystemUi() } catch (t: Throwable) { "failed" }
-        val ok = result == "ok" || result == "noop"
-        val step = ToolsStep(
-            step = "hvacdigital.applySysui",
-            command = "kill \$(pidof ${HvacFlagsApply.SYSUI_PKG})",
-            startedAtMs = t0, finishedAtMs = android.os.SystemClock.uptimeMillis(),
-            exitCode = if (ok) 0 else 1,
-            stdout = "FLAG_APPLY method=sysui_restart result=$result",
-            stderr = "",
-            expected = "SystemUI перезапущен (CarPlay/музыка прервутся на ~10 с)",
-            actual = "result=$result",
-            status = if (ok) ToolsStep.Status.OK else ToolsStep.Status.PARTIAL
-        )
-        return ToolsResult("hvacdigital.applySysui", "Применить слоты (SystemUI)", listOf(step))
     }
 
     /**

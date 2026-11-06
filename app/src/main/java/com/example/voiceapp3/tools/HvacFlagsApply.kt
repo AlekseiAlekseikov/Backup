@@ -3,29 +3,36 @@ package com.example.voiceapp3.tools
 import android.content.Context
 
 /**
- * iter33k §1-§2 — ЕДИНЫЙ путь тумблеров слотов: флаги → `via` → apply.
+ * iter33k fix1 §1 — ЕДИНЫЙ путь тумблеров слотов, ТОЧНО как в референсе CentralEXAuto 3.3.9
+ * (`Lw0/x7;->j(Context, Z, Z, Z, Lw0/y8;)Z`, вызывается из обёрток `w0/ab`, `w0/ib`, `w0/ua`).
  *
- * Что было (1.0.55, дефект из лога владельца): клик «Процент заряда» запускал ПОЛНЫЙ
- * `plugin.enable` (маунт + `kill SystemUI`), а клики «Цифровой климат»/«Наружняя» — только
- * PUSH-флаги. Теперь тумблер НИКОГДА не монтирует плагин и не убивает SystemUI:
+ * Референс делает ровно две вещи на клик (третья, `x7.b`, — их «Ar Digital»-валидация, у нас её нет):
  *
- *  1. переключаем свой преф (это состояние тумблера);
- *  2. одна PUSH-команда — три флага `0|1` сразу (формат референса `w0/x7.i()`);
- *  3. `persist.sys.hvacdigital.via` = `bind`, если хоть один тумблер включён, иначе `nenhum`
- *     (всё выключено ⇒ сток);
- *  4. мягкий apply — перезапуск ПРОЦЕССА ПЛАГИНА (`kill $(pidof com.flyme.auto.systemuiplugin)`),
- *     как в старом рабочем логе владельца (`setHvacDigital = prop=… restart=com.flyme.auto.systemuiplugin`).
- *     SystemUI автоматически не убивается никогда — только кнопкой «Применить слоты (SystemUI)».
+ *  1. `x7.i(temp,batt,ext)` — одна команда `setprop persist.sys.hvacdigital.temp <0|1> &&
+ *     … batt … && … exttemp … && echo FLAGS_OK` (+ наш `via`);
+ *  2. `x7.g("tela")` — **recarga панели**: `p=$(pidof com.android.systemui); [ -z "$p" ] || kill $p`,
+ *     затем до 20 попыток по 500 мс (общий таймаут 20 с) с проверкой, что процесс поднялся
+ *     и pid сменился. Их слова о механизме: `única (bind + reinício)`.
+ *
+ * Процесс ПЛАГИНА референс не убивает никогда — в его дексе нет pidof этого пакета. Мягкий kill
+ * процесса плагина (наша выдумка из iter19) удалён полностью.
+ * Отдельной кнопки применения тоже нет: интерфейс мигает на несколько секунд — это штатное
+ * поведение референса, а не дефект.
  *
  * Одна строка лога на клик:
- *   `TOGGLE [hvacBatt] → ON | flags=temp:0 batt:1 ext:0 | via=bind | apply=plugin_restart result=ok | ✓`
+ *   `TOGGLE [hvacBatt] → ON | flags=temp:0 batt:1 ext:0 | via=bind | apply=bar_recarga result=ok | ✓`
+ *   `FLAG_APPLY method=bar_recarga tries=3 result=ok dt=1620ms`
  */
 internal object HvacFlagsApply {
     private const val TAG = "CENTRAL_HvacFlagsApply"
 
-    /** Процесс нашего плагина (пакет `com.flyme.auto.systemuiplugin`). */
-    internal const val PLUGIN_PKG = "com.flyme.auto.systemuiplugin"
+    /** Панель (SystemUI) — единственный процесс, который перезапускает recarga (как в референсе). */
     internal const val SYSUI_PKG = "com.android.systemui"
+
+    /** Референс `x7.g("tela")`: не более 20 попыток × 500 мс, общий таймаут 20 с. */
+    internal const val RECARGA_TRIES = 20
+    internal const val RECARGA_STEP_MS = 500L
+    internal const val RECARGA_TIMEOUT_MS = 20_000L
 
     /** Человеческие метки тумблеров для строки `TOGGLE [hvacX]`. */
     fun toggleLabel(pref: String): String = when (pref) {
@@ -47,9 +54,13 @@ internal object HvacFlagsApply {
         "TOGGLE [$label] → ${if (on) "ON" else "OFF"} | flags=$flags | via=$via | " +
             "apply=$method result=$result | ${if (result == "ok" || result == "noop") "✓" else "✗"}"
 
-    /** Строка мягкого apply. */
-    fun applyLine(method: String, flags: String, result: String): String =
-        "FLAG_APPLY method=$method flags=$flags result=$result"
+    /** Строка применения (мандат fix1 §1.3): `FLAG_APPLY method=bar_recarga tries=… result=… dt=…ms`. */
+    fun applyLine(method: String, tries: Int, result: String, dtMs: Long): String =
+        "FLAG_APPLY method=$method tries=$tries result=$result dt=${dtMs}ms"
+
+    /** Честная строка провала — словами референса (`barra NAO reiniciou`). */
+    fun recargaFailLine(tries: Int): String =
+        "bar_recarga fail (barra NAO reiniciou) tries=$tries"
 
     /**
      * Разбор факта из `getprop` (мандат §1.3: тумблеры показывают ФАКТ, не память приложения).
@@ -64,22 +75,39 @@ internal object HvacFlagsApply {
         return Triple(vals.getOrElse(0) { false }, vals.getOrElse(1) { false }, vals.getOrElse(2) { false })
     }
 
-    /** Скрипт мягкого apply: перезапуск процесса плагина (no-op, если процесса нет). */
-    fun pluginRestartScript(): String =
-        "P=\$(pidof $PLUGIN_PKG); if [ -n \"\$P\" ]; then kill \$P && echo APPLY_KILLED=\$P; " +
-            "else echo APPLY_NOOP=no_process; fi"
+    /**
+     * Скрипт recarga панели — 1:1 с референсом (`x7.g("tela")`):
+     * `p=$(pidof com.android.systemui); [ -z "$p" ] || kill $p`, затем ожидание подъёма
+     * до [RECARGA_TRIES] попыток по [RECARGA_STEP_MS] мс с проверкой, что pid СМЕНИЛСЯ.
+     */
+    fun recargaScript(tries: Int = RECARGA_TRIES): String = """
+        PB=@@(pidof $SYSUI_PKG)
+        [ -z "@@PB" ] || kill @@PB
+        i=0
+        while [ @@i -lt $tries ]; do
+          sleep ${RECARGA_STEP_MS / 1000.0}
+          i=@@((i+1))
+          PA=@@(pidof $SYSUI_PKG)
+          if [ -n "@@PA" ] && [ "@@PA" != "@@PB" ]; then
+            echo "RECARGA_OK pid_before=@@{PB:-none} pid_after=@@PA tries=@@i"
+            exit 0
+          fi
+        done
+        PA=@@(pidof $SYSUI_PKG)
+        echo "RECARGA_FAIL pid_before=@@{PB:-none} pid_after=@@{PA:-none} tries=@@i (barra NAO reiniciou)"
+    """.trimIndent().replace("@@", "$")
 
-    /** Какая строка результата соответствует выводу скрипта apply. */
-    fun applyResult(out: String): String = when {
-        out.contains("APPLY_KILLED=") -> "ok"
-        out.contains("APPLY_NOOP=") -> "noop"
-        out.contains("Permission denied") -> "denied"
-        out.isBlank() -> "failed"
-        else -> "ok"
+    /** Разбор вывода recarga: `ok|fail` и число попыток. */
+    fun recargaResult(out: String): Pair<String, Int> {
+        val ok = Regex("RECARGA_OK[^\\n]*tries=(\\d+)").find(out)
+        if (ok != null) return "ok" to (ok.groupValues[1].toIntOrNull() ?: 0)
+        val bad = Regex("RECARGA_FAIL[^\\n]*tries=(\\d+)").find(out)
+        if (bad != null) return "fail" to (bad.groupValues[1].toIntOrNull() ?: 0)
+        return "fail" to 0
     }
 
     /**
-     * Один клик тумблера: преф → флаги → `via` → мягкий apply.
+     * Один клик тумблера: преф → флаги → `via` → recarga панели (референс `x7.g("tela")`).
      * Возвращает строку `TOGGLE …` (она же уходит в лог), чтобы UI мог показать статус.
      */
     fun toggle(ctx: Context, pref: String, value: Boolean): String {
@@ -100,36 +128,28 @@ internal object HvacFlagsApply {
         }
         AppLog.i(TAG, "HVACDIGITAL_PUSH rc=$rc ${HvacDigitalProps.flagsFingerprint(tempOn, battOn, extOn)} " +
             "via=$via out=${out.replace('\n', ' ').take(200)}")
-        // 2) мягкий apply — процесс плагина, не SystemUI
-        val (_, applyOut) = try {
-            AdbClient.execute(pluginRestartScript(), 8000)
-        } catch (t: Throwable) {
-            Pair(1, "")
+        // 2) recarga панели — ровно как у референса (x7.g("tela"))
+        val t0 = android.os.SystemClock.elapsedRealtime()
+        var tries = 0
+        var result = "fail"
+        if (rc == 0) {
+            val out = try {
+                AdbClient.executeScript("bar_recarga", recargaScript(), (RECARGA_TIMEOUT_MS + 4_000L).toInt()).second
+            } catch (t: Throwable) {
+                AppLog.w(TAG, "bar_recarga threw: ${t.javaClass.simpleName}: ${t.message}")
+                ""
+            }
+            val (r, n) = recargaResult(out)
+            result = r
+            tries = n
+            AppLog.i(TAG, "RECARGA out=${out.replace('\n', ' ').take(240)}")
         }
-        val result = if (rc == 0) applyResult(applyOut) else "failed"
-        AppLog.i(TAG, applyLine("plugin_restart", flagsSegment(tempOn, battOn, extOn), result))
-        val line = toggleLine(toggleLabel(pref), value, flagsSegment(tempOn, battOn, extOn), via, "plugin_restart", result)
+        val dt = android.os.SystemClock.elapsedRealtime() - t0
+        AppLog.i(TAG, applyLine("bar_recarga", tries, result, dt))
+        if (result != "ok") AppLog.i(TAG, recargaFailLine(tries))
+        val line = toggleLine(toggleLabel(pref), value, flagsSegment(tempOn, battOn, extOn), via, "bar_recarga", result)
         AppLog.i(TAG, line)
         return line
-    }
-
-    /**
-     * Кнопка «Применить слоты (SystemUI)» — единственное место, где убивается SystemUI,
-     * и только по явному клику с предупреждением (CarPlay/музыка прервутся на ~10 с).
-     */
-    fun applySystemUi(): String {
-        val (rc, out) = try {
-            AdbClient.execute(
-                "P=\$(pidof $SYSUI_PKG); if [ -n \"\$P\" ]; then kill \$P && echo APPLY_KILLED=\$P; " +
-                    "else echo APPLY_NOOP=no_process; fi", 12000)
-        } catch (t: Throwable) {
-            Pair(1, "")
-        }
-        val result = applyResult(out)
-        val flags = readFlagsLine()
-        AppLog.i(TAG, applyLine("sysui_restart", flags, if (rc == 0) result else "failed"))
-        AppLog.i(TAG, "SYSUI_RESTART_BY_OWNER killed=${out.contains("APPLY_KILLED=")} result=$result")
-        return result
     }
 
     /** Read-only факт флагов одной командой (для строк лога/UI). */
