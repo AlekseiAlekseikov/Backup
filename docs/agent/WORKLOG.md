@@ -751,6 +751,10 @@
   `ZipException: Archive is not a ZIP archive`), код не компилировался.
 - **`42252401367` (`96d22eb`) — success, 91 PASSED / 0 FAILED**, `BUILD SUCCESSFUL in 4m 4s`,
   job `128010643713`, артефакт `13521099296` (**177 121 097 Б**).
+- **`42254379400` (`b90a8da`, handoff: маркер `SOURCE_SHA=96d22eb` + отчёт + WORKLOG) — success,
+  91 PASSED / 0 FAILED**, `BUILD SUCCESSFUL in 3m 22s`, job `128017548566`, артефакт `13523295893`
+  (177 121 100 Б). `BuildMarkerTest > commitSourceIsHonest PASSED` — маркер реально доходит до
+  `BuildConfig.GIT_COMMIT` (владелец увидит `commit=96d22eb ci_run=local`).
 
 ### Отчёт
 

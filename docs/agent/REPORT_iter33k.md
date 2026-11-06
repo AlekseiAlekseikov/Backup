@@ -169,6 +169,7 @@ $ grep -rn "tcpdump" app/src/main/java --include=*.kt          → 0 (в код�
 | `42249659613` | `f903a1e` | после правки теста | ✅ success, **88 PASSED / 0 FAILED**, `BUILD SUCCESSFUL in 3m 25s`, job `128001064019`, артефакт `13521081145` (177 120 940 Б) |
 | `42251502684` | `704911c` | добавлен `BuildMarkerTest` | ❌ **FAILED: инфраструктура раннера** — `Install CMake 3.22.1` упал с `ZipException: Archive is not a ZIP archive` (`:jni:configureCMakeDebug[arm64-v8a]`). Код не компилировался — не наш дефект; прогон перезапущен следующим коммитом. |
 | **`42252401367`** | **`96d22eb`** | финальный код итерации | ✅ **success**, **91 PASSED / 0 FAILED**, `BUILD SUCCESSFUL in 4m 4s`, job `128010643713`, артефакт `13521099296` (**177 121 097 Б**) |
+| **`42254379400`** | **`b90a8da`** | handoff-коммит: маркер `SOURCE_SHA=96d22eb` + отчёт + WORKLOG | ✅ **success**, **91 PASSED / 0 FAILED**, `BUILD SUCCESSFUL in 3m 22s`, job `128017548566`, артефакт `13523295893` (177 121 100 Б); `BuildMarkerTest > commitSourceIsHonest PASSED` — путь «маркер → `BuildConfig.GIT_COMMIT`» подтверждён в сборке |
 
 Доказательство по тестам (лог джобы `128010643713`):
 
