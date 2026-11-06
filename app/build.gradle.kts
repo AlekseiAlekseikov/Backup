@@ -37,12 +37,17 @@ val roadcastClientLib = file("src/main/jniLibs/arm64-v8a/libroadcast_client.so")
 // Итерация 12: пробрасываем SHA коммита в BuildConfig.GIT_COMMIT, чтобы
 // приложение писало его в файл-лог при старте (владелец видит точную сборку).
 val gitSha: String by lazy {
+    // iter33j §4.4: SHA берём СНАЧАЛА из окружения CI (GITHUB_SHA есть всегда, .git не нужен),
+    // и только потом из git. Иначе в логе появлялся чужой/старый SHA, а `ci_run=unknown`.
+    // Правило: реальный SHA из CI, иначе честное `unknown` (выдуманный печатать запрещено).
+    val env = System.getenv("GITHUB_SHA")?.trim().orEmpty()
+    if (env.matches(Regex("[0-9a-f]{40}"))) return@lazy env.take(7)
     try {
-        // iter33h H1.7: в CI checkout бывает shallow/без .git — тогда SHA не выдумываем.
         val p = ProcessBuilder("git", "rev-parse", "--short=7", "HEAD")
             .directory(rootProject.projectDir)
             .redirectErrorStream(true).start()
         val out = p.inputStream.bufferedReader().readText().trim().also { p.waitFor() }
+        // Только если git реально знает HEAD этой сборки (в CI shallow-checkout даёт пусто).
         if (out.matches(Regex("[0-9a-f]{7,40}"))) out else "unknown"
     } catch (_: Throwable) { "unknown" }
 }
@@ -59,8 +64,8 @@ android {
         applicationId = "com.example.voiceapp3"
         minSdk = 28
         targetSdk = 32
-        versionCode = 54
-        versionName = "1.0.54"
+        versionCode = 55
+        versionName = "1.0.55"
 
         buildConfigField("String", "APP_UPDATE_MANIFEST_URL", "\"$appUpdateManifestUrl\"")
         buildConfigField("String", "CHARGE_CONTROL_MANIFEST_URL", "\"$chargeControlManifestUrl\"")

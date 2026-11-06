@@ -37,6 +37,9 @@ class App : Application() {
             "${Prefs2.diag(this, NetworkTtl.PREF_TTL_65_ACTIVE)} " +
             "${Prefs2.diag(this, ScreenBrightness.PREF_KEEP_AWAKE)} " +
             "${Prefs2.diag(this, ScreenBrightness.PREF_REMEMBER)}")
+        // iter33j §4.5: мусор прошлых версий в persist.sys.hvacdigital.* (числа вместо флагов,
+        // фантомный `temp_ext`) вычищаем один раз за процесс, в фоне — не на главном потоке.
+        BgWorker.post("PersistCleaner.cleanupOnce") { runCatching { com.example.voiceapp3.tools.PersistCleaner.cleanupOnce() } }
         // iter20: ОДИН BgWorker-пост — чтение screen_off_timeout ДО любых записей (с ретраем root-канала),
         // сразу же вердикт DURABLE_AFTER_REBOOT, и только потом ensureKeepAwake/runBootDiag.
         // Устранена гонка потоков из iter19 (два независимых поста на 4-поточном пуле).

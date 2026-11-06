@@ -698,6 +698,36 @@ class UiBridge(
                     runCatching { StatusIcons.dumpVhalOnDemand(activity) }
                 }
             }
+            // ── iter33j §4.2/§4.3: точечные действия вместо «перезагрузки ГУ» ──────────
+            // Все четыре — одна операция на клик, результат в общем блоке итогов и в лог.
+            "perf.jitRound" -> {
+                com.example.voiceapp3.tools.BgWorker.run("UiBridge.perf.jitRound", {
+                    AppPerformance.jitRound(activity)
+                }) { res ->
+                    res.getOrNull()?.let { result -> lastToolsResult = result; pushToolsState() }
+                }
+            }
+            "perf.optimizeAll" -> {
+                com.example.voiceapp3.tools.BgWorker.run("UiBridge.perf.optimizeAll", {
+                    AppPerformance.optimizeAllApps(activity)
+                }) { res ->
+                    res.getOrNull()?.let { result -> lastToolsResult = result; pushToolsState() }
+                }
+            }
+            "perf.recoverAdbd" -> {
+                com.example.voiceapp3.tools.BgWorker.run("UiBridge.perf.recoverAdbd", {
+                    AppPerformance.recoverAdbdResult()
+                }) { res ->
+                    res.getOrNull()?.let { result -> lastToolsResult = result; pushToolsState() }
+                }
+            }
+            "perf.restartCarplay" -> {
+                com.example.voiceapp3.tools.BgWorker.run("UiBridge.perf.restartCarplay", {
+                    AppPerformance.restartCarplayMonitor()
+                }) { res ->
+                    res.getOrNull()?.let { result -> lastToolsResult = result; pushToolsState() }
+                }
+            }
             "perf.getKeepAliveList" -> {
                 com.example.voiceapp3.tools.BgWorker.run("UiBridge.perf.appList", {
                     AppPerformance.getInstalledAppsInfo(activity)

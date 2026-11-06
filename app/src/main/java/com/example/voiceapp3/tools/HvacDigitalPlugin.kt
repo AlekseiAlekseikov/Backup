@@ -18,6 +18,17 @@ object HvacDigitalPlugin {
     private const val OEM_PKG = "com.flyme.auto.systemuiplugin"
 
     /**
+     * iter33j P0.1 — опознание плагина по СОДЕРЖИМОМУ, а не только по строке маунта.
+     * Это наш бинарь референса как есть (CentralEXAuto, коммит 99c4fe0…):
+     * `sha256 de4b47422cf7b4b90385dd0dc371cc5c6b3c9a3928b5bd8e2bf00b4d24d0fd03`,
+     * размер 18 280 162 Б, md5 файла `2fa3d11d3a5350cd4a427cc69617482b`.
+     * Никаких smali/apktool-правок в нём нет и быть не должно (правило владельца 06.11).
+     */
+    internal const val PLUGIN_APK_MD5 = "2fa3d11d3a5350cd4a427cc69617482b"
+    internal const val PLUGIN_APK_SIZE = 18_280_162L
+    internal const val PLUGIN_APK_SHA256 = "de4b47422cf7b4b90385dd0dc371cc5c6b3c9a3928b5bd8e2bf00b4d24d0fd03"
+
+    /**
      * iter33h D1.1 — ЕДИНСТВЕННЫЙ предикат «маунт плагина есть»: без учёта регистра, обе формы
      * имени. Используется в checkStatus (pre/post_check), в скриптах umount и в HVAC_PROBE.
      *
@@ -86,7 +97,11 @@ object HvacDigitalPlugin {
         /** iter23 P2: команда pm path не выполнилась (канал) — это НЕ «пакет не установлен». */
         val pmCommandFailed: Boolean = false,
         /** iter23 P2: путь pm path указывает в /data/app → установка «затенила» /system. */
-        val shadowedByInstall: Boolean = false
+        val shadowedByInstall: Boolean = false,
+        /** iter33j P0.4: размер APK в точке монтирования (-1 — не читали). */
+        val pluginApkSize: Long = -1L,
+        /** iter33j P0.4: содержимое совпало с нашим бинарём референса (по размеру). */
+        val pluginContentOk: Boolean = false
     )
 
     /**
@@ -145,10 +160,22 @@ object HvacDigitalPlugin {
             LogKit.trace("HVAC_MOUNT") { "checkStatus mounts mounted=$mounted reason=$mountReason" }
         }
 
+        // iter33j P0.4: опознаём плагин по СОДЕРЖИМОМУ, а не только по строке маунта.
+        // Частый путь (watchdog/HEARTBEAT) читает только размер — это `stat`, без md5 18 МБ.
+        var apkSize = -1L
+        if (mounted && oemPath != null) {
+            val (sRc, sOut) = runCatching {
+                AdbClient.shellLocal("stat -c '%s' '$oemPath' 2>/dev/null", 4000)
+            }.getOrDefault(Pair(1, ""))
+            apkSize = sOut.trim().lineSequence().firstOrNull { it.matches(Regex("[0-9]+")) }?.toLongOrNull() ?: -1L
+            if (sRc != 0 && apkSize < 0) AppLog.d(TAG, "checkStatus: размер APK не прочитан (rc=$sRc)")
+        }
+        val contentOk = apkSize == PLUGIN_APK_SIZE
+
         val oemInstalled = try { ctx.packageManager.getPackageInfo(OEM_PKG, 0); true } catch (_: Exception) { false }
         val shadowed = oemPath?.contains("/data/app/") == true
         if (shadowed) AppLog.w(TAG, "checkStatus: ПЛАГИН ЗАТЕНЁН установкой — pm path=$oemPath (ожидался /system/...)")
-        return Status(oemInstalled, mounted, mountLine, oemPath, mountReason, pmFailed, shadowed)
+        return Status(oemInstalled, mounted, mountLine, oemPath, mountReason, pmFailed, shadowed, apkSize, contentOk)
     }
 
     /** iter23 P2: путь заводского плагина без опоры на pm — простой ls по /system. */
@@ -216,7 +243,7 @@ object HvacDigitalPlugin {
         // iter33 A3/B2: повторный enable в том же процессе — только чтение состояния.
         if (enableDoneThisProcess) {
             val st = checkStatus(ctx)
-            if (st.overlayMounted) {
+            if (st.overlayMounted && st.pluginContentOk) {
                 AppLog.i(TAG, "HVAC_PROBE pm_path=${st.oemPkgPath ?: "?"} mounted=true src_inode=- tgt_inode=- " +
                     "selinux=${selinux()} via=none rc=0 props=${propsLine()} (enable уже выполнен в этом процессе)")
                 AppLog.i(TAG, "HVAC_RESULT: OK reason=already_enabled_this_process")
@@ -232,12 +259,26 @@ object HvacDigitalPlugin {
             PM_PATH=@@(pm path $OEM_PKG 2>/dev/null | sed 's/^package://' | head -n1)
             echo "PM_PATH=@@PM_PATH"
             mkdir -p $STAGE_DIR 2>/dev/null
-            cp -f '%APKSRC%' $STAGE_APK 2>/dev/null || echo CP_FAILED
-            chown root:root $STAGE_APK 2>/dev/null || true
-            chmod 644 $STAGE_APK 2>/dev/null || true
-            chcon u:object_r:system_app_file:s0 $STAGE_APK 2>/dev/null || echo CHCON_FAILED
+            # iter33j P0.3: /data/local/hvac-digital/sysui.apk — путь-стейдж как у референса.
+            # Чужой файл не затираем МОЛЧА: сначала сверяем md5 и печатаем CONFLICT.
+            SRC_MD5=@@(md5sum '%APKSRC%' 2>/dev/null | awk '{print $1}')
+            OLD_MD5=@@(md5sum $STAGE_APK 2>/dev/null | awk '{print $1}')
+            echo "STAGE_MD5 old=${OLD_MD5:-absent} new=@@SRC_MD5 path=$STAGE_APK"
+            if [ -n "@@OLD_MD5" ] && [ "@@OLD_MD5" != "@@SRC_MD5" ]; then
+              echo "CONFLICT другой файл, не затираю молча: $STAGE_APK old=@@OLD_MD5 new=@@SRC_MD5 action=replace_by_owner_click"
+            fi
+            if [ "@@OLD_MD5" = "@@SRC_MD5" ]; then
+              echo "STAGE_COPY skip reason=same_md5"
+            else
+              cp -f '%APKSRC%' $STAGE_APK 2>/dev/null || echo CP_FAILED
+              chown root:root $STAGE_APK 2>/dev/null || true
+              chmod 644 $STAGE_APK 2>/dev/null || true
+              chcon u:object_r:system_app_file:s0 $STAGE_APK 2>/dev/null || echo CHCON_FAILED
+              echo "STAGE_COPY done md5=@@(md5sum $STAGE_APK 2>/dev/null | awk '{print $1}')"
+            fi
             SRC_INODE=@@(stat -c '%i' $STAGE_APK 2>/dev/null)
             echo "SRC_INODE=@@SRC_INODE"
+            echo "SRC_SIZE=@@(stat -c '%s' $STAGE_APK 2>/dev/null)"
             if [ -s $STAGE_APK ]; then
               echo "###STAGE name=check status=OK reason=pm_path:@@PM_PATH"
             else
@@ -285,42 +326,56 @@ object HvacDigitalPlugin {
                 ;;
             esac
 
-            # ---------- bind-mount (идемпотентно) ----------
+            # ---------- bind-mount: СВЕЖИЙ umount → mount --bind → inode И md5 обоих концов ----------
+            # iter33j P0.2: прежний вердикт «OK при inode:false» закрыт. Одна строка на попытку:
+            #   HVAC_MOUNT_RESULT mount=0|1 inode_match=true|false md5_match=true|false verdict=OK|FAILED
+            # FAILED — при любом расхождении inode ИЛИ md5 (или если маунта нет вовсе).
             TGT=@@(pm path $OEM_PKG 2>/dev/null | sed 's/^package://' | head -n1)
             [ -z "@@TGT" ] && TGT=@@PM_AFTER
             TGT_INODE=@@(stat -c '%i' "@@TGT" 2>/dev/null)
-            # iter33c A1: раньше TGT_INODE существовал ТОЛЬКО внутри reason у ###STAGE, отдельного
-            # echo не было — поэтому `HVAC_PROBE … tgt_inode=-`, а разбор inode не срабатывал.
             echo "TGT_INODE=@@TGT_INODE"
             MOUNTED=0
             grep -F " @@TGT " /proc/mounts >/dev/null 2>&1 && MOUNTED=1
+            echo "MOUNT_BEFORE=@@MOUNTED"
+            echo "###STAGE name=bind status=BEGIN"
+            UMOUNT_N=0
+            _i=0
+            while grep -F " @@TGT " /proc/mounts >/dev/null 2>&1 && [ @@_i -lt 6 ]; do
+              umount "@@TGT" 2>/dev/null || umount -l "@@TGT" 2>/dev/null || break
+              _i=@@((_i+1))
+              UMOUNT_N=@@_i
+            done
+            echo "UMOUNT_COUNT=@@UMOUNT_N"
+            MOUNTED=0
+            grep -F " @@TGT " /proc/mounts >/dev/null 2>&1 && MOUNTED=1
+            echo "MOUNT_AFTER_UMOUNT=@@MOUNTED"
             APK_REPLACED=0
-            if [ "@@MOUNTED" = "1" ] && [ -n "@@SRC_INODE" ] && [ "@@SRC_INODE" = "@@TGT_INODE" ]; then
-              echo "###STAGE name=bind status=SKIP reason=already_mounted_inode_match"
+            mount --bind $STAGE_APK "@@TGT" 2>/dev/null || echo BIND_FAILED
+            restorecon -v "@@TGT" 2>/dev/null || true
+            MOUNTED=0
+            grep -F " @@TGT " /proc/mounts >/dev/null 2>&1 && MOUNTED=1
+            SRC_INODE=@@(stat -c '%i' $STAGE_APK 2>/dev/null)
+            TGT_INODE=@@(stat -c '%i' "@@TGT" 2>/dev/null)
+            SRC_MD5_NOW=@@(md5sum $STAGE_APK 2>/dev/null | awk '{print $1}')
+            TGT_MD5_NOW=@@(md5sum "@@TGT" 2>/dev/null | awk '{print $1}')
+            INODE_MATCH=false
+            [ -n "@@SRC_INODE" ] && [ "@@SRC_INODE" = "@@TGT_INODE" ] && INODE_MATCH=true
+            MD5_MATCH=false
+            [ -n "@@SRC_MD5_NOW" ] && [ "@@SRC_MD5_NOW" = "@@TGT_MD5_NOW" ] && MD5_MATCH=true
+            VERDICT=FAILED
+            [ "@@MOUNTED" = "1" ] && [ "@@INODE_MATCH" = "true" ] && [ "@@MD5_MATCH" = "true" ] && VERDICT=OK
+            echo "HVAC_MOUNT_RESULT mount=@@MOUNTED inode_match=@@INODE_MATCH md5_match=@@MD5_MATCH verdict=@@VERDICT"
+            echo "HVAC_MOUNT_DETAIL src=$STAGE_APK dst=@@TGT src_inode=@@SRC_INODE tgt_inode=@@TGT_INODE src_md5=@@SRC_MD5_NOW tgt_md5=@@TGT_MD5_NOW src_size=@@(stat -c '%s' $STAGE_APK 2>/dev/null) tgt_size=@@(stat -c '%s' "@@TGT" 2>/dev/null)"
+            if [ "@@VERDICT" = "OK" ]; then
+              APK_REPLACED=1
+              echo "###STAGE name=bind status=OK reason=inode_and_md5_match"
+              setprop persist.sys.hvacdigital.via bind 2>/dev/null || true
             else
-              echo "###STAGE name=bind status=BEGIN"
-              _i=0
-              while grep -F " @@TGT " /proc/mounts >/dev/null 2>&1 && [ @@_i -lt 6 ]; do
-                umount "@@TGT" 2>/dev/null || umount -l "@@TGT" 2>/dev/null || break
-                _i=@@((_i+1))
-              done
-              mount --bind $STAGE_APK "@@TGT" 2>/dev/null || echo BIND_FAILED
-              restorecon -v "@@TGT" 2>/dev/null || true
-              TGT_INODE=@@(stat -c '%i' "@@TGT" 2>/dev/null)
-              echo "TGT_INODE=@@TGT_INODE"
-              MOUNTED=0
-              grep -F " @@TGT " /proc/mounts >/dev/null 2>&1 && MOUNTED=1
-              if [ "@@MOUNTED" = "1" ] && [ "@@SRC_INODE" = "@@TGT_INODE" ]; then
-                APK_REPLACED=1
-                echo "###STAGE name=bind status=OK reason=inode_match:@@SRC_INODE"
-                setprop persist.sys.hvacdigital.via bind 2>/dev/null || true
-              else
-                echo "###STAGE name=bind status=FAILED reason=mounted:@@MOUNTED inode:@@SRC_INODE/@@TGT_INODE"
-                setprop persist.sys.hvacdigital.via nenhum 2>/dev/null || true
-                echo "VIA=nenhum"
-                echo "HVAC_DIGITAL_FALHOU"
-                exit 3
-              fi
+              echo "###STAGE name=bind status=FAILED reason=mount:@@MOUNTED inode:@@INODE_MATCH md5:@@MD5_MATCH"
+              setprop persist.sys.hvacdigital.via nenhum 2>/dev/null || true
+              echo "VIA=nenhum"
+              echo "HVAC_DIGITAL_FALHOU"
+              exit 3
             fi
 
             # ---------- SystemUI: только если APK реально заменён и не чаще раза за процесс ----------
@@ -373,8 +428,23 @@ object HvacDigitalPlugin {
                 "VIA_PREV=$viaPrev PM=$pmLine PM_PATH=$pmPath " +
                 "SELINUX_BEFORE=${selinuxPair?.groupValues?.get(1)} SELINUX_AFTER=${selinuxPair?.groupValues?.get(2)} " +
                 "SEM_FONTE=$semFonte SEM_ALVO=$semAlvo")
-        val mountOk = out.contains("HVAC_DIGITAL_OK") && !out.contains("MOUNT_FAIL")
-        val inodeMatch = verdict.inodeMatch
+        // iter33j P0.2: вердикт маунта — ТОЛЬКО из строки HVAC_MOUNT_RESULT (inode И md5).
+        val mountResult = MountResult.parse(out)
+        val mountOk = mountResult?.ok == true && out.contains("HVAC_DIGITAL_OK")
+        val inodeMatch = mountResult?.inodeMatch ?: verdict.inodeMatch
+        val md5Match = mountResult?.md5Match == true
+        val tgtSize = MountResult.detailSize(out, "tgt_size")
+        if (mountResult == null) {
+            AppLog.w(TAG, "HVAC_MOUNT_RESULT: строки нет в выводе скрипта — вердикт маунта НЕ подтверждён")
+        } else {
+            AppLog.i(TAG, "HVAC_MOUNT_RESULT mount=${mountResult.mount} inode_match=${mountResult.inodeMatch} " +
+                "md5_match=${mountResult.md5Match} verdict=${mountResult.verdict} " +
+                "tgt_size=${tgtSize ?: "?"} expected_size=$PLUGIN_APK_SIZE size_ok=${tgtSize == PLUGIN_APK_SIZE}")
+            if (!mountResult.ok) {
+                AppLog.w(TAG, "HVAC_MOUNT_RESULT FAILED: inode=${mountResult.inodeMatch} md5=${mountResult.md5Match} " +
+                    "mount=${mountResult.mount} — маунт НЕ считается рабочим")
+            }
+        }
         // A1 (третье следствие): при `mountOk == true` и bind-стадии OK|SKIP шаг обязан быть OK,
         // даже если inode посчитать не удалось. PARTIAL — только когда mount есть, а вердикта по bind нет.
         val activateStatus = when (
@@ -392,7 +462,7 @@ object HvacDigitalPlugin {
             "BLOCKED" -> ToolsStep.Status.BLOCKED
             else -> ToolsStep.Status.FAILED
         }
-        val reason = "rc=$rc VIA=$via PM_PATH=$pmPath inode=$inodeMatch mount=$mountOk"
+        val reason = "rc=$rc VIA=$via PM_PATH=$pmPath inode=$inodeMatch md5=$md5Match mount=$mountOk"
         AppLog.i(TAG, "VERIFY hvacdigital.enable: $activateStatus ($reason)")
         // iter33 A5: одна строка на попытку — по ней владелец сразу видит, где стоит.
         val unshadowLine = Regex("HVAC_UNSHADOW: ([^\\n]*)").find(out)?.groupValues?.get(1)?.trim()
@@ -403,7 +473,9 @@ object HvacDigitalPlugin {
         val probePath = pmPath.ifEmpty { status0.oemPkgPath ?: "?" }
         val probeMounted = out.contains("mounted=true") || postMountedHint(out)
         AppLog.i(TAG, "HVAC_PROBE pm_path=$probePath mounted=$probeMounted src_inode=$probeSrc tgt_inode=$probeTgt " +
-            "selinux=$probeSel via=$via rc=$rc props=$probeProps")
+            "selinux=$probeSel via=$via rc=$rc props=$probeProps " +
+            "apk_size=${tgtSize ?: "?"} apk_expected=$PLUGIN_APK_SIZE apk_size_ok=${tgtSize == PLUGIN_APK_SIZE} " +
+            "md5_match=$md5Match")
         if (unshadowLine != null) AppLog.i(TAG, "HVAC_UNSHADOW_DETAIL: $unshadowLine")
         LogKit.stateHvac(if (probeMounted) "mounted" else "not")
         val hvacResult = when (activateStatus) {
@@ -464,9 +536,10 @@ object HvacDigitalPlugin {
             AppLog.w(TAG, "HVAC_BOOT: skip (checkStatus threw — состояние неизвестно, ничего не пишем)")
             return false
         }
-        if (st.overlayMounted && inodeMatchesStage(st.oemPkgPath)) {
+        if (st.overlayMounted && inodeMatchesStage(st.oemPkgPath) && st.pluginContentOk) {
             LogKit.stateHvac("mounted")
-            AppLog.i(TAG, "HVAC_BOOT: skip (already mounted) pm_path=${st.oemPkgPath ?: "?"} inode=match")
+            AppLog.i(TAG, "HVAC_BOOT: skip (already mounted) pm_path=${st.oemPkgPath ?: "?"} inode=match " +
+                "apk_size=${st.pluginApkSize} expected=$PLUGIN_APK_SIZE")
             return false
         }
 

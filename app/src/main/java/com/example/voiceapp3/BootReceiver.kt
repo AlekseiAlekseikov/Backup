@@ -41,7 +41,7 @@ class BootReceiver : BroadcastReceiver() {
      *  содержимое settings_system.xml. */
     private fun screenTimeoutBootDiag(ctx: Context) {
         val script = """
-            echo "=== SCREEN_TIMEOUT_BOOT: uptime=$(cat /proc/uptime) bootcount=$(getprop ro.boot.bootcount 2>/dev/null) ==="
+            echo "=== SCREEN_TIMEOUT_BOOT: uptime=$(cat /proc/uptime 2>/dev/null || echo unavailable) bootcount=$(getprop ro.boot.bootcount 2>/dev/null) ==="
             echo "-- settings get system screen_off_timeout --"
             settings get system screen_off_timeout 2>&1 || echo settings_err
             echo "-- settings list system | grep -i timeout --"

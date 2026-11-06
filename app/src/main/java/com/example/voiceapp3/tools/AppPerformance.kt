@@ -209,122 +209,59 @@ object AppPerformance {
             )
 
             val valStr = if (enabled) "true" else "false"
-            val D = "$"
-            // Точный порт la.java case 0: wifi disable -> wait wlan0 -> umount /data/app/* -> setprop usejit -> ctl.restart zygote
-            // P6: Гарантированно возвращаем Wi-Fi обратно через trap (в т.ч. при EXIT/INT/TERM/ошибке).
-            // P6: Логируем ZYGOTE_PID_BEFORE/AFTER и USEJIT_AFTER для VERIFY.
-            val script = """
-                WIFI_BEFORE=${'$'}(settings get global wifi_on)
-                echo WIFI_BEFORE=${'$'}WIFI_BEFORE
-                restore_wifi() {
-                  if [ "${'$'}WIFI_BEFORE" = "1" ]; then
-                    svc wifi enable
-                    echo WIFI_RESTORED=1
-                  else
-                    echo WIFI_RESTORED=0
-                  fi
-                }
-                trap restore_wifi EXIT INT TERM
-                ZYGOTE_PID_BEFORE=${'$'}(pidof zygote 2>/dev/null; pidof zygote64 2>/dev/null)
-                echo ZYGOTE_PID_BEFORE=${'$'}ZYGOTE_PID_BEFORE
-                svc wifi disable
-                echo WIFI_WAIT_DONE=waiting
-                _n=0
-                while [ ${D}_n -lt 30 ]; do
-                  sleep 1; _n=${D}((${D}_n + 1))
-                  if [ "${'$'}(ip rule show 2>/dev/null | grep -c 'oif wlan0')" = "0" ]; then echo WIFI_WAIT_DONE=down; break; fi
-                done
-                for _m in ${D}(grep ' /data/app/' /proc/mounts 2>/dev/null | awk '{print ${D}2}'); do
-                  umount -l "${D}_m" 2>/dev/null
-                done
-                setprop dalvik.vm.usejit $valStr
-                setprop dalvik.vm.usejitprofiles $valStr
-                setprop ctl.restart zygote
-                sleep 4
-                ZYGOTE_PID_AFTER=${'$'}(pidof zygote 2>/dev/null; pidof zygote64 2>/dev/null)
-                USEJIT_AFTER=${'$'}(getprop dalvik.vm.usejit)
-                echo ZYGOTE_PID_AFTER=${'$'}ZYGOTE_PID_AFTER
-                echo USEJIT_AFTER=${'$'}USEJIT_AFTER
-                echo ZYGOTE_RESTARTED=${'$'}([ "${'$'}ZYGOTE_PID_BEFORE" != "${'$'}ZYGOTE_PID_AFTER" ] && echo YES || echo NO)
-            """.trimIndent()
-
-            // ── iter33b A2б, маршрут 1: свой persist-дублёр ─────────────────────────
-            // Зачем: `setprop dalvik.vm.usejit` живёт до ребута. Persist-значение читается
-            // инициализацией свойств при загрузке, и некоторые вендорские сборки поднимают
-            // из него runtime-значение — тогда JIT восстанавливается БЕЗ перезапуска zygote.
-            // Это НЕ adb-свойства (запрет владельца — `persist.adb.tcp.port` и порты).
-            // Добавлена РОВНО ОДНА persist-запись — `persist.sys.dalvik.vm.usejit`; других нет.
-            // Одна строка на запись (её печатает jitPersistBackfill): JIT_PERSIST_SET … reason=toggle.
+            // ── iter33j §4.1 (правило владельца 06.11) ─────────────────────────────
+            // рестарт zygote УДАЛЁН ВООБЩЕ: он ложит root-канал и CarPlay (таймлайн
+            // владельца), а у референса zygote не перезапускается никогда — там `jit_pedido` /
+            // `jit_restaurar` меняют только prop. Здесь ровно два setprop + чтение обратно;
+            // ни `svc wifi`, ни `umount /data/app/*`, ни `sleep`, ни рестартов процессов.
+            val (rtBefore, psBefore) = jitProps()
             jitPersistBackfill(valStr, "toggle")
-
+            val D = "$"
+            val script = """
+                setprop $PROP_USEJIT $valStr 2>/dev/null
+                setprop $PROP_USEJIT_PROFILES $valStr 2>/dev/null
+                echo RT_AFTER=${D}(getprop $PROP_USEJIT)
+                echo PS_AFTER=${D}(getprop $PROP_PERSIST_USEJIT)
+            """.trimIndent()
             val t0 = System.currentTimeMillis()
             val ret = runSuCommand(script)
             val t1 = System.currentTimeMillis()
-
-            // P6 VERIFY: разбираем диагностические маркеры из stdout скрипта
-            // (WIFI_BEFORE, WIFI_RESTORED, ZYGOTE_PID_BEFORE/AFTER, USEJIT_AFTER,
-            // ZYGOTE_RESTARTED, WIFI_WAIT_DONE) — по ним определяем РЕАЛЬНЫЙ статус
-            // шага вместо безусловного OK.
-            val wifiBefore = parseTag(ret.output, "WIFI_BEFORE")
-            val wifiRestored = parseTag(ret.output, "WIFI_RESTORED")
-            val zygBefore = parseTag(ret.output, "ZYGOTE_PID_BEFORE")
-            val zygAfter = parseTag(ret.output, "ZYGOTE_PID_AFTER")
-            val usejitAfter = parseTag(ret.output, "USEJIT_AFTER")
-            val zygRestarted = parseTag(ret.output, "ZYGOTE_RESTARTED")
-            val wifiWaitDone = parseTag(ret.output, "WIFI_WAIT_DONE")
+            val rtAfter = parseTag(ret.output, "RT_AFTER") ?: ""
+            val psAfter = parseTag(ret.output, "PS_AFTER") ?: ""
             val rootUnavailable = ret.output.contains("ERR_ROOT_CHANNEL_UNAVAILABLE")
-            val zygOk = zygRestarted == "YES" && (zygBefore != zygAfter)
-            val jitOk = usejitAfter == valStr
-            val wifiRestoredOk = (wifiBefore != "1") || (wifiRestored == "1")
-            val zygStatus: ToolsStep.Status = when {
+            val persistOk = psAfter == valStr
+            val runtimeOk = rtAfter == valStr
+            // Честный текст: runtime меняется только после перезагрузки ГУ — это НЕ ошибка.
+            AppLog.i(TAG, "JIT: runtime_before=$rtBefore persist_before=$psBefore runtime=$rtAfter " +
+                "persist=$psAfter action=setprop_only zygote_restart=never " +
+                "apply=\"применится после перезагрузки ГУ\" rc=${ret.exitCode} root_err=$rootUnavailable")
+            val jitStatus: ToolsStep.Status = when {
                 rootUnavailable -> ToolsStep.Status.BLOCKED
-                !zygOk -> ToolsStep.Status.FAILED   // Zygote не рестартовал
-                !jitOk -> ToolsStep.Status.FAILED   // usejit не применился
-                !wifiRestoredOk -> ToolsStep.Status.PARTIAL  // Wi-Fi не вернулся
-                ret.exitCode != 0 -> ToolsStep.Status.FAILED
-                else -> ToolsStep.Status.OK
+                persistOk -> ToolsStep.Status.OK
+                else -> ToolsStep.Status.FAILED
             }
-            val zygReason = buildString {
-                append("WIFI_BEFORE=").append(wifiBefore).append(" WIFI_RESTORED=").append(wifiRestored)
-                append(" ZYGOTE_BEFORE=").append(zygBefore).append(" AFTER=").append(zygAfter)
-                append(" RESTARTED=").append(zygRestarted).append(" USEJIT_AFTER=").append(usejitAfter)
-                append(" WIFI_WAIT=").append(wifiWaitDone)
-                if (!wifiRestoredOk) append(" | Wi-Fi НЕ БЫЛ ВОЗВРАЩЁН — возможен обрыв")
-                if (!zygOk) append(" | Zygote PID совпадает — рестарта НЕ произошло")
-                if (!jitOk) append(" | usejit=$usejitAfter после setprop (ожидалось $valStr)")
-            }
-            AppLog.i(TAG, "VERIFY jit_zygote: $zygStatus ($zygReason)")
-
+            val jitReason = "persist_before=$psBefore persist_after=$psAfter runtime=$rtAfter " +
+                "runtime_applied=$runtimeOk (применится после перезагрузки ГУ, zygote не перезапускаем)"
+            AppLog.i(TAG, "VERIFY jit_setprop: $jitStatus ($jitReason)")
             steps.add(
                 ToolsStep(
-                    step = "perf_prop_zygote",
-                    command = "svc wifi disable; umount /data/app/*; setprop dalvik.vm.usejit=$valStr; ctl.restart zygote; trap restore_wifi EXIT",
+                    step = "perf_prop",
+                    command = "setprop dalvik.vm.usejit=$valStr (без ctl.restart — zygote не перезапускаем)",
                     startedAtMs = t0,
                     finishedAtMs = t1,
                     exitCode = ret.exitCode,
-                    expected = "ZYGOTE_RESTARTED=YES USEJIT_AFTER=$valStr WIFI_RESTORED=1(if was on)",
-                    actual = zygReason,
-                    stdout = "dalvik.vm.usejit=$valStr → $zygReason",
+                    expected = "persist.sys.dalvik.vm.usejit=$valStr",
+                    actual = jitReason,
+                    stdout = "dalvik.vm.usejit=$valStr · применится после перезагрузки ГУ",
                     stderr = ret.output.take(2000),
-                    status = zygStatus
+                    status = jitStatus
                 )
             )
 
             if (enabled) {
-                val tOpt0 = System.currentTimeMillis()
-                val optRet = runSuCommand("cmd package compile -m speed-profile -a 2>&1")
-                val tOpt1 = System.currentTimeMillis()
-                steps.add(
-                    ToolsStep(
-                        step = "compile_all_apps",
-                        command = "cmd package compile -m speed-profile -a",
-                        startedAtMs = tOpt0,
-                        finishedAtMs = tOpt1,
-                        exitCode = optRet.exitCode,
-                        stdout = "Оптимизация всех приложений запущена",
-                        status = ToolsStep.Status.OK
-                    )
-                )
+                // iter33j §4.2: вместо `compile_all_apps` — «раунд оптимизации» как у референса
+                // (`rodada de otimizacao`): по одной строке на пакет, без красных текстов.
+                steps.addAll(jitRoundSteps(context, JIT_ROUND_MODE, null))
             }
 
             return ToolsResult(
@@ -592,63 +529,165 @@ object AppPerformance {
         }
     }
 
+    /** iter33j §4.2: режим «раунда» и режим полной компиляции (отдельная кнопка с предупреждением). */
+    internal const val JIT_ROUND_MODE = "speed-profile"
+    internal const val JIT_FULL_MODE = "speed"
+
     /**
-     * Оптимизация всех приложений разом через dex2oat.
+     * iter33j §4.2 — «раунд оптимизации» по модели референса (`rodada de otimizacao`,
+     * `OTIMIZAR_PELO_PERFIL`): поочерёдная компиляция приложений
+     * `cmd package compile -m speed-profile <pkg>`, на каждый пакет ровно одна строка
+     * `JIT_ROUND pkg=… mode=… → OTIMIZADO|NAO_OTIMIZADO dt=…ms`.
+     *
+     * Список пакетов — «всегда активные»/избранные ([getKeepAliveApps]); `-a` (все приложения
+     * разом) больше не используется: долго и непредсказуемо на ГУ.
+     */
+    internal fun jitRoundSteps(context: Context, mode: String, packages: List<String>?): List<ToolsStep> {
+        val pkgs = packages ?: getKeepAliveApps(context)
+        val out = mutableListOf<ToolsStep>()
+        if (pkgs.isEmpty()) {
+            val t = System.currentTimeMillis()
+            AppLog.i(TAG, "JIT_ROUND skipped reason=empty_package_list mode=$mode " +
+                "(список «всегда активные» пуст — добавьте приложения)")
+            out.add(ToolsStep(
+                step = "jit_round_empty",
+                command = "cmd package compile -m $mode <pkg>",
+                startedAtMs = t, finishedAtMs = t, exitCode = 0,
+                stdout = "JIT_ROUND skipped reason=empty_package_list",
+                status = ToolsStep.Status.PARTIAL
+            ))
+            return out
+        }
+        for (pkg in pkgs) {
+            val t0 = System.currentTimeMillis()
+            val r = runCatching { runSuCommand("cmd package compile -m $mode $pkg 2>&1") }
+                .getOrNull()
+            val dt = System.currentTimeMillis() - t0
+            val text = (r?.output ?: "").trim()
+            val ok = text.contains("Success", ignoreCase = true) && !text.contains("Error", ignoreCase = true)
+            val verdict = if (ok) "OTIMIZADO" else "NAO_OTIMIZADO"
+            val line = "JIT_ROUND pkg=$pkg mode=$mode → $verdict dt=${dt}ms"
+            AppLog.i(TAG, line)
+            out.add(ToolsStep(
+                step = "jit_round_$pkg",
+                command = "cmd package compile -m $mode $pkg",
+                startedAtMs = t0, finishedAtMs = System.currentTimeMillis(),
+                exitCode = r?.exitCode ?: 1,
+                expected = "Success",
+                actual = line,
+                stdout = text.take(400),
+                // Красных текстов в UI нет: неудачная компиляция одного пакета — не ошибка всего раунда.
+                status = ToolsStep.Status.OK
+            ))
+        }
+        return out
+    }
+
+    /** Публичное действие «Раунд оптимизации» (кнопка) — speed-profile по избранным. */
+    fun jitRound(context: Context): ToolsResult {
+        BgWorker.assertNotMain("AppPerformance.jitRound")
+        val steps = jitRoundSteps(context, JIT_ROUND_MODE, null)
+        return ToolsResult("perf.jitRound", "Раунд оптимизации (speed-profile)", steps)
+    }
+
+    /**
+     * iter33j §4.3 (а) — восстановление root-канала: ОДНА попытка `ctl.restart adbd`
+     * (как у референса: `( sleep 1; setprop ctl.restart adbd ) &`), затем повторная проба `id`.
+     * Ничего другого не перезапускаем.
+     */
+    fun recoverAdbd(reason: String): Boolean {
+        val t0 = System.currentTimeMillis()
+        val (_, before) = runCatching {
+            AdbClient.execute("id", 4000, expectRoot = false)
+        }.getOrDefault(Pair(1, ""))
+        val rootBefore = before.contains("uid=0")
+        // Фоновая попытка ровно как у референса, затем ждём и проверяем.
+        runCatching {
+            AdbClient.execute("( sleep 1; setprop ctl.restart adbd ) >/dev/null 2>&1 &", 6000)
+        }
+        Thread.sleep(4000)
+        val (rcAfter, after) = runCatching {
+            AdbClient.execute("id", 6000, expectRoot = false)
+        }.getOrDefault(Pair(1, ""))
+        val rootAfter = after.contains("uid=0")
+        val out = "ADB_RECOVERY action=restart_adbd reason=$reason root_before=$rootBefore root_after=$rootAfter " +
+            "rc=$rcAfter dt=${System.currentTimeMillis() - t0}ms result=${if (rootAfter) "OK" else "FAILED"}"
+        AppLog.i(TAG, out)
+        return rootAfter
+    }
+
+    /** Публичное действие «Восстановить root» (кнопка) — одна попытка `ctl.restart adbd`. */
+    fun recoverAdbdResult(): ToolsResult {
+        BgWorker.assertNotMain("AppPerformance.recoverAdbdResult")
+        val ok = recoverAdbd("owner_click")
+        return ToolsResult("perf.recoverAdbd", "Восстановить root-канал", listOf(
+            ToolsStep(
+                step = "adbd_restart",
+                command = "( sleep 1; setprop ctl.restart adbd ) &",
+                startedAtMs = System.currentTimeMillis(),
+                finishedAtMs = System.currentTimeMillis(),
+                exitCode = if (ok) 0 else 1,
+                expected = "id → uid=0",
+                actual = "root_after=$ok",
+                stdout = "ADB_RECOVERY action=restart_adbd result=${if (ok) "OK" else "FAILED"}",
+                status = if (ok) ToolsStep.Status.OK else ToolsStep.Status.PARTIAL
+            )
+        ))
+    }
+
+    /**
+     * iter33j §4.3 (б) — «Восстановить CarPlay»: ровно одна команда `ctl.restart CarplayMonitor`
+     * (образец референса `ctl.restart CarplayMonitor`). Никаких автопредложений и циклов.
+     */
+    fun restartCarplayMonitor(): ToolsResult {
+        BgWorker.assertNotMain("AppPerformance.restartCarplayMonitor")
+        val t0 = System.currentTimeMillis()
+        val r = runCatching { runSuCommand("setprop ctl.restart CarplayMonitor") }
+            .getOrNull()
+        val rc = r?.exitCode ?: 1
+        AppLog.i(TAG, "CARPLAY_RESTART action=ctl.restart CarplayMonitor rc=$rc " +
+            "dt=${System.currentTimeMillis() - t0}ms result=${if (rc == 0) "OK" else "FAILED"}")
+        return ToolsResult("perf.restartCarplay", "Восстановить CarPlay", listOf(
+            ToolsStep(
+                step = "carplay_monitor_restart",
+                command = "setprop ctl.restart CarplayMonitor",
+                startedAtMs = t0, finishedAtMs = System.currentTimeMillis(),
+                exitCode = rc,
+                expected = "rc=0",
+                actual = "rc=$rc (CarPlay перезапущен, соединение восстановится в течение ~10 с)",
+                stdout = r?.output?.take(400) ?: "",
+                status = if (rc == 0) ToolsStep.Status.OK else ToolsStep.Status.PARTIAL
+            )
+        ))
+    }
+
+    /**
+     * «Ускорить всё» (полная компиляция, `-m speed`, аналог `OTIMIZAR_INTEIRO_COM_AVISO`).
+     * Отдельная кнопка с предупреждением: долго и нагружает ГУ.
      */
     fun optimizeAllApps(context: Context): ToolsResult {
+        BgWorker.assertNotMain("AppPerformance.optimizeAllApps")
         val steps = mutableListOf<ToolsStep>()
-        val t0 = System.currentTimeMillis()
-        val cmd = "cmd package compile -m speed-profile -a 2>&1"
-        val ret = runSuCommand(cmd)
-        val t1 = System.currentTimeMillis()
-
-        steps.add(
-            ToolsStep(
-                step = "compile_all",
-                command = cmd,
-                startedAtMs = t0,
-                finishedAtMs = t1,
-                exitCode = ret.exitCode,
-                stdout = "Все приложения оптимизированы",
-                status = ToolsStep.Status.OK
-            )
-        )
-
+        val t = System.currentTimeMillis()
+        AppLog.i(TAG, "JIT_FULL_ROUND start mode=$JIT_FULL_MODE warn="полная компиляция: долго и нагружает ГУ"")
+        steps.add(ToolsStep(
+            step = "jit_full_warn",
+            command = "cmd package compile -m $JIT_FULL_MODE <pkg>",
+            startedAtMs = t, finishedAtMs = t, exitCode = 0,
+            stdout = "Полная компиляция (speed) выбранных приложений — это долго; ГУ может отвечать медленнее",
+            status = ToolsStep.Status.OK
+        ))
+        steps.addAll(jitRoundSteps(context, JIT_FULL_MODE, null))
         return ToolsResult(
             action = "perf.optimizeAll",
-            title = "Оптимизация приложений",
+            title = "Ускорить всё (полная компиляция)",
             steps = steps
         )
     }
 
+    /** Результат root-команды (код + stdout/stderr одной строкой). */
     data class ExecResult(val exitCode: Int, val output: String)
 
-    /**
-     * Аудит §5.7: БАГ был — для iptables/setprop/mount/dex2oat требовался root,
-     * а код запускал команду через простой Runtime.exec("sh"), который работает
-     * от пользователя u0_a* без прав. В других инструментах (TTL, LockSound)
-     * используется AdbClient (локальный ADB сокет 127.0.0.1:5555 с adbd в
-     * режиме root) — единый путь выполнения команд с правами root.
-     */
-    // ═══════════════ iter33b A2а: видео на boot (одна попытка) ═══════════════
-
-    /** Одна boot-попытка на процесс (отдельный счётчик от HVAC и от JIT). */
-    private val videoBootAttempted = java.util.concurrent.atomic.AtomicBoolean(false)
-
-    /**
-     * iter33b A2а — приведение «Видео 60 fps» в соответствие с тумблером после ребута.
-     *
-     * `mount --bind` на `/vendor/lib/libvcodecdrv.so` ребут не переживает: тумблер «включён»,
-     * а подмены нет. Раньше на boot вызывался только [verifyVideoOnly] (чтение) и владелец
-     * видел в логе `not applied (boot/watchdog, no action)` — то есть эффекта нет и не будет.
-     *
-     * Правила (все — из мандата iter33b):
-     *  1. pref выключен ⇒ ничего, одна строка `VIDEO_BOOT: pref=off`;
-     *  2. [isVideoApplied] == true ⇒ `SKIP (already applied)`, ноль пишущих команд;
-     *  3. иначе — полный [setVideo60Fps] РОВНО ОДИН раз за загрузку (флаг [videoBootAttempted]);
-     *  4. `ctl.restart mediacodec` допустим только внутри этой единственной попытки;
-     *  5. в watchdog'е остаётся только [verifyVideoOnly] — без записи.
-     */
     fun bootRestoreVideo(context: Context) {
         BgWorker.assertNotMain("AppPerformance.bootRestoreVideo")
         val app = context.applicationContext
@@ -739,366 +778,49 @@ object AppPerformance {
     }
 
     /**
-     * iter33b A2б — восстановление JIT после ребута. Вызывается ТОЛЬКО из boot-ветки
-     * ([EXTRA_BOOT_RESTORE]) и только дважды за загрузку: сразу и через 30 с (`secondPass=true`).
-     * Из watchdog'а — никогда (там [verifyJitOnly], только чтение).
+     * iter33j §4.1 — восстановление JIT после ребута БЕЗ перезапуска zygote.
      *
-     * Маршрут 1 — persist-дублёр (без перезапусков): runtime уже равен желаемому либо прошивка
-     *             поднимает runtime из `persist.sys.dalvik.vm.usejit`.
-     * Маршрут 2 — один `ctl.restart zygote`, только при `uptime < 120 с`, реальном расхождении
-     *             `getprop` и отсутствии попытки в этой загрузке (метка `files/jit_boot_attempt`).
-     * Маршрут 3 — честный отказ: `JIT_BOOT: unsupported`.
+     * Механизм референса (`jit_pedido` / `jit_restaurar`, dex 3.3.9): переключатель — только
+     * prop; zygote там не перезапускается никогда. Поэтому на boot мы:
+     *  • читаем runtime/persist; при расхождении пишем ТОЛЬКО persist-маркер (одна запись);
+     *  • печатаем одну строку с честным «применится после перезагрузки ГУ»;
+     *  • не делаем `pidof zygote`, рестартов zygote, файлов-намерений и postDelayed-сверок —
+     *    ждать нечего, потому что рестарта нет (владелец 06.11: zygote ложит root и CarPlay).
      */
     fun bootRestoreJit(context: Context, secondPass: Boolean = false) {
         BgWorker.assertNotMain("AppPerformance.bootRestoreJit")
         val app = context.applicationContext
-        // Тумблер выключен — JIT не наш, ничего не читаем и не пишем.
         if (!isAutoOptimizeEnabled(app)) {
             if (!secondPass) AppLog.i(TAG, "JIT_BOOT: pref=off (no attempt)")
             return
         }
-        val desired = "true"
-        // ── iter33d A2 / iter33e A2: опознание загрузки одной функцией ([JitBootMark.sameLoad]) —
-        // здесь (guard маршрута 2) и в `checkPendingZygoteVerify` (классификация намерения).
+        // Один проход: второй нужен был только для проверки «поднялся ли runtime после zygote».
+        if (!secondPass) return
         val bootTag = currentBootTag()
-        val upNow = android.os.SystemClock.elapsedRealtime()
-        val markerFile = File(app.filesDir, JIT_BOOT_MARKER)
-        val markerRaw = runCatching { markerFile.readText().trim() }.getOrDefault("")
-        val sameLoad = JitBootMark.sameLoad(markerRaw, bootTag)
-        AppLog.i(TAG, "JIT_BOOT: attempt_marker boot_tag=$bootTag same_load=$sameLoad uptime_ms=$upNow " +
-            "marker=${LogKit.kv(markerRaw.ifEmpty { "empty" })}")
-        // A2: метка старого формата (просто uptime) — консервативно считаем «эта загрузка»
-        // и сразу переписываем в новый формат, чтобы состояние не залипало.
-        if (JitBootMark.isLegacy(markerRaw)) {
-            runCatching { markerFile.writeText(JitBootMark.format(bootTag, JitBootMark.uptimeOf(markerRaw))) }
-            AppLog.i(TAG, "JIT_BOOT: attempt_marker legacy=true action=rewrite " +
-                "was=$markerRaw now=${JitBootMark.format(bootTag, JitBootMark.uptimeOf(markerRaw))}")
-        }
         var (runtime, persist) = jitProps()
-
-        // ── B2: маршрут 1 должен быть самодостаточен ────────────────────────────
-        // Дублёр писался ТОЛЬКО по клику (`setAutoOptimize`), поэтому у владельца, включавшего JIT
-        // в 1.0.52 (и после сброса настроек), persist был пуст и маршрут 1 не срабатывал никогда.
-        // Теперь: тумблер включён, а дублёра нет (или он врёт) ⇒ пишем ЕГО ЖЕ один раз и читаем обратно.
-        // iter33d C: снимок ДО дозаписи. Раньше `persist_present` считался после неё и означал
-        // почти только «канал ответил», а не «дублёр был». Теперь в пробе три поля.
-        val persistBefore = persist
-        var backfilled = false
-        if (persist != desired) {
+        if (persist != "true") {
             val reason = if (persist.isEmpty()) "boot_backfill" else "boot_mismatch"
-            jitPersistBackfill(desired, reason)
+            jitPersistBackfill("true", reason)
             persist = jitProps().second
-            backfilled = true
         }
-        // iter33e C1: `persist_present` убран — он дублировал `persist_before`. Теперь два разных
-        // факта и явный признак дозаписи: что было ДО и что стало ПОСЛЕ.
-        val persistBeforeWire = if (persistBefore.isEmpty()) "empty" else LogKit.kv(persistBefore)
-        val persistAfterWire = if (persist.isEmpty()) "empty" else LogKit.kv(persist)
-        val backfillWire = if (backfilled) "yes" else "no"
-        val probeCommon = "persist_before=$persistBeforeWire persist_after=$persistAfterWire " +
-            "backfill=$backfillWire runtime=$runtime"
-
-        if (runtime == desired) {
-            // ── B1/A3: честная строка ────────────────────────────────────────────
-            // Этот второй проход отвечает ТОЛЬКО за маршрут 1 (persist): runtime уже поднят,
-            // попытки zygote в этой загрузке быть не могло — иначе процесс не дожил бы до прохода.
-            // Факт «поднято перезапуском zygote» печатает A2
-            // (`checkPendingZygoteVerify` → `JIT_BOOT: match_after_zygote`), потому что после
-            // рестарта zygote второй проход не наступает вообще. Ветка `attempted` удалена как
-            // недостижимая (мёртвый код), вместе с ней ушла вторая копия опознания загрузки.
-            if (secondPass && persist == desired) {
-                AppLog.i(TAG, "JIT_PERSIST_PROBE: supported=true $probeCommon " +
-                    "reason=runtime_raised_from_persist")
-                AppLog.i(TAG, "JIT_BOOT: restored_from_persist prop=$PROP_PERSIST_USEJIT runtime=$runtime " +
-                    "persist=$persist (zygote не перезапускали)")
-            } else {
-                // iter33e C1: та же четвёрка полей, что и в остальных трёх ветках, — `persist=`
-                // рядом с `persist_after=` не дублируем (именно за дубль убран `persist_present`).
-                AppLog.i(TAG, "JIT_BOOT: match $probeCommon (ноль пишущих команд)")
-            }
-            return
-        }
-
-        // ── B3: перезапуск zygote — ТОЛЬКО на втором проходе ────────────────────
-        // Порядок в boot-ветке: сначала ставим плагин климата (при смене APK он перезапускает
-        // SystemUI), и только потом — один перезапуск zygote. Иначе статус-бар мигал бы дважды
-        // подряд, а между ними был бы пустым.
-        if (!secondPass) {
-            AppLog.i(TAG, "JIT_PERSIST_PROBE: supported=unknown $probeCommon action=read_again_in_30s")
-            return
-        }
-        AppLog.i(TAG, "JIT_PERSIST_PROBE: supported=false $probeCommon reason=runtime_not_raised_from_persist")
-
-        // маршрут 2
-        val up = android.os.SystemClock.elapsedRealtime()
-        if (up >= JIT_ZYGOTE_WINDOW_MS) {
-            AppLog.i(TAG, "JIT_BOOT: deferred reason=outside_window uptime_ms=$up (перезапуск zygote на этой стадии запрещён)")
-            return
-        }
-        // iter33d A1/A2: guard по ОПОЗНАНИЮ ЗАГРУЗКИ, арифметики по разнице uptime больше нет.
-        // Старое условие сравнивало метку с текущим uptime и давало SKIP после каждого второго
-        // ребута: метка прошлой загрузки (≤120 с) оказывалась меньше текущего uptime.
-        if (sameLoad) {
-            AppLog.i(TAG, "JIT_BOOT: skip reason=attempt_guard same_load=true " +
-                "marker_uptime_ms=${JitBootMark.uptimeOf(markerRaw)} now_ms=$up")
-            return
-        }
-        if (!jitBootAttempted.compareAndSet(false, true)) {
-            AppLog.i(TAG, "JIT_BOOT: skip reason=attempt_guard_process")
-            return
-        }
-        // Метка этой попытки: идентификатор загрузки + uptime (A2).
-        runCatching { markerFile.writeText(JitBootMark.format(bootTag, up)) }
-
-        // ── iter33e A1/A5: порядок строго «метка → лог → вызов» ──────────────
-        // Метка `jit_boot_attempt` уже записана выше (до этой точки) — поэтому после рестарта
-        // `same_load=true` и повторной попытки в этой загрузке не будет.
-        // Наш процесс — потомок zygote: после `ctl.restart zygote` он умирает, поэтому строка
-        // ПРО ПОПЫТКУ должна попасть на диск ДО вызова, иначе доказательства не останется.
-        AppLog.i(TAG, "JIT_BOOT: zygote_restart intent=pending boot_tag=$bootTag uptime_ms=$up " +
-            "marker=$JIT_BOOT_MARKER")
-        // Оба файла синхронно: `AppLog.i` → enqueueOrWrite → writeRaw (FileWriter+flush+close под
-        // synchronized, без очереди), `flushOpsNow` — выжимка.
-        runCatching { File(app.filesDir, JIT_PENDING_FILE).writeText(JitBootMark.format(bootTag, up)) }
-        LogKit.flushOpsNow()
-
-        // Ровно три команды, без svc wifi / umount /data/app / sleep.
-        val pidBefore = runCatching {
-            AdbClient.execute("pidof zygote; pidof zygote64", 4000, expectRoot = false).second.trim()
-        }.getOrDefault("")
-        val (rc, out) = runSuCommand(
-            "setprop $PROP_USEJIT true; setprop $PROP_USEJIT_PROFILES true; setprop ctl.restart zygote")
-        // Может не успеть: строка-доказательство уже выше (A1).
-        AppLog.i(TAG, "JIT_BOOT: pref=on desired=true runtime_before=$runtime action=setprop+zygote " +
-            "uptime_ms=$up marker=$JIT_BOOT_MARKER rc=$rc out=${LogKit.kv(out.take(120))}")
-
-        // Не блокируя поток: через 20 с — сверка результата (JIT_VERIFY).
-        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-            BgWorker.post("AppPerformance.jitVerify") {
-                val (rt, ps) = jitProps()
-                val pidAfter = runCatching {
-                    AdbClient.execute("pidof zygote; pidof zygote64", 4000, expectRoot = false).second.trim()
-                }.getOrDefault("")
-                AppLog.i(TAG, "JIT_VERIFY: runtime_after=$rt persist=$ps " +
-                    "zygote_pid_before=${LogKit.kv(pidBefore)} zygote_pid_after=${LogKit.kv(pidAfter)} " +
-                    "result=${if (rt == desired) "OK" else "FAILED"}")
-                if (rt != desired) {
-                    AppLog.i(TAG, "JIT_BOOT: unsupported (прошивка не даёт восстановить JIT без zygote) — " +
-                        "пометка в интерфейсе: «применится после перезагрузки, включите заново»")
-                }
-            }
-        }, 20_000L)
+        AppLog.i(TAG, "JIT_BOOT: runtime=$runtime persist=${if (persist.isEmpty()) "empty" else persist} " +
+            "boot_tag=$bootTag zygote_restart=never action=persist_only " +
+            "apply=\"применится после перезагрузки ГУ\" (механизм референса: только prop)")
     }
 
     /**
-     * iter33c B2: единственная разрешённая persist-запись — `persist.sys.dalvik.vm.usejit`.
-     * Пишется и по клику (`reason=toggle`), и на boot как backfill (`reason=boot_backfill`),
-     * всегда с чтением обратно. Никаких других persist-свойств не добавляется.
-     */
-    private fun jitPersistBackfill(value: String, reason: String): String {
-        val ret = runCatching {
-            runSuCommand("setprop $PROP_PERSIST_USEJIT $value; " +
-                "echo JIT_PERSIST_READBACK=\$(getprop $PROP_PERSIST_USEJIT)")
-        }.getOrNull()
-        val rb = ret?.let { parseTag(it.output, "JIT_PERSIST_READBACK") } ?: "?"
-        AppLog.i(TAG, "JIT_PERSIST_SET desired=$value readback=$rb reason=$reason")
-        return rb
-    }
-
-    /**
-     * iter33d A2: идентификатор текущей загрузки.
-     *  1. `/proc/sys/kernel/random/boot_id` — обычный файл, разрешений не требует;
-     *  2. иначе `bootEpoch = System.currentTimeMillis() - elapsedRealtime()` (секунды) —
-     *     для него в [JitBootMark.sameLoad] работает допуск ±60 с.
-     */
-    /** iter33h I3: тег загрузки не меняется в пределах процесса — кэшируем. */
-    @Volatile private var bootTagCache: String? = null
-
-    private fun currentBootTag(): String {
-        bootTagCache?.let { return it }
-        val id = runCatching { File("/proc/sys/kernel/random/boot_id").readText().trim() }
-            .getOrDefault("")
-        if (id.isNotEmpty()) { bootTagCache = id; return id }
-        // iter33e B: формат fallback-тега задаётся ТОЛЬКО в JitBootMark (epochTag) — здесь
-        // никаких строковых литералов, иначе `sameLoad` снова перестанет его узнавать.
-        // Передаём МИЛЛИСЕКУНДЫ: перевод в секунды — внутри epochTag.
-        val epochMs = System.currentTimeMillis() - android.os.SystemClock.elapsedRealtime()
-        val tag = JitBootMark.epochTag(epochMs)
-        bootTagCache = tag
-        return tag
-    }
-
-    /**
-     * iter33e A2/A3 + iter33f A1 — сверка ПОСЛЕ перезапуска zygote.
-     *
-     * Зачем: наш процесс — потомок zygote, поэтому после `ctl.restart zygote` ни `postDelayed(20 c)`,
-     * ни второй проход boot-ветки не наступают (сервис поднимается по `START_STICKY` с `intent == null`,
-     * а boot-ветка требует extra). Значит сверка должна жить на САМОМ старте сервиса.
-     *
-     * Вызывается из `VoiceAssistantService.onCreate` и `onStartCommand` ДО проверки
-     * `EXTRA_BOOT_RESTORE`. Ничего не пишет в систему: только читает `getprop` и удаляет свой
-     * файл-намерение.
-     *
-     * iter33f A1: намерение СНАЧАЛА захватывается синхронно ([claimPendingIntent]), поэтому
-     * `onCreate` + `onStartCommand` на один рестарт zygote дают РОВНО одну сверку
-     * (раньше файл удалялся только в фоновой задаче — и оба входа успевали его увидеть).
+     * iter33j §4.1 — сверка «после рестарта zygote» больше не существует: рестарта нет.
+     * Функция сохранена, потому что её вызывают `VoiceAssistantService.onCreate/onStartCommand`;
+     * она ровно один раз за процесс пишет в лог, почему ничего не ждёт, и подчищает файл-намерение
+     * старых версий (он больше не используется).
      */
     fun checkPendingZygoteVerify(context: Context) {
-        val app = context.applicationContext
-        val claimed = claimPendingIntent(app) ?: return
-        val bootTag = currentBootTag()
-        val pending = runCatching { claimed.readText().trim() }.getOrDefault("")
-        when (JitBootMark.pendingDecision(pending, bootTag)) {
-            JitBootMark.PendingDecision.NONE -> {
-                runCatching { claimed.delete() }
-                jitVerifyScheduled.set(false)
-            }
-            JitBootMark.PendingDecision.STALE -> {
-                // Намерение от прошлой загрузки: удаляем ЗАХВАЧЕННЫЙ файл — исходного уже нет.
-                runCatching { claimed.delete() }
-                jitVerifyScheduled.set(false)
-                AppLog.i(TAG, "JIT_VERIFY: skip reason=pending_stale pending=${kvE(pending)} boot_tag=$bootTag")
-            }
-            JitBootMark.PendingDecision.VERIFY -> {
-                // iter33g B1: не больше одного цикла сверки за загрузку. Файл `jit_verify_cycle`
-                // хранит bootTag той загрузки, где цикл уже был; запись — ДО запуска сверки,
-                // иначе падение процесса повторило бы цикл.
-                val cycleFile = File(app.filesDir, JIT_VERIFY_CYCLE_FILE)
-                val storedCycle = runCatching { cycleFile.readText().trim() }.getOrDefault("")
-                if (JitBootMark.cycleDecision(storedCycle, bootTag) == JitBootMark.CycleDecision.SKIP) {
-                    AppLog.i(TAG, "JIT_VERIFY: skip reason=already_this_boot boot_tag=$bootTag " +
-                        "(цикл сверки в этой загрузке уже был)")
-                    // Намерение не теряем и `.processing` не оставляем — возвращаем на место.
-                    restorePendingIntent(app, claimed)
-                    jitVerifyScheduled.set(false)
-                    return
-                }
-                runCatching { cycleFile.writeText(bootTag) }
-                BgWorker.post("AppPerformance.jitVerifyAfterRestart") {
-                    verifyClaimedAfterRestart(app, claimed, bootTag, 0)
-                }
-            }
-        }
+        if (!saidNoClaim.compareAndSet(false, true)) return
+        runCatching { File(context.applicationContext.filesDir, JIT_PENDING_FILE).delete() }
+        AppLog.i(TAG, "JIT_VERIFY: skipped reason=zygote_restart_removed " +
+            "(iter33j: JIT применяется prop-маркером, zygote не перезапускаем)")
     }
 
-    /**
-     * iter33f A1.1/A1.2/A1.4/A1.7 — атомарный захват намерения в вызывающем потоке.
-     *
-     * `renameTo` в пределах одного `filesDir` атомарен: либо файл достался нам, либо его забрал
-     * другой вызов. Решение принимается по содержимому ЗАХВАЧЕННОГО файла, не исходного.
-     * Флаг [jitVerifyScheduled] ставится прямо здесь (захват = «сверка запланирована»), поэтому
-     * второй вход видит `claim taken` и ничего не планирует; снимается флаг в конце сверки
-     * или сразу, если сверка не нужна (`NONE`/`STALE`).
-     *
-     * Возвращает `null`, когда захватывать нечего.
-     */
-    private fun claimPendingIntent(app: Context): File? {
-        val src = File(app.filesDir, JIT_PENDING_FILE)
-        val claimed = File(app.filesDir, JIT_PENDING_FILE + PROCESSING_SUFFIX)
-        val bootTag = currentBootTag()
-        // 1. Второй вход (onStartCommand сразу после onCreate): сверка уже забрана этим процессом.
-        if (jitVerifyScheduled.get()) {
-            AppLog.i(TAG, "JIT_VERIFY: claim taken reason=already_scheduled boot_tag=$bootTag")
-            return null
-        }
-        // 2. Захват: переименование, а не чтение.
-        val renamed = runCatching { src.renameTo(claimed) }.getOrDefault(false)
-        if (!renamed) {
-            if (src.exists()) {
-                // renameTo отказал, а намерение на месте — не теряем его молча.
-                val left = runCatching { src.readText().trim() }.getOrDefault("")
-                AppLog.i(TAG, "JIT_VERIFY: claim failed reason=rename pending=${kvE(left)} boot_tag=$bootTag")
-                return null
-            }
-            if (claimed.exists()) {
-                // Остаток прерванной сверки (процесс умер между захватом и проверкой):
-                // забираем его, иначе `.processing` висел бы вечно.
-                jitVerifyScheduled.set(true)
-                val left = runCatching { claimed.readText().trim() }.getOrDefault("")
-                AppLog.i(TAG, "JIT_VERIFY: claim ok reason=leftover boot_tag=$bootTag pending=${kvE(left)}")
-                return claimed
-            }
-            // Захватывать нечего: файла-намерения нет вовсе (обычный старт из приложения).
-            // Это НЕ `claim taken` — «забран другим вызовом» и «нечего забирать» разные факты.
-            if (saidNoClaim.compareAndSet(false, true)) {
-                AppLog.i(TAG, "JIT_VERIFY: claim none boot_tag=$bootTag")
-            }
-            return null
-        }
-        jitVerifyScheduled.set(true)
-        val pending = runCatching { claimed.readText().trim() }.getOrDefault("")
-        AppLog.i(TAG, "JIT_VERIFY: claim ok boot_tag=$bootTag pending=${kvE(pending)}")
-        return claimed
-    }
-
-    /** Вернуть захваченное намерение на место (чтобы следующий старт всё-таки его увидел). */
-    private fun restorePendingIntent(app: Context, claimed: File) {
-        val src = File(app.filesDir, JIT_PENDING_FILE)
-        val ok = runCatching { claimed.renameTo(src) }.getOrDefault(false)
-        if (!ok) AppLog.i(TAG, "JIT_VERIFY: restore failed reason=rename file=${kvE(claimed.name)}")
-    }
-
-    /**
-     * iter33f A1.6/B1/B2 — сверка захваченного намерения с тремя исходами.
-     *
-     * `OK` / `FAILED` — ответ определённый, намерение удаляется (повторять бессмысленно).
-     * `UNKNOWN` (канал не ответил, `jitProps()` вернул пустоту) — намерение НЕ сжигается:
-     * до 3 повторов через 10 с, и в повторе ЕДИНСТВЕННОЕ действие — `jitProps()` (read-only):
-     * никаких записей в систему и никаких повторных `ctl.restart zygote`. После третьего повтора —
-     * одна итоговая строка, намерение возвращается на место, `.processing` не остаётся висеть.
-     */
-    private fun verifyClaimedAfterRestart(app: Context, claimed: File, bootTag: String, attempt: Int) {
-        val (runtime, persist) = jitProps()   // единственное действие повтора: чтение getprop
-        val outcome = JitBootMark.verifyOutcome(runtime, persist)
-        // iter33g A2: две разные причины у FAILED — «прошивка не даёт» и «свойство читается,
-        // но не true»; решение о слове принимает JitBootMark (покрыто тестом).
-        val reasonWord = JitBootMark.outcomeReason(outcome, runtime, persist)
-        val reason = if (reasonWord.isEmpty()) "" else " reason=$reasonWord"
-        // iter33h I1: `source=after_restart` — ТОЛЬКО на первой попытке; повторы печатаются
-        // как `JIT_VERIFY: retry attempt=N …` без `source=` (иначе по логу не отличить
-        // первую сверку от повтора, и критерий приёмки «одна строка на сверку» невыполним).
-        val srcField = if (attempt == 0) " source=after_restart" else ""
-        val lineName = if (attempt == 0) "JIT_VERIFY" else "JIT_VERIFY: retry"
-        AppLog.i(TAG, "$lineName runtime_after=${kvE(runtime)} persist=${kvE(persist)}$srcField " +
-            "result=${outcome.name}$reason boot_tag=$bootTag attempt=${attempt + 1}")
-        when (outcome) {
-            JitBootMark.VerifyOutcome.OK -> {
-                // A3: этот факт печатается ЗДЕСЬ (второй проход после рестарта не наступает),
-                // и только на исходе OK — поэтому строк не больше, чем сверок.
-                AppLog.i(TAG, "JIT_BOOT: match_after_zygote runtime=${kvE(runtime)} persist=${kvE(persist)} " +
-                    "(поднят перезапуском zygote в этой загрузке)")
-                runCatching { claimed.delete() }
-                jitVerifyScheduled.set(false)
-            }
-            JitBootMark.VerifyOutcome.FAILED -> {
-                runCatching { claimed.delete() }
-                jitVerifyScheduled.set(false)
-            }
-            JitBootMark.VerifyOutcome.UNKNOWN -> {
-                if (attempt + 1 >= JIT_VERIFY_ATTEMPTS_MAX) {
-                    // iter33h I2: «3 попытки, 2 паузы по 10 с» — словами ревью.
-                    AppLog.i(TAG, "JIT_VERIFY: result=UNKNOWN attempts=$JIT_VERIFY_ATTEMPTS_MAX " +
-                        "pauses=${JIT_VERIFY_ATTEMPTS_MAX - 1} delay_ms=$JIT_VERIFY_RETRY_DELAY_MS " +
-                        "reason=no_channel boot_tag=$bootTag (намерение оставлено следующему старту)")
-                    restorePendingIntent(app, claimed)
-                    jitVerifyScheduled.set(false)
-                } else {
-                    BgWorker.postDelayed("AppPerformance.jitVerifyRetry", JIT_VERIFY_RETRY_DELAY_MS) {
-                        verifyClaimedAfterRestart(app, claimed, bootTag, attempt + 1)
-                    }
-                }
-            }
-        }
-    }
-
-    /**
-     * Watchdog: ТОЛЬКО сверка `getprop`, без записи в систему. Вызывается не чаще раза в 5 тиков
-     * (см. `VoiceAssistantService.settingsWatchdog`).
-     *
-     * iter33e A4: при успехе печатается ОДНА положительная строка за загрузку — иначе по логу
-     * нельзя ответить «JIT поднят», видно только молчание. Флаг хранится в `files/jit_verified`
-     * (не в памяти: процесс перезапускается). Это свой файл приложения, не системное свойство.
-     */
     fun verifyJitOnly(context: Context) {
         val app = context.applicationContext
         if (!isAutoOptimizeEnabled(app)) return

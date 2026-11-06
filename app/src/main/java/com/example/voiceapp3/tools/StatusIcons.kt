@@ -107,8 +107,8 @@ object StatusIcons {
      * Приоритет запрета «0x11600703 не читать» снят этим решением владельца.
      */
     private const val PROP_ENV_OUTSIDE_TEMP = 0x11600703
-    /** Зоны ENV_OUTSIDE_TEMPERATURE — порядок референса (TempStepperService.f1286d0). */
-    private val ENV_OUTSIDE_AREAS = intArrayOf(0, 1, 4, 7)
+    /** iter33j P1: AC_INSIDE_TEMP 0x2140A379 (csv:987) — диагностика тем же decode. */
+    private const val PROP_AC_INSIDE_TEMP = 0x2140A379
     // Резервные ID — ТОЛЬКО для строки лога TEMP_CANDS, автопереключения нет.
     private const val PROP_TEMP_RESERVE_1 = 0x2160A6E9
     private const val PROP_TEMP_RESERVE_2 = 0x2140A673
@@ -137,6 +137,9 @@ object StatusIcons {
     @Volatile private var tempPrev: Float? = null
     // iter16: кэш последних прочитанных значений (для push в persist.sys.hvacdigital.*
     // под строковый плагин). Плагин ожидает ЗНАЧЕНИЯ (напр. "98.1", "22.5", "9.7"), а не 0/1.
+    /** iter33j §4.6: время последней строки VHAL_WAIT (не чаще раза в 30 с). */
+    private var vhalWaitLoggedAtMs = 0L
+
     @Volatile private var lastBattPct: Float? = null
     @Volatile private var lastTempC: Float? = null
     @Volatile private var lastExtTempC: Float? = null
@@ -379,40 +382,57 @@ object StatusIcons {
     }
 
     /**
-     * F1 (iter33h): источник наружной температуры — ENV_OUTSIDE_TEMPERATURE `0x11600703` с area,
-     * как в референсе (`TempStepperService.i(int)` / `g()`): float → иначе int (−550…700 ⇒ /10,
-     * иначе −45…65 как есть), зоны {0,1,4,7}, валидный диапазон −55…+70, печать `%.1f`.
-     * AC_AMBIENT_TEMP (0x2140A377) и AC_AMBIENT_TEMP_INVALID (0x2140A376) — ТОЛЬКО диагностика.
+     * iter33j P1 — источник НАРУЖНОЙ температуры (эталон владельца
+     * `icar-dev/geely_ex2_tools/TemperatureReader.kt`):
+     *
+     *  1. ОСНОВНОЙ: `AC_AMBIENT_TEMP` = `0x2140A377`, `getIntProperty`, area 0,
+     *     decode `(raw − 80) / 2` ([decodeFlymeTemp]). Лог-строка формата владельца:
+     *     `TEMP_DECODE raw=86 → 3.0°C (formula (raw-80)/2 source=AC_AMBIENT_TEMP)`.
+     *  2. FALLBACK: `ENV_OUTSIDE_TEMPERATURE` = `0x11600703` (area 0) — ТОЛЬКО если чтение
+     *     ambient не удалось/значение вне коридора. При живом ambient честно пишем
+     *     `ENV_OUTSIDE_TEMPERATURE ignored: 25.0`.
+     *  3. Диагностика (в UI не идут): `AC_INSIDE_TEMP` — тот же decode;
+     *     `AC_AMBIENT_TEMP_INVALID` — НЕ гейт (эталон его не читает), только строка в лог.
      */
     private fun readTempScan(): Float? {
-        val m = cpm ?: run { AppLog.w(TAG, "TEMP: no CarPropertyManager"); return null }
-        // 1) наружная — ровно как в референсе: зоны {0,1,4,7}, float → int.
-        var outside: Float? = null
-        var outsideArea = -1
-        for (a in ENV_OUTSIDE_AREAS) {
-            val v = readEnvOutsideProp(m, a)
-            if (v != null) { outside = v; outsideArea = a; break }
+        val m = cpm ?: return null
+        val fmt = { v: Float? -> if (v == null) "н/д" else String.format(Locale.US, "%.1f", v) }
+        // 1) основной источник
+        var ambRaw: Int? = null
+        var ambErr = ""
+        try {
+            ambRaw = m.getIntProperty(PROP_AC_AMBIENT_TEMP, 0)
+        } catch (e: Exception) {
+            ambErr = e.javaClass.simpleName
         }
-        if (outside != null && outsideArea >= 0) {
-            tempSource = "HAL 0x11600703@0x%x".format(outsideArea)
-            AppLog.i(TAG, "Exterior OK (ENV_OUTSIDE_TEMPERATURE) area=0x%x → %.1f°C".format(outsideArea, outside))
-        } else {
-            tempSource = "none"
-            AppLog.w(TAG, "TEMP: ENV_OUTSIDE_TEMPERATURE (0x11600703) недоступен во всех зонах " +
-                ENV_OUTSIDE_AREAS.joinToString(",") { "0x%x".format(it) } + " — показываем н/д")
-        }
-        // 2) диагностика: ambient + INVALID + резервные ID. В UI не идут.
-        val (amb, ambRaw) = readTempProp(m, PROP_AC_AMBIENT_TEMP, 0)
+        val ambC = decodeFlymeTemp(ambRaw)
+        // 2) диагностика: INVALID (не гейт) и AC_INSIDE_TEMP тем же decode
         val inv = try { m.getIntProperty(PROP_AC_AMBIENT_INVALID, 0) } catch (e: Exception) { null }
-        val (r1, _) = readTempProp(m, PROP_TEMP_RESERVE_1, 0)
-        val (r2, _) = readTempProp(m, PROP_TEMP_RESERVE_2, 0)
-        val fmt = { v: Float? -> v?.let { String.format(Locale.US, "%.1f", it) } ?: "н/д" }
-        // TEMP_CANDS — одна строка на цикл опроса (H1: без повторов).
-        AppLog.i(TAG, "TEMP_CANDS: A377=${fmt(amb)} A673=${fmt(r2)} A6E9=${fmt(r1)} " +
-            "env_outside=${fmt(outside)} area=0x%x src=%s".format(outsideArea, tempSource))
-        AppLog.i(TAG, "TEMP_SRC ambient=${fmt(amb)} invalid=${inv ?: "н/д"} env_outside=${fmt(outside)} " +
-            "ambient_raw=$ambRaw")
-        return outside
+        val insideRaw = try { m.getIntProperty(PROP_AC_INSIDE_TEMP, 0) } catch (e: Exception) { null }
+        val envRaw = readEnvOutsideProp(m, 0)
+
+        if (ambRaw != null && plausibleOutsideC(ambC)) {
+            AppLog.i(TAG, "TEMP_DECODE raw=$ambRaw → ${fmt(ambC)}°C (formula (raw-80)/2 source=AC_AMBIENT_TEMP)")
+            // ambient живой: ENV_OUTSIDE в этом цикле НЕ используется — фиксируем факт, а не молчим.
+            AppLog.i(TAG, "ENV_OUTSIDE_TEMPERATURE ignored: ${fmt(envRaw)} (source=AC_AMBIENT_TEMP)")
+            AppLog.i(TAG, "TEMP_SRC ambient_raw=$ambRaw inside_raw=${insideRaw ?: "н/д"} " +
+                "inside=${fmt(decodeFlymeTemp(insideRaw))} invalid=${inv ?: "н/д"} (не гейт) src=AC_AMBIENT_TEMP")
+            tempSource = "HAL 0x2140A377@0x0"
+            return ambC
+        }
+
+        // 3) fallback — только при ошибке/неправдоподобном ambient
+        AppLog.w(TAG, "TEMP: AC_AMBIENT_TEMP недоступен (err=${ambErr.ifEmpty { "none" }} " +
+            "raw=${ambRaw ?: "н/д"} → ${fmt(ambC)}°C) — fallback ENV_OUTSIDE_TEMPERATURE")
+        if (envRaw != null) {
+            AppLog.i(TAG, "TEMP_DECODE env_outside=${fmt(envRaw)}°C (fallback, source=ENV_OUTSIDE_TEMPERATURE)")
+            tempSource = "HAL 0x11600703@0x0(fallback)"
+            return envRaw
+        }
+        tempSource = "none"
+        AppLog.w(TAG, "TEMP: ни ambient, ни ENV_OUTSIDE_TEMPERATURE — показываем н/д " +
+            "(inside_raw=${insideRaw ?: "н/д"} invalid=${inv ?: "н/д"})")
+        return null
     }
 
     /**
@@ -771,6 +791,17 @@ object StatusIcons {
     private fun syncAllImpl(app: Context, seq: Int): Int {
         var reads = 0
         ensureCar(app)
+        // iter33j §4.6: при старте CarPropertyManager ещё не поднят — это НЕ ошибка.
+        // Вместо `BATT: SOC null` / `TEMP: no CarPropertyManager` на каждом цикле печатаем
+        // одну понятную строку не чаще раза в 30 с и ждём готовности (ensureCar уже вызван).
+        if (cpm == null) {
+            val nowMs = android.os.SystemClock.elapsedRealtime()
+            if (nowMs - vhalWaitLoggedAtMs > 30_000L) {
+                vhalWaitLoggedAtMs = nowMs
+                AppLog.i(TAG, "VHAL_WAIT: CarPropertyManager не готов — чтение батареи/температуры " +
+                    "отложено (это нормально на старте, ждём ready=true)")
+            }
+        }
         val showBatt = prefs(app).getBoolean(PREF_BATTERY, false)
         val showTemp = prefs(app).getBoolean(PREF_EXT_TEMP, false)
         val showWifi = prefs(app).getBoolean(PREF_WIFI, false)
@@ -792,7 +823,9 @@ object StatusIcons {
         var tempStr: String? = null; var tempVal: Float? = null; var tempHas = false
         var wifiStr: String? = null; var wifiLvl: Int = -1; var wifiHas = false
 
-        if (showBatt) {
+        if (showBatt && cpm == null) {
+            // VHAL_WAIT уже напечатан выше — тихо ждём, старую иконку не снимаем.
+        } else if (showBatt) {
             AppLog.d(TAG, "BATT: toggle=on read start")
             val soc = readSocScan().also { reads++ }
             if (soc != null) {
@@ -809,7 +842,9 @@ object StatusIcons {
             } else { cancel(app, NOTIF_BATT); AppLog.w(TAG,"BATT: SOC null") }
         } else cancel(app, NOTIF_BATT)
 
-        if (showTemp) {
+        if (showTemp && cpm == null) {
+            // VHAL_WAIT уже напечатан выше — тихо ждём, значение не подменяем.
+        } else if (showTemp) {
             val t = readTempScan().also { reads++ }
             // iter22 §2: число показываем ВСЕГДА, если хоть раз его прочитали
             // (аналогично OEM-панели "10°C"). "--" только при полном отсутствии данных.
@@ -835,7 +870,7 @@ object StatusIcons {
             } else {
                 val icon = makeTextIconCex(app, "н/д", "", Color.WHITE, kind = "temp")
                 postNotif(app, NOTIF_TEMP, ICON_ID_TEMP, RANK_TEMP,
-                    "Снаружи н/д", "ENV_OUTSIDE_TEMPERATURE недоступен", "StatusIcon_OutsideTemperature", icon,
+                    "Снаружи н/д", "AC_AMBIENT_TEMP/ENV_OUTSIDE недоступны", "StatusIcon_OutsideTemperature", icon,
                     telemetryPi(app, NOTIF_TEMP))
                 tempStr = "н/д"; tempHas = true
                 AppLog.w(TAG, "TEMP: no data yet → \"н/д\" shown")

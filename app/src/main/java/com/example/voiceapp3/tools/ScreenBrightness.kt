@@ -626,7 +626,7 @@ echo "after=${D}_AFTER stay_after=${D}_STAY_AFTER rc=${D}_RC"
 echo '=== SCREEN_TIMEOUT_DIAG (root via AdbClient, OBSERVE-ONLY — no settings put) ==='
 date
 echo "uid: \$(id)"
-echo "uptime: \$(cat /proc/uptime)"
+echo "uptime: \$(cat /proc/uptime 2>/dev/null || echo unavailable)"
 echo "bootcount: \$(getprop ro.boot.bootcount)"
 echo "serial: \$(getprop ro.serialno)"
 echo "--- ls -l settings_system.xml ---"
@@ -651,7 +651,7 @@ echo "=== END ==="
                     val afterScript = """
 echo '=== SCREEN_TIMEOUT_DIAG AFTER 30s (observe-only) ==='
 date
-echo "uptime: \$(cat /proc/uptime)"
+echo "uptime: \$(cat /proc/uptime 2>/dev/null || echo unavailable)"
 echo "ls -l xml:"; ls -l /data/system/users/0/settings_system.xml 2>&1
 echo "md5 xml:"; md5sum /data/system/users/0/settings_system.xml 2>&1
 echo "screen_off_timeout NOW:"; settings get system screen_off_timeout 2>&1

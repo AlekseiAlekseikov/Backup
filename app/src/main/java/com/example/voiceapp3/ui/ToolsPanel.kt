@@ -811,6 +811,18 @@ class ToolsPanel(
         )
 
         addDiv()
+        // iter33j §4.2/§4.3: JIT — «раунд оптимизации» по избранным приложениям (как
+        // `rodada de otimizacao` референса); полная компиляция — отдельной кнопкой с
+        // предупреждением; восстановление — точечными рестартами, БЕЗ перезагрузки ГУ.
+        addSect("page.devPerf")
+        soundButtons(
+            soundButton("Раунд оптимизации (speed-profile)", 1) { send("perf.jitRound", "{}") },
+            soundButton("Ускорить всё (полная, долго)", 2) { send("perf.optimizeAll", "{}") },
+            soundButton("Восстановить root-канал", 0) { send("perf.recoverAdbd", "{}") },
+            soundButton("Восстановить CarPlay", 0) { send("perf.restartCarplay", "{}") },
+        )
+
+        addDiv()
         addSect("page.devLogs")
         val logRow = LinearLayout(activity).apply { orientation = LinearLayout.HORIZONTAL }
         logRow.addView(soundButton("ПОКАЗАТЬ ПОСЛЕДНИЙ LOGCAT", 0) {
