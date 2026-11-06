@@ -46,13 +46,14 @@ object NetworkTtl {
     /**
  * iter17: строим shell-скрипт с РЕАЛЬНЫМ замером TTL на проводе.
  * Ключевые требования iter17 §6a:
- *  — НИКОГДА не печатать "65" из константы; TTL приходит ИЗ tcpdump или ИЗ iptables -S.
- *  — Формат TTL_CHECK: real=<n> expected=<n> src=... dst=1.1.1.1 iface=... method=tcpdump → VERIFIED
+ *  — НИКОГДА не печатать "65" из константы; правило читается ИЗ iptables -S (`ttl-set 65`).
+ *  — iter33k §3: провод (tcpdump) в этой итерации не снимается; подтверждение — счётчики правил.
+ *  — Формат TTL_CHECK: real=UNKNOWN expected=65 … method=counters → SCOPED_OK|OFF_OK|CHECK_OWNER
  *    или real=UNKNOWN method=none reason=... → UNVERIFIED
  *  — iptables -C НЕ ВСЕГДА поддерживает TTL target (на некоторых ядрах выдаёт "No chain/target/match")
  *    → используем grep -c по iptables -S как надёжный fallback.
  *  — Замер ДО и ПОСЛЕ ping для счётчиков: TTL_COUNTERS: before=... after=... delta=...
- *  — IPv6: ищем hlim N в tcpdump и hl-set в ip6tables.
+ *  — IPv6: счётчик правил `hl-set 65` в ip6tables (mangle/POSTROUTING), только со скоупом.
  *  — Замер производится на iface текущего дефолтного маршрута.
  */
 private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
@@ -82,6 +83,10 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
         val v6Verify = kv["VERIFY_V6"]
         val ttlCheckLine = out.lineSequence().firstOrNull { it.startsWith("TTL_CHECK:") } ?: ""
         val ttlVerdict = when {
+            // iter33k §3: скрипт со СКОУПОМ печатает вердикт словами (провод не измеряется).
+            "SCOPED_OK" in ttlCheckLine -> "SCOPED_OK"
+            "OFF_OK" in ttlCheckLine -> "OFF_OK"
+            "CHECK_OWNER" in ttlCheckLine -> "CHECK_OWNER"
             "→ VERIFIED" in ttlCheckLine -> "VERIFIED"
             "→ MISMATCH" in ttlCheckLine -> "MISMATCH"
             "→ INDIRECT" in ttlCheckLine -> "INDIRECT"
@@ -117,10 +122,12 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
             hasLock   -> "xtables lock (iptables занят, попробуйте снова)"
             noTarget  -> "iptables target 'TTL' не поддерживается ядром (модуль отсутствует)"
             expected && ttlVerdict == "MISMATCH" -> "wire TTL mismatch (real=$ttlReal, expected=65)"
-            expected && ttlVerdict == "INDIRECT" -> "wire TTL не снят с провода (счётчики подросли, но ttl N в tcpdump не попал) → непрямое подтверждение"
+            expected && ttlVerdict == "CHECK_OWNER" ->
+                "правило со скоупом стоит, но uplink/CarPlay не определились — проверьте подключение (глобальное правило не ставим: ломает CarPlay)"
             // iter33h G1.2: если правила нет — это FAILED, а не «применено частично».
             expected && ttlRuleEarly.isBlank() && !v4Ok -> "rule_not_installed: правила TTL в mangle/POSTROUTING нет (TTL_V4=$v4)"
-            expected && ttlVerdict == "UNVERIFIED" -> "wire TTL не измерен (real=UNKNOWN${if (ttlRuleEarly.isNotBlank()) ", правило $ttlRuleEarly" else ""}): tcpdump не дал ttl N и счётчики не растут"
+            // iter33k: провод (tcpdump) в этой итерации НЕ снимается — подтверждение по счётчикам правил.
+            expected && ttlVerdict == "UNVERIFIED" -> "правило не подтверждено счётчиками (real=UNKNOWN${if (ttlRuleEarly.isNotBlank()) ", правило $ttlRuleEarly" else ""}, method=counters)"
             !v4Ok     -> "TTL_V4 mismatch (expected=${if (expected) 1 else 0}, got=$v4 verify=$v4Verify)"
             !v6Ok     -> "TTL_V6 mismatch (expected=${if (expected) 1 else 0}, got=$v6 verify=$v6Verify)"
             else      -> null
@@ -133,7 +140,7 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
             // iter33h G1.2: правило отсутствует ⇒ FAILED (PARTIAL — только когда правило есть,
             // а проводное значение не измерено).
             expected && ttlRuleEarly.isBlank() && !v4Ok -> ToolsStep.Status.FAILED
-            expected && ttlVerdict == "INDIRECT" -> ToolsStep.Status.PARTIAL
+            expected && ttlVerdict == "CHECK_OWNER" -> ToolsStep.Status.PARTIAL
             else -> ToolsStep.Status.PARTIAL
         }
         return stepStatus to (reason ?: "TTL_V4=$v4 TTL_V6=$v6 VERIFY=$v4Verify/$v6Verify wire=$ttlVerdict(real=$ttlReal)")
