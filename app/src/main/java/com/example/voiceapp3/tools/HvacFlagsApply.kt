@@ -479,7 +479,7 @@ internal object HvacFlagsApply {
         val names = EXT_NAMES + HvacDigitalProps.PROP_TEMP + HvacDigitalProps.PROP_BATT + HvacDigitalProps.PROP_VIA
         val cmd = names.joinToString("; ") { "echo \"PROP $it=\$(getprop $it)\"" } + "; " +
             "echo \"SYSUI_PLUGIN=\$(settings get secure sysui_plugin_shortcut_settings 2>&1)\"; " +
-            "echo \"SYSUI_TUNER=\$(settings get secure sysui_tuner_version 2>&1)""
+            "echo \"SYSUI_TUNER=\$(settings get secure sysui_tuner_version 2>&1)\""
         val out = runCatching { AdbClient.execute(cmd, 8000).second }.getOrDefault("")
         if (out.isBlank()) {
             AppLog.i(TAG, "EXT_DIAG result=no_channel")
@@ -490,7 +490,7 @@ internal object HvacFlagsApply {
                 line.startsWith("PROP ") -> AppLog.i(TAG, "EXT_DIAG ${line.removePrefix("PROP ")}")
                 line.startsWith("SYSUI_PLUGIN=") -> AppLog.i(TAG, "PLUGIN_DIAG sysui_plugin_shortcut_settings=" +
                     line.substringAfter('=').ifBlank { "empty" })
-                line.startsWith("SYSUI_TUNER=") -> AppLog.i(TAG, "PLUGIN_DIAG sysui_tuner_version=" +
+            "echo \"SYSUI_TUNER=\$(settings get secure sysui_tuner_version 2>&1)\""
                     line.substringAfter('=').ifBlank { "empty" })
             }
         }
