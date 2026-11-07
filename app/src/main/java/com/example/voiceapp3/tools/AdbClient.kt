@@ -265,7 +265,7 @@ object AdbClient {
     @Volatile private var lastCmdStartedAtMs: Long = 0L
 
     private fun noteCmd(cmd: String) {
-        lastCmdForLog = cmd.replace("\s+".toRegex(), " ").take(70)
+        lastCmdForLog = cmd.replace(Regex("\\s+"), " ").take(70)
         lastCmdStartedAtMs = android.os.SystemClock.uptimeMillis()
     }
 
