@@ -850,3 +850,51 @@
 3. 🟡 TTL: повторный тест владельцем после лечения канала.
 4. ⛔ Не делалось: правки системы, smali, `setenforce 0`, `pm install`, `pkill avas`,
    `ctl.restart zygote`, глобальное правило TTL, перезагрузка ГУ как лечение.
+
+## 2026-11-07 — iter33m (1.0.58)
+
+### Сделано
+
+- **§1 P0 TTL + CarPlay.** `del_all()` переписан без word-splitting:
+  `iptables -t mangle -S POSTROUTING | grep 'ttl-set' | sed -n 's/^-A POSTROUTING //p' | while IFS= read -r spec`
+  → `-D POSTROUTING $spec` (то же для `ip6tables`/`hl-set`), эталонный цикл `1..5 ‖ break` оставлен как
+  дополнение. Скоуп ровно один — `-o <uplink>`; fallback `! -o <carplay>` (`exclude_carplay`) удалён и из
+  `TtlScript`, и из `TtlRules.variants`; uplink-интерфейс CarPlay (`p2p*`, `rndis*`, `ncm*`, `usb*`, `ap0*`)
+  отбраковывается (`TTL_UPLINK_REJECT`). Нет uplink → правило не ставится (`TTL_TRY variant=none
+  reason=no_uplink`, `TTL_SCOPE result=failed`), тумблер `✗`. Санация при старте/ON/OFF печатает
+  `TTL_SANITIZED removed=N v4_removed=… v6_removed=…`, судьбу каждого правила (`TTL_DEL v4|v6 spec="…" rc=…`)
+  и чужое правило (`TTL_FOREIGN`). Честный OFF: `VERIFY_V4=OFF_OK` + `TTL_OFF … result=OK` только при
+  `TTL_V4=0 && TTL_V6=0`; `NetworkTtl.parseVerifyResult` больше не возвращает `PARTIAL` — только `OK`/`FAILED`
+  (отсюда исчезло «✓ SUCCESS | применено частично»). Попутно: boot-ветка ставит правило только при
+  включённом тумблере (`buildScript(active)`), раньше ставила всегда.
+- **§2 P0 тумблеры.** Источник истины — префы `hvacdigital_temp/_batt/_temp_ext`: `getHvacDigital` читает преф,
+  клик пишет преф и сразу обновляет `cachedFlags`; `syncFromDevice` — read-only (`FLAGS_SYNC … action=props_readonly`),
+  обратная запись `ui_from_props` удалена; стартовое выравнивание теперь ПРЕФЫ→props
+  (`alignPropsToPrefs`, `FLAG_ALIGN … action=align_props_to_prefs`); трасса `PREF TRACE write/read key=hvacdigital_*`.
+- **§3 P0 EXT_PROBE_V2.** Поочерёдный перебор трёх имён наружней (`exttemp`, `temp_ext`, новое из `getprop.txt`
+  `ext_temp`): одно `=1`, остальные `=0` одной командой → полный цикл recarga → read всех трёх → строка
+  `EXT_PROBE_V2 step=i/3 prop=… wrote=1 found=… result=ok|missing owner_look=wait15s` → пауза 15 с; в конце
+  `EXT_PROBE_V2 props_follow_prefs=ok|fail`. Ничего не удаляется. `PersistCleaner` нормализует в `0` все три
+  легаси-имени. Стартовая read-only диагностика: `EXT_DIAG prop=…` (6 props) + `PLUGIN_DIAG`
+  (`sysui_plugin_shortcut_settings`, `sysui_tuner_version`). Своя раскладка строки состояния не рисовалась.
+- **§5 тесты.** `TtlScriptTest` 6→8, `ToggleNoLieTest` 3→4 (`prefsAreSourceOfTruth`), новый `ExtProbeV2Test` (5),
+  `PersistCleanerTest` (три имени), `TtlRulesTest` (fallback удалён), `BuildMarkerTest` → 58/`1.0.58`.
+  Было 111 PASSED → стало **119 PASSED / 0 FAILED**.
+
+### CI
+
+- `42387938562` (`0e611d0`) — ❌ компиляция: незакрытая кавычка в `startupDiagnostics` (ошибка патча).
+- `42388708679` (`1fe50d1`) — ❌ компиляция: наложение правки съело ветку `when` для `SYSUI_TUNER`.
+- `42389628649` (`bfa4409`) — ❌ тесты: 119 completed, 2 failed — `ToggleNoLieTest.prefsAreSourceOfTruth`
+  (слово `action=ui_from_props` осталось в KDoc) и `TtlScriptTest.offVerdictNeedsZeroRules` (проверка ловила
+  grep-шаблон `^-A POSTROUTING -o`, а не добавление правила).
+- **`42390693171` (`d62b5bd`) — success, 119 PASSED / 0 FAILED**, job `128457450413`, артефакт `13581512748`
+  (177 129 381 Б), `BUILD SUCCESSFUL in 3m 23s`, `BuildMarkerTest > commitSourceIsHonest PASSED`.
+
+### Открыто
+
+1. 🟡 Какое из трёх имён наружней читает панель — решит `EXT_PROBE_V2` по логу и скрину владельца.
+2. 🟡 TTL: повторная проверка владельцем, что CarPlay жив при включённом тумблере и что OFF даёт `TTL_V4=0 V6=0`.
+3. 🟡 Экран не менялся даже при `FLAG_VERIFY match=ok` — ждём `EXT_DIAG`/`PLUGIN_DIAG` и скрин панели 1.0.58.
+4. ⛔ Не делалось: правки системы, smali, `setenforce 0`, `pm install`, `pkill avas`, `ctl.restart zygote`,
+   глобальное правило TTL, перезагрузка ГУ как лечение, своя раскладка строки состояния.
