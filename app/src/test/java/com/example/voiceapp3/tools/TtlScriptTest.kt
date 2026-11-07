@@ -105,7 +105,10 @@ class TtlScriptTest {
         assertTrue("TTL_OFF печатается только при выключении", off.contains("TTL_OFF v4="))
         assertTrue("result=OK только при TTL_V4=0 и TTL_V6=0",
             off.contains("TTL_OFF v4=\$TTL_V4 v6=\$TTL_V6 result="))
-        assertTrue("при выключении правило не добавляется", !off.contains("-A POSTROUTING -o "))
+        assertTrue("при выключении правило не добавляется",
+            !off.contains("mangle -A POSTROUTING -o "))
+        assertTrue("при включении правило добавляется ровно со скоупом uplink",
+            TtlScript.build(true).contains("mangle -A POSTROUTING \$SCOPE -j TTL --ttl-set 65"))
         // OFF-маркер не должен выглядеть как «правило стоит»
         assertTrue("VERIFY_V4=OFF_OK для выключения", off.contains("VERIFY_V4=OFF_OK"))
         assertTrue("OFF_OK попадает в вердикт", off.contains("VERDICT=OFF_OK"))
