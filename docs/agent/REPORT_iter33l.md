@@ -121,7 +121,8 @@ TOGGLE_NOT_APPLIED pref=hvacTemp reason=props_rewritten
 |---|---|---|
 | `42375642156` | `e7f191c` | ❌ компиляция: `AdbClient.kt:268 Unsupported escape sequence` (`"\s+"` в обычной строке) — исправлено на `Regex("\\s+")` в `f0ce4c9` |
 | `42376515294` | `f0ce4c9` | ❌ тест: `JitPersistTest > bootProbePrintsThreeValues` — тест ждал неинтерполированный литерал (в исходнике `$PROP_PERSIST_USEJIT_INIT` подставляется в константу) — исправлено в `3441865` |
-| **`42377387076`** | **`3441865`** | ✅ **success**, **111 PASSED / 0 FAILED**, `BUILD SUCCESSFUL in 4m 19s`, job `128417673619`, артефакт `13576018450` (**177 124 140 Б**) |
+| `42377387076` | `3441865` | ✅ **success**, **111 PASSED / 0 FAILED**, `BUILD SUCCESSFUL in 4m 19s`, job `128417673619`, артефакт `13576018450` (**177 124 140 Б**) |
+| **`42378330319`** | **`98d1ae1`** (код `3441865` + маркер `SOURCE_SHA=3441865` + отчёты) | ✅ **success**, **111 PASSED / 0 FAILED**, job `128420457583`, артефакт `13577001294` (**177 124 163 Б**); `BuildMarkerTest > commitSourceIsHonest PASSED` — маркер доходит до `BuildConfig.GIT_COMMIT` |
 
 Строки из лога джобы `128417673619`:
 

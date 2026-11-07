@@ -839,7 +839,9 @@
 - `42376515294` (`f0ce4c9`) — тест `JitPersistTest > bootProbePrintsThreeValues` (ожидал
   неинтерполированный литерал) → исправлено.
 - **`42377387076` (`3441865`) — success, 111 PASSED / 0 FAILED**, `BUILD SUCCESSFUL in 4m 19s`,
-  job `128417673619`, артефакт `13576018450` (177 124 140 Б).
+  job `128417673619`, артефакт `13576018450` (177 124 140 Б); handoff-прогон **`42378330319`**
+  (`98d1ae1`, маркер `SOURCE_SHA=3441865` + отчёты) — success, **111 PASSED / 0 FAILED**,
+  job `128420457583`, артефакт `13577001294` (177 124 163 Б), `BuildMarkerTest > commitSourceIsHonest PASSED`.
 
 ### Открыто
 
