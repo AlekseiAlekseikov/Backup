@@ -38,7 +38,9 @@ class JitPersistTest {
     @Test
     fun bootProbePrintsThreeValues() {
         val s = perf()
-        assertTrue("JIT_PROBE должен читать init-ключ", s.contains("echo PI=\$(getprop \$PROP_PERSIST_USEJIT_INIT)"))
+        // в исходнике это `"echo PI=\\$(getprop $PROP_PERSIST_USEJIT_INIT)"` — проверяем обе части
+        assertTrue("JIT_PROBE должен читать init-ключ",
+            s.contains("echo PI=") && s.contains("getprop \$PROP_PERSIST_USEJIT_INIT"))
         assertTrue("boot-строка JIT_BOOT", s.contains("JIT_BOOT runtime="))
         assertTrue("вердикт «поднимется после ребута»", s.contains("expect_runtime_true_after_reboot="))
     }
