@@ -1070,8 +1070,9 @@ object StatusIcons {
     }
 
     /**
-     * §1.3 — состояние тумблера для UI = ФАКТ из `getprop` (кэш последнего чтения),
-     * а не только память приложения. Память — резерв, пока канал ещё не ответил ни разу.
+     * iter33m §2.1 — состояние тумблера для UI = ПРЕФ пользователя (источник истины).
+     * Факт из `persist.sys.hvacdigital.*` только читается (`FLAGS_SYNC action=props_readonly`)
+     * и выравнивается к префам (`FLAG_ALIGN action=align_props_to_prefs`), а не наоборот.
      */
     @JvmStatic fun getHvacDigital(ctx: Context, pref: String): Boolean =
         // iter33m §2.1: состояние тумблера = ПРЕФ пользователя (источник истины).

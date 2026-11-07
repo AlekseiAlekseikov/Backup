@@ -490,7 +490,7 @@ internal object HvacFlagsApply {
                 line.startsWith("PROP ") -> AppLog.i(TAG, "EXT_DIAG ${line.removePrefix("PROP ")}")
                 line.startsWith("SYSUI_PLUGIN=") -> AppLog.i(TAG, "PLUGIN_DIAG sysui_plugin_shortcut_settings=" +
                     line.substringAfter('=').ifBlank { "empty" })
-            "echo \"SYSUI_TUNER=\$(settings get secure sysui_tuner_version 2>&1)\""
+                line.startsWith("SYSUI_TUNER=") -> AppLog.i(TAG, "PLUGIN_DIAG sysui_tuner_version=" +
                     line.substringAfter('=').ifBlank { "empty" })
             }
         }
