@@ -796,3 +796,55 @@
 - **Отчёт:** `docs/agent/REPORT_iter33k_fix1.md`.
 - **Для владельца:** клик тумблера перезапускает панель, интерфейс мигает несколько секунд —
   это штатный механизм референса, не дефект. Отдельной кнопки применения нет и не будет.
+
+## 2026-11-07 — iter33l (1.0.57)
+
+**Мандат:** `PROMPT_iter33l_1.0.57.md`. База `811ced6`, ветка `fix/v2`, `versionCode = 57`,
+`versionName = "1.0.57"`. Разбор лога `voiceapp3 (23).log` (07.11, сеансы 15:02–15:05 и 15:09–15:25).
+
+### Корень «деградации транспорта» (главная находка)
+
+Не таймауты adbd: **две параллельные заливки одного скрипта**. В `15:10:04.931` (`CENTRAL_Bg-2`) и
+`15:10:05.056` (`CENTRAL_Bg-3`) два потока льют `ttl_script` в один и тот же
+`/data/local/tmp/voiceapp3_ttl_script.sh`; `rm -f` одного стирает файл другого, чанки идут в общий
+файл → `SCRIPT_BYTES=12296 EXPECTED=6148` (ровно ×2), затем `No such file`. В `15:04:03` то же с
+`hvac_enable` (`SCRIPT_BYTES= EXPECTED=7408`). Отсюда `rc=99` → `rule_not_installed` у TTL и общий
+вид «транспорт сломался».
+
+### Сделано
+
+- **§1 слоты:** `FLAG_VERIFY wrote=… via=… found=… match=ok|rewritten` после каждой recarga
+  (`HvacFlagsApply.verifyNow`), повторный push до 3 раз без новых kill (`FLAG_REWRITE`);
+  `EXT_PROBE` — эксперимент с обоими именами наружней (`exttemp` и легаси `temp_ext`) + кнопка
+  «Проба слотов (наружняя)»; `PersistCleaner` больше не удаляет `temp_ext` (нормализует в `0`).
+- **§2 тумблеры:** mutex клика (`TOGGLE_SKIP reason=busy`), успех только при `rc=0` И `match=ok`,
+  периодический PUSH из sync убран → одноразовое `FLAG_ALIGN` (`alignHvacFlagsOnce`).
+- **§3 рут:** `AdbClient.reconnectRoot()` — полное переподключение (тот же цикл, что старт:
+  `localTargets` → `discoverDestination` → `fullProbe` → `channelUp`), до 3 попыток, строка
+  `ADB_RECOVERY action=reconnect … root_after=root|none`; `ctl.restart adbd` — только крайняя мера
+  после провала reconnect (`action=restart_adbd_after_reconnect`); кнопка «Восстановить root-канал»
+  теперь зовёт reconnect; root-команда без канала инициирует reconnect, а не тихий отказ;
+  `CHANNEL_LOST last_cmd=… dt=… reason=…` на обрывах и таймаутах; заливки скриптов сериализованы
+  (`synchronized(scriptUploadLock)`) и повторяются до 3 раз со сверкой размера (`size_check=ok` /
+  `SCRIPT_UPLOAD GIVEUP`).
+- **§3.5 JIT:** основной ключ `persist.dalvik.vm.usejit` (init поднимет `dalvik.vm.usejit`),
+  `persist.sys.dalvik.vm.usejit` остаётся маркером; boot-строка
+  `JIT_BOOT runtime=… persist=… init=… expect_runtime_true_after_reboot=…`.
+- **§6 тесты:** новые `FlagVerifyTest` (5), `ToggleNoLieTest` (3), `ReconnectRecoveryTest` (5),
+  `JitPersistTest` (4); `BuildMarkerTest` → 57; `PersistCleanerTest` → нормализация.
+
+### CI
+
+- `42375642156` (`e7f191c`) — компиляция: `Unsupported escape sequence` в `noteCmd` → исправлено.
+- `42376515294` (`f0ce4c9`) — тест `JitPersistTest > bootProbePrintsThreeValues` (ожидал
+  неинтерполированный литерал) → исправлено.
+- **`42377387076` (`3441865`) — success, 111 PASSED / 0 FAILED**, `BUILD SUCCESSFUL in 4m 19s`,
+  job `128417673619`, артефакт `13576018450` (177 124 140 Б).
+
+### Открыто
+
+1. 🟡 §1.3: нужен `SystemUI.apk` (read-only pull) для точных имён пропов и правила склейки ячеек.
+2. 🟡 Какой ключ наружней читает панель — решит эксперимент `EXT_PROBE` по логу владельца.
+3. 🟡 TTL: повторный тест владельцем после лечения канала.
+4. ⛔ Не делалось: правки системы, smali, `setenforce 0`, `pm install`, `pkill avas`,
+   `ctl.restart zygote`, глобальное правило TTL, перезагрузка ГУ как лечение.
