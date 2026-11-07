@@ -41,8 +41,28 @@ class ToggleNoLieTest {
         val icons = src("src/main/java/com/example/voiceapp3/tools/StatusIcons.kt")
         assertFalse("периодический PUSH из sync запрещён (петля тумблеров)",
             icons.contains("pushHvacDigitalPropsIfEnabled"))
-        assertTrue("вместо него — одноразовое выравнивание", icons.contains("alignHvacFlagsOnce(app)"))
+        assertTrue("стартовое выравнивание осталось одноразовым", icons.contains("alignHvacFlagsOnce(app)"))
         assertTrue("выравнивание одно за процесс", icons.contains("alignDone.compareAndSet(false, true)"))
+        assertTrue("выравнивание идёт ПО ПРЕФАМ (props ← prefs), а не наоборот",
+            icons.contains("HvacFlagsApply.alignPropsToPrefs(app)"))
+    }
+
+    /**
+     * iter33m §2 — ПРЕФЫ источник истины. Лог 07.11: `FLAGS_SYNC … action=ui_from_props`
+     * переписывал префы по props (`prefs=0,0,0 fact=0,1,1`) — тумблеры «скакали».
+     */
+    @Test
+    fun prefsAreSourceOfTruth() {
+        val apply = src("src/main/java/com/example/voiceapp3/tools/HvacFlagsApply.kt")
+        val icons = src("src/main/java/com/example/voiceapp3/tools/StatusIcons.kt")
+        assertFalse("обратная запись props→prefs запрещена", apply.contains("action=ui_from_props"))
+        assertTrue("sync только читает: action=props_readonly", apply.contains("action=props_readonly"))
+        assertTrue("клик обновляет кэш сразу (без ожидания 60 с)",
+            apply.contains("cachedFlags = Triple(tempOn, battOn, extOn)"))
+        assertTrue("трасса префов write", apply.contains("PREF TRACE write key="))
+        assertTrue("трасса префов read", apply.contains("PREF TRACE read key="))
+        assertTrue("тумблер читает ПРЕФ, а не кэш props",
+            icons.contains("prefs(ctx).getBoolean(pref, false)"))
     }
 
     @Test

@@ -38,6 +38,12 @@ class PersistCleanerTest {
     fun legacyKeyNormalizedAndFlagValuesResetToZero() {
         val s = PersistCleaner.script()
         assertTrue("легаси-ключ temp_ext обрабатывается", s.contains("persist.sys.hvacdigital.temp_ext"))
+        // iter33m §3.2: третье имя наружней из getprop.txt — тоже только в 0, без удаления.
+        assertTrue("третье имя ext_temp нормализуется", s.contains("persist.sys.hvacdigital.ext_temp"))
+        assertTrue("все три имени — в LEGACY_PROPS",
+            PersistCleaner.LEGACY_PROPS == listOf(
+                "persist.sys.hvacdigital.temp_ext",
+                "persist.sys.hvacdigital.ext_temp"))
         // iter33l §1.2: НЕ удаляем (эксперимент с именем пропа наружней ещё идёт) — только в 0.
         assertTrue("легаси — нормализация, не удаление", s.contains("reason=legacy_key_normalized"))
         assertFalse("пустое значение в temp_ext больше не пишем", s.contains("setprop persist.sys.hvacdigital.temp_ext \"\""))

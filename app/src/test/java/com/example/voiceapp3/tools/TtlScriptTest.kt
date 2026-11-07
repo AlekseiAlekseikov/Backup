@@ -9,7 +9,11 @@ import org.junit.Test
  * (`enable=$enableBit`) вместо значения.
  *
  * iter33k §3 — скрипт переписан на ПРАВИЛА СО СКОУПОМ (глобальное правило ломало CarPlay),
- * измерение по проводу (tcpdump) убрано: проверка — счётчики правил. Тест держит это.
+ * измерение по проводу (tcpdump) убрано: проверка — счётчики правил.
+ *
+ * iter33m §1 — удаление БЕЗ word-splitting (`while IFS= read -r spec`), скоуп ТОЛЬКО `-o <uplink>`
+ * (fallback `! -o p2p0`/`exclude_carplay` удалён: групповой `p2p-p2p0-0` он не покрывал и ломал
+ * CarPlay), санация `TTL_SANITIZED`, честный итог OFF (`TTL_V4=0 && TTL_V6=0`).
  */
 class TtlScriptTest {
 
@@ -30,7 +34,7 @@ class TtlScriptTest {
     fun resultLinePresent() {
         val s = TtlScript.build(true)
         assertTrue("нужна строка TTL_RESULT:\n$s", s.contains("TTL_RESULT rule_v4="))
-        for (f in listOf("rule_v6=", "verify_v4=", "verify_v6=", "wire_v4=not_measured", "enable=", "scoped=")) {
+        for (f in listOf("rule_v6=", "verify_v4=", "verify_v6=", "wire_v4=not_measured", "enable=", "scoped=", "variant=")) {
             assertTrue("в TTL_RESULT нет поля $f", s.contains(f))
         }
         assertTrue("финальная строка TTL_CHECK обязана остаться", s.contains("TTL_CHECK:"))
@@ -44,41 +48,69 @@ class TtlScriptTest {
         assertTrue(s.contains("ROUTE_SRC=none reason=no_default_route"))
     }
 
-    // 4. iter33k §3: скоуп обязателен, tcpdump больше не нужен.
+    // 4. iter33m §1.1 — удаление правил БЕЗ word-splitting.
     @Test
-    fun scopedOnlyNoTcpdump() {
-        val s = TtlScript.build(true)
-        assertFalse("tcpdump/снятие по проводу убрано:\n$s", s.contains("tcpdump"))
-        assertFalse(s.contains("run_v4_capture"))
-        assertTrue("нужна диагностика TTL_NET", s.contains("TTL_NET ifaces="))
-        assertTrue("нужна строка попытки TTL_TRY", s.contains("TTL_TRY variant="))
-        assertTrue("нужна строка итога скоупа TTL_SCOPE", s.contains("TTL_SCOPE result="))
-        assertTrue("отказ без uplink и без CarPlay печатается явно",
-            s.contains("TTL_TRY variant=none"))
-        assertTrue("глобальное правило запрещено — в скрипте есть отказ",
-            s.contains("reason=no_uplink_no_carplay"))
-        // вариант «только со скоупом»: правило всегда с -o
-        assertTrue(s.contains("-o \$UPLINK"))
-        // вариант «всё кроме CarPlay»: первый найденный интерфейс CarPlay (CP_FIRST)
-        assertTrue("нет исключения CarPlay в скоупе", s.contains("! -o \$CP_FIRST"))
-    }
-
-    // 5. Выключение — эталонный цикл 1..5 и generic-удаление; строка TTL_OFF только в OFF.
-    @Test
-    fun offRemovesRules() {
+    fun delAllHasNoWordSplitting() {
         val off = TtlScript.build(false)
-        assertTrue(off.contains("TTL_OFF v4="))
-        assertTrue("эталонный цикл удаления 1..5", off.contains("for i in 1 2 3 4 5"))
-        assertTrue("generic-удаление по iptables -S", off.contains("iptables -t mangle -S POSTROUTING"))
-        assertFalse("при выключении правило не добавляется", off.contains("-A POSTROUTING -o "))
+        assertTrue("нужен цикл while IFS= read -r spec (без разбиения по пробелам):\n$off",
+            off.contains("while IFS= read -r spec"))
+        assertTrue("спецификатор правила отдаёт sed '-A POSTROUTING ' → ''",
+            off.contains("sed -n 's/^-A POSTROUTING //p'"))
+        assertTrue("удаление точным спецификатором", off.contains("-D POSTROUTING \$spec"))
+        assertFalse("word-splitting через for spec in \$(…) запрещён", off.contains("for spec in \$(iptables"))
+        assertFalse("word-splitting через for spec in \$(…) запрещён (v6)", off.contains("for spec in \$(ip6tables"))
+        assertTrue("эталонный цикл -D … || break обязан остаться", off.contains("|| break"))
     }
 
-    // 6. Вердикт требует ≥1 правила и скоуп.
+    // 5. iter33m §1.2 — скоуп ТОЛЬКО uplink, вариант «всё кроме CarPlay» удалён.
     @Test
-    fun verdictRequiresScopedRule() {
+    fun scopeIsUplinkOnly() {
         val s = TtlScript.build(true)
-        assertTrue(s.contains("\"\$TTL_V4\" -ge 1"))
-        assertTrue(s.contains("VERDICT=SCOPED_OK"))
-        assertTrue(s.contains("VERDICT=OFF_OK"))
+        assertTrue("правило ставится с -o \$UPLINK", s.contains("-o \$UPLINK"))
+        assertFalse("fallback 'всё кроме CarPlay' запрещён (ломал CarPlay)", s.contains("! -o \$CP_FIRST"))
+        assertFalse("вариант exclude_carplay удалён", s.contains("exclude_carplay"))
+        assertFalse("причина no_uplink_no_carplay удалена", s.contains("no_uplink_no_carplay"))
+        assertTrue("uplink-CarPlay отбраковывается явно", s.contains("TTL_UPLINK_REJECT"))
+        assertTrue("строка TTL_TRY остаётся", s.contains("TTL_TRY variant="))
+        assertTrue("строка TTL_SCOPE остаётся", s.contains("TTL_SCOPE result="))
+        assertTrue("вердикт учитывает uplink_only", s.contains("SCOPE_UPLINK_ONLY=yes"))
+    }
+
+    // 6. Нет uplink — правило не ставится, тумблер получает честную причину.
+    @Test
+    fun noUplinkIsHonestFail() {
+        val s = TtlScript.build(true)
+        assertTrue("нужна попытка с variant=none", s.contains("TTL_TRY variant=none"))
+        assertTrue("причина — no_uplink", s.contains("reason=no_uplink"))
+        assertTrue("скоуп печатает failed при отсутствии uplink",
+            s.contains("TTL_SCOPE result=failed"))
+    }
+
+    // 7. Санация: сколько сняли + чужое правило в лог.
+    @Test
+    fun sanitizeReportsRemovedCount() {
+        for (s in listOf(TtlScript.build(true), TtlScript.build(false))) {
+            assertTrue("нужна строка TTL_SANITIZED removed=", s.contains("TTL_SANITIZED removed="))
+            assertTrue("санация считает v4_removed", s.contains("v4_removed="))
+            assertTrue("санация считает v6_removed", s.contains("v6_removed="))
+            assertTrue("судьба правила печатается (TTL_DEL)", s.contains("TTL_DEL v4 spec="))
+            assertTrue("чужое правило ttl-set логируется", s.contains("TTL_FOREIGN"))
+        }
+    }
+
+    // 8. iter33m §1.3 — OFF честен только при нуле правил; VERIFY у OFF отдельным маркером.
+    @Test
+    fun offVerdictNeedsZeroRules() {
+        val off = TtlScript.build(false)
+        assertTrue("TTL_OFF печатается только при выключении", off.contains("TTL_OFF v4="))
+        assertTrue("result=OK только при TTL_V4=0 и TTL_V6=0",
+            off.contains("TTL_OFF v4=\$TTL_V4 v6=\$TTL_V6 result="))
+        assertTrue("при выключении правило не добавляется", !off.contains("-A POSTROUTING -o "))
+        // OFF-маркер не должен выглядеть как «правило стоит»
+        assertTrue("VERIFY_V4=OFF_OK для выключения", off.contains("VERIFY_V4=OFF_OK"))
+        assertTrue("OFF_OK попадает в вердикт", off.contains("VERDICT=OFF_OK"))
+        val on = TtlScript.build(true)
+        assertTrue("для включения нужен VERIFY_V4=OK", on.contains("VERIFY_V4=OK"))
+        assertTrue("--ttl-set 65 остаётся значением правила", on.contains("--ttl-set 65"))
     }
 }

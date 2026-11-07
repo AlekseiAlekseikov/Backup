@@ -929,10 +929,9 @@ object StatusIcons {
     } catch (t: Throwable) { "н/д" }
 
     /**
-     * iter33l §2.2 — ОДНОРAЗОВОЕ стартовое выравнивание (вместо периодического PUSH).
-     *
-     * Читаем факт из `getprop` (`FLAG_VERIFY`/`FLAGS_SYNC` уже сделали это) и пишем флаги ТОЛЬКО
-     * если read-back расходится с состоянием UI. Дальше за процесс — ни одной записи из sync.
+     * iter33m §2.3 — ОДНОРАЗОВОЕ стартовое выравнивание, но в ДРУГУЮ сторону, чем в 1.0.57:
+     * не props→префы, а ПРЕФЫ→props (`alignPropsToPrefs`). Префы — источник истины UI;
+     * факт в `persist.sys.hvacdigital.*` подтягивается к ним один раз за процесс.
      */
     private val alignDone = java.util.concurrent.atomic.AtomicBoolean(false)
 
@@ -943,37 +942,8 @@ object StatusIcons {
             alignDone.set(false)   // попробуем на следующем тике, когда канал поднимется
             return
         }
-        val p = prefs(app)
-        val tempOn = p.getBoolean(PREF_HVAC_TEMP, false)
-        val battOn = p.getBoolean(PREF_HVAC_BATT, false)
-        val extOn = p.getBoolean(PREF_HVAC_EXT_TEMP, false)
-        val want = HvacFlagsApply.flagsSegment(tempOn, battOn, extOn)
-        val read = "echo \$(getprop ${HvacDigitalProps.PROP_TEMP}); " +
-            "echo \$(getprop ${HvacDigitalProps.PROP_BATT}); " +
-            "echo \$(getprop ${HvacDigitalProps.PROP_EXT})"
-        val out = runCatching { AdbClient.execute(read, 5000).second }.getOrDefault("")
-        if (out.isBlank()) {
-            AppLog.i(TAG, "FLAG_ALIGN none reason=no_readback")
-            return
-        }
-        val (t, b, e) = HvacFlagsApply.parseFlags(out)
-        val fact = HvacFlagsApply.flagsSegment(t, b, e)
-        if (fact == want) {
-            AppLog.i(TAG, "FLAG_ALIGN none (readback совпал) flags=$want")
-            return
-        }
-        val via = HvacFlagsApply.viaFor(tempOn, battOn, extOn)
-        val cmd = HvacDigitalProps.flagsCommand(tempOn, battOn, extOn)
-            .replace("&& echo FLAGS_OK", "&& setprop ${HvacDigitalProps.PROP_VIA} $via && echo FLAGS_OK")
-        val (rc, res) = runCatching { AdbClient.execute(cmd, 6000) }.getOrDefault(Pair(1, ""))
-        AppLog.i(TAG, "FLAG_ALIGN push rc=$rc want=$want fact=$fact via=$via " +
-            "out=${res.replace('\n', ' ').take(160)} action=push_once")
-        // Перерисовка панели — тем же механизмом, что и клик (x7.g): без неё флаги не подхватятся.
-        if (rc == 0) {
-            runCatching {
-                AdbClient.executeScript("bar_recarga", HvacFlagsApply.recargaScript(), 24000)
-            }.onSuccess { AppLog.i(TAG, "FLAG_ALIGN recarga out=${it.second.replace('\n', ' ').take(160)}") }
-        }
+        val r = runCatching { HvacFlagsApply.alignPropsToPrefs(app) }.getOrElse { "error:${it.javaClass.simpleName}" }
+        AppLog.i(TAG, "FLAG_ALIGN result=$r action=align_props_to_prefs")
     }
 
     @JvmStatic fun cancelAll(ctx: Context) {
@@ -1072,47 +1042,41 @@ object StatusIcons {
     }
 
     /**
-     * iter33l §1.2 — кнопка «Проба слотов»: пишем ОБА имени пропа наружней (`exttemp` и легаси
-     * `temp_ext`), делаем recarga панели и печатаем `EXT_PROBE prop=… wrote=1 found=… result=…`.
-     * Владелец по панели говорит, какое имя читает SystemUI.
+     * iter33m §3.1 — кнопка «Проба слотов (наружняя)»: `EXT_PROBE_V2` перебирает ТРИ имени
+     * (`exttemp`, `temp_ext`, `ext_temp`) по одному, с полной recarga и паузой 15 с, в конце
+     * возвращает флаги по префам (`props_follow_prefs`). Владелец по панели говорит, какое имя
+     * читает SystemUI. Ничего не удаляем.
      */
     @JvmStatic fun extProbe(ctx: Context): ToolsResult {
         val t0 = android.os.SystemClock.uptimeMillis()
         val outcome = try {
-            HvacFlagsApply.extProbe(ctx)
+            HvacFlagsApply.extProbeV2(ctx)
         } catch (t: Throwable) {
-            AppLog.w(TAG, "EXT_PROBE failed: ${t.javaClass.simpleName}: ${t.message}")
-            HvacFlagsApply.Outcome("EXT_PROBE result=failed", false, 1, false)
+            AppLog.w(TAG, "EXT_PROBE_V2 failed: ${t.javaClass.simpleName}: ${t.message}")
+            HvacFlagsApply.Outcome("EXT_PROBE_V2 result=failed", false, 1, false)
         }
         val step = ToolsStep(
-            step = "hvacdigital.extProbe",
-            command = "setprop ${HvacDigitalProps.PROP_EXT} 1; setprop temp_ext 1; + bar_recarga",
+            step = "hvacdigital.extProbeV2",
+            command = "setprop exttemp/temp_ext/ext_temp по одному =1 (остальные 0) + bar_recarga + пауза 15с",
             startedAtMs = t0, finishedAtMs = android.os.SystemClock.uptimeMillis(),
             exitCode = if (outcome.ok) 0 else 1,
             stdout = outcome.line,
             stderr = "",
-            expected = "EXT_PROBE prop=exttemp|temp_ext wrote=1 found=1 result=ok",
+            expected = "EXT_PROBE_V2 step=1/3…3/3 result=ok props_follow_prefs=ok",
             actual = outcome.line,
             status = if (outcome.ok) ToolsStep.Status.OK else ToolsStep.Status.PARTIAL
         )
-        return ToolsResult("hvacdigital.extProbe", "Проба слотов (наружняя)", listOf(step))
+        return ToolsResult("hvacdigital.extProbeV2", "Проба слотов (наружняя)", listOf(step))
     }
 
     /**
      * §1.3 — состояние тумблера для UI = ФАКТ из `getprop` (кэш последнего чтения),
      * а не только память приложения. Память — резерв, пока канал ещё не ответил ни разу.
      */
-    @JvmStatic fun getHvacDigital(ctx: Context, pref: String): Boolean {
-        HvacFlagsApply.cachedFlags?.let { (t, b, e) ->
-            return when (pref) {
-                PREF_HVAC_TEMP -> t
-                PREF_HVAC_BATT -> b
-                PREF_HVAC_EXT_TEMP -> e
-                else -> prefs(ctx).getBoolean(pref, false)
-            }
-        }
-        return prefs(ctx).getBoolean(pref, false)
-    }
+    @JvmStatic fun getHvacDigital(ctx: Context, pref: String): Boolean =
+        // iter33m §2.1: состояние тумблера = ПРЕФ пользователя (источник истины).
+        // Факт из props только читается (FLAGS_SYNC action=props_readonly) и выравнивается к префам.
+        prefs(ctx).getBoolean(pref, false)
 
     /**
      * iter33 B2: в watchdog'е — ТОЛЬКО чтение состояния.

@@ -32,6 +32,18 @@ internal object HvacFlagsApply {
     /** iter33l §1.2: легаси-имя наружней из рабочего лога iter19 (`temp_ext`), не чистим до решения. */
     internal const val PROP_EXT_LEGACY = "persist.sys.hvacdigital.temp_ext"
 
+    /** iter33m §0/§3: ТРЕТЬЕ имя наружней — из `getprop.txt` (`persist.sys.hvacdigital.ext_temp`). */
+    internal const val PROP_EXT_THIRD = "persist.sys.hvacdigital.ext_temp"
+
+    /**
+     * iter33m §3.1 — три известных имени слота наружней, в порядке опроса `EXT_PROBE_V2`:
+     * `exttemp` (наш писатель по референсу), `temp_ext` (iter19), `ext_temp` (getprop.txt).
+     */
+    internal val EXT_NAMES = listOf(HvacDigitalProps.PROP_EXT, PROP_EXT_LEGACY, PROP_EXT_THIRD)
+
+    /** iter33m §3.1: пауза, за которую владелец успевает увидеть панель после recarga. */
+    internal const val EXT_PROBE_V2_PAUSE_MS = 15_000L
+
     /** iter33l §1.1: до 3 повторных push после recarga (БЕЗ новых kill). */
     internal const val FLAG_VERIFY_PUSH_TRIES = 3
 
@@ -92,6 +104,32 @@ internal object HvacFlagsApply {
     fun extProbeLine(prop: String, wrote: String, found: String): String =
         "EXT_PROBE prop=$prop wrote=$wrote found=${found.ifEmpty { "empty" }} " +
             "result=${if (found == wrote) "ok" else "missing"}"
+
+    /**
+     * iter33m §3.1 — строка одного шага эксперимента с именами наружней:
+     * `EXT_PROBE_V2 step=1/3 prop=… wrote=1 found=1 result=ok|missing owner_look=…`.
+     */
+    fun extProbeV2StepLine(step: Int, total: Int, prop: String, wrote: String, found: String,
+                           ownerLook: String): String {
+        val res = if (found.trim() == wrote.trim() && wrote.isNotEmpty()) "ok" else "missing"
+        return "EXT_PROBE_V2 step=$step/$total prop=$prop wrote=$wrote " +
+            "found=${found.ifBlank { "empty" }} result=$res owner_look=$ownerLook"
+    }
+
+    /**
+     * iter33m §3.1 — скрипт одного шага: ОДНО имя `=1`, остальные `=0`, одной командой
+     * (`&& echo FLAGS_OK`). Ничего не удаляем и не `setprop … ""`.
+     */
+    fun extProbeV2WriteScript(prop: String, names: List<String> = EXT_NAMES): String {
+        val cmd = names.joinToString(" && ") { n ->
+            "setprop $n ${if (n == prop) "1" else "0"}"
+        }
+        return "$cmd && echo FLAGS_OK"
+    }
+
+    /** Чтение всех трёх имён наружней (порядок фиксирован: exttemp, temp_ext, ext_temp). */
+    fun extProbeV2ReadScript(names: List<String> = EXT_NAMES): String =
+        names.joinToString("; ") { "echo \$(getprop $it)" }
 
     /** Скрипт эксперимента: пишем ОБА имени (наш `exttemp` и легаси `temp_ext`). */
     fun extProbeScript(): String =
@@ -173,10 +211,15 @@ internal object HvacFlagsApply {
         }
         try {
             val app = ctx.applicationContext
+            // iter33m §2.1: префы — ИСТОЧНИК ИСТИНЫ. Пишем ровно ключ тумблера, сразу (без ожидания
+            // 60-секундного цикла), и тут же обновляем кэш, чтобы UI не «скакал» через минуту.
             Prefs2.putBoolean(app, pref, value)
+            AppLog.i(TAG, prefTraceWrite(pref, value))
             val tempOn = Prefs2.getBoolean(app, StatusIcons.PREF_HVAC_TEMP, false)
             val battOn = Prefs2.getBoolean(app, StatusIcons.PREF_HVAC_BATT, false)
             val extOn = Prefs2.getBoolean(app, StatusIcons.PREF_HVAC_EXT_TEMP, false)
+            cachedFlags = Triple(tempOn, battOn, extOn)
+            AppLog.i(TAG, prefTraceRead(tempOn, battOn, extOn))
             val via = viaFor(tempOn, battOn, extOn)
             val wrote = flagsSegment(tempOn, battOn, extOn)
             val flagsCmd = HvacDigitalProps.flagsCommand(tempOn, battOn, extOn)
@@ -264,37 +307,78 @@ internal object HvacFlagsApply {
     }
 
     /**
-     * iter33l §1.2 — эксперимент с именем пропа наружней: пишем `exttemp=1` И `temp_ext=1`,
-     * делаем recarga и печатаем `EXT_PROBE prop=… wrote=1 found=… result=ok|missing` на каждое имя.
-     * Владелец смотрит на панель: появилась наружняя — значит SystemUI читает это имя.
+     * iter33m §3.1 — `EXT_PROBE_V2`: поочерёдный перебор ТРЁХ имён слота наружней.
+     *
+     * Шаг i/3: ОДНО имя `=1`, остальные `=0` одной командой → `bar_recarga` (полный цикл, как в
+     * референсе) → read всех трёх → строка `EXT_PROBE_V2 step=i/3 prop=… wrote=1 found=… result=…
+     * owner_look=…` → пауза 15 с (владелец смотрит панель). Ничего не удаляем: имена остаются
+     * persist-свойствами (нормализует их `PersistCleaner`), в конце флаги возвращаются ПО ПРЕФАМ.
      */
-    fun extProbe(ctx: Context): Outcome {
+    fun extProbeV2(ctx: Context): Outcome {
         if (!busy.compareAndSet(false, true)) {
-            return Outcome("EXT_PROBE skipped reason=busy", false, 1, false, busySkip = true)
+            return Outcome("EXT_PROBE_V2 skipped reason=busy", false, 1, false, busySkip = true)
         }
         try {
-            val (rc, out) = try {
-                AdbClient.execute(extProbeScript(), 6000)
-            } catch (t: Throwable) { Pair(1, "") }
-            AppLog.i(TAG, "EXT_PROBE write rc=$rc out=${out.replace('\n', ' ').take(160)}")
-            if (rc != 0) {
-                AppLog.i(TAG, "EXT_PROBE prop=temp_ext,exttemp wrote=1 found=none result=no_channel")
-                return Outcome("EXT_PROBE result=no_channel", false, rc, false)
+            val app = ctx.applicationContext
+            val tempOn = Prefs2.getBoolean(app, StatusIcons.PREF_HVAC_TEMP, false)
+            val battOn = Prefs2.getBoolean(app, StatusIcons.PREF_HVAC_BATT, false)
+            val extOn = Prefs2.getBoolean(app, StatusIcons.PREF_HVAC_EXT_TEMP, false)
+            val prefsFlags = flagsSegment(tempOn, battOn, extOn)
+            val total = EXT_NAMES.size
+            AppLog.i(TAG, "EXT_PROBE_V2 start names=${EXT_NAMES.joinToString(",")} prefs=$prefsFlags " +
+                "pause_ms=$EXT_PROBE_V2_PAUSE_MS")
+            AppLog.i(TAG, prefTraceRead(tempOn, battOn, extOn))
+            var okSteps = 0
+            var last = ""
+            EXT_NAMES.forEachIndexed { idx, prop ->
+                val step = idx + 1
+                val (rc, out) = try {
+                    AdbClient.execute(extProbeV2WriteScript(prop), 6000)
+                } catch (t: Throwable) {
+                    AppLog.w(TAG, "EXT_PROBE_V2 write failed: ${t.javaClass.simpleName}: ${t.message}")
+                    Pair(1, "")
+                }
+                AppLog.i(TAG, "EXT_PROBE_V2 write step=$step/$total prop=$prop rc=$rc " +
+                    "flags=${out.replace('\n', ' ').take(140)}")
+                if (rc == 0 && out.contains("FLAGS_OK")) {
+                    // полный цикл recarga, как у клика тумблера (x7.g) — иначе панель не перечитает props
+                    val rout = runCatching {
+                        AdbClient.executeScript("bar_recarga", recargaScript(),
+                            (RECARGA_TIMEOUT_MS + 4_000L).toInt()).second
+                    }.getOrDefault("")
+                    val (rres, rtry) = recargaResult(rout)
+                    AppLog.i(TAG, "EXT_PROBE_V2 recarga step=$step/$total result=$rres tries=$rtry")
+                }
+                val read = runCatching { AdbClient.execute(extProbeV2ReadScript(), 5000).second }
+                    .getOrDefault("")
+                val vals = read.split("\n").map { it.trim() }
+                val found = vals.getOrElse(idx) { "" }
+                val line = extProbeV2StepLine(step, total, prop, "1", found,
+                    "wait${EXT_PROBE_V2_PAUSE_MS / 1000}s")
+                AppLog.i(TAG, line)
+                last = line
+                if (line.contains("result=ok")) okSteps++
+                if (step < total) {
+                    // пауза: владелец глазами смотрит, появилась ли наружняя на панели
+                    runCatching { Thread.sleep(EXT_PROBE_V2_PAUSE_MS) }
+                }
             }
-            val rout = runCatching {
-                AdbClient.executeScript("bar_recarga", recargaScript(), (RECARGA_TIMEOUT_MS + 4_000L).toInt()).second
-            }.getOrDefault("")
-            AppLog.i(TAG, "RECARGA out=${rout.replace('\n', ' ').take(200)}")
-            val read = "echo \$(getprop ${HvacDigitalProps.PROP_EXT}); echo \$(getprop $PROP_EXT_LEGACY)"
-            val vals = runCatching { AdbClient.execute(read, 5000).second }.getOrDefault("")
-                .lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.toList()
-            val l1 = extProbeLine(HvacDigitalProps.PROP_EXT.substringAfterLast('.'), "1", vals.getOrElse(0) { "" })
-            val l2 = extProbeLine("temp_ext", "1", vals.getOrElse(1) { "" })
-            AppLog.i(TAG, l1)
-            AppLog.i(TAG, l2)
-            AppLog.i(TAG, "EXT_PROBE done — владельцу: посмотрите, появилась ли наружняя на панели " +
-                "(если да — какое имя читает SystemUI, см. две строки выше)")
-            return Outcome(l1, true, 0, true)
+            // восстановление: пишем флаги ПО ПРЕФАМ (префы — истина) и сверяем read-back
+            val via = viaFor(tempOn, battOn, extOn)
+            val cmd = HvacDigitalProps.flagsCommand(tempOn, battOn, extOn)
+                .replace("&& echo FLAGS_OK", "&& setprop ${HvacDigitalProps.PROP_VIA} $via && echo FLAGS_OK")
+            val (rcr, outr) = runCatching { AdbClient.execute(cmd, 6000) }.getOrDefault(Pair(1, ""))
+            AppLog.i(TAG, "EXT_PROBE_V2 restore rc=$rcr want=$prefsFlags via=$via " +
+                "out=${outr.replace('\n', ' ').take(140)}")
+            val back = runCatching { AdbClient.execute(extProbeV2ReadScript(), 5000).second }.getOrDefault("")
+            val (bt, bb, be) = parseFlags(back)
+            val fact = flagsSegment(bt, bb, be)
+            val follow = if (fact == prefsFlags) "ok" else "fail"
+            AppLog.i(TAG, "EXT_PROBE_V2 props_follow_prefs=$follow prefs=$prefsFlags fact=$fact " +
+                "steps_ok=$okSteps/$total")
+            AppLog.i(TAG, "EXT_PROBE_V2 done — владельцу: на каком шаге (1=exttemp, 2=temp_ext, " +
+                "3=ext_temp) на панели появилась наружняя?")
+            return Outcome(last.ifEmpty { "EXT_PROBE_V2 done" }, okSteps > 0 && follow == "ok", 0, follow == "ok")
         } finally {
             busy.set(false)
         }
@@ -311,8 +395,12 @@ internal object HvacFlagsApply {
     }
 
     /**
-     * Синхронизация UI↔факт (мандат §1.3): читаем `getprop` и, если префы разошлись с фактом,
-     * пишем строку в лог и выравниваем префы по факту (источник истины — props).
+     * iter33m §2.2 — чтение факта БЕЗ записи: `action=props_readonly`.
+     *
+     * Что было (1.0.57): `FLAGS_SYNC … action=ui_from_props` переписывал префы по значениям
+     * `persist.sys.hvacdigital.*`, т.е. props были источником истины для UI. В логе 07.11 это дало
+     * `prefs=0,0,0 fact=0,1,1` → тумблеры «скакали». Теперь префы — истина, а расхождение только
+     * ПЕЧАТАЕТСЯ здесь и выравнивается в другую сторону — props по префам (`alignPropsToPrefs`).
      */
     @Volatile private var lastSyncAtMs = 0L
     internal const val SYNC_EVERY_MS = 60_000L
@@ -321,26 +409,102 @@ internal object HvacFlagsApply {
         val now = android.os.SystemClock.elapsedRealtime()
         if (!force && now - lastSyncAtMs < SYNC_EVERY_MS) return cachedFlags
         lastSyncAtMs = now
-        val cmd = "echo \$(getprop ${HvacDigitalProps.PROP_TEMP}); " +
-            "echo \$(getprop ${HvacDigitalProps.PROP_BATT}); " +
-            "echo \$(getprop ${HvacDigitalProps.PROP_EXT})"
-        val out = try { AdbClient.execute(cmd, 5000).second } catch (t: Throwable) { return cachedFlags }
-        if (out.isBlank()) return cachedFlags
-        val (t, b, e) = parseFlags(out)
-        cachedFlags = Triple(t, b, e)
         val app = ctx.applicationContext
         val pt = Prefs2.getBoolean(app, StatusIcons.PREF_HVAC_TEMP, false)
         val pb = Prefs2.getBoolean(app, StatusIcons.PREF_HVAC_BATT, false)
         val pe = Prefs2.getBoolean(app, StatusIcons.PREF_HVAC_EXT_TEMP, false)
+        val out = try {
+            AdbClient.execute(extProbeV2ReadScript(), 5000).second
+        } catch (t: Throwable) { "" }
+        if (out.isBlank()) {
+            // канал молчит — показываем префы (они и есть истина), факт неизвестен
+            cachedFlags = Triple(pt, pb, pe)
+            AppLog.i(TAG, "FLAGS_SYNC props=none prefs=${flagsSegment(pt, pb, pe)} action=props_readonly reason=no_channel")
+            return cachedFlags
+        }
+        val (t, b, e) = parseFlags(out)
+        cachedFlags = Triple(pt, pb, pe)   // кэш UI = ПРЕФЫ, не props
+        AppLog.i(TAG, prefTraceRead(pt, pb, pe))
         if (pt != t || pb != b || pe != e) {
             AppLog.i(TAG, "FLAGS_SYNC prefs=${flagsSegment(pt, pb, pe)} fact=${flagsSegment(t, b, e)} " +
-                "action=ui_from_props (источник истины — persist.sys.hvacdigital.*)")
-            Prefs2.putBoolean(app, StatusIcons.PREF_HVAC_TEMP, t)
-            Prefs2.putBoolean(app, StatusIcons.PREF_HVAC_BATT, b)
-            Prefs2.putBoolean(app, StatusIcons.PREF_HVAC_EXT_TEMP, e)
+                "action=props_readonly (префы — истина; выравнивание — alignPropsToPrefs)")
         }
         return cachedFlags
     }
+
+    /**
+     * iter33m §2.3 — выравнивание PROPS ПО ПРЕФАМ (замена `alignHvacFlagsOnce`).
+     *
+     * Вызывается при старте (один раз за процесс) и при расхождении факта с префами.
+     * Пишет флаги из префов, делает recarga панели и печатает `FLAG_ALIGN action=align_props_to_prefs`.
+     */
+    fun alignPropsToPrefs(ctx: Context, recarga: Boolean = true): String {
+        val app = ctx.applicationContext
+        val tempOn = Prefs2.getBoolean(app, StatusIcons.PREF_HVAC_TEMP, false)
+        val battOn = Prefs2.getBoolean(app, StatusIcons.PREF_HVAC_BATT, false)
+        val extOn = Prefs2.getBoolean(app, StatusIcons.PREF_HVAC_EXT_TEMP, false)
+        val want = flagsSegment(tempOn, battOn, extOn)
+        AppLog.i(TAG, prefTraceRead(tempOn, battOn, extOn))
+        val out = runCatching { AdbClient.execute(extProbeV2ReadScript(), 5000).second }.getOrDefault("")
+        if (out.isBlank()) {
+            AppLog.i(TAG, "FLAG_ALIGN none reason=no_readback want=$want action=align_props_to_prefs")
+            return "none:no_readback"
+        }
+        val (t, b, e) = parseFlags(out)
+        val fact = flagsSegment(t, b, e)
+        if (fact == want) {
+            AppLog.i(TAG, "FLAG_ALIGN none (readback совпал) flags=$want action=align_props_to_prefs")
+            return "none:match"
+        }
+        val via = viaFor(tempOn, battOn, extOn)
+        val cmd = HvacDigitalProps.flagsCommand(tempOn, battOn, extOn)
+            .replace("&& echo FLAGS_OK", "&& setprop ${HvacDigitalProps.PROP_VIA} $via && echo FLAGS_OK")
+        val (rc, res) = runCatching { AdbClient.execute(cmd, 6000) }.getOrDefault(Pair(1, ""))
+        AppLog.i(TAG, "FLAG_ALIGN push rc=$rc want=$want fact=$fact via=$via " +
+            "out=${res.replace('\n', ' ').take(160)} action=align_props_to_prefs")
+        if (rc == 0 && recarga) {
+            runCatching {
+                AdbClient.executeScript("bar_recarga", recargaScript(), 24000)
+            }.onSuccess { AppLog.i(TAG, "FLAG_ALIGN recarga out=${it.second.replace('\n', ' ').take(160)}") }
+        }
+        return "push:rc=$rc"
+    }
+
+    /**
+     * iter33m §3.3 — стартовая диагностика READ-ONLY (ничего не пишем, не удаляем):
+     *   `EXT_DIAG prop=persist.sys.hvacdigital.* value=…`  — что реально лежит в props;
+     *   `PLUGIN_DIAG settings=single|fail sysui_plugin_shortcut_settings=… sysui_tuner_version=…`.
+     */
+    fun startupDiagnostics() {
+        val names = EXT_NAMES + HvacDigitalProps.PROP_TEMP + HvacDigitalProps.PROP_BATT + HvacDigitalProps.PROP_VIA
+        val cmd = names.joinToString("; ") { "echo \"PROP $it=\$(getprop $it)\"" } + "; " +
+            "echo \"SYSUI_PLUGIN=\$(settings get secure sysui_plugin_shortcut_settings 2>&1)\"; " +
+            "echo \"SYSUI_TUNER=\$(settings get secure sysui_tuner_version 2>&1)""
+        val out = runCatching { AdbClient.execute(cmd, 8000).second }.getOrDefault("")
+        if (out.isBlank()) {
+            AppLog.i(TAG, "EXT_DIAG result=no_channel")
+            return
+        }
+        for (line in out.lineSequence().map { it.trim() }.filter { it.isNotEmpty() }) {
+            when {
+                line.startsWith("PROP ") -> AppLog.i(TAG, "EXT_DIAG ${line.removePrefix("PROP ")}")
+                line.startsWith("SYSUI_PLUGIN=") -> AppLog.i(TAG, "PLUGIN_DIAG sysui_plugin_shortcut_settings=" +
+                    line.substringAfter('=').ifBlank { "empty" })
+                line.startsWith("SYSUI_TUNER=") -> AppLog.i(TAG, "PLUGIN_DIAG sysui_tuner_version=" +
+                    line.substringAfter('=').ifBlank { "empty" })
+            }
+        }
+    }
+
+    /** iter33m §2.4 — трасса префов: `PREF TRACE write key=hvacdigital_batt value=1`. */
+    fun prefTraceWrite(key: String, value: Boolean): String =
+        "PREF TRACE write key=$key value=${if (value) "1" else "0"}"
+
+    /** iter33m §2.4 — трасса чтения всех трёх префов: `PREF TRACE read key=hvacdigital_* …`. */
+    fun prefTraceRead(temp: Boolean, batt: Boolean, ext: Boolean): String =
+        "PREF TRACE read key=${StatusIcons.PREF_HVAC_TEMP},${StatusIcons.PREF_HVAC_BATT}," +
+            "${StatusIcons.PREF_HVAC_EXT_TEMP} value=${if (temp) "1" else "0"}," +
+            "${if (batt) "1" else "0"},${if (ext) "1" else "0"}"
 
     @Volatile internal var cachedFlags: Triple<Boolean, Boolean, Boolean>? = null
 }

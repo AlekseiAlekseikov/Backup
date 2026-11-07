@@ -19,8 +19,15 @@ package com.example.voiceapp3.tools
 internal object PersistCleaner {
     private const val TAG = "CENTRAL_PersistCleaner"
 
-    /** Фантомные ключи прошлых версий: референс их не знает. */
-    internal val LEGACY_PROPS = listOf("persist.sys.hvacdigital.temp_ext")
+    /**
+     * iter33m §3.2 — ВСЕ три имени слота наружней, которые встречались в наших версиях и в
+     * `getprop.txt`: `exttemp` (референс), `temp_ext` (iter19), `ext_temp` (getprop.txt).
+     * Нормализуем мусор в `0` — но НЕ удаляем: какое имя читает SystemUI, решает `EXT_PROBE_V2`.
+     */
+    internal val LEGACY_PROPS = listOf(
+        "persist.sys.hvacdigital.temp_ext",
+        "persist.sys.hvacdigital.ext_temp",
+    )
 
     /** Настоящие ключи референса — только флаги `0|1`. */
     internal val FLAG_PROPS = listOf(

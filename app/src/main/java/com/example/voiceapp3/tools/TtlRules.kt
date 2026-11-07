@@ -7,9 +7,10 @@ package com.example.voiceapp3.tools
  * `ip6tables … -j HL --hl-set 65`), но у референса правило глобальное; у нас глобальное правило
  * рубит CarPlay (опыт владельца 06.11), поэтому применяем ТОЛЬКО со скоупом:
  *
- *  • вариант (а) `uplink` — правило на исходящий интерфейс интернета/раздачи (`-o <uplink>`);
- *  • вариант (б) `exclude_carplay` — если uplink не определён, но найден интерфейс CarPlay
- *    (`rndis*`/`ncm*`/`usb*`/`p2p*`): `! -o <carplay>`.
+ *  • вариант `uplink` — правило на исходящий интерфейс интернета/раздачи (`-o <uplink>`);
+ *  • варианта «всё кроме CarPlay» (`! -o <carplay>`) БОЛЬШЕ НЕТ (iter33m §1.2): групповой
+ *    интерфейс `p2p-p2p0-0` под `! -o p2p0` не попадал, и CarPlay отваливался.
+ *    Нет uplink — правила нет вовсе (`TTL_TRY variant=none reason=no_uplink`), тумблер `✗`.
  *
  * Выключение — удаление ВСЕХ правил с `ttl-set`/`hl-set` из POSTROUTING (generic-проход по
  * `iptables -S`), плюс эталонный цикл `1..5` для глобальной формы из старых версий.
@@ -60,15 +61,14 @@ internal object TtlRules {
     fun ruleV6(scope: String): String = "$scope -j HL --hl-set 65"
 
     /**
-     * Порядок вариантов: сначала «на uplink» (не трогает CarPlay вовсе), затем «всё кроме CarPlay»,
-     * затем — отказ (глобальное правило запрещено).
+     * Варианты скоупа: ТОЛЬКО «на uplink» (`-o <uplink>`). Нет uplink — пустой список,
+     * т.е. правило не ставится вообще (глобальное запрещено — ломает CarPlay).
+     * `carplay` остаётся параметром ради совместимости вызовов/диагностики и не влияет на скоуп.
      */
+    @Suppress("UNUSED_PARAMETER")
     fun variants(uplink: String?, carplay: List<String>): List<Pair<String, String>> {
-        val out = ArrayList<Pair<String, String>>()
-        if (!uplink.isNullOrEmpty()) out.add("uplink" to "-A POSTROUTING -o $uplink")
-        val cp = carplay.firstOrNull()
-        if (cp != null && cp != uplink) out.add("exclude_carplay" to "-A POSTROUTING ! -o $cp")
-        return out
+        if (uplink.isNullOrEmpty()) return emptyList()
+        return listOf("uplink" to "-A POSTROUTING -o $uplink")
     }
 
     /**

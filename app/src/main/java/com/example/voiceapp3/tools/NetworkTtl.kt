@@ -75,6 +75,16 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
     private fun ttlResultLine(out: String): String =
         out.lineSequence().firstOrNull { it.startsWith("TTL_RESULT ") }?.trim().orEmpty()
 
+    /**
+     * iter33m §1 — ЧЕСТНЫЙ разбор итога скрипта.
+     *
+     * Правила (мандат §1.3):
+     *   • ON успешен ТОЛЬКО при `TTL_V4>=1` И `VERIFY_V4=OK` И скоупе `uplink_only=yes` И `variant=uplink`;
+     *     нет uplink (`TTL_TRY variant=none reason=no_uplink`) — провал, никакого «применено частично»;
+     *   • OFF успешен ТОЛЬКО при `TTL_V4=0 && TTL_V6=0` И `TTL_OFF … result=OK`;
+     *     осталось правило — `FAILED` с честной причиной (в логе 07.11 было `PARTIAL` при v4=1 v6=1);
+     *   • PARTIAL у TTL больше не возвращается: либо правило подтверждено, либо нет.
+     */
     private fun parseVerifyResult(expected: Boolean, out: String): Pair<ToolsStep.Status, String> {
         val kv = parseKv(out)
         val v4 = kv["TTL_V4"]?.trim()
@@ -83,7 +93,6 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
         val v6Verify = kv["VERIFY_V6"]
         val ttlCheckLine = out.lineSequence().firstOrNull { it.startsWith("TTL_CHECK:") } ?: ""
         val ttlVerdict = when {
-            // iter33k §3: скрипт со СКОУПОМ печатает вердикт словами (провод не измеряется).
             "SCOPED_OK" in ttlCheckLine -> "SCOPED_OK"
             "OFF_OK" in ttlCheckLine -> "OFF_OK"
             "CHECK_OWNER" in ttlCheckLine -> "CHECK_OWNER"
@@ -93,57 +102,46 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
             "→ UNVERIFIED" in ttlCheckLine -> "UNVERIFIED"
             else -> ""
         }
-        val ttlReal = Regex("real=([^ ]+)").find(ttlCheckLine)?.groupValues?.get(1) ?: "UNKNOWN"
-        // iter19 §4.3: при real=UNKNOWN показываем rule_ttl (например "не измерен, правило 65").
-        val ttlRuleEarly = Regex("rule_ttl=([^ ]+)").find(ttlCheckLine)?.groupValues?.get(1) ?: ""
+        val tryLine = out.lineSequence().firstOrNull { it.startsWith("TTL_TRY") } ?: ""
+        val scopeLine = out.lineSequence().firstOrNull { it.startsWith("TTL_SCOPE") } ?: ""
+        val variant = Regex("variant=([^ ]+)").find(tryLine)?.groupValues?.get(1) ?: ""
+        val noUplink = variant == "none" && "reason=no_uplink" in tryLine
+        val uplinkOnly = "uplink_only=yes" in scopeLine
         val hasLock = out.lowercase().contains("xtables lock")
         val hasPerm = out.lowercase().contains("permission denied") || out.lowercase().contains("avc: denied")
         val hasNoRoot = out.contains("ERR_ROOT_CHANNEL_UNAVAILABLE")
         val noTarget = out.lowercase().contains("no chain/target/match")
-
-        // iter17: VERIFY допускает "OK-grepc" (когда iptables -C не знает TTL target,
-        // но grep -c по -S видит правило). Это нормальный верифицированный вариант.
-        val v4Ok: Boolean
-        val v6Ok: Boolean
-        if (expected) {
-            val v4Count = v4?.toIntOrNull() ?: 0
-            val v6Count = v6?.toIntOrNull() ?: 0
-            v4Ok = v4Count >= 1 && (v4Verify == "OK" || v4Verify == "OK-grepc")
-            v6Ok = v6Count >= 1 && (v6Verify == "OK" || v6Verify == "OK-grepc")
-        } else {
-            v4Ok = (v4 == null || v4 == "0") && v4Verify != "OK" && v4Verify != "OK-grepc"
-            v6Ok = (v6 == null || v6 == "0") && v6Verify != "OK" && v6Verify != "OK-grepc"
-        }
+        val v4Count = v4?.toIntOrNull() ?: 0
+        val v6Count = v6?.toIntOrNull() ?: 0
+        val offLine = out.lineSequence().firstOrNull { it.startsWith("TTL_OFF ") } ?: ""
+        val offOk = "result=OK" in offLine
 
         val reason = when {
             // iter23 P2.6: честный текст — канал это 5555, а не «второй»/резервный порт.
             hasNoRoot -> "канал недоступен — 5555 не отвечает (uid=1000). Проверьте «Для разработчика» → «Проверить root»."
             hasPerm   -> "Permission denied (нужен root-шелл uid=0)"
-            hasLock   -> "xtables lock (iptables занят, попробуйте снова)"
+            hasLock   -> "xtables lock (iptables занят) — правило не применилось, повторите"
             noTarget  -> "iptables target 'TTL' не поддерживается ядром (модуль отсутствует)"
-            expected && ttlVerdict == "MISMATCH" -> "wire TTL mismatch (real=$ttlReal, expected=65)"
-            expected && ttlVerdict == "CHECK_OWNER" ->
-                "правило со скоупом стоит, но uplink/CarPlay не определились — проверьте подключение (глобальное правило не ставим: ломает CarPlay)"
-            // iter33h G1.2: если правила нет — это FAILED, а не «применено частично».
-            expected && ttlRuleEarly.isBlank() && !v4Ok -> "rule_not_installed: правила TTL в mangle/POSTROUTING нет (TTL_V4=$v4)"
-            // iter33k: провод (tcpdump) в этой итерации НЕ снимается — подтверждение по счётчикам правил.
-            expected && ttlVerdict == "UNVERIFIED" -> "правило не подтверждено счётчиками (real=UNKNOWN${if (ttlRuleEarly.isNotBlank()) ", правило $ttlRuleEarly" else ""}, method=counters)"
-            !v4Ok     -> "TTL_V4 mismatch (expected=${if (expected) 1 else 0}, got=$v4 verify=$v4Verify)"
-            !v6Ok     -> "TTL_V6 mismatch (expected=${if (expected) 1 else 0}, got=$v6 verify=$v6Verify)"
-            else      -> null
+            !expected && !(v4 == "0" && v6 == "0" && offOk) ->
+                "TTL_OFF не выполнился: осталось правило v4=$v4 v6=$v6 (см. TTL_DEL/TTL_SANITIZED/TTL_FOREIGN)"
+            !expected -> null
+            noUplink -> "нет uplink (правило без uplink не ставим — ломает CarPlay), TTL_TRY variant=none reason=no_uplink"
+            v4Count < 1 || v4Verify != "OK" ->
+                "rule_not_installed: правила TTL в mangle/POSTROUTING нет (TTL_V4=$v4 VERIFY_V4=$v4Verify)"
+            !uplinkOnly ->
+                "правило без скоупа -o <uplink> — запрещено (CarPlay): $scopeLine"
+            else -> null
         }
-        val stepStatus = when {
+        val status = when {
             reason == null -> ToolsStep.Status.OK
             hasNoRoot -> ToolsStep.Status.BLOCKED
-            hasPerm || noTarget -> ToolsStep.Status.FAILED
-            expected && ttlVerdict == "MISMATCH" -> ToolsStep.Status.FAILED
-            // iter33h G1.2: правило отсутствует ⇒ FAILED (PARTIAL — только когда правило есть,
-            // а проводное значение не измерено).
-            expected && ttlRuleEarly.isBlank() && !v4Ok -> ToolsStep.Status.FAILED
-            expected && ttlVerdict == "CHECK_OWNER" -> ToolsStep.Status.PARTIAL
-            else -> ToolsStep.Status.PARTIAL
+            else -> ToolsStep.Status.FAILED
         }
-        return stepStatus to (reason ?: "TTL_V4=$v4 TTL_V6=$v6 VERIFY=$v4Verify/$v6Verify wire=$ttlVerdict(real=$ttlReal)")
+        val detail = if (reason == null) {
+            if (expected) "TTL_V4=$v4 TTL_V6=$v6 VERIFY=$v4Verify/$v6Verify scoped=uplink_only verdict=$ttlVerdict"
+            else "TTL_V4=0 TTL_V6=0 VERIFY=$v4Verify/$v6Verify verdict=$ttlVerdict TTL_OFF result=OK"
+        } else reason
+        return status to detail
     }
 
     @Volatile private var ttlInFlight = false
@@ -184,6 +182,12 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
             val script = buildScript(enabled)
             val (exitCode, output) = AdbClient.executeScript("ttl_script", script, 40000)
 
+        // iter33m §1.2: санация и судьба каждого правила — отдельными строками лога.
+        output.lineSequence().firstOrNull { it.startsWith("TTL_SANITIZED") }?.let { AppLog.i(TAG, it.trim()) }
+        output.lineSequence().filter { it.startsWith("TTL_DEL") || it.startsWith("TTL_FOREIGN") }
+            .forEach { AppLog.i(TAG, it.trim()) }
+        output.lineSequence().firstOrNull { it.startsWith("TTL_TRY") }?.let { AppLog.i(TAG, it.trim()) }
+        output.lineSequence().firstOrNull { it.startsWith("TTL_ADD") }?.let { AppLog.i(TAG, it.trim()) }
         val (status, reason) = parseVerifyResult(enabled, output)
 
         // P8: toggle back OFF if failed and we were trying to turn ON (PARTIAL/BLOCKED оставляем как есть — пользователь должен видеть не-идеал)
@@ -273,19 +277,26 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
         }
         if (!active) {
             if (cnt4 == 0 && cnt6 == 0) {
+                // iter33m §1.2: стартовая санация — нечего снимать, фиксируем факт строкой.
+                AppLog.i(TAG, "TTL_SANITIZED removed=0 v4_removed=0 v6_removed=0 reason=start_nothing_to_remove")
                 AppLog.i(TAG, "TTL: SKIP (rule absent, toggle off) v4=$cnt4 v6=$cnt6")
                 return
             }
-            AppLog.i(TAG, "TTL bootRestore: active=false, но правило есть (v4=$cnt4 v6=$cnt6) — снимаю")
+            AppLog.i(TAG, "TTL bootRestore: active=false, но правило есть (v4=$cnt4 v6=$cnt6) — снимаю (санация)")
         } else if (cnt4 > 0 && cnt6 > 0) {
             AppLog.i(TAG, "TTL: SKIP (rule present) v4=$cnt4 v6=$cnt6")
             // iter33k §3.4: правило уже стоит (напр. после перезапуска приложения) — фиксируем факт.
             AppLog.i(TAG, TtlRules.bootLine(cnt4, cnt6) + " reason=already_present")
             return
         }
-        val script = buildScript(true)
+        // iter33m §1.2: boot-ветка ставит правило ТОЛЬКО если тумблер включён; иначе это санация.
+        val script = buildScript(active)
         val (rc, out) = AdbClient.executeScript("ttl_script", script, 40000)
-        val (status, reason) = parseVerifyResult(true, out)
+        out.lineSequence().firstOrNull { it.startsWith("TTL_SANITIZED") }?.let { AppLog.i(TAG, it.trim()) }
+        out.lineSequence().filter { it.startsWith("TTL_DEL") || it.startsWith("TTL_FOREIGN") }
+            .forEach { AppLog.i(TAG, it.trim()) }
+        out.lineSequence().firstOrNull { it.startsWith("TTL_TRY") }?.let { AppLog.i(TAG, it.trim()) }
+        val (status, reason) = parseVerifyResult(active, out)
         // iter33k §3.4: одна строка восстановления при загрузке (правила — со скоупом).
         val after = ttlRuleCounts()
         AppLog.i(TAG, TtlRules.bootLine(after.first, after.second))

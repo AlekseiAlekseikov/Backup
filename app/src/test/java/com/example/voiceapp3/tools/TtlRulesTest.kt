@@ -36,19 +36,16 @@ class TtlRulesTest {
         assertTrue(TtlRules.allIfaces(link).containsAll(listOf("wlan0", "rndis0", "dummy0")))
     }
 
-    // 3. Варианты: uplink первым, затем исключение CarPlay; без uplink — только исключение.
+    // 3. iter33m §1.2: единственный вариант — uplink; «всё кроме CarPlay» удалён.
     @Test
     fun variantsOrderedAndScoped() {
         val v = TtlRules.variants("wlan0", listOf("rndis0"))
-        assertEquals(2, v.size)
+        assertEquals(1, v.size)
         assertEquals("uplink", v[0].first)
         assertEquals("-A POSTROUTING -o wlan0", v[0].second)
-        assertEquals("exclude_carplay", v[1].first)
-        assertEquals("-A POSTROUTING ! -o rndis0", v[1].second)
 
-        val only = TtlRules.variants(null, listOf("rndis0"))
-        assertEquals(1, only.size)
-        assertEquals("exclude_carplay", only[0].first)
+        // без uplink правила нет вовсе: `! -o rndis0` не покрывал групповой p2p-p2p0-0
+        assertTrue("fallback exclude_carplay удалён", TtlRules.variants(null, listOf("rndis0")).isEmpty())
     }
 
     // 4. Нет ни uplink, ни CarPlay — вариантов нет (глобальное правило запрещено).
