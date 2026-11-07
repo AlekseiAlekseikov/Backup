@@ -91,6 +91,7 @@
 | `42388708679` | `1fe50d1` | ❌ failure | компиляция `HvacFlagsApply.kt:493-494` — наложение правки съело ветку `when` для `SYSUI_TUNER` |
 | `42389628649` | `bfa4409` | ❌ failure | тесты: `ToggleNoLieTest.prefsAreSourceOfTruth` (маркер `ui_from_props` остался в KDoc), `TtlScriptTest.offVerdictNeedsZeroRules` (проверка ловила grep-шаблон `^-A POSTROUTING -o`) — 119 тестов, 2 failed |
 | **`42390693171`** | **`d62b5bd`** | ✅ **success** | **119 PASSED / 0 FAILED**, job `128457450413`, артефакт `13581512748` (177 129 381 Б) |
+| **`42391607364`** | **`a1d4d5b`** (handoff: маркер `SOURCE_SHA=d62b5bd` + отчёты) | ✅ **success** | **119 PASSED / 0 FAILED**, job `128460179802`, артефакт `13581349184` (177 129 336 Б), `BuildMarkerTest > commitSourceIsHonest PASSED`, `BUILD SUCCESSFUL in 4m 15s` |
 
 ## §6 что проверить владельцу (по логу + 1–2 скрина)
 

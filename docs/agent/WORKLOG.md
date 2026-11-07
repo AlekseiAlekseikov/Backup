@@ -889,7 +889,10 @@
   (слово `action=ui_from_props` осталось в KDoc) и `TtlScriptTest.offVerdictNeedsZeroRules` (проверка ловила
   grep-шаблон `^-A POSTROUTING -o`, а не добавление правила).
 - **`42390693171` (`d62b5bd`) — success, 119 PASSED / 0 FAILED**, job `128457450413`, артефакт `13581512748`
-  (177 129 381 Б), `BUILD SUCCESSFUL in 3m 23s`, `BuildMarkerTest > commitSourceIsHonest PASSED`.
+  (177 129 381 Б), `BUILD SUCCESSFUL in 3m 23s`, `BuildMarkerTest > commitSourceIsHonest PASSED`;
+  handoff-прогон **`42391607364`** (`a1d4d5b`, маркер `SOURCE_SHA=d62b5bd` + отчёт/WORKLOG) — success,
+  **119 PASSED / 0 FAILED**, job `128460179802`, артефакт `13581349184` (177 129 336 Б),
+  `BUILD SUCCESSFUL in 4m 15s`.
 
 ### Открыто
 
