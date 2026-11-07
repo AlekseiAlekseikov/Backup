@@ -10,7 +10,8 @@ package com.example.voiceapp3.tools
  *
  * Правила (не расширять без мандата):
  *  • трогаем ТОЛЬКО `persist.sys.hvacdigital.*` — чужие persist-свойства не наши;
- *  • легаси-ключ `temp_ext` — в пустое;
+ *  • легаси-ключ `temp_ext` — НЕ удалять (iter33l §1.2: это имя из рабочего лога iter19,
+ *    эксперимент `EXT_PROBE` ещё не решил, какое имя читает SystemUI) — только `0`, если мусор;
  *  • числовое значение в `temp`/`batt`/`exttemp` — в `0` (наш флаг-писатель поставит нужное
  *    значение при следующем изменении тумблера);
  *  • одноразово за процесс, всё в лог строками `PERSIST_CLEAN …`.
@@ -36,9 +37,11 @@ internal object PersistCleaner {
     /** Скрипт чистки (чистая функция — покрыт тестом `PersistCleanerTest`). */
     internal fun script(): String {
         val sb = StringBuilder()
+        // iter33l §1.2: легаси-имя НЕ чистим в пусто — переводим мусор в `0` (эксперимент идёт).
         for (p in LEGACY_PROPS) {
-            sb.append("V=\$(getprop $p); if [ -n \"\$V\" ]; then setprop $p \"\" 2>/dev/null; ")
-            sb.append("echo \"PERSIST_CLEAN prop=$p was=\$V now=\$(getprop $p) reason=legacy_key\"; fi\n")
+            sb.append("V=\$(getprop $p); case \"\$V\" in 0|1|\"\") ;; *) ")
+            sb.append("setprop $p 0 2>/dev/null; ")
+            sb.append("echo \"PERSIST_CLEAN prop=$p was=\$V now=\$(getprop $p) reason=legacy_key_normalized\";; esac\n")
         }
         for (p in FLAG_PROPS) {
             sb.append("V=\$(getprop $p); case \"\$V\" in 0|1|\"\") ;; *) ")

@@ -35,10 +35,12 @@ class PersistCleanerTest {
     }
 
     @Test
-    fun legacyKeyIsEmptiedAndFlagValuesResetToZero() {
+    fun legacyKeyNormalizedAndFlagValuesResetToZero() {
         val s = PersistCleaner.script()
         assertTrue("легаси-ключ temp_ext обрабатывается", s.contains("persist.sys.hvacdigital.temp_ext"))
-        assertTrue("легаси — в пустое", s.contains("reason=legacy_key"))
+        // iter33l §1.2: НЕ удаляем (эксперимент с именем пропа наружней ещё идёт) — только в 0.
+        assertTrue("легаси — нормализация, не удаление", s.contains("reason=legacy_key_normalized"))
+        assertFalse("пустое значение в temp_ext больше не пишем", s.contains("setprop persist.sys.hvacdigital.temp_ext \"\""))
         assertTrue("числа в флагах — в 0", s.contains("reason=numeric_not_flag"))
         assertTrue("setprop на 0 для флага", s.contains("setprop persist.sys.hvacdigital.batt 0"))
         // Флаги перечислены ровно как у референса (ah.java:17 / u5.java:27).

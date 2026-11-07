@@ -35,21 +35,22 @@ class HvacFlagsApplyTest {
         assertEquals(Triple(false, true, false), HvacFlagsApply.parseFlags("0\n1\n"))
     }
 
-    // 4. Строка TOGGLE мандата §1.4 — со статусом ✓/✗, без красных слов.
+    // 4. Строка TOGGLE мандата §1.4 + iter33l §1.4 (verify в строке, ✓ только при ok).
     @Test
     fun toggleLine() {
-        val ok = HvacFlagsApply.toggleLine("hvacBatt", true, "temp:0 batt:1 ext:0", "bind", "plugin_restart", "ok")
+        val ok = HvacFlagsApply.toggleLine("hvacBatt", true, "temp:0 batt:1 ext:0", "bind", "bar_recarga", "ok", "ok")
         assertEquals(
-            "TOGGLE [hvacBatt] → ON | flags=temp:0 batt:1 ext:0 | via=bind | apply=plugin_restart result=ok | ✓",
+            "TOGGLE [hvacBatt] → ON | flags=temp:0 batt:1 ext:0 | via=bind | apply=bar_recarga result=ok verify=ok | ✓",
             ok)
         finalAssert { assertFalse(ok, ok.contains("ошибка")) }
         finalAssert {
-            assertTrue(HvacFlagsApply.toggleLine("hvacTemp", false, "temp:0 batt:0 ext:0", "nenhum", "plugin_restart", "failed")
+            assertTrue(HvacFlagsApply.toggleLine("hvacTemp", false, "temp:0 batt:0 ext:0", "nenhum", "bar_recarga", "fail", "none")
                 .endsWith("✗"))
         }
         finalAssert {
-            assertTrue(HvacFlagsApply.toggleLine("hvacTemp", false, "temp:0 batt:0 ext:0", "nenhum", "plugin_restart", "noop")
-                .endsWith("✓"))
+            // rc=0, но пропы переписаны — это НЕ успех (ложный ✓ запрещён, лог 07.11)
+            assertTrue(HvacFlagsApply.toggleLine("hvacTemp", true, "temp:1 batt:0 ext:0", "bind", "bar_recarga", "ok", "rewritten")
+                .endsWith("✗"))
         }
     }
 

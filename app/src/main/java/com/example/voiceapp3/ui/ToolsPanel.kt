@@ -292,6 +292,13 @@ class ToolsPanel(
                 "панели — CarPlay и музыка прервутся на ~10 сек. Тумблеры слотов перезапускают панель сами.",
             "hvacdigital.plugin.enable")
         addDiv()
+        // iter33l §1.2: проба имени пропа наружней — пишет оба имени и перерисовывает панель.
+        addOneShot("hvac_ext_probe_btn", "Проба слотов (наружняя)",
+            "Ставит 1 в ОБА имени пропа наружней (exttemp и temp_ext), перерисовывает панель " +
+                "(CarPlay и музыка прервутся на ~10 сек) и пишет две строки EXT_PROBE в лог. " +
+                "Посмотрите на панель и пришлите лог: по нему будет видно, какое имя читает SystemUI.",
+            "hvacdigital.extProbe")
+        addDiv()
         addOneShot("hvac_restore_btn", "Вернуть панель SystemUI",
             "Снимет зависший bind-mount плагина, перезапустит SystemUI и проверит /proc/mounts. Нажимайте, если шторка Системы чёрная или не открывается.",
             "hvacdigital.plugin.restore")

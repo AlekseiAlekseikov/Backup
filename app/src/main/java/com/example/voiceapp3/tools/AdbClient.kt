@@ -211,6 +211,10 @@ object AdbClient {
     private val rootState = AtomicReference(RootState.UNKNOWN)
     private val rootProbeAt = java.util.concurrent.atomic.AtomicLong(0L)
     private const val ROOT_PROBE_INTERVAL_MS = 60_000L
+
+    /** iter33l §3.4: одна заливка за раз (иначе файлы перемешиваются) + до 3 попыток на размер. */
+    private val scriptUploadLock = Any()
+    private const val SCRIPT_UPLOAD_TRIES = 3
     private val rootRestoreDone = java.util.concurrent.atomic.AtomicBoolean(false)
 
     /** Колбэк «root вернулся» — один проход восстановления (`bootrestore pass=1`). */
@@ -237,8 +241,8 @@ object AdbClient {
             }
         }
         if (to != RootState.ROOT) rootRestoreDone.set(false)
-        // iter33k §4.1: ЛЮБОЙ переход в SHELL_NO_ROOT — одна попытка восстановления на событие
-        // (`( sleep 1; setprop ctl.restart adbd ) &`, как у референса), затем проба `id`.
+        // iter33l §3.1: ЛЮБОЙ переход в SHELL_NO_ROOT — ОДНА попытка восстановления на событие,
+        // и это ПОЛНОЕ ПЕРЕПОДКЛЮЧЕНИЕ канала (не `ctl.restart adbd`): см. [reconnectRoot].
         if (to == RootState.ROOT) rootRecoveryDone.set(false)
         if (to == RootState.SHELL_NO_ROOT) autoRecoverRoot(reason)
     }
@@ -246,22 +250,116 @@ object AdbClient {
     /** iter33k §4.1: одна попытка на событие потери; повтор — только по кнопке владельца. */
     private val rootRecoveryDone = java.util.concurrent.atomic.AtomicBoolean(false)
 
+    /**
+     * iter33l §3.1 — восстановление канала = ПОЛНОЕ переподключение (закрыть/переоткрыть сокет,
+     * тот же цикл, что при старте: ADB_DEST → CNXN → проба `id`). Доказано логом 07.11: каждый
+     * свежий handshake даёт ROOT мгновенно, а деградировавший транспорт не лечится ничем другим.
+     */
+    private val reconnecting = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** iter33l §3.1: не чаще одного автоматического reconnect за 20 с. */
+    @Volatile private var lastReconnectAtMs: Long = 0L
+
+    /** iter33l §3.3: имя/начало последней команды — для строки `CHANNEL_LOST last_cmd=…`. */
+    @Volatile private var lastCmdForLog: String = "-"
+    @Volatile private var lastCmdStartedAtMs: Long = 0L
+
+    private fun noteCmd(cmd: String) {
+        lastCmdForLog = cmd.replace("\s+".toRegex(), " ").take(70)
+        lastCmdStartedAtMs = android.os.SystemClock.uptimeMillis()
+    }
+
+    /** iter33l §3.3 — одна строка на каждый обрыв/таймаут: какая команда висела последней. */
+    private fun channelLost(reason: String) {
+        val dt = if (lastCmdStartedAtMs == 0L) -1L
+                 else android.os.SystemClock.uptimeMillis() - lastCmdStartedAtMs
+        AppLog.e(TAG, "CHANNEL_LOST last_cmd=${lastCmdForLog.ifEmpty { "-" }} dt=${dt}ms reason=$reason")
+    }
+
+    /**
+     * iter33l §3.1 — потеря канала лечится ПЕРЕПОДКЛЮЧЕНИЕМ, а не `ctl.restart adbd`
+     * (без root его не выполнить, и транспорт он не чинит — лог 07.11, 15:19+).
+     * `ctl.restart adbd` остался только как крайняя мера ВНУТРИ [reconnectRoot] после 3 неудач.
+     */
     private fun autoRecoverRoot(reason: String) {
         if (!rootRecoveryDone.compareAndSet(false, true)) return
         Thread {
-            val t0 = android.os.SystemClock.elapsedRealtime()
+            val ok = reconnectRoot("auto:$reason", maxTries = 3)
+            AppLog.i(TAG, "ADB_RECOVERY action=auto_reconnect reason=$reason result=${if (ok) "OK" else "FAILED"}")
+        }.apply { name = "adb-root-recovery"; isDaemon = true }.start()
+    }
+
+    /**
+     * iter33l §3.1/§3.2 — восстановление root-канала полным переподключением.
+     *
+     * Шаги (ровно как при старте приложения, где ROOT приходит всегда):
+     *   1. состояние → BOOTING (root-команды в это время честно получают отказ, а не идут в sh);
+     *   2. `localTargets()` → `discoverDestination()` → CNXN-рукопожатие;
+     *   3. проба `id` — при `uid=0` фиксируем канал ([channelUp]) и печатаем
+     *      `ADB_RECOVERY action=reconnect tries=N root_after=root`;
+     *   4. до [maxTries] попыток с паузой 1 с; при полном провале — `root_after=none`,
+     *      и ТОЛЬКО тогда крайняя мера `( sleep 1; setprop ctl.restart adbd ) &`.
+     *
+     * Вызывать только с фонового потока (внутри шлёт команды через тот же worker).
+     */
+    fun reconnectRoot(reason: String, maxTries: Int = 3): Boolean {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            AppLog.w(TAG, "ADB_RECOVERY action=reconnect skipped reason=main_thread")
+            return false
+        }
+        if (!reconnecting.compareAndSet(false, true)) {
+            AppLog.i(TAG, "ADB_RECOVERY action=reconnect skipped reason=busy")
+            return rootState.get() == RootState.ROOT
+        }
+        val t0 = android.os.SystemClock.uptimeMillis()
+        try {
+            state.set(ChannelState.BOOTING)
+            for (n in 1..maxTries) {
+                val targets = localTargets()
+                val w = runCatching { discoverDestination(targets, attempts = 1) }.getOrNull()
+                if (w == null) {
+                    AppLog.i(TAG, "ADB_RECOVERY action=reconnect tries=$n dest=none (5555 молчит), пауза 1с")
+                    Thread.sleep(1_000L)
+                    continue
+                }
+                workingHost = w.addr
+                val pr = runCatching { fullProbe() }.getOrNull()
+                val kind = pr?.kind ?: "error:probe"
+                if (pr != null && pr.kind == KIND_ROOT) {
+                    channelUp(pr)
+                    AppLog.i(TAG, "ADB_RECOVERY action=reconnect reason=$reason tries=$n host=${w.addr} " +
+                        "root_after=root dt=${android.os.SystemClock.uptimeMillis() - t0}ms")
+                    runCatching { replayDeferred() }
+                    return true
+                }
+                AppLog.i(TAG, "ADB_RECOVERY action=reconnect reason=$reason tries=$n host=${w.addr} " +
+                    "kind=$kind uid=${pr?.uid?.take(40) ?: "-"}, пауза 1с")
+                Thread.sleep(1_000L)
+            }
+            AppLog.i(TAG, "ADB_RECOVERY action=reconnect reason=$reason tries=$maxTries root_after=none " +
+                "dt=${android.os.SystemClock.uptimeMillis() - t0}ms")
+            // Крайняя мера (мандат §3.1): только после провала reconnect, всегда с логом.
+            AppLog.i(TAG, "ADB_RECOVERY action=restart_adbd_after_reconnect reason=$reason " +
+                "(крайняя мера, одна попытка)")
             runCatching {
                 execute("( sleep 1; setprop ctl.restart adbd ) >/dev/null 2>&1 &", 6000, expectRoot = false)
             }
-            Thread.sleep(4000)
-            val out = runCatching { execute("id", 6000, expectRoot = false) }
-                .getOrDefault(Pair(1, "")).second
-            val ok = isRootUid(out)
-            AppLog.i(TAG, "ADB_RECOVERY action=restart_adbd reason=$reason root_before=none " +
-                "root_after=${if (ok) "root" else "none"} result=${if (ok) "OK" else "FAILED"} " +
-                "wait=4000ms probe=id dt=${android.os.SystemClock.elapsedRealtime() - t0}ms")
-            if (ok) transitionRootState(RootState.ROOT, "recovery_ok")
-        }.apply { name = "adb-root-recovery"; isDaemon = true }.start()
+            return false
+        } catch (t: Throwable) {
+            AppLog.w(TAG, "ADB_RECOVERY reconnect crashed: ${t.javaClass.simpleName}: ${t.message}")
+            return false
+        } finally {
+            reconnecting.set(false)
+        }
+    }
+
+    /** Фоновый reconnect не чаще раза в 20 с (не заваливаем worker при потоке отказов). */
+    private fun scheduleReconnectOnce(reason: String) {
+        val now = android.os.SystemClock.uptimeMillis()
+        if (now - lastReconnectAtMs < 20_000L) return
+        lastReconnectAtMs = now
+        Thread { reconnectRoot("async:$reason") }
+            .apply { name = "adb-reconnect"; isDaemon = true }.start()
     }
 
     /**
@@ -320,7 +418,12 @@ object AdbClient {
         var res: Pair<Int, String> = Pair(1, "pending")
         queue.offer(Job(command, timeoutMs, expectRoot) { r -> res = r; latch.countDown() })
         val ok = latch.await((timeoutMs + 5000).toLong(), TimeUnit.MILLISECONDS)
-        if (!ok) return Pair(137, "ERR_ADB_TIMEOUT after ${timeoutMs}ms")
+        if (!ok) {
+            // iter33l §3.3: таймаут = транспорт деградировал; фиксируем и лечим переподключением.
+            channelLost("timeout:${timeoutMs}ms")
+            if (expectRoot) scheduleReconnectOnce("timeout")
+            return Pair(137, "ERR_ADB_TIMEOUT after ${timeoutMs}ms")
+        }
         return res
     }
 
@@ -344,25 +447,52 @@ object AdbClient {
         // Короткий скрипт — напрямую (никакой нарезки, значит и риска нет).
         if (bytes.size <= 3500) return execute(script, timeoutMs, expectRoot)
         val path = "/data/local/tmp/voiceapp3_${name}.sh"
-        // iter33 A0: ТОЛЬКО base64-чанки (ScriptChunker). Никакого `String(bytes, off, len, UTF_8)`
-        // и никакого heredoc с сырым UTF-8 — именно там рвались многобайтовые символы (+83 байта).
-        // Каждый чанк — ОТДЕЛЬНАЯ ADB-команда (payload ≤ 4096): лить всю заливку одной
-        // командой нельзя, она не пролезет в лимит.
-        val (rcClear, outClear) = execute(ScriptChunker.clearCommand(path), 8000, expectRoot)
-        if (rcClear != 0) return Pair(rcClear, "ERR_SCRIPT_UPLOAD_CLEAR: $outClear")
-        var sent = 0
-        for (c in ScriptChunker.chunks(script)) {
-            val (rcChunk, outChunk) = execute(ScriptChunker.chunkCommand(path, c), 15000, expectRoot)
-            if (rcChunk != 0) return Pair(rcChunk, "ERR_SCRIPT_UPLOAD_CHUNK #$sent: $outChunk")
-            sent++
+        // iter33l §3.4 — ДВЕ защиты, обе доказаны логом 07.11 (`SCRIPT_BYTES=12296 EXPECTED=6148`
+        // и `ERR_SCRIPT_UPLOAD expected=7408 actual=`):
+        //  (а) заливки СЕРИАЛИЗУЮТСЯ. Раньше два потока (hvac_enable в Bg-4 и ttl_script в Bg-2/Bg-3)
+        //      лили скрипты одновременно: `rm -f` одного стирал файл другого, а чанки шли в общий
+        //      файл — получалось ровно двойное содержимое и пустой файл. Транспорт тут не виноват;
+        //  (б) сверка размера с ПОВТОРОМ: при `SCRIPT_BYTES != EXPECTED` — полная перезаливка,
+        //      до 3 попыток, затем честный FAILED (а не молчаливое продолжение).
+        synchronized(scriptUploadLock) {
+            var lastRc = 1
+            var lastOut = ""
+            for (attempt in 1..SCRIPT_UPLOAD_TRIES) {
+                val (rcClear, outClear) = execute(ScriptChunker.clearCommand(path), 8000, expectRoot)
+                if (rcClear != 0) {
+                    lastRc = rcClear; lastOut = "ERR_SCRIPT_UPLOAD_CLEAR: $outClear"
+                    AppLog.w(TAG, "SCRIPT_UPLOAD name=$name attempt=$attempt clear failed rc=$rcClear")
+                    continue
+                }
+                var sent = 0
+                var chunkFailed = false
+                for (c in ScriptChunker.chunks(script)) {
+                    val (rcChunk, outChunk) = execute(ScriptChunker.chunkCommand(path, c), 15000, expectRoot)
+                    if (rcChunk != 0) {
+                        lastRc = rcChunk; lastOut = "ERR_SCRIPT_UPLOAD_CHUNK #$sent: $outChunk"; chunkFailed = true
+                        break
+                    }
+                    sent++
+                }
+                if (chunkFailed) {
+                    AppLog.w(TAG, "SCRIPT_UPLOAD name=$name attempt=$attempt chunk=$sent failed — перезалью")
+                    continue
+                }
+                val (rc, out) = execute(ScriptChunker.verifyAndRunCommand(path, bytes.size), timeoutMs + 10000, expectRoot)
+                lastRc = rc; lastOut = out
+                val badSize = out.contains("ERR_SCRIPT_UPLOAD")
+                if (!badSize) {
+                    AppLog.i(TAG, "SCRIPT_UPLOAD name=$name bytes=${bytes.size} chunks=$sent rc=$rc " +
+                        "attempt=$attempt size_check=ok")
+                    return Pair(rc, out)
+                }
+                // Предохранитель сработал — это ФАКТ, его надо доставить наверх (A0.2), а не глотать.
+                AppLog.e(TAG, "SCRIPT_UPLOAD FAIL name=$name attempt=$attempt expect=${bytes.size} rc=$rc " +
+                    "out=${out.replace('\n', ' ').take(300)}")
+            }
+            AppLog.e(TAG, "SCRIPT_UPLOAD GIVEUP name=$name bytes=${bytes.size} tries=$SCRIPT_UPLOAD_TRIES rc=$lastRc")
+            return Pair(lastRc, lastOut)
         }
-        val (rc, out) = execute(ScriptChunker.verifyAndRunCommand(path, bytes.size), timeoutMs + 10000, expectRoot)
-        if (out.contains("ERR_SCRIPT_UPLOAD")) {
-            // Предохранитель сработал — это ФАКТ, его надо доставить наверх (A0.2), а не глотать.
-            AppLog.e(TAG, "SCRIPT_UPLOAD FAIL name=$name expect=${bytes.size} rc=$rc out=${out.replace('\n', ' ').take(300)}")
-        }
-        AppLog.i(TAG, "SCRIPT_UPLOAD name=$name bytes=${bytes.size} chunks=$sent rc=$rc")
-        return Pair(rc, out)
     }
 
     /**
@@ -1653,6 +1783,7 @@ object AdbClient {
      */
     private fun runCommand(cmd: String, timeoutMs: Int, expectRoot: Boolean): Pair<Int, String> {
         val shortCmd = cmd.replace("\\s+".toRegex(), " ").take(160)
+        noteCmd(cmd)
         val st = state.get()
 
         // iter26 B.2: если канал найден через unix-сокет — работаем через него, TCP не трогаем.
@@ -1668,9 +1799,11 @@ object AdbClient {
         }
 
         if (expectRoot && st != ChannelState.ROOT_5555) {
-            // Жёсткий запрет: root-команда без root-канала — не падаем в sh.
+            // Жёсткий запрет: root-команда без root-канала — не падаем в sh (мандат §3.2).
             val reason = "ERR_ROOT_CHANNEL_UNAVAILABLE (state=$st)"
             AppLog.e(TAG, "VERIFY EXEC port=- rc=1 expectRoot=true cmd=${shortCmd} → FAILED ($reason)")
+            // iter33l §3.1/§3.2: вместо тихого отказа — переподключение канала (фоново, не чаще 20 с).
+            if (st != ChannelState.BOOTING) scheduleReconnectOnce("root_cmd:${shortCmd.take(24)}")
             return Pair(1, reason)
         }
 
@@ -1683,6 +1816,8 @@ object AdbClient {
                 // iter24 P0.3: альтернативного порта нет — переключение портов = миграция.
                 // IOException на 5555 означает, что канал умер: честно сообщаем и уходим в NO_ROOT.
                 state.compareAndSet(ChannelState.ROOT_5555, ChannelState.NO_ROOT_SH)
+                // iter33l §3.3: какая команда висела последней — по каждому обрыву.
+                channelLost("io:${e.javaClass.simpleName}")
                 // iter33h B1.4: причина в лог — одна строка на переход (см. transitionRootState).
                 transitionRootState(RootState.SHELL_NO_ROOT, "channel_dropped")
                 val msg = "ERR_ADB_IO: ${e.message} (port 5555 dropped, channel closed)"

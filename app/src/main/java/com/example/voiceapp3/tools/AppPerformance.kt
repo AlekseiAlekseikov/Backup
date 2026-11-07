@@ -591,9 +591,12 @@ object AppPerformance {
     }
 
     /**
-     * iter33j §4.3 (а) — восстановление root-канала: ОДНА попытка `ctl.restart adbd`
-     * (как у референса: `( sleep 1; setprop ctl.restart adbd ) &`), затем повторная проба `id`.
-     * Ничего другого не перезапускаем.
+     * iter33l §3.1 — восстановление root-канала = ПОЛНОЕ ПЕРЕПОДКЛЮЧЕНИЕ (как при старте),
+     * а не `ctl.restart adbd`: без root его не выполнить, и транспорт он не чинит (лог 07.11:
+     * после `NO_ROOT_SH` канал так и не поднялся, а каждый свежий handshake давал ROOT сразу).
+     *
+     * `ctl.restart adbd` остался только крайней мерой ВНУТРИ [AdbClient.reconnectRoot] — после
+     * трёх неудачных переподключений и всегда со строкой в логе.
      */
     fun recoverAdbd(reason: String): Boolean {
         val t0 = System.currentTimeMillis()
@@ -601,35 +604,31 @@ object AppPerformance {
             AdbClient.execute("id", 4000, expectRoot = false)
         }.getOrDefault(Pair(1, ""))
         val rootBefore = before.contains("uid=0")
-        // Фоновая попытка ровно как у референса, затем ждём и проверяем.
-        runCatching {
-            AdbClient.execute("( sleep 1; setprop ctl.restart adbd ) >/dev/null 2>&1 &", 6000)
-        }
-        Thread.sleep(4000)
-        val (rcAfter, after) = runCatching {
+        val ok = AdbClient.reconnectRoot("owner_click:$reason", maxTries = 3)
+        val (_, after) = runCatching {
             AdbClient.execute("id", 6000, expectRoot = false)
         }.getOrDefault(Pair(1, ""))
-        val rootAfter = after.contains("uid=0")
-        val out = "ADB_RECOVERY action=restart_adbd reason=$reason root_before=$rootBefore root_after=$rootAfter " +
-            "rc=$rcAfter dt=${System.currentTimeMillis() - t0}ms result=${if (rootAfter) "OK" else "FAILED"}"
-        AppLog.i(TAG, out)
+        val rootAfter = after.contains("uid=0") || ok
+        AppLog.i(TAG, "ADB_RECOVERY action=reconnect reason=$reason root_before=$rootBefore " +
+            "root_after=$rootAfter dt=${System.currentTimeMillis() - t0}ms result=${if (rootAfter) "OK" else "FAILED"}")
         return rootAfter
     }
 
-    /** Публичное действие «Восстановить root» (кнопка) — одна попытка `ctl.restart adbd`. */
+    /** Публичное действие «Восстановить root-канал» (кнопка) — полное переподключение. */
     fun recoverAdbdResult(): ToolsResult {
         BgWorker.assertNotMain("AppPerformance.recoverAdbdResult")
+        val t0 = System.currentTimeMillis()
         val ok = recoverAdbd("owner_click")
         return ToolsResult("perf.recoverAdbd", "Восстановить root-канал", listOf(
             ToolsStep(
-                step = "adbd_restart",
-                command = "( sleep 1; setprop ctl.restart adbd ) &",
-                startedAtMs = System.currentTimeMillis(),
+                step = "channel_reconnect",
+                command = "переподключение канала: ADB_DEST → CNXN → id (до 3 попыток)",
+                startedAtMs = t0,
                 finishedAtMs = System.currentTimeMillis(),
                 exitCode = if (ok) 0 else 1,
                 expected = "id → uid=0",
                 actual = "root_after=$ok",
-                stdout = "ADB_RECOVERY action=restart_adbd result=${if (ok) "OK" else "FAILED"}",
+                stdout = "ADB_RECOVERY action=reconnect result=${if (ok) "OK" else "FAILED"}",
                 status = if (ok) ToolsStep.Status.OK else ToolsStep.Status.PARTIAL
             )
         ))
@@ -722,7 +721,13 @@ object AppPerformance {
 
     private const val PROP_USEJIT = "dalvik.vm.usejit"
     private const val PROP_USEJIT_PROFILES = "dalvik.vm.usejitprofiles"
+    /**
+     * iter33l §3.5 — init поднимает `persist.X` в `X`, поэтому ОСНОВНОЙ ключ —
+     * `persist.dalvik.vm.usejit` (из него при загрузке станет `dalvik.vm.usejit`).
+     * `persist.sys.dalvik.vm.usejit` остаётся МАРКЕРОМ (совместимость и лог миграции).
+     */
     private const val PROP_PERSIST_USEJIT = "persist.sys.dalvik.vm.usejit"
+    private const val PROP_PERSIST_USEJIT_INIT = "persist.dalvik.vm.usejit"
     private const val JIT_BOOT_MARKER = "jit_boot_attempt"
     /** iter33e A2: намерение «после перезапуска zygote нужно сверить runtime». */
     private const val JIT_PENDING_FILE = "jit_pending_verify"
@@ -765,18 +770,23 @@ object AppPerformance {
      */
     private fun kvE(s: String): String = if (s.isEmpty()) "empty" else LogKit.kv(s)
 
-    /** Один короткий read-only вызов: runtime + persist-дублёр (две строки). */
+    /** Один короткий read-only вызов: runtime + маркер + init-ключ (три строки, iter33l §3.5). */
     private fun jitProps(): Pair<String, String> {
         val (_, out) = runCatching {
             AdbClient.execute(
-                "echo RT=\$(getprop $PROP_USEJIT); echo PS=\$(getprop $PROP_PERSIST_USEJIT)",
+                "echo RT=\$(getprop $PROP_USEJIT); echo PS=\$(getprop $PROP_PERSIST_USEJIT); " +
+                    "echo PI=\$(getprop $PROP_PERSIST_USEJIT_INIT)",
                 5000, expectRoot = false)
         }.getOrDefault(Pair(1, ""))
+        lastJitInitKey = Regex("PI=([^\\n]*)").find(out)?.groupValues?.get(1)?.trim().orEmpty()
         return Pair(
             Regex("RT=([^\\n]*)").find(out)?.groupValues?.get(1)?.trim().orEmpty(),
             Regex("PS=([^\\n]*)").find(out)?.groupValues?.get(1)?.trim().orEmpty()
         )
     }
+
+    /** Значение init-ключа из последнего [jitProps] — только для строк лога. */
+    @Volatile private var lastJitInitKey: String = ""
 
     /** Одна boot-попытка на процесс (отдельный счётчик от HVAC и от JIT). */
     private val videoBootAttempted = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -789,11 +799,15 @@ object AppPerformance {
      */
     private fun jitPersistBackfill(value: String, reason: String): String {
         val ret = runCatching {
-            runSuCommand("setprop $PROP_PERSIST_USEJIT $value; " +
-                "echo JIT_PERSIST_READBACK=\$(getprop $PROP_PERSIST_USEJIT)")
+            runSuCommand("setprop $PROP_PERSIST_USEJIT_INIT $value; " +
+                "setprop $PROP_PERSIST_USEJIT $value; " +
+                "echo JIT_PERSIST_READBACK=\$(getprop $PROP_PERSIST_USEJIT_INIT); " +
+                "echo JIT_PERSIST_MARKER=\$(getprop $PROP_PERSIST_USEJIT)")
         }.getOrNull()
         val rb = ret?.let { parseTag(it.output, "JIT_PERSIST_READBACK") } ?: "?"
-        AppLog.i(TAG, "JIT_PERSIST_SET desired=$value readback=$rb reason=$reason")
+        val marker = ret?.let { parseTag(it.output, "JIT_PERSIST_MARKER") } ?: "?"
+        AppLog.i(TAG, "JIT_PERSIST_SET desired=$value readback_init=$rb marker=$marker reason=$reason " +
+            "key=$PROP_PERSIST_USEJIT_INIT (init поднимет dalvik.vm.usejit при загрузке)")
         return rb
     }
 
@@ -860,7 +874,13 @@ object AppPerformance {
         if (!isAutoOptimizeEnabled(app)) return
         val (runtime, persist) = jitProps()
         if (runtime != "true") {
-            AppLog.i(TAG, "JIT_PROBE: runtime=$runtime persist=$persist desired=true (read-only, без записи)")
+            AppLog.i(TAG, "JIT_PROBE: runtime=$runtime persist=$persist init=${lastJitInitKey.ifEmpty { "empty" }} " +
+                "desired=true (read-only, без записи)")
+            // iter33l §3.5: boot-проверка — что в runtime сейчас и поднимется ли он из init-ключа.
+            AppLog.i(TAG, "JIT_BOOT runtime=${runtime.ifEmpty { "empty" }} " +
+                "persist=${persist.ifEmpty { "empty" }} init=${lastJitInitKey.ifEmpty { "empty" }} " +
+                "expect_runtime_true_after_reboot=${lastJitInitKey == "true" || persist == "true"} " +
+                "key=persist.dalvik.vm.usejit")
             return
         }
         val tagNow = currentBootTag()

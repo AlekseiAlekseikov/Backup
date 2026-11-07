@@ -50,7 +50,7 @@ object StatusIcons {
     const val PREF_WIFI = "status_icon_wifi"
 
     /** Цифровая индикация в статус-баре (плагин GeelyAutoSystemUIPlugin-digital.apk).
-     *  Значения пишем только для batt/exttemp (%.1f) и via — см. pushHvacDigitalPropsIfEnabled. */
+     *  Значения пишем только для batt/exttemp (%.1f) и via — см. alignHvacFlagsOnce. */
     const val PREF_HVAC_BATT = "hvacdigital_batt"
     const val PREF_HVAC_TEMP = "hvacdigital_temp"
     const val PREF_HVAC_EXT_TEMP = "hvacdigital_temp_ext"
@@ -905,10 +905,10 @@ object StatusIcons {
         } else cancel(app, NOTIF_WIFI)
 
 
-        // iter33h E1: проталкиваем только batt и exttemp (значения %.1f) + via.
-        // `persist.sys.hvacdigital.temp` не пишем: уставку климата плагин читает сам.
-        // Если значение ещё не прочитано (первый tick) — не пишем ничего (пропускаем).
-        pushHvacDigitalPropsIfEnabled(app)
+        // iter33l §2.2: ПЕРИОДИЧЕСКИЙ PUSH УБРАН (он и был источником петли: watchdog писал флаги,
+        // а FLAGS_SYNC тут же возвращал тумблеры по этим же пропам). Теперь sync только ЧИТАЕТ,
+        // запись — по клику тумблера и ОДИН раз при старте, если read-back расходится с UI.
+        alignHvacFlagsOnce(app)
         return reads
     }
 
@@ -928,55 +928,51 @@ object StatusIcons {
         Runtime.getRuntime().exec(arrayOf("getprop", SYS_HVAC_VIA)).inputStream.bufferedReader().readText().trim()
     } catch (t: Throwable) { "н/д" }
 
-    private fun pushHvacDigitalPropsIfEnabled(app: Context, retried: Boolean = false) {
-        // iter33k §6.2: не писать флаги, пока канал не поднят (в логе были ERR_ADB_TIMEOUT на старте).
-        // Ждём готовности один раз с повтором через 5 с; второй раз — честная строка deferred.
-        if (!AdbClient.isPrivilegedAllowed() && AdbClient.currentRootState() != AdbClient.RootState.PROBING) {
-            if (!retried) {
-                AppLog.i(TAG, "HVACDIGITAL_PUSH wait reason=channel_not_ready action=retry_once_in_5s")
-                BgWorker.postDelayed("StatusIcons.hvacdigital.pushRetry", 5000L) {
-                    pushHvacDigitalPropsIfEnabled(app, retried = true)
-                }
-            } else {
-                AppLog.i(TAG, "HVACDIGITAL_PUSH deferred reason=channel_not_ready (повтор уже был)")
-            }
+    /**
+     * iter33l §2.2 — ОДНОРAЗОВОЕ стартовое выравнивание (вместо периодического PUSH).
+     *
+     * Читаем факт из `getprop` (`FLAG_VERIFY`/`FLAGS_SYNC` уже сделали это) и пишем флаги ТОЛЬКО
+     * если read-back расходится с состоянием UI. Дальше за процесс — ни одной записи из sync.
+     */
+    private val alignDone = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    private fun alignHvacFlagsOnce(app: Context) {
+        if (!alignDone.compareAndSet(false, true)) return
+        if (!AdbClient.isPrivilegedAllowed()) {
+            AppLog.i(TAG, "FLAG_ALIGN deferred reason=channel_not_ready (стартовое выравнивание отложено)")
+            alignDone.set(false)   // попробуем на следующем тике, когда канал поднимется
             return
         }
         val p = prefs(app)
-        // iter33i P0-a: в чужие props уходят ТОЛЬКО флаги 0|1 — ровно как в референсе
-        // (`w0/x7.java:137-147`: setprop …temp/batt/exttemp = "1"/"0"). Значения (°C, %) в эти
-        // свойства НЕ пишем: наш плагин их не читает вовсе (0 вхождений "hvacdigital" в APK),
-        // а цифры нашей строки состояния рисуются своими иконками ниже.
         val tempOn = p.getBoolean(PREF_HVAC_TEMP, false)
         val battOn = p.getBoolean(PREF_HVAC_BATT, false)
         val extOn = p.getBoolean(PREF_HVAC_EXT_TEMP, false)
-        val command = HvacDigitalProps.flagsCommand(tempOn, battOn, extOn)
-        // E1.1 (iter33h): setprop persist.sys.hvacdigital.temp УБРАН. Уставку климата плагин
-        // читает сам (com.flyme.auto.hvacapi.widget.HvacVehicleTempWidget.getPropertyId() →
-        // 358614275 == HVAC_TEMPERATURE_SET, area=1), а наше «значение» уходило в слот климата
-        // и ложилось поверх стандартной полоски.
-        // iter33 B5: dirty-флаг. Раньше setprop уходил каждые 15 с «на всякий случай»
-        // (44 записи за 10 минут). Теперь — только когда набор флагов реально изменился.
-        val fingerprint = HvacDigitalProps.flagsFingerprint(tempOn, battOn, extOn)
-        if (fingerprint == lastPushedHvac) {
-            // H1: не чаще одного раза в 5 минут.
-            val now = android.os.SystemClock.elapsedRealtime()
-            if (now - lastPushSkipLogAtMs >= PUSH_SKIP_LOG_EVERY_MS) {
-                lastPushSkipLogAtMs = now
-                AppLog.d(TAG, "HVACDIGITAL_PUSH skip reason=unchanged " + fingerprint)
-            }
+        val want = HvacFlagsApply.flagsSegment(tempOn, battOn, extOn)
+        val read = "echo \$(getprop ${HvacDigitalProps.PROP_TEMP}); " +
+            "echo \$(getprop ${HvacDigitalProps.PROP_BATT}); " +
+            "echo \$(getprop ${HvacDigitalProps.PROP_EXT})"
+        val out = runCatching { AdbClient.execute(read, 5000).second }.getOrDefault("")
+        if (out.isBlank()) {
+            AppLog.i(TAG, "FLAG_ALIGN none reason=no_readback")
             return
         }
-        // verify echo: читаем обратно ровно то, что записали (три флага), плюс `via` — ТОЛЬКО чтение.
-        val script = command.replace("&& echo FLAGS_OK",
-            "&& echo \"temp=\$(getprop ${HvacDigitalProps.PROP_TEMP}) batt=\$(getprop ${HvacDigitalProps.PROP_BATT}) " +
-                "exttemp=\$(getprop ${HvacDigitalProps.PROP_EXT}) via=\$(getprop ${HvacDigitalProps.PROP_VIA})\"")
-        try {
-            val (rc, out) = AdbClient.execute(script, 5000)
-            if (rc == 0) lastPushedHvac = fingerprint
-            AppLog.i(TAG, "HVACDIGITAL_PUSH rc=$rc $fingerprint out=${out.replace('\n', ' ').take(200)}")
-        } catch (t: Throwable) {
-            AppLog.w(TAG, "HVACDIGITAL_PUSH failed: ${t.message}")
+        val (t, b, e) = HvacFlagsApply.parseFlags(out)
+        val fact = HvacFlagsApply.flagsSegment(t, b, e)
+        if (fact == want) {
+            AppLog.i(TAG, "FLAG_ALIGN none (readback совпал) flags=$want")
+            return
+        }
+        val via = HvacFlagsApply.viaFor(tempOn, battOn, extOn)
+        val cmd = HvacDigitalProps.flagsCommand(tempOn, battOn, extOn)
+            .replace("&& echo FLAGS_OK", "&& setprop ${HvacDigitalProps.PROP_VIA} $via && echo FLAGS_OK")
+        val (rc, res) = runCatching { AdbClient.execute(cmd, 6000) }.getOrDefault(Pair(1, ""))
+        AppLog.i(TAG, "FLAG_ALIGN push rc=$rc want=$want fact=$fact via=$via " +
+            "out=${res.replace('\n', ' ').take(160)} action=push_once")
+        // Перерисовка панели — тем же механизмом, что и клик (x7.g): без неё флаги не подхватятся.
+        if (rc == 0) {
+            runCatching {
+                AdbClient.executeScript("bar_recarga", HvacFlagsApply.recargaScript(), 24000)
+            }.onSuccess { AppLog.i(TAG, "FLAG_ALIGN recarga out=${it.second.replace('\n', ' ').take(160)}") }
         }
     }
 
@@ -1021,7 +1017,7 @@ object StatusIcons {
      *
      * iter33h E1: `persist.sys.hvacdigital.temp` (уставка климата) приложением НЕ пишется —
      * плагин читает её сам через CarPropertyManager; значения приложение даёт только для
-     * `batt` и наружной (`exttemp`), см. pushHvacDigitalPropsIfEnabled.
+     * `batt` и наружной (`exttemp`), см. alignHvacFlagsOnce.
      * F2: ключ наружной — ОДИН (`exttemp`), поэтому списков «оба свойства» больше нет.
      */
     fun sysPropFor(pref: String): String = when (pref) {
@@ -1044,15 +1040,19 @@ object StatusIcons {
      */
     @JvmStatic fun setHvacDigital(ctx: Context, pref: String, value: Boolean): ToolsResult {
         val t0 = android.os.SystemClock.uptimeMillis()
-        val line = try {
-            HvacFlagsApply.toggle(ctx, pref, value)
+        // iter33l §1.4/§2.3: успех — только `rc=0` И `FLAG_VERIFY match=ok`.
+        val outcome = try {
+            HvacFlagsApply.toggleOutcome(ctx, pref, value)
         } catch (t: Throwable) {
             AppLog.w(TAG, "TOGGLE failed: ${t.javaClass.simpleName}: ${t.message}")
-            "TOGGLE [${HvacFlagsApply.toggleLabel(pref)}] → ${if (value) "ON" else "OFF"} | " +
-                "flags=? | via=? | apply=plugin_restart result=failed | ✗"
+            HvacFlagsApply.Outcome(
+                "TOGGLE [${HvacFlagsApply.toggleLabel(pref)}] → ${if (value) "ON" else "OFF"} | " +
+                    "flags=? | via=? | apply=bar_recarga result=failed verify=none | ✗",
+                ok = false, rc = 1, match = false)
         }
+        val line = outcome.line
         // Серый/жёлтый статус вместо красного: клик — это команда, а не ошибка.
-        val ok = line.trimEnd().endsWith("✓")
+        val ok = outcome.ok
         val step = ToolsStep(
             step = "hvacdigital.$pref",
             command = "flags(temp,batt,exttemp) + via + bar_recarga (kill \$(pidof ${HvacFlagsApply.SYSUI_PKG}))",
@@ -1060,7 +1060,7 @@ object StatusIcons {
             exitCode = if (ok) 0 else 1,
             stdout = line,
             stderr = "",
-            expected = "TOGGLE … ✓",
+            expected = "TOGGLE … apply=bar_recarga result=ok verify=ok ✓",
             actual = line,
             status = if (ok) ToolsStep.Status.OK else ToolsStep.Status.PARTIAL
         )
@@ -1069,6 +1069,33 @@ object StatusIcons {
             title = "Цифровая индикация климата",
             steps = listOf(step)
         )
+    }
+
+    /**
+     * iter33l §1.2 — кнопка «Проба слотов»: пишем ОБА имени пропа наружней (`exttemp` и легаси
+     * `temp_ext`), делаем recarga панели и печатаем `EXT_PROBE prop=… wrote=1 found=… result=…`.
+     * Владелец по панели говорит, какое имя читает SystemUI.
+     */
+    @JvmStatic fun extProbe(ctx: Context): ToolsResult {
+        val t0 = android.os.SystemClock.uptimeMillis()
+        val outcome = try {
+            HvacFlagsApply.extProbe(ctx)
+        } catch (t: Throwable) {
+            AppLog.w(TAG, "EXT_PROBE failed: ${t.javaClass.simpleName}: ${t.message}")
+            HvacFlagsApply.Outcome("EXT_PROBE result=failed", false, 1, false)
+        }
+        val step = ToolsStep(
+            step = "hvacdigital.extProbe",
+            command = "setprop ${HvacDigitalProps.PROP_EXT} 1; setprop temp_ext 1; + bar_recarga",
+            startedAtMs = t0, finishedAtMs = android.os.SystemClock.uptimeMillis(),
+            exitCode = if (outcome.ok) 0 else 1,
+            stdout = outcome.line,
+            stderr = "",
+            expected = "EXT_PROBE prop=exttemp|temp_ext wrote=1 found=1 result=ok",
+            actual = outcome.line,
+            status = if (outcome.ok) ToolsStep.Status.OK else ToolsStep.Status.PARTIAL
+        )
+        return ToolsResult("hvacdigital.extProbe", "Проба слотов (наружняя)", listOf(step))
     }
 
     /**

@@ -983,6 +983,13 @@ enum class Choice(
                 AppLog.logAction(appContext, "status.tempProbe", res)
                 return res
             }
+            // iter33l §1.2: эксперимент с именем пропа наружней (temp_ext vs exttemp).
+            "hvac_ext_probe_btn" -> {
+                BgWorker.assertNotMain("ToolsBackend.extProbe")
+                val res = StatusIcons.extProbe(appContext)
+                AppLog.logAction(appContext, "hvacdigital.extProbe", res)
+                return res
+            }
             // iter33k §1.1: маунт плагина — отдельной кнопкой, а не из тумблера.
             "hvac_mount_btn" -> {
                 BgWorker.assertNotMain("ToolsBackend.mountPlugin")
