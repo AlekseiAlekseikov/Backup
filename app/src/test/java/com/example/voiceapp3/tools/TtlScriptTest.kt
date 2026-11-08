@@ -123,7 +123,7 @@ class TtlScriptTest {
         val on = TtlScript.build(true)
         assertTrue("нужна строка TTL_ADD_COUNT n=", on.contains("TTL_ADD_COUNT n="))
         assertTrue("дедупликация лишних копий", on.contains("dedupe()"))
-        assertTrue("снимаем копию через -D POSTROUTING $SCOPE",
+        assertTrue("снимаем копию через -D POSTROUTING \$SCOPE",
             on.contains("-D POSTROUTING \$SCOPE -j TTL --ttl-set 65"))
     }
 
