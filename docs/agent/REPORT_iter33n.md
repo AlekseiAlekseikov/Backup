@@ -4,6 +4,7 @@
 **Код итерации:** `056d14e0e2144dab57949de111970d1ec429f7e5`.
 **Маркер:** `app/buildinfo.properties` → `SOURCE_SHA=056d14e` (пишет агент; `git rev-parse` в сборке запрещён).
 **Версия:** `versionCode = 59`, `versionName = "1.0.59"` (`app/build.gradle.kts:78-79`).
+**HEAD ветки `fix/v2`:** `ee13abd` (после `1b69177` — только документация, код не менялся).
 **CI:** прогон `42499097146` (`056d14e`) — **success, 129 PASSED / 0 FAILED**, job `128787726449`,
 артефакт `13624524776` (177 142 576 Б), `BUILD SUCCESSFUL in 3m 18s`.
 
@@ -190,6 +191,7 @@ JIT-запись `persist.dalvik.vm.usejit`, `StatusIcon_*`/ресурсы/ра�
 | **`42499097146`** | **`056d14e`** | ✅ **success** | **129 PASSED / 0 FAILED**, job `128787726449`, артефакт `13624524776` (177 142 576 Б), `BUILD SUCCESSFUL in 3m 18s` |
 | **`42500110715`** | **`28fdac1`** (handoff: отчёт + WORKLOG + `SOURCE_SHA=056d14e`) | ✅ **success** | **129 PASSED / 0 FAILED**, job `128790823798`, артефакт `13625751211` (177 142 520 Б), `BUILD SUCCESSFUL in 2m 53s`, `BuildMarkerTest > commitSourceIsHonest PASSED` |
 | **`42500938241`** | **`1b69177`** (финальная сдача) | ✅ **success** | **129 PASSED / 0 FAILED**, job `128793320740`, артефакт `13626041033` (177 142 563 Б), `BUILD SUCCESSFUL in 4m 20s` |
+| **`42501921140`** | **`ee13abd`** (HEAD ветки `fix/v2`) | ✅ **success** | **129 PASSED / 0 FAILED**, job `128796319927`, артефакт `13626356749` (177 142 518 Б), `BUILD SUCCESSFUL in 3m 24s` |
 
 ## §7 Что проверить владельцу
 
