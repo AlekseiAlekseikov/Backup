@@ -1,5 +1,6 @@
 package com.example.voiceapp3.tools
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
@@ -48,5 +49,65 @@ class JitBootTest {
         val app = src("src/main/java/com/example/voiceapp3/App.kt")
         assertTrue("проба вызывается из App.onCreate через BgWorker",
             app.contains("AppPerformance.jitBootProbe(this)"))
+    }
+
+    /**
+     * iter33n-fix1 §2/§4 — правило владельца 08.11: рестарт фреймворка разрешён ТОЛЬКО в тумблере
+     * JIT (по явному клику). Статический поиск call-sites: литерал есть ровно в одном файле и
+     * только внутри блока `JIT_ZYGOTE_BEGIN … JIT_ZYGOTE_END`, а сам блок вызывается из
+     * `setAutoOptimize` и НЕ вызывается из boot/фоновых путей.
+     */
+    @Test
+    fun zygoteRestartOnlyInsideJitToggleBlock() {
+        val root = listOf(File("src/main/java"), File("app/src/main/java")).first { it.isDirectory }
+        val withLiteral = root.walkTopDown()
+            .filter { it.isFile && it.extension == "kt" && it.readText().contains("ctl.restart zygote") }
+            .map { it.name }.toList()
+        assertEquals("рестарт фреймворка допустим только в AppPerformance.kt",
+            listOf("AppPerformance.kt"), withLiteral)
+
+        val perf = src("src/main/java/com/example/voiceapp3/tools/AppPerformance.kt")
+        val begin = perf.indexOf("JIT_ZYGOTE_BEGIN")
+        val end = perf.indexOf("JIT_ZYGOTE_END")
+        assertTrue("нет маркеров блока JIT_ZYGOTE", begin > 0 && end > begin)
+        var idx = perf.indexOf("ctl.restart zygote")
+        var count = 0
+        while (idx >= 0) {
+            count++
+            assertTrue("литерал вне блока JIT_ZYGOTE (позиция $idx)", idx in begin..end)
+            idx = perf.indexOf("ctl.restart zygote", idx + 1)
+        }
+        assertTrue("в блоке должен быть вызов рестарта", count >= 1)
+
+        assertTrue("тумблер JIT обязан вызывать jitApplyWithZygote",
+            perf.contains("jitApplyWithZygote(context, enabled, rtBefore, psBefore)"))
+        for (fn in listOf("fun jitBootProbe", "fun bootRestoreJit", "fun verifyJitOnly",
+                          "fun jitPendingVerify", "fun checkPendingZygoteVerify", "fun jitRound")) {
+            val body = bodyOf(perf, fn)
+            assertTrue("нет функции $fn", body.isNotEmpty())
+            assertTrue("$fn не должен запускать рестарт фреймворка", !body.contains("jitApplyWithZygote("))
+        }
+    }
+
+    /**
+     * Тело функции по балансу фигурных скобок: `indexOf` + N символов давал ложные срабатывания
+     * (соседняя функция попадала в окно).
+     */
+    private fun bodyOf(src: String, fn: String): String {
+        val i = src.indexOf(fn)
+        if (i < 0) return ""
+        val j = src.indexOf('{', i)
+        if (j < 0) return ""
+        var depth = 0
+        for (k in j until src.length) {
+            when (src[k]) {
+                '{' -> depth++
+                '}' -> {
+                    depth--
+                    if (depth == 0) return src.substring(i, k + 1)
+                }
+            }
+        }
+        return src.substring(i)
     }
 }

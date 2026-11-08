@@ -15,18 +15,22 @@ object HvacDigitalPlugin {
     /** iter33b A1: ключ префа с uptime прошлой boot-попытки (защита от повтора при рестарте процесса). */
     private const val STAGE_DIR = "/data/local/hvac-digital"
     private const val STAGE_APK = "$STAGE_DIR/sysui.apk"
-    private const val OEM_PKG = "com.flyme.auto.systemuiplugin"
+    internal const val OEM_PKG = "com.flyme.auto.systemuiplugin"   // iter33n-fix1 §1.3: нужен PLUGIN_DIAG
 
     /**
-     * iter33j P0.1 — опознание плагина по СОДЕРЖИМОМУ, а не только по строке маунта.
-     * Это наш бинарь референса как есть (CentralEXAuto, коммит 99c4fe0…):
-     * `sha256 de4b47422cf7b4b90385dd0dc371cc5c6b3c9a3928b5bd8e2bf00b4d24d0fd03`,
-     * размер 18 280 162 Б, md5 файла `2fa3d11d3a5350cd4a427cc69617482b`.
+     * iter33j P0.1 / iter33n-fix1 §1.2 — опознание плагина по СОДЕРЖИМОМУ, а не по строке маунта.
+     *
+     * iter33n-fix1: бандл заменён на сборку референса **1.4.1 «exttemp-empilhado»**
+     * (CentralEXAuto, коммит `e0bd36c9`): только она читает
+     * `persist.sys.hvacdigital.batt` / `.exttemp` / `.temp` — из-за этого в 1.0.58 слоты молчали.
+     *   md5    `5aab306b34a2ce06d527399ed536cb35`
+     *   sha256 `fabc06a38cb588bae64f4cfc71e4848d21809b01bca43f6f85363839cc353d21`
+     *   размер `18 284 258` Б
      * Никаких smali/apktool-правок в нём нет и быть не должно (правило владельца 06.11).
      */
-    internal const val PLUGIN_APK_MD5 = "2fa3d11d3a5350cd4a427cc69617482b"
-    internal const val PLUGIN_APK_SIZE = 18_280_162L
-    internal const val PLUGIN_APK_SHA256 = "de4b47422cf7b4b90385dd0dc371cc5c6b3c9a3928b5bd8e2bf00b4d24d0fd03"
+    internal const val PLUGIN_APK_MD5 = "5aab306b34a2ce06d527399ed536cb35"
+    internal const val PLUGIN_APK_SIZE = 18_284_258L
+    internal const val PLUGIN_APK_SHA256 = "fabc06a38cb588bae64f4cfc71e4848d21809b01bca43f6f85363839cc353d21"
 
     /**
      * iter33h D1.1 — ЕДИНСТВЕННЫЙ предикат «маунт плагина есть»: без учёта регистра, обе формы

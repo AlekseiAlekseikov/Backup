@@ -209,59 +209,31 @@ object AppPerformance {
             )
 
             val valStr = if (enabled) "true" else "false"
-            // ── iter33j §4.1 (правило владельца 06.11) ─────────────────────────────
-            // рестарт zygote УДАЛЁН ВООБЩЕ: он ложит root-канал и CarPlay (таймлайн
-            // владельца), а у референса zygote не перезапускается никогда — там `jit_pedido` /
-            // `jit_restaurar` меняют только prop. Здесь ровно два setprop + чтение обратно;
-            // ни `svc wifi`, ни `umount /data/app/*`, ни `sleep`, ни рестартов процессов.
+            // iter33n-fix1 §2 — механизм референса (`w0/bb.run`): prop → рестарт фреймворка →
+            // сверка на следующем старте. Рестарт фреймворка разрешён владельцем (08.11)
+            // ТОЛЬКО здесь — в потоке тумблера JIT по явному клику (см. блок JIT_ZYGOTE).
             val (rtBefore, psBefore) = jitProps()
             jitPersistBackfill(valStr, "toggle")
-            val D = "$"
-            val script = """
-                setprop $PROP_USEJIT $valStr 2>/dev/null
-                setprop $PROP_USEJIT_PROFILES $valStr 2>/dev/null
-                echo RT_AFTER=${D}(getprop $PROP_USEJIT)
-                echo PS_AFTER=${D}(getprop $PROP_PERSIST_USEJIT)
-            """.trimIndent()
-            val t0 = System.currentTimeMillis()
-            val ret = runSuCommand(script)
-            val t1 = System.currentTimeMillis()
-            val rtAfter = parseTag(ret.output, "RT_AFTER") ?: ""
-            val psAfter = parseTag(ret.output, "PS_AFTER") ?: ""
-            val rootUnavailable = ret.output.contains("ERR_ROOT_CHANNEL_UNAVAILABLE")
-            val persistOk = psAfter == valStr
-            val runtimeOk = rtAfter == valStr
-            // Честный текст: runtime меняется только после перезагрузки ГУ — это НЕ ошибка.
-            AppLog.i(TAG, "JIT: runtime_before=$rtBefore persist_before=$psBefore runtime=$rtAfter " +
-                "persist=$psAfter action=setprop_only zygote_restart=never " +
-                "apply=\"применится после перезагрузки ГУ\" rc=${ret.exitCode} root_err=$rootUnavailable")
-            val jitStatus: ToolsStep.Status = when {
-                rootUnavailable -> ToolsStep.Status.BLOCKED
-                persistOk -> ToolsStep.Status.OK
-                else -> ToolsStep.Status.FAILED
-            }
-            val jitReason = "persist_before=$psBefore persist_after=$psAfter runtime=$rtAfter " +
-                "runtime_applied=$runtimeOk (применится после перезагрузки ГУ, zygote не перезапускаем)"
-            AppLog.i(TAG, "VERIFY jit_setprop: $jitStatus ($jitReason)")
-            steps.add(
-                ToolsStep(
-                    step = "perf_prop",
-                    command = "setprop dalvik.vm.usejit=$valStr (без ctl.restart — zygote не перезапускаем)",
-                    startedAtMs = t0,
-                    finishedAtMs = t1,
-                    exitCode = ret.exitCode,
-                    expected = "persist.sys.dalvik.vm.usejit=$valStr",
-                    actual = jitReason,
-                    stdout = "dalvik.vm.usejit=$valStr · применится после перезагрузки ГУ",
-                    stderr = ret.output.take(2000),
-                    status = jitStatus
-                )
-            )
+            val zygotePatch = jitApplyWithZygote(context, enabled, rtBefore, psBefore)
+            steps.addAll(zygotePatch)
 
             if (enabled) {
-                // iter33j §4.2: вместо `compile_all_apps` — «раунд оптимизации» как у референса
-                // (`rodada de otimizacao`): по одной строке на пакет, без красных текстов.
-                steps.addAll(jitRoundSteps(context, JIT_ROUND_MODE, null))
+                // iter33n-fix1 §2: «раунд оптимизации» ПОСЛЕ рестарта фреймворка бессмыслен —
+                // процесс всё равно умирает через несколько секунд, компиляция оборвётся на
+                // середине и оставит мусор в логе. Пропускаем честной строкой.
+                AppLog.i(TAG, "JIT_ROUND skipped reason=zygote_restart_armed mode=$JIT_ROUND_MODE " +
+                    "(тумблер JIT перезапускает фреймворк — раунд запускается отдельной кнопкой)")
+                steps.add(
+                    ToolsStep(
+                        step = "jit_round_skip",
+                        command = "cmd package compile -m $JIT_ROUND_MODE <pkg>",
+                        startedAtMs = now,
+                        finishedAtMs = System.currentTimeMillis(),
+                        exitCode = 0,
+                        stdout = "JIT_ROUND skipped reason=zygote_restart_armed",
+                        status = ToolsStep.Status.OK
+                    )
+                )
             }
 
             return ToolsResult(
@@ -890,23 +862,263 @@ object AppPerformance {
             AppLog.i(TAG, "JIT_BOOT runtime=$runtime persist=$persist reason=init_did_not_carry " +
                 "marker=$marker (persist есть, runtime не true)")
         }
+        // iter33n-fix1 §2.4(в): если перед рестартом фреймворка осталось намерение — дочитываем
+        // итог здесь же (`JIT_APPLIED … via=pending_verify`), это первый старт после рестарта.
+        runCatching { jitPendingVerify(context) }
     }
 
     /** Одна проба за процесс (§3: строка ровно одна, без спама на каждый тик). */
     private val jitProbeDone = java.util.concurrent.atomic.AtomicBoolean(false)
 
     /**
-     * iter33j §4.1 — сверка «после рестарта zygote» больше не существует: рестарта нет.
-     * Функция сохранена, потому что её вызывают `VoiceAssistantService.onCreate/onStartCommand`;
-     * она ровно один раз за процесс пишет в лог, почему ничего не ждёт, и подчищает файл-намерение
-     * старых версий (он больше не используется).
+     * iter33n-fix1 §2.4(в) — сверка итога применения JIT после перезапуска фреймворка.
+     *
+     * Вызывается из `VoiceAssistantService.onCreate/onStartCommand` (там main-поток ⇒ сразу
+     * уходим в [BgWorker]) и из [jitBootProbe]. Работает ровно один раз за процесс и только
+     * при наличии файла-намерения, который пишется ПЕРЕД рестартом zygote.
      */
     fun checkPendingZygoteVerify(context: Context) {
-        if (!saidNoClaim.compareAndSet(false, true)) return
-        runCatching { File(context.applicationContext.filesDir, JIT_PENDING_FILE).delete() }
-        AppLog.i(TAG, "JIT_VERIFY: skipped reason=zygote_restart_removed " +
-            "(iter33j: JIT применяется prop-маркером, zygote не перезапускаем)")
+        val app = context.applicationContext
+        if (!File(app.filesDir, JIT_PENDING_FILE).isFile) return
+        BgWorker.post("AppPerformance.jitPendingVerify") {
+            runCatching { jitPendingVerify(app) }
+        }
+        saidNoClaim.compareAndSet(false, true)
     }
+
+    /** Одна сверка на процесс (иначе `onCreate` + `onStartCommand` дают две одинаковые строки). */
+    private val jitPendingDone = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /**
+     * iter33n-fix1 §2.4(в) — дочитать итог: `getprop dalvik.vm.usejit` + файл результата,
+     * который после рестарта пишет device-side watcher, + `/proc/self/maps` НАШЕГО процесса
+     * (только в живом app-процессе есть `dalvik-jit-code-cache`).
+     *
+     * Строка ровно одна:
+     *   `JIT_APPLIED runtime=<true|false|empty> want=<…> zygote_restart=<ok|unknown> maps=<yes|no>
+     *    result=<ok|failed|unknown> via=pending_verify …`
+     *
+     * Намерение НЕ сжигается, если канал молчит: иначе в логе остался бы ложный `failed`.
+     */
+    fun jitPendingVerify(context: Context): Boolean {
+        if (!jitPendingDone.compareAndSet(false, true)) return false
+        val app = context.applicationContext
+        val pendFile = File(app.filesDir, JIT_PENDING_FILE)
+        if (!pendFile.isFile) return false
+        val pending = runCatching { pendFile.readText().trim() }.getOrDefault("")
+        val want = runCatching { File(app.filesDir, JIT_PENDING_WANT_FILE).readText().trim() }
+            .getOrDefault("")
+        val tag = currentBootTag()
+        when (JitBootMark.pendingDecision(pending, tag)) {
+            JitBootMark.PendingDecision.NONE -> return false
+            JitBootMark.PendingDecision.STALE -> {
+                runCatching { pendFile.delete() }
+                runCatching { File(app.filesDir, JIT_PENDING_WANT_FILE).delete() }
+                AppLog.i(TAG, "JIT_APPLIED runtime=unknown want=${want.ifEmpty { "empty" }} " +
+                    "zygote_restart=unknown maps=unknown result=unknown via=pending_verify " +
+                    "reason=pending_stale (намерение от другой загрузки — итог неизвестен)")
+                return false
+            }
+            JitBootMark.PendingDecision.VERIFY -> Unit
+        }
+        val read = {
+            val (_, out) = runCatching {
+                AdbClient.execute(
+                    "echo RT=\$(getprop $PROP_USEJIT); echo PS=\$(getprop $PROP_PERSIST_USEJIT_INIT); " +
+                        "echo ZR=\$(tr '\n' '|' < $JIT_ZYGOTE_RESULT_PATH 2>/dev/null)",
+                    8000, expectRoot = false
+                )
+            }.getOrDefault(Pair(1, ""))
+            val rt = Regex("RT=([^\\n]*)").find(out)?.groupValues?.get(1)?.trim().orEmpty()
+            val ps = Regex("PS=([^\\n]*)").find(out)?.groupValues?.get(1)?.trim().orEmpty()
+            val zr = Regex("ZR=([^\\n]*)").find(out)?.groupValues?.get(1)?.trim().orEmpty()
+            Triple(rt, ps, zr)
+        }
+        var (runtime, persist, zr) = read()
+        if (runtime.isEmpty() && persist.isEmpty()) {
+            // Канала нет — это НЕ провал JIT. Пробуем поднять транспорт и читаем ещё раз.
+            val recovered = runCatching { AdbClient.reconnectRoot("jit_pending_verify") }.getOrDefault(false)
+            if (recovered) {
+                val again = read()
+                runtime = again.first; persist = again.second; zr = again.third
+            }
+            if (runtime.isEmpty() && persist.isEmpty()) {
+                AppLog.i(TAG, "JIT_APPLIED runtime=empty want=${want.ifEmpty { "empty" }} " +
+                    "zygote_restart=unknown maps=unknown result=unknown via=pending_verify " +
+                    "reason=no_channel reconnect=${if (recovered) "OK" else "FAILED"} " +
+                    "(намерение сохранено — итог дочитаем на следующем старте)")
+                jitPendingDone.set(false)   // намерение не сжигаем
+                return false
+            }
+        }
+        val maps = runCatching {
+            File("/proc/self/maps").useLines { l -> l.any { it.contains("dalvik-jit-code-cache") } }
+        }.getOrDefault(false)
+        val zygoteRestart = when {
+            zr.contains("zygote_restart=ok") -> "ok"
+            zr.isEmpty() -> "unknown"
+            else -> "unknown"
+        }
+        val detail = zr.replace('|', ' ').trim().take(220)
+        val result = when {
+            want.isEmpty() -> "unknown"
+            runtime == want -> "ok"
+            else -> "failed"
+        }
+        AppLog.i(TAG, "JIT_APPLIED runtime=${runtime.ifEmpty { "empty" }} want=${want.ifEmpty { "empty" }} " +
+            "persist=${persist.ifEmpty { "empty" }} zygote_restart=$zygoteRestart maps=${if (maps) "yes" else "no"} " +
+            "result=$result via=pending_verify detail=\"$detail\"")
+        if (zygoteRestart != "ok") {
+            AppLog.i(TAG, "JIT_APPLIED runtime=${runtime.ifEmpty { "empty" }} zygote_restart=unknown " +
+                "reason=no_result_file (watcher не оставил $JIT_ZYGOTE_RESULT_PATH — итог по getprop)")
+        }
+        runCatching { pendFile.delete() }
+        runCatching { File(app.filesDir, JIT_PENDING_WANT_FILE).delete() }
+        runCatching { AdbClient.execute("rm -f $JIT_ZYGOTE_RESULT_PATH", 4000) }
+        return true
+    }
+
+    // ═══════════ JIT_ZYGOTE_BEGIN ═══════════
+    /*
+     * ЕДИНСТВЕННОЕ место в коде, где разрешён перезапуск фреймворка (владелец, 08.11):
+     * только тумблер JIT по явному клику. Механизм — байткод референса `w0/bb.run`:
+     *   `getprop` → сохранить восстановление (wifi) → `setprop` → рестарт → проверка
+     *   `getprop` + `/proc/self/maps` (`dalvik-jit-code-cache`).
+     *
+     * Почему watcher, а не прямой вызов из приложения: перезапуск фреймворка убивает ВСЕ
+     * app-процессы (это и есть его работа), поэтому собственный `getprop` после рестарта
+     * физически некому выполнить. Скрипт запускается detached (`nohup … &`), переживает
+     * смерть нашего процесса, восстанавливает wifi и кладёт итог в файл; приложение
+     * дочитывает его на следующем старте ([jitPendingVerify]).
+     */
+    private const val JIT_ZYGOTE_RESULT_PATH = "/data/local/tmp/jit_zygote_result.txt"
+    private const val JIT_ZYGOTE_WATCH_PATH = "/data/local/tmp/jit_zygote_watch.sh"
+    /** Задержка рестарта: успеваем записать маркер, лог и вернуть честный статус в UI. */
+    private const val JIT_ZYGOTE_DELAY_S = 8
+    /** Файл «чего мы хотели» рядом с намерением (формат намерения занят тегом загрузки). */
+    private const val JIT_PENDING_WANT_FILE = "jit_pending_want"
+
+    /** Device-side watcher: рестарт + сверка + восстановление wifi + итог в файл. */
+    internal fun jitZygoteWatcherScript(): String {
+        val D = "$"
+        return """
+            #!/system/bin/sh
+            # iter33n-fix1 §2.1 — пишет итог ПОСЛЕ подъёма фреймворка (наше приложение к тому
+            # моменту уже убито рестартом). Параметры: 1=want(true|false) 2=wifi_before(0|1) 3=delay_s
+            V=${D}1
+            WIFI=${D}2
+            DELAY=${D}3
+            OUT=$JIT_ZYGOTE_RESULT_PATH
+            ZP0=${D}(pidof zygote 2>/dev/null)
+            SS0=${D}(pidof system_server 2>/dev/null)
+            sleep ${D}{DELAY:-8}
+            echo "JIT_ZYGOTE_WATCH start want=${D}V zygote_pid_before=${D}ZP0 system_server_before=${D}SS0" > ${D}OUT
+            setprop ctl.restart zygote
+            i=0
+            while [ ${D}i -lt 180 ]; do
+              sleep 1
+              i=${D}((i+1))
+              ZP=${D}(pidof zygote 2>/dev/null)
+              SS=${D}(pidof system_server 2>/dev/null)
+              if [ -n "${D}ZP" ] && [ "${D}ZP" != "${D}ZP0" ] && [ -n "${D}SS" ] && [ "${D}SS" != "${D}SS0" ]; then break; fi
+            done
+            sleep 5
+            RT=${D}(getprop dalvik.vm.usejit)
+            PS=${D}(getprop persist.dalvik.vm.usejit)
+            if [ "${D}WIFI" = "1" ]; then svc wifi enable >/dev/null 2>&1; sleep 1; fi
+            WF=${D}(settings get global wifi_on 2>/dev/null)
+            {
+              echo "JIT_ZYGOTE_DONE runtime=${D}RT persist=${D}PS want=${D}V zygote_restart=ok"
+              echo "zygote_pid_after=${D}(pidof zygote 2>/dev/null) waited_s=${D}i wifi_before=${D}WIFI wifi_after=${D}WF"
+            } >> ${D}OUT
+        """.trimIndent() + "
+"
+    }
+
+    /**
+     * Применение JIT механизмом референса: setprop → detached watcher → рестарт фреймворка.
+     * Возвращает шаги для UI. Статус честный: `PARTIAL` — «перезапускаем, итог на следующем старте»,
+     * потому что проверить `runtime` из умирающего процесса нельзя (§2.4б).
+     */
+    fun jitApplyWithZygote(context: Context, enabled: Boolean, rtBefore: String, psBefore: String): List<ToolsStep> {
+        BgWorker.assertNotMain("AppPerformance.jitApplyWithZygote")
+        val app = context.applicationContext
+        val want = if (enabled) "true" else "false"
+        val t0 = System.currentTimeMillis()
+        // §2.4(а): намерение ДО рестарта — иначе после него результата ждать неоткуда.
+        runCatching {
+            File(app.filesDir, JIT_PENDING_FILE)
+                .writeText(JitBootMark.format(currentBootTag(), android.os.SystemClock.uptimeMillis()))
+            File(app.filesDir, JIT_PENDING_WANT_FILE).writeText(want)
+        }
+        val D = "$"
+        val b64 = android.util.Base64.encodeToString(
+            jitZygoteWatcherScript().toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP)
+        val prep = """
+            setprop $PROP_USEJIT $want 2>/dev/null
+            setprop $PROP_USEJIT_PROFILES $want 2>/dev/null
+            echo RT=${D}(getprop $PROP_USEJIT)
+            echo PS=${D}(getprop $PROP_PERSIST_USEJIT_INIT)
+            echo WIFI=${D}(settings get global wifi_on 2>/dev/null)
+            echo '$b64' | base64 -d > $JIT_ZYGOTE_WATCH_PATH 2>/dev/null
+            chmod 755 $JIT_ZYGOTE_WATCH_PATH 2>/dev/null
+            echo WSIZE=${D}(wc -c < $JIT_ZYGOTE_WATCH_PATH 2>/dev/null | tr -d ' ')
+        """.trimIndent()
+        val ret = runCatching { runSuCommand(prep) }.getOrNull()
+        val out = ret?.output ?: ""
+        val rootUnavailable = out.contains("ERR_ROOT_CHANNEL_UNAVAILABLE") || out.isBlank()
+        val rtNow = parseTag(out, "RT") ?: ""
+        val psNow = parseTag(out, "PS") ?: ""
+        val wifi = parseTag(out, "WIFI") ?: "?"
+        val wsize = (parseTag(out, "WSIZE") ?: "0").toIntOrNull() ?: 0
+        val watcherOk = wsize > 200
+        if (rootUnavailable || !watcherOk) {
+            // Рестарт НЕ запускаем: без канала/скрипта это был бы прыжок в неизвестность.
+            runCatching { File(app.filesDir, JIT_PENDING_FILE).delete() }
+            runCatching { File(app.filesDir, JIT_PENDING_WANT_FILE).delete() }
+            val why = if (rootUnavailable) "reason=no_root_channel" else "reason=watcher_not_written"
+            AppLog.i(TAG, "JIT_APPLIED runtime=${rtNow.ifEmpty { "empty" }} want=$want zygote_restart=not_started " +
+                "maps=unknown result=failed via=toggle $why watcher_bytes=$wsize")
+            return listOf(
+                ToolsStep(
+                    step = "perf_zygote",
+                    command = "setprop dalvik.vm.usejit=$want + detached watcher",
+                    startedAtMs = t0, finishedAtMs = System.currentTimeMillis(),
+                    exitCode = ret?.exitCode ?: 1,
+                    expected = "watcher written",
+                    actual = "JIT_APPLIED zygote_restart=not_started $why",
+                    stdout = out.take(600),
+                    status = if (rootUnavailable) ToolsStep.Status.BLOCKED else ToolsStep.Status.FAILED
+                )
+            )
+        }
+        val launch = "( nohup sh $JIT_ZYGOTE_WATCH_PATH $want $wifi $JIT_ZYGOTE_DELAY_S " +
+            ">/dev/null 2>&1 </dev/null & ) ; sleep 1; " +
+            "echo LAUNCHED=${D}(pgrep -f jit_zygote_watch 2>/dev/null | head -n1 || echo unknown)"
+        val lret = runCatching { runSuCommand(launch) }.getOrNull()
+        // pgrep может отсутствовать в прошивке — это НЕ провал запуска, поэтому статус не зависит
+        // от него: watcher уже detached, рестарт произойдёт по расписанию.
+        val launched = (parseTag(lret?.output ?: "", "LAUNCHED") ?: "").ifEmpty { "unknown" }
+        AppLog.i(TAG, "JIT_APPLIED_REQUEST want=$want runtime_before=${rtBefore.ifEmpty { "empty" }} " +
+            "persist_before=${psBefore.ifEmpty { "empty" }} runtime_now=${rtNow.ifEmpty { "empty" }} " +
+            "persist_readback=${psNow.ifEmpty { "empty" }} wifi_before=$wifi watcher_bytes=$wsize " +
+            "launched=$launched zygote_restart=armed in=${JIT_ZYGOTE_DELAY_S}s verify=next_start " +
+            "warning=\"фреймворк перезапустится: экран гаснет на 10–20 с, приложения закрываются\"")
+        return listOf(
+            ToolsStep(
+                step = "perf_zygote",
+                command = "setprop dalvik.vm.usejit=$want · перезапуск фреймворка (тумблер JIT)",
+                startedAtMs = t0, finishedAtMs = System.currentTimeMillis(),
+                exitCode = lret?.exitCode ?: 0,
+                expected = "JIT_APPLIED runtime=$want zygote_restart=ok (следующий старт)",
+                actual = "zygote_restart=armed in=${JIT_ZYGOTE_DELAY_S}s launched=$launched " +
+                    "runtime_now=${rtNow.ifEmpty { "empty" }} persist=$psNow",
+                stdout = "экран гаснет на 10–20 с · итог строкой JIT_APPLIED … via=pending_verify",
+                status = ToolsStep.Status.PARTIAL
+            )
+        )
+    }
+    // ═══════════ JIT_ZYGOTE_END ═══════════
 
     fun verifyJitOnly(context: Context) {
         val app = context.applicationContext

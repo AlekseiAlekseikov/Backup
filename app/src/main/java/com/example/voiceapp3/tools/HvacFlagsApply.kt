@@ -529,9 +529,12 @@ internal object HvacFlagsApply {
      */
     fun startupDiagnostics() {
         val names = EXT_NAMES + HvacDigitalProps.PROP_TEMP + HvacDigitalProps.PROP_BATT + HvacDigitalProps.PROP_VIA
+        // iter33n-fix1 §1.3: сверка СМОНТИРОВАННОГО плагина с ожидаемым md5 1.4.1.
+        val md5Cmd = "P=\$(pm path ${HvacDigitalPlugin.OEM_PKG} 2>/dev/null | sed 's/^package://' | head -n1); " +
+            "echo \"PLUGIN_MD5=\$(md5sum \"\$P\" 2>/dev/null | cut -d' ' -f1) path=\$P\""
         val cmd = names.joinToString("; ") { "echo \"PROP $it=\$(getprop $it)\"" } + "; " +
             "echo \"SYSUI_PLUGIN=\$(settings get secure sysui_plugin_shortcut_settings 2>&1)\"; " +
-            "echo \"SYSUI_TUNER=\$(settings get secure sysui_tuner_version 2>&1)\""
+            "echo \"SYSUI_TUNER=\$(settings get secure sysui_tuner_version 2>&1)\"; " + md5Cmd
         val out = runCatching { AdbClient.execute(cmd, 8000).second }.getOrDefault("")
         if (out.isBlank()) {
             AppLog.i(TAG, "EXT_DIAG result=no_channel")
@@ -544,6 +547,15 @@ internal object HvacFlagsApply {
                     line.substringAfter('=').ifBlank { "empty" })
                 line.startsWith("SYSUI_TUNER=") -> AppLog.i(TAG, "PLUGIN_DIAG sysui_tuner_version=" +
                     line.substringAfter('=').ifBlank { "empty" })
+                line.startsWith("PLUGIN_MD5=") -> {
+                    // `PLUGIN_MD5=<md5> path=<…>`
+                    val md5 = line.removePrefix("PLUGIN_MD5=").substringBefore(' ').trim()
+                    val path = Regex("path=([^\\n]*)").find(line)?.groupValues?.get(1)?.trim().orEmpty()
+                    val match = md5.isNotEmpty() && md5 == HvacDigitalPlugin.PLUGIN_APK_MD5
+                    AppLog.i(TAG, "PLUGIN_DIAG md5=${md5.ifEmpty { "empty" }} " +
+                        "expected_md5=${HvacDigitalPlugin.PLUGIN_APK_MD5} md5_match=${if (match) "yes" else "no"} " +
+                        "path=${path.ifEmpty { "none" }} version=1.4.1")
+                }
             }
         }
     }

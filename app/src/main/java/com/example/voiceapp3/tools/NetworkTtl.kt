@@ -154,6 +154,13 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
     @Volatile private var ttlInFlight = false
     @Volatile private var ttlLastRunAtMs: Long = 0L
 
+    /**
+     * iter33n-fix1 §3.1 — окно debounce для ПОВТОРНОГО ON: 3 с (было 30 с).
+     * Приёмник сети (`TTL_RECEIVER`) продолжает жить со своим окном 30 с: там шторм
+     * переподключений, а не клик владельца. OFF не блокируется никогда (`debounceMs = 0`).
+     */
+    internal const val TTL_ON_DEBOUNCE_MS = 3_000L
+
     fun setTtl65Active(context: Context, enabled: Boolean): ToolsResult {
         BgWorker.assertNotMain("NetworkTtl.setTtl65Active")
         val t0 = SystemClock.uptimeMillis()
@@ -165,12 +172,17 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
                 stderr="skipped: single-flight in-flight", expected="", actual="", status=ToolsStep.Status.BLOCKED)
             return ToolsResult("settings.ttl65", "Фиксация TTL 65", listOf(skipStep))
         }
+        // iter33n-fix1 §3.1: окно debounce — только для ПОВТОРНОГО включения и ≤ 3 с.
+        // Лог 08.11: второй клик через 13 с съедался окном 30 с (`skipped: debounce 13424ms`),
+        // а выключение вообще не должно блокироваться: OFF — это возврат в сток, его ждут.
+        val debounceMs = if (enabled) TTL_ON_DEBOUNCE_MS else 0L
         val sinceLast = t0 - ttlLastRunAtMs
-        if (sinceLast in 0 until 30_000L) {
-            AppLog.w(TAG, "TTL: setTtl65Active DEBOUNCE lastRan=${sinceLast}ms ago (<30s)")
+        if (debounceMs > 0L && sinceLast in 0 until debounceMs) {
+            AppLog.w(TAG, "TTL: setTtl65Active DEBOUNCE lastRan=${sinceLast}ms ago (<${debounceMs}ms) enabled=$enabled")
             val skipStep = ToolsStep(step="settings.ttl65", command="iptables ttl-set", startedAtMs=t0,
                 finishedAtMs=SystemClock.uptimeMillis(), exitCode=1, stdout="",
-                stderr="skipped: debounce ${sinceLast}ms", expected="", actual="", status=ToolsStep.Status.BLOCKED)
+                stderr="skipped: debounce ${sinceLast}ms (<${debounceMs}ms)", expected="", actual="",
+                status=ToolsStep.Status.BLOCKED)
             return ToolsResult("settings.ttl65", "Фиксация TTL 65", listOf(skipStep))
         }
         synchronized(this) {

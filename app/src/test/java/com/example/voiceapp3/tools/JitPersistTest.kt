@@ -44,13 +44,4 @@ class JitPersistTest {
         assertTrue("boot-строка JIT_BOOT", s.contains("JIT_BOOT runtime="))
         assertTrue("вердикт «поднимется после ребута»", s.contains("expect_runtime_true_after_reboot="))
     }
-
-    @Test
-    fun zygoteNeverRestarted() {
-        val root = listOf(File("src/main/java"), File("app/src/main/java")).first { it.isDirectory }
-        val hits = root.walkTopDown().filter { it.isFile && it.extension == "kt" }
-            .filter { it.readText().contains("ctl.restart zygote") }
-            .map { it.name }.toList()
-        assertTrue("ctl.restart zygote запрещён: $hits", hits.isEmpty())
-    }
 }

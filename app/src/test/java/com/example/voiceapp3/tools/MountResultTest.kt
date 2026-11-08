@@ -61,9 +61,9 @@ class MountResultTest {
     @Test
     fun detailSizeParsed() {
         val out = "HVAC_MOUNT_DETAIL src=/data/local/hvac-digital/sysui.apk dst=/system/app/x.apk " +
-            "src_inode=11 tgt_inode=11 src_md5=aa tgt_md5=aa src_size=18280162 tgt_size=18280162"
-        assertEquals(18_280_162L, MountResult.detailSize(out, "tgt_size"))
-        assertEquals(18_280_162L, MountResult.detailSize(out, "src_size"))
+            "src_inode=11 tgt_inode=11 src_md5=aa tgt_md5=aa src_size=18284258 tgt_size=18284258"
+        assertEquals(18_284_258L, MountResult.detailSize(out, "tgt_size"))
+        assertEquals(18_284_258L, MountResult.detailSize(out, "src_size"))
         assertNull(MountResult.detailSize("HVAC_MOUNT_DETAIL dst=x", "tgt_size"))
     }
 
