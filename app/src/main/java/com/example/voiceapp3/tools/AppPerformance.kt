@@ -925,7 +925,7 @@ object AppPerformance {
             val (_, out) = runCatching {
                 AdbClient.execute(
                     "echo RT=\$(getprop $PROP_USEJIT); echo PS=\$(getprop $PROP_PERSIST_USEJIT_INIT); " +
-                        "echo ZR=\$(tr '\n' '|' < $JIT_ZYGOTE_RESULT_PATH 2>/dev/null)",
+                        "echo ZR=\$(tr '\\n' '|' < $JIT_ZYGOTE_RESULT_PATH 2>/dev/null)",
                     8000, expectRoot = false
                 )
             }.getOrDefault(Pair(1, ""))
@@ -1031,8 +1031,7 @@ object AppPerformance {
               echo "JIT_ZYGOTE_DONE runtime=${D}RT persist=${D}PS want=${D}V zygote_restart=ok"
               echo "zygote_pid_after=${D}(pidof zygote 2>/dev/null) waited_s=${D}i wifi_before=${D}WIFI wifi_after=${D}WF"
             } >> ${D}OUT
-        """.trimIndent() + "
-"
+        """.trimIndent()
     }
 
     /**
