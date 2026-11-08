@@ -895,9 +895,6 @@ object AppPerformance {
     /** Одна проба за процесс (§3: строка ровно одна, без спама на каждый тик). */
     private val jitProbeDone = java.util.concurrent.atomic.AtomicBoolean(false)
 
-    /** `dalvik.vm.usejitprofiles` — читается только для строки `JIT_BOOT`. */
-    private const val PROP_USEJIT_PROFILES = "dalvik.vm.usejitprofiles"
-
     /**
      * iter33j §4.1 — сверка «после рестарта zygote» больше не существует: рестарта нет.
      * Функция сохранена, потому что её вызывают `VoiceAssistantService.onCreate/onStartCommand`;
