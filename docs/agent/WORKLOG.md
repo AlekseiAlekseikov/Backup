@@ -944,3 +944,6 @@
    правка APK плагина (сейчас запрещена).
 2. 🟡 Проверка владельцем: `JIT_BOOT` на старте, три шага `EXT_PROBE_V2`, `TTL_ADD_COUNT n=1`,
    `TTL_OFF … result=OK`, CarPlay при ON.
+- **`42500110715`** (`28fdac1`, handoff: отчёт + WORKLOG + `SOURCE_SHA=056d14e`) — **success,
+  129 PASSED / 0 FAILED**, job `128790823798`, артефакт `13625751211` (177 142 520 Б),
+  `BUILD SUCCESSFUL in 2m 53s`.
