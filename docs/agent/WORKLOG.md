@@ -949,3 +949,43 @@
   `BUILD SUCCESSFUL in 2m 53s`.
 - **`42500938241`** (`1b69177`, финальная сдача) — **success, 129 PASSED / 0 FAILED**, job `128793320740`,
   артефакт `13626041033` (177 142 563 Б), `BUILD SUCCESSFUL in 4m 20s`.
+
+---
+
+## iter33n-fix1 — 1.0.59 (база `af913cd`, код `69729e9`, маркер `SOURCE_SHA=69729e9`)
+
+### Сделано
+
+- **§1 P0 — плагин 1.4.1.** `res/raw/geely_auto_systemui_plugin_digital.apk` заменён на сборку
+  `CentralEXAuto e0bd36c9` (md5 `5aab306b…`, sha256 `fabc06a3…`, 18 284 258 Б) — проверено локально
+  байт-в-байт. Константы `PLUGIN_APK_MD5/SIZE/SHA256` обновлены (`HvacDigitalPlugin.kt:31-33`),
+  `OEM_PKG` стал `internal` (`:18`). `PLUGIN_DIAG` теперь печатает `md5=… expected_md5=… md5_match=…`
+  для СМОНТИРОВАННОГО apk (`HvacFlagsApply.kt:533-558`). Старых значений md5/размера в коде — 0.
+- **§2 P0 — JIT механизмом референса.** `setAutoOptimize` → `jitApplyWithZygote` (блок
+  `JIT_ZYGOTE_BEGIN/END`, `AppPerformance.kt:981-1120`): setprop → detached watcher
+  (`/data/local/tmp/jit_zygote_watch.sh`) → `setprop ctl.restart zygote` → ожидание нового pid
+  zygote/system_server → `getprop` + восстановление wifi → итог в `/data/local/tmp/jit_zygote_result.txt`.
+  Наше приложение к тому моменту убито рестартом, поэтому итог печатает `jitPendingVerify`
+  (`:903-980`) на следующем старте: `JIT_APPLIED runtime=… want=… zygote_restart=… maps=… result=… via=pending_verify`
+  (`maps` — по `/proc/self/maps` своего процесса). Намерение `jit_pending_verify` пишется ДО рестарта
+  и не сжигается, если канал молчит (там же — `reconnectRoot`). UI-предупреждение — `ToolsCatalog.kt:31`.
+  «Раунд оптимизации» при тумблере пропускается (`JIT_ROUND skipped reason=zygote_restart_armed`).
+- **§3 P1 — TTL debounce.** `NetworkTtl.kt:162` `TTL_ON_DEBOUNCE_MS = 3_000L`; OFF не блокируется
+  никогда (`:178`). Правила TTL не менялись.
+- **§4 тесты.** +`PluginAssetTest` (5), +`TtlDebounceTest` (3), `JitBootTest` 3→4
+  (`zygoteRestartOnlyInsideJitToggleBlock`), `JitPersistTest` 4→3 (абсолютный запрет zygote заменён
+  проверкой call-sites), `MountResultTest` — новый размер. Итого **137**.
+
+### CI
+
+- `42508998476` (`0339d34`) — ❌ `compileDebugKotlin` `AppPerformance.kt:1034`: литеральный перевод
+  строки попал в Kotlin-строку при генерации патча. Исправлено в `69729e9`.
+- **`42510035315` (`69729e9`) — success, 137 PASSED / 0 FAILED**, job `128820887253`,
+  артефакт `13628863500` (177 148 033 Б), `BUILD SUCCESSFUL in 4m 20s`.
+
+### Открыто
+
+1. 🟡 Поведение `ctl.restart zygote` на IHU629G проверяется только владельцем (первый раз за всё время).
+2. 🟡 Стек «°C» над «%» даёт именно бандл 1.4.1 — нужен скрин после установки.
+3. ⛔ Не делалось: правки системы/smali/`setenforce 0`/`pm install`, глобальное правило TTL,
+   своя раскладка строки состояния, смена версии.
