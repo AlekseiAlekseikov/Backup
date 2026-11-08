@@ -947,3 +947,5 @@
 - **`42500110715`** (`28fdac1`, handoff: отчёт + WORKLOG + `SOURCE_SHA=056d14e`) — **success,
   129 PASSED / 0 FAILED**, job `128790823798`, артефакт `13625751211` (177 142 520 Б),
   `BUILD SUCCESSFUL in 2m 53s`.
+- **`42500938241`** (`1b69177`, финальная сдача) — **success, 129 PASSED / 0 FAILED**, job `128793320740`,
+  артефакт `13626041033` (177 142 563 Б), `BUILD SUCCESSFUL in 4m 20s`.
