@@ -550,6 +550,72 @@ object StatusIcons {
      * setSmallIcon(icon: Icon), setContentTitle/Text/Intent, setOngoing/ShowWhen,
      * extras flag_status_icon_* ровно как в CEX.
      */
+    /**
+     * iter33n §1.2 — КОНТРАКТ extras уведомления статус-иконки, 1:1 с референсом `w0/kg.j`
+     * (CentralEXAuto 3.3.9). Порядок и состав ключей — ровно как в байткоде:
+     * `flag_status_icon_notification=true`, `flag_status_icon_id`, `flag_status_icon_describe`,
+     * `flag_status_icon_icon`, `flag_status_icon_pressed_icon`, `flag_status_icon_hide=false`,
+     * `flag_status_icon_rank`, `flag_status_icon_space_x=1`, `flag_status_icon_is_pick_on=false`,
+     * `flag_status_icon_specific_width=0`.
+     *
+     * Зачем отдельной структурой: плагин читает эти поля напрямую
+     * (`StatusIconManager.isStatusBarIconNotification`, `crateAppStatusIconInfo`), и любое
+     * расхождение (строка вместо Integer в `flag_status_icon_id`, отсутствие иконки)
+     * отбрасывает уведомление. Тест `StatusIconContractTest` держит список и значения.
+     */
+    internal data class StatusIconContract(
+        val iconId: Int,
+        val describe: String,
+        val rank: Int,
+        val hasIcon: Boolean = true,
+        val hasPressedIcon: Boolean = true,
+        val hasRemoteView: Boolean = false,
+        val hide: Boolean = false,
+        val isPickOn: Boolean = false,
+        val spaceX: Int = 1,
+        val specificWidth: Int = 0,
+    )
+
+    /** Ключи extras в порядке референса (без значений-иконок). */
+    internal fun contractKeys(): List<String> = listOf(
+        "flag_status_icon_notification",
+        "flag_status_icon_id",
+        "flag_status_icon_describe",
+        "flag_status_icon_icon",
+        "flag_status_icon_pressed_icon",
+        "flag_status_icon_hide",
+        "flag_status_icon_rank",
+        "flag_status_icon_space_x",
+        "flag_status_icon_is_pick_on",
+        "flag_status_icon_specific_width",
+    )
+
+    /** Канал статус-иконок CEX (`kg.j` создаёт его с IMPORTANCE_LOW = 2, setShowBadge(false)). */
+    internal fun channelStatus(): String = CHANNEL_STATUS
+
+    /** IMPORTANCE канала (§1.2): ровно `IMPORTANCE_LOW`. */
+    internal fun channelImportance(): Int = NotificationManager.IMPORTANCE_LOW
+
+    /** Таблица слотов CEX (`w0/b3.run`): notifId / iconId / rank — батарея и наружняя. */
+    internal fun cexTable(): List<Triple<Int, Int, Int>> = listOf(
+        Triple(NOTIF_BATT, ICON_ID_BATT, RANK_BATT),
+        Triple(NOTIF_TEMP, ICON_ID_TEMP, RANK_TEMP),
+    )
+
+    /** Пары «ключ → значение» для extras (иконки подставляет `postNotif`, здесь только факт наличия). */
+    internal fun contractExtras(c: StatusIconContract): List<Pair<String, Any>> = listOf(
+        "flag_status_icon_notification" to true,
+        "flag_status_icon_id" to c.iconId,          // Integer, НЕ строка (иначе плагин ставит 0)
+        "flag_status_icon_describe" to c.describe,
+        "flag_status_icon_icon" to c.hasIcon,
+        "flag_status_icon_pressed_icon" to c.hasPressedIcon,
+        "flag_status_icon_hide" to c.hide,
+        "flag_status_icon_rank" to c.rank,
+        "flag_status_icon_space_x" to c.spaceX,
+        "flag_status_icon_is_pick_on" to c.isPickOn,
+        "flag_status_icon_specific_width" to c.specificWidth,
+    )
+
     private fun postNotif(ctx: Context, notifId: Int, iconId: Int, rank: Int,
                           title: String, text: String, describe: String,
                           icon: Icon, contentIntent: PendingIntent,
@@ -560,16 +626,17 @@ object StatusIcons {
             .setSmallIcon(icon)
             .setContentTitle(title).setContentText(text).setContentIntent(contentIntent)
             .setOngoing(true).setShowWhen(false).build()
-        n.extras.putBoolean("flag_status_icon_notification", true)
-        n.extras.putInt("flag_status_icon_id", iconId)
-        n.extras.putString("flag_status_icon_describe", describe)
-        n.extras.putParcelable("flag_status_icon_icon", icon)
-        n.extras.putParcelable("flag_status_icon_pressed_icon", icon)
-        n.extras.putBoolean("flag_status_icon_hide", false)
-        n.extras.putInt("flag_status_icon_rank", rank)
-        n.extras.putInt("flag_status_icon_space_x", 1)
-        n.extras.putBoolean("flag_status_icon_is_pick_on", false)
-        n.extras.putInt("flag_status_icon_specific_width", 0)
+        // iter33n §1.2: extras строго по контракту референса kg.j (значения — из одной таблицы).
+        val c = StatusIconContract(iconId = iconId, describe = describe, rank = rank)
+        for ((k, v) in contractExtras(c)) {
+            when (k) {
+                "flag_status_icon_icon", "flag_status_icon_pressed_icon" -> n.extras.putParcelable(k, icon)
+                "flag_status_icon_id", "flag_status_icon_rank",
+                "flag_status_icon_space_x", "flag_status_icon_specific_width" -> n.extras.putInt(k, v as Int)
+                "flag_status_icon_describe" -> n.extras.putString(k, v as String)
+                else -> n.extras.putBoolean(k, v as Boolean)
+            }
+        }
         try {
             nm.notify(notifId, n)
             // iter33 C3: полная строка — только при смене того, что реально отрисовано.
@@ -940,6 +1007,24 @@ object StatusIcons {
         if (!AdbClient.isPrivilegedAllowed()) {
             AppLog.i(TAG, "FLAG_ALIGN deferred reason=channel_not_ready (стартовое выравнивание отложено)")
             alignDone.set(false)   // попробуем на следующем тике, когда канал поднимется
+            return
+        }
+        // iter33n §4.3: выравнивание НИКОГДА не идёт с main thread. В логе 08.11 было
+        // `FLAG_ALIGN push rc=1 … ERR_MAIN_THREAD_FORBIDDEN` на старте — нарушение своего же правила,
+        // из-за которого выравнивание в этом процессе вообще не выполнялось.
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+            alignDone.set(false)   // не «сожгли» попытку: сделаем на BgWorker
+            BgWorker.post("StatusIcons.alignPropsToPrefs") {
+                if (!alignDone.compareAndSet(false, true)) return@post
+                if (!AdbClient.isPrivilegedAllowed()) {
+                    AppLog.i(TAG, "FLAG_ALIGN deferred reason=channel_not_ready")
+                    alignDone.set(false)
+                    return@post
+                }
+                val r = runCatching { HvacFlagsApply.alignPropsToPrefs(app) }
+                    .getOrElse { "error:${it.javaClass.simpleName}" }
+                AppLog.i(TAG, "FLAG_ALIGN result=$r action=align_props_to_prefs thr=bg")
+            }
             return
         }
         val r = runCatching { HvacFlagsApply.alignPropsToPrefs(app) }.getOrElse { "error:${it.javaClass.simpleName}" }

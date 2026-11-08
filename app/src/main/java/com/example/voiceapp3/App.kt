@@ -46,6 +46,11 @@ class App : Application() {
         BgWorker.post("HvacFlagsApply.startupDiagnostics") {
             runCatching { com.example.voiceapp3.tools.HvacFlagsApply.startupDiagnostics() }
         }
+        // iter33n §3: строка `JIT_BOOT runtime/persist/profiles/init` — ВСЕГДА, на каждом старте,
+        // независимо от тумблера (после ребута иначе состояние JIT по логу неизвестно).
+        BgWorker.post("AppPerformance.jitBootProbe") {
+            runCatching { com.example.voiceapp3.tools.AppPerformance.jitBootProbe(this) }
+        }
         // iter20: ОДИН BgWorker-пост — чтение screen_off_timeout ДО любых записей (с ретраем root-канала),
         // сразу же вердикт DURABLE_AFTER_REBOOT, и только потом ensureKeepAwake/runBootDiag.
         // Устранена гонка потоков из iter19 (два независимых поста на 4-поточном пуле).

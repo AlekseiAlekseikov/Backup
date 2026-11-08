@@ -857,6 +857,48 @@ object AppPerformance {
     }
 
     /**
+     * iter33n §3 — проба JIT на КАЖДОМ старте, БЕЗ условий (ни преф, ни runtime не влияют).
+     *
+     * Лог 08.11 (после ребута ГУ): `JIT_VERIFY: skipped reason=zygote_restart_removed` и больше
+     * ничего — состояние JIT после перезагрузки по логу не восстановить. Теперь одна строка всегда:
+     *
+     *   `JIT_BOOT runtime=… persist=… profiles=… init=… expect_runtime_true_after_reboot=… key=…`
+     *
+     * и, если `persist=true`, а `runtime` не `true`, — вторая строка с причиной
+     * `reason=init_did_not_carry` (§3.2). Ничего не пишем: только чтение.
+     */
+    fun jitBootProbe(context: Context) {
+        if (!jitProbeDone.compareAndSet(false, true)) return
+        val cmd = "echo RT=\$(getprop $PROP_USEJIT); " +
+            "echo PS=\$(getprop $PROP_PERSIST_USEJIT_INIT); " +
+            "echo MK=\$(getprop $PROP_PERSIST_USEJIT); " +
+            "echo PR=\$(getprop $PROP_USEJIT_PROFILES)"
+        val out = runCatching { AdbClient.execute(cmd, 6000, expectRoot = false).second }.getOrDefault("")
+        fun read(tag: String): String =
+            Regex("$tag=([^\\n]*)").find(out)?.groupValues?.get(1)?.trim().orEmpty()
+        val runtime = read("RT").ifEmpty { "empty" }
+        val persist = read("PS").ifEmpty { "empty" }        // persist.dalvik.vm.usejit (init-ключ)
+        val marker = read("MK").ifEmpty { "empty" }         // persist.sys.dalvik.vm.usejit (наш маркер)
+        val profiles = read("PR").ifEmpty { "empty" }
+        val init = persist                                   // мандат §3.1: init = тот же ключ
+        val expect = init == "true" || marker == "true"
+        val pref = if (isAutoOptimizeEnabled(context)) "on" else "off"
+        AppLog.i(TAG, "JIT_BOOT runtime=$runtime persist=$persist profiles=$profiles init=$init " +
+            "expect_runtime_true_after_reboot=$expect marker=$marker key=$PROP_PERSIST_USEJIT_INIT pref=$pref")
+        if (runtime != "true" && (persist == "true" || marker == "true")) {
+            // §3.2: persist-ключ стоит, а init значение в runtime не поднял — диагностика для след. шага.
+            AppLog.i(TAG, "JIT_BOOT runtime=$runtime persist=$persist reason=init_did_not_carry " +
+                "marker=$marker (persist есть, runtime не true)")
+        }
+    }
+
+    /** Одна проба за процесс (§3: строка ровно одна, без спама на каждый тик). */
+    private val jitProbeDone = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** `dalvik.vm.usejitprofiles` — читается только для строки `JIT_BOOT`. */
+    private const val PROP_USEJIT_PROFILES = "dalvik.vm.usejitprofiles"
+
+    /**
      * iter33j §4.1 — сверка «после рестарта zygote» больше не существует: рестарта нет.
      * Функция сохранена, потому что её вызывают `VoiceAssistantService.onCreate/onStartCommand`;
      * она ровно один раз за процесс пишет в лог, почему ничего не ждёт, и подчищает файл-намерение

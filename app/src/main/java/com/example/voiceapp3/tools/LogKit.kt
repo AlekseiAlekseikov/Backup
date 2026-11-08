@@ -26,7 +26,12 @@ import java.util.Locale
  * ВАЖНО: логирование не выполняет ни одной ADB-команды и не открывает ни одного соединения (C8.5).
  */
 object LogKit {
-    const val VER = "1.0.53"
+    /**
+     * iter33n §4.1 — версия берётся из сборки (`BuildConfig.VERSION_NAME`), а не хардкодом:
+     * в логе 1.0.58 стояло `SESSION_START … ver=1.0.53`, по нему нельзя было понять,
+     * какой билд реально работает.
+     */
+    val VER: String = com.example.voiceapp3.BuildConfig.VERSION_NAME
     const val OPS_NAME = "app.ops.log"
     private const val OPS_MAX_LINES = 200
     private const val TRACE_PER_SESSION = 20

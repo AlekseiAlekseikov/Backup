@@ -116,4 +116,23 @@ class TtlScriptTest {
         assertTrue("для включения нужен VERIFY_V4=OK", on.contains("VERIFY_V4=OK"))
         assertTrue("--ttl-set 65 остаётся значением правила", on.contains("--ttl-set 65"))
     }
+
+    // 9. iter33n §4.4 — после ON правило РОВНО одно: счётчик печатается, лишние копии снимаются.
+    @Test
+    fun onKeepsSingleRule() {
+        val on = TtlScript.build(true)
+        assertTrue("нужна строка TTL_ADD_COUNT n=", on.contains("TTL_ADD_COUNT n="))
+        assertTrue("дедупликация лишних копий", on.contains("dedupe()"))
+        assertTrue("снимаем копию через -D POSTROUTING $SCOPE",
+            on.contains("-D POSTROUTING \$SCOPE -j TTL --ttl-set 65"))
+    }
+
+    // 10. iter33m/n §1.3 — OFF печатает OK при нуле правил (парс-баг v6=null исправлен).
+    @Test
+    fun offMessageIsOkWhenNoRules() {
+        val off = TtlScript.build(false)
+        assertTrue("TTL_OFF result=OK строится из счётчиков",
+            off.contains("result=\$([ \"\$TTL_V4\" = \"0\" ]"))
+        assertTrue("VERIFY_V4/V6 = OFF_OK", off.contains("VERIFY_V4=OFF_OK") && off.contains("VERIFY_V6=OFF_OK"))
+    }
 }

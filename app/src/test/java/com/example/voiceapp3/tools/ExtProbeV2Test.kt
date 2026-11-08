@@ -83,9 +83,15 @@ class ExtProbeV2Test {
     fun pauseIsFifteenSecondsAndNothingIsDeleted() {
         assertEquals(15_000L, HvacFlagsApply.EXT_PROBE_V2_PAUSE_MS)
         val s = src("src/main/java/com/example/voiceapp3/tools/HvacFlagsApply.kt")
-        assertTrue("пауза между шагами", s.contains("Thread.sleep(EXT_PROBE_V2_PAUSE_MS)"))
+        // iter33n §2.1: пауза логируется до/после и идёт короткими отрезками (не «тихая смерть»)
+        assertTrue("пауза между шагами", s.contains("Thread.sleep(minOf(slice, left))"))
+        assertTrue("лог паузы до сна", s.contains("EXT_PROBE_V2 wait step="))
+        assertTrue("лог паузы после сна", s.contains("EXT_PROBE_V2 wait_done step="))
         assertTrue("полный цикл recarga на каждом шаге", s.contains("EXT_PROBE_V2 recarga step="))
         assertTrue("в конце флаги возвращаются по префам", s.contains("EXT_PROBE_V2 props_follow_prefs="))
+        // iter33n §2: ни одна ветка не завершается молча
+        assertTrue("ошибка шага логируется", s.contains("EXT_PROBE_V2_ERROR step="))
+        assertTrue("finally гарантирует финальную строку", s.contains("props_follow_prefs=unknown error="))
         // ничего не удаляем: ни unset, ни setprop в пусто
         for (n in HvacFlagsApply.EXT_NAMES) {
             assertFalse("нельзя сбрасывать имя в пусто: $n", s.contains("setprop $n \\\"\\\""))

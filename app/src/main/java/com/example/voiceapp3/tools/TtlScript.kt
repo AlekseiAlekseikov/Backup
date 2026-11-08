@@ -120,6 +120,24 @@ if [ "${D}ENABLE" = "1" ]; then
     echo "TTL_ADD v4 scope=\"${D}SCOPE\" rc=${D}?"
     ip6tables -w 5 -t mangle -A POSTROUTING ${D}SCOPE -j HL --hl-set 65 2>&1
     echo "TTL_ADD v6 scope=\"${D}SCOPE\" rc=${D}?"
+    # iter33n §4.4: правило РОВНО одно. Если после добавления копий больше (гонка двух
+    # одновременных включений / старый дубль), лишние снимаем здесь же и печатаем счётчик.
+    dedupe() {
+      N=${D}(iptables -t mangle -S POSTROUTING 2>/dev/null | grep -c 'ttl-set')
+      [ -z "${D}N" ] && N=0
+      while [ "${D}N" -gt 1 ] 2>/dev/null; do
+        iptables -w 5 -t mangle -D POSTROUTING ${D}SCOPE -j TTL --ttl-set 65 2>/dev/null || break
+        N=${D}((N-1))
+      done
+      M=${D}(ip6tables -t mangle -S POSTROUTING 2>/dev/null | grep -c 'hl-set')
+      [ -z "${D}M" ] && M=0
+      while [ "${D}M" -gt 1 ] 2>/dev/null; do
+        ip6tables -w 5 -t mangle -D POSTROUTING ${D}SCOPE -j HL --hl-set 65 2>/dev/null || break
+        M=${D}((M-1))
+      done
+      echo "TTL_ADD_COUNT n=${D}N v6=${D}M scope=\"${D}SCOPE\""
+    }
+    dedupe
   fi
 else
   # ---------- выключение: санация (снять всё) ----------

@@ -275,6 +275,24 @@ object AppLog {
      * `LOG_BUDGET exceeded=… action=trim` и переходит на одну строку-сводку в минуту.
      * [len] — длина строки в байтах UTF-8.
      */
+    /**
+     * iter33n §4.5 — префиксы строк ДЕЙСТВИЙ, которые бюджет не имеет права выбрасывать.
+     * Список ровно из мандата: `OP_*`, `TOGGLE*`, `TTL_*`, `EXT_PROBE*`, `FLAG_*`, `JIT_*`, `ADB_*`,
+     * плюс `BUILD:`/`SESSION_START`/`LOG_BUDGET` (шапка и сам факт обрезки).
+     */
+    private val ACTION_PREFIXES = arrayOf(
+        "OP_", "TOGGLE", "TTL_", "EXT_PROBE", "FLAG_", "JIT_", "ADB_", "BUILD:", "SESSION_START",
+        "LOG_BUDGET", "CHANNEL_LOST", "ADB_RECOVERY", "SCRIPT_UPLOAD",
+    )
+
+    /** Строка действия (exempt-список §4.5). */
+    internal fun isActionLine(msg: String): Boolean {
+        val m = msg.trimStart()
+        for (p in ACTION_PREFIXES) if (m.startsWith(p)) return true
+        // строки вида «Марк: OP_STEP …» и «RU: …» не считаем действиями — они дублируют OP_*.
+        return false
+    }
+
     private fun budgetAllow(len: Int): Boolean {
         val now = android.os.SystemClock.elapsedRealtime()
         synchronized(lock) {
@@ -315,7 +333,10 @@ object AppLog {
         var line = formatLine(lvl, tag, msg, null)
         // H1.6: бюджет считается по уже сформированной строке; уведомление бюджета
         // подменяет собой очередную запись (порядок важен: сначала budgetAllow).
-        val allowed = budgetAllow(line.toByteArray(Charsets.UTF_8).size)
+        // iter33n §4.5: строки ДЕЙСТВИЙ не режутся бюджетом никогда — иначе из лога пропадают
+        // клики тумблеров и пробы (в прогоне 08.11 из файла исчезли TTL_*/TOGGLE*).
+        val exempt = isActionLine(msg)
+        val allowed = if (exempt) true else budgetAllow(line.toByteArray(Charsets.UTF_8).size)
         val notice = budgetNotice
         budgetNotice = null
         if (notice != null) line = formatLine("INFO", "CENTRAL_LogBudget", notice, null)

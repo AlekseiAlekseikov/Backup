@@ -307,80 +307,132 @@ internal object HvacFlagsApply {
     }
 
     /**
-     * iter33m §3.1 — `EXT_PROBE_V2`: поочерёдный перебор ТРЁХ имён слота наружней.
+     * iter33m §3.1 / iter33n §2 — `EXT_PROBE_V2`: поочерёдный перебор ТРЁХ имён слота наружней.
      *
      * Шаг i/3: ОДНО имя `=1`, остальные `=0` одной командой → `bar_recarga` (полный цикл, как в
-     * референсе) → read всех трёх → строка `EXT_PROBE_V2 step=i/3 prop=… wrote=1 found=… result=…
-     * owner_look=…` → пауза 15 с (владелец смотрит панель). Ничего не удаляем: имена остаются
-     * persist-свойствами (нормализует их `PersistCleaner`), в конце флаги возвращаются ПО ПРЕФАМ.
+     * референсе) → read всех трёх → строка `EXT_PROBE_V2 step=i/3 prop=… wrote=1 found=… result=…`
+     * → пауза 15 с (владелец смотрит панель). Ничего не удаляем, в конце флаги возвращаются ПО ПРЕФАМ.
+     *
+     * iter33n §2 (лог 08.11): проба «умирала молча» после шага 1/3 — в логе была строка шага и
+     * больше ничего, ни ошибки, ни `props_follow_prefs`. Теперь:
+     *  • каждый шаг целиком в try/catch(Throwable) с ОБЯЗАТЕЛЬНОЙ строкой
+     *    `EXT_PROBE_V2_ERROR step=i/3 err=<класс>:<msg>`;
+     *  • пауза логируется ДО и ПОСЛЕ (`EXT_PROBE_V2 wait …` / `wait_done`), чтобы видно было,
+     *    на чём именно оборвалось, и сон идёт короткими отрезками (реакция на interrupt);
+     *  • восстановление флагов и `EXT_PROBE_V2 props_follow_prefs=…` выполняются ВСЕГДА,
+     *    в `finally`, даже если упал любой шаг;
+     *  • в каждой строке — `thr=<имя потока>`, чтобы отличать обрыв BgWorker от ошибки ADB.
      */
     fun extProbeV2(ctx: Context): Outcome {
         if (!busy.compareAndSet(false, true)) {
             return Outcome("EXT_PROBE_V2 skipped reason=busy", false, 1, false, busySkip = true)
         }
+        val app = ctx.applicationContext
+        val tempOn = Prefs2.getBoolean(app, StatusIcons.PREF_HVAC_TEMP, false)
+        val battOn = Prefs2.getBoolean(app, StatusIcons.PREF_HVAC_BATT, false)
+        val extOn = Prefs2.getBoolean(app, StatusIcons.PREF_HVAC_EXT_TEMP, false)
+        val prefsFlags = flagsSegment(tempOn, battOn, extOn)
+        val total = EXT_NAMES.size
+        var stepsOk = 0
+        var stepsErr = 0
+        var last = ""
         try {
-            val app = ctx.applicationContext
-            val tempOn = Prefs2.getBoolean(app, StatusIcons.PREF_HVAC_TEMP, false)
-            val battOn = Prefs2.getBoolean(app, StatusIcons.PREF_HVAC_BATT, false)
-            val extOn = Prefs2.getBoolean(app, StatusIcons.PREF_HVAC_EXT_TEMP, false)
-            val prefsFlags = flagsSegment(tempOn, battOn, extOn)
-            val total = EXT_NAMES.size
             AppLog.i(TAG, "EXT_PROBE_V2 start names=${EXT_NAMES.joinToString(",")} prefs=$prefsFlags " +
-                "pause_ms=$EXT_PROBE_V2_PAUSE_MS")
+                "pause_ms=$EXT_PROBE_V2_PAUSE_MS thr=${Thread.currentThread().name}")
             AppLog.i(TAG, prefTraceRead(tempOn, battOn, extOn))
-            var okSteps = 0
-            var last = ""
-            EXT_NAMES.forEachIndexed { idx, prop ->
+            for ((idx, prop) in EXT_NAMES.withIndex()) {
                 val step = idx + 1
-                val (rc, out) = try {
-                    AdbClient.execute(extProbeV2WriteScript(prop), 6000)
+                try {
+                    val (rc, out) = AdbClient.execute(extProbeV2WriteScript(prop), 6000)
+                    AppLog.i(TAG, "EXT_PROBE_V2 write step=$step/$total prop=$prop rc=$rc " +
+                        "flags=${out.replace('\n', ' ').take(140)}")
+                    if (rc != 0 || !out.contains("FLAGS_OK")) {
+                        stepsErr++
+                        AppLog.i(TAG, "EXT_PROBE_V2_ERROR step=$step/$total " +
+                            "err=write_failed rc=$rc")
+                    } else {
+                        val rout = runCatching {
+                            AdbClient.executeScript("bar_recarga", recargaScript(),
+                                (RECARGA_TIMEOUT_MS + 4_000L).toInt()).second
+                        }.getOrElse { t ->
+                            AppLog.i(TAG, "EXT_PROBE_V2_ERROR step=$step/$total " +
+                                "err=${t.javaClass.simpleName}:${t.message}")
+                            ""
+                        }
+                        val (rres, rtry) = recargaResult(rout)
+                        AppLog.i(TAG, "EXT_PROBE_V2 recarga step=$step/$total result=$rres tries=$rtry")
+                        val read = runCatching { AdbClient.execute(extProbeV2ReadScript(), 5000).second }
+                            .getOrDefault("")
+                        val vals = read.split("\n").map { it.trim() }
+                        val found = vals.getOrElse(idx) { "" }
+                        val line = extProbeV2StepLine(step, total, prop, "1", found,
+                            "wait${EXT_PROBE_V2_PAUSE_MS / 1000}s")
+                        AppLog.i(TAG, line)
+                        last = line
+                        if (line.contains("result=ok")) stepsOk++ else stepsErr++
+                    }
                 } catch (t: Throwable) {
-                    AppLog.w(TAG, "EXT_PROBE_V2 write failed: ${t.javaClass.simpleName}: ${t.message}")
-                    Pair(1, "")
+                    stepsErr++
+                    AppLog.i(TAG, "EXT_PROBE_V2_ERROR step=$step/$total " +
+                        "err=${t.javaClass.simpleName}:${t.message ?: "no_msg"} thr=${Thread.currentThread().name}")
                 }
-                AppLog.i(TAG, "EXT_PROBE_V2 write step=$step/$total prop=$prop rc=$rc " +
-                    "flags=${out.replace('\n', ' ').take(140)}")
-                if (rc == 0 && out.contains("FLAGS_OK")) {
-                    // полный цикл recarga, как у клика тумблера (x7.g) — иначе панель не перечитает props
-                    val rout = runCatching {
-                        AdbClient.executeScript("bar_recarga", recargaScript(),
-                            (RECARGA_TIMEOUT_MS + 4_000L).toInt()).second
-                    }.getOrDefault("")
-                    val (rres, rtry) = recargaResult(rout)
-                    AppLog.i(TAG, "EXT_PROBE_V2 recarga step=$step/$total result=$rres tries=$rtry")
-                }
-                val read = runCatching { AdbClient.execute(extProbeV2ReadScript(), 5000).second }
-                    .getOrDefault("")
-                val vals = read.split("\n").map { it.trim() }
-                val found = vals.getOrElse(idx) { "" }
-                val line = extProbeV2StepLine(step, total, prop, "1", found,
-                    "wait${EXT_PROBE_V2_PAUSE_MS / 1000}s")
-                AppLog.i(TAG, line)
-                last = line
-                if (line.contains("result=ok")) okSteps++
-                if (step < total) {
-                    // пауза: владелец глазами смотрит, появилась ли наружняя на панели
-                    runCatching { Thread.sleep(EXT_PROBE_V2_PAUSE_MS) }
-                }
+                if (step < total) pauseLogged(step, total)
             }
-            // восстановление: пишем флаги ПО ПРЕФАМ (префы — истина) и сверяем read-back
-            val via = viaFor(tempOn, battOn, extOn)
-            val cmd = HvacDigitalProps.flagsCommand(tempOn, battOn, extOn)
-                .replace("&& echo FLAGS_OK", "&& setprop ${HvacDigitalProps.PROP_VIA} $via && echo FLAGS_OK")
-            val (rcr, outr) = runCatching { AdbClient.execute(cmd, 6000) }.getOrDefault(Pair(1, ""))
-            AppLog.i(TAG, "EXT_PROBE_V2 restore rc=$rcr want=$prefsFlags via=$via " +
-                "out=${outr.replace('\n', ' ').take(140)}")
-            val back = runCatching { AdbClient.execute(extProbeV2ReadScript(), 5000).second }.getOrDefault("")
-            val (bt, bb, be) = parseFlags(back)
-            val fact = flagsSegment(bt, bb, be)
-            val follow = if (fact == prefsFlags) "ok" else "fail"
-            AppLog.i(TAG, "EXT_PROBE_V2 props_follow_prefs=$follow prefs=$prefsFlags fact=$fact " +
-                "steps_ok=$okSteps/$total")
+        } catch (t: Throwable) {
+            AppLog.i(TAG, "EXT_PROBE_V2_ERROR step=loop err=${t.javaClass.simpleName}:${t.message ?: "no_msg"} " +
+                "thr=${Thread.currentThread().name}")
+        } finally {
+            // Восстановление и финальная строка — ВСЕГДА (§2.2), даже если шаги падали.
+            try {
+                val via = viaFor(tempOn, battOn, extOn)
+                val cmd = HvacDigitalProps.flagsCommand(tempOn, battOn, extOn)
+                    .replace("&& echo FLAGS_OK",
+                        "&& setprop ${HvacDigitalProps.PROP_VIA} $via && echo FLAGS_OK")
+                val (rcr, outr) = runCatching { AdbClient.execute(cmd, 6000) }
+                    .getOrDefault(Pair(1, ""))
+                AppLog.i(TAG, "EXT_PROBE_V2 restore rc=$rcr want=$prefsFlags via=$via " +
+                    "out=${outr.replace('\n', ' ').take(140)}")
+                val back = runCatching { AdbClient.execute(extProbeV2ReadScript(), 5000).second }
+                    .getOrDefault("")
+                val (bt, bb, be) = parseFlags(back)
+                val fact = flagsSegment(bt, bb, be)
+                val follow = if (fact == prefsFlags) "ok" else "fail"
+                AppLog.i(TAG, "EXT_PROBE_V2 props_follow_prefs=$follow prefs=$prefsFlags fact=$fact " +
+                    "steps_ok=$stepsOk/$total steps_err=$stepsErr")
+            } catch (t: Throwable) {
+                AppLog.i(TAG, "EXT_PROBE_V2 props_follow_prefs=unknown error=" +
+                    "${t.javaClass.simpleName}:${t.message ?: "no_msg"}")
+            }
             AppLog.i(TAG, "EXT_PROBE_V2 done — владельцу: на каком шаге (1=exttemp, 2=temp_ext, " +
                 "3=ext_temp) на панели появилась наружняя?")
-            return Outcome(last.ifEmpty { "EXT_PROBE_V2 done" }, okSteps > 0 && follow == "ok", 0, follow == "ok")
-        } finally {
             busy.set(false)
+        }
+        return Outcome(last.ifEmpty { "EXT_PROBE_V2 done" }, stepsOk > 0, 0, stepsOk > 0)
+    }
+
+    /**
+     * iter33n §2.1 — пауза пробы с логом ДО/ПОСЛЕ и короткими отрезками: если поток прервут,
+     * это будет видно в логе (`wait_done interrupted=…`), а не «тихая смерть».
+     */
+    private fun pauseLogged(step: Int, total: Int) {
+        AppLog.i(TAG, "EXT_PROBE_V2 wait step=$step/$total ms=$EXT_PROBE_V2_PAUSE_MS " +
+            "thr=${Thread.currentThread().name} (владелец смотрит панель)")
+        val slice = 2_500L
+        var slept = 0L
+        try {
+            while (slept < EXT_PROBE_V2_PAUSE_MS) {
+                val left = EXT_PROBE_V2_PAUSE_MS - slept
+                Thread.sleep(minOf(slice, left))
+                slept += minOf(slice, left)
+            }
+            AppLog.i(TAG, "EXT_PROBE_V2 wait_done step=$step/$total ms=$slept")
+        } catch (t: InterruptedException) {
+            AppLog.i(TAG, "EXT_PROBE_V2 wait_done step=$step/$total ms=$slept interrupted=true " +
+                "err=${t.javaClass.simpleName}")
+            Thread.currentThread().interrupt()
+        } catch (t: Throwable) {
+            AppLog.i(TAG, "EXT_PROBE_V2 wait_done step=$step/$total ms=$slept " +
+                "err=${t.javaClass.simpleName}:${t.message ?: "no_msg"}")
         }
     }
 

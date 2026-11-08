@@ -86,11 +86,18 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
      *   • PARTIAL у TTL больше не возвращается: либо правило подтверждено, либо нет.
      */
     private fun parseVerifyResult(expected: Boolean, out: String): Pair<ToolsStep.Status, String> {
-        val kv = parseKv(out)
-        val v4 = kv["TTL_V4"]?.trim()
-        val v6 = kv["TTL_V6"]?.trim()
-        val v4Verify = kv["VERIFY_V4"]
-        val v6Verify = kv["VERIFY_V6"]
+        // iter33n §4.2: ТОЛЬКО строгий разбор `TTL_V4=<n>` / `TTL_V6=<n>` из сводной строки.
+        // Было `parseKv(...)`, который для строки `TTL_V4=0 TTL_V6=0 VERIFY_V4=OFF_OK …`
+        // возвращал в v4 весь хвост строки, а v6 — "null": отсюда ложное
+        // «TTL_OFF не выполнился: осталось правило v4=0 … v6=null» при полностью снятых правилах.
+        fun num(key: String): String? =
+            Regex("(?:^|\\s|_)$key=(\\d+)").find(out)?.groupValues?.get(1)
+        fun flag(key: String): String? =
+            Regex("(?:^|\\s)$key=([A-Za-z0-9_-]+)").find(out)?.groupValues?.get(1)
+        val v4 = num("TTL_V4")
+        val v6 = num("TTL_V6")
+        val v4Verify = flag("VERIFY_V4")
+        val v6Verify = flag("VERIFY_V6")
         val ttlCheckLine = out.lineSequence().firstOrNull { it.startsWith("TTL_CHECK:") } ?: ""
         val ttlVerdict = when {
             "SCOPED_OK" in ttlCheckLine -> "SCOPED_OK"
