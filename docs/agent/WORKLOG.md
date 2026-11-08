@@ -901,3 +901,46 @@
 3. 🟡 Экран не менялся даже при `FLAG_VERIFY match=ok` — ждём `EXT_DIAG`/`PLUGIN_DIAG` и скрин панели 1.0.58.
 4. ⛔ Не делалось: правки системы, smali, `setenforce 0`, `pm install`, `pkill avas`, `ctl.restart zygote`,
    глобальное правило TTL, перезагрузка ГУ как лечение, своя раскладка строки состояния.
+
+---
+
+## iter33n — 1.0.59 (база `e70e615`, код `056d14e`, маркер `SOURCE_SHA=056d14e`)
+
+### Сделано
+
+- **§1 P0 слоты.** Разобран плагин `geely_auto_systemui_plugin_digital.apk` (androguard, smali):
+  `StatusIconManager` (условия приёма, `crateAppStatusIconInfo`, `mIdRankMap`, `addDefaultStatusIcon`),
+  `StatusContentLayout.addIcon`, `StatusIconPositionManager`, `SmartBarController`, `HvacVehicleTempWidget`/`HvacDigitalHelper`.
+  Итог: extras у нас 1:1 с `kg.j`; направление иконки в протоколе отсутствует и в байткоде
+  для уведомлений жёстко `LEFT` ⇒ «справа» через этот API недостижимо (правый кластер — только родные
+  иконки плагина + SmartBar-плитки). Наше уведомление приведено к единой таблице
+  `StatusIconContract`/`contractExtras()`/`cexTable()`; `StatusIconContractTest` (5 тестов) держит контракт.
+  `HvacDigitalHelper` берёт режим из VHAL `354419984` area 5, строк `persist.sys.hvacdigital` в APK нет.
+- **§2 P0 `EXT_PROBE_V2`.** Каждый шаг в `try/catch(Throwable)` с `EXT_PROBE_V2_ERROR step=i/3 …`,
+  пауза через `pauseLogged()` (логи `wait`/`wait_done`, сон по 2.5 с), восстановление флагов и строка
+  `props_follow_prefs` — в `finally`, т.е. выполняется всегда.
+- **§3 P0 `JIT_BOOT`.** `AppPerformance.jitBootProbe()` вызывается из `App.onCreate` через `BgWorker`
+  без условий, одна проба за процесс, печатает `runtime/persist/profiles/init/expect_runtime_true_after_reboot/marker/key/pref`,
+  при `runtime!=true && persist|marker` — `reason=init_did_not_carry`.
+- **§4.** `VER` из `BuildConfig.VERSION_NAME`; строгий разбор `TTL_V4/TTL_V6` (ложный `v6=null` снят);
+  `dedupe()` + `TTL_ADD_COUNT n=… v6=…` в ON; `FLAG_ALIGN` не с main thread (попытка не сжигается);
+  `isActionLine()` + `ACTION_PREFIXES` — строки `OP_/TOGGLE/TTL_/EXT_PROBE/FLAG_/JIT_/ADB_/…` вне лог-бюджета.
+- **§6 тесты.** +`StatusIconContractTest` (5), +`JitBootTest` (3), `TtlScriptTest` 8→10,
+  `ExtProbeV2Test` 5, `BuildMarkerTest` 59/1.0.59. Итого **129**.
+
+### CI
+
+- `42497296670` (`4a64bc7`) — ❌ `compileDebugKotlin`: дубль `PROP_USEJIT_PROFILES` (вставка константы,
+  которая уже была в файле). Исправлено в `60689c9`.
+- `42498093676` (`60689c9`) — ❌ `compileDebugUnitTestKotlin`: `TtlScriptTest.kt:126` неэкранированный
+  `$SCOPE` в сообщении ассерта → `Unresolved reference 'SCOPE'`. Исправлено в `056d14e`.
+- **`42499097146` (`056d14e`) — success, 129 PASSED / 0 FAILED**, job `128787726449`,
+  артефакт `13624524776` (177 142 576 Б), `BUILD SUCCESSFUL in 3m 18s`.
+
+### Открыто
+
+1. ⛔ Слоты в правом кластере строки состояния недостижимы через notification-API плагина
+   (направление жёстко `LEFT`). Нужно решение владельца: принять левый кластер / SmartBar-плитка дока /
+   правка APK плагина (сейчас запрещена).
+2. 🟡 Проверка владельцем: `JIT_BOOT` на старте, три шага `EXT_PROBE_V2`, `TTL_ADD_COUNT n=1`,
+   `TTL_OFF … result=OK`, CarPlay при ON.
