@@ -4,8 +4,11 @@
 **Код итерации:** `69729e954596b3c4b7b67781cd4ff9d0551df7f4`.
 **Маркер:** `app/buildinfo.properties` → `SOURCE_SHA=69729e9` (пишет агент; `git rev-parse` в сборке запрещён).
 **Версия НЕ менялась:** `versionCode = 59`, `versionName = "1.0.59"` (`app/build.gradle.kts:78-79`, `BuildMarkerTest` не тронут).
+**HEAD ветки `fix/v2`:** `74af9c8` (handoff: отчёт + WORKLOG + `SOURCE_SHA=69729e9`; код = `69729e9`).
 **CI:** прогон `42510035315` (`69729e9`) — **success, 137 PASSED / 0 FAILED**, job `128820887253`,
-артефакт `13628863500` (177 148 033 Б), `BUILD SUCCESSFUL in 4m 20s`.
+артефакт `13628863500` (177 148 033 Б), `BUILD SUCCESSFUL in 4m 20s`; handoff-прогон
+**`42511098442`** (`74af9c8`) — success, **137 PASSED / 0 FAILED**, job `128824133411`,
+артефакт `13629277892` (177 147 942 Б), `BUILD SUCCESSFUL in 4m 12s`, `BuildMarkerTest > commitSourceIsHonest PASSED`.
 
 ---
 
