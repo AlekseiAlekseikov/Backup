@@ -994,3 +994,42 @@
   `BUILD SUCCESSFUL in 4m 12s`.
 - **`42512116433`** (`47e927b`, HEAD) — success, **137 PASSED / 0 FAILED**, job `128827221487`,
   артефакт `13630073416` (177 148 005 Б), `BUILD SUCCESSFUL in 4m 8s`.
+
+---
+
+## iter33o — 1.0.60 (база `739bc32`, код `a155e79`, маркер `SOURCE_SHA=a155e79`)
+
+### Сделано
+
+- **§1 P0 — AVAS по механизму референса.** Новый `tools/AvasRestore.kt`: `Car.createCar` →
+  `getCarManager("audio")` → рефлексия `getAVASMode()`/`setAVASMode(Integer)` (как `w0/d0`, `w0/df`, `w0/qa`).
+  Сохранение перед рестартом (`AVAS_SAVE mode=<int>`), восстановление после (`AVAS_RESTORE … result=ok|failed`),
+  `skipped reason=already_ok|no_getAVASMode`. Только возврат сохранённого значения; звук/sound type/демон не трогаем.
+  Точки вызова: тумблер JIT (`AppPerformance.kt:1170`), старт приложения (`:873`), boot-restore (§1.5).
+  Плюс итог рестарта больше не «unknown»: `jitPendingVerify` ждёт вторую строку `JIT_ZYGOTE_DONE` (6 × 7.5 с).
+- **§1.5 — авто-восстановление JIT при загрузке.** `AppPerformance.jitBootRestoreArm` (`:915-948`),
+  вызов из `App.onCreate` (`App.kt:57-59`), guard `jit_boot_restore_done=<boot_tag>` ставится ДО рестарта,
+  задержка 30 с, `skipped reason=pref_off|already_on|same_boot`, итог — `JIT_APPLIED … via=boot_restore`.
+- **§2.1 — PLUGIN_DIAG.** Ранняя строка помечена `phase=pre_mount`; новая `md5Diag()`
+  (`HvacDigitalPlugin.kt:193-212`) печатает `phase=post_mount` после `enable` и `bootInstall`.
+- **§2.2 — TTL retry.** `TTL_UPLINK_RETRIES = 2`, пауза 3 с, повтор только при `reason=no_uplink`
+  (`NetworkTtl.kt:158-163`, цикл `:214-232`); скрипт/правила не менялись.
+- **§2.3 — текст JIT_BOOT.** `jit=off_after_reboot toggle_to_enable` вместо «применится после перезагрузки ГУ».
+- **Версия 1.0.60** (`versionCode = 60`), `BuildMarkerTest` обновлён.
+- **Тесты 137 → 147**: `AvasRestoreTest` (7), `JitBootTest` 4→6, `TtlDebounceTest` 3→4.
+
+### CI
+
+- `42669479902` (`949a31a`) — ❌ 4 FAILED (KDoc-литералы и поиск `TTL_ADD_COUNT` не в том файле).
+- `42671578054` (`15f9bb5`) — ❌ **0 джобов**: partial outage GitHub Actions в 18:09–18:13 UTC
+  (status.github.com «Minor/Partial System Outage»), код не при чём — повтор запустился.
+- `42672009784` (`963a7fb`) — ❌ 1 FAILED (слово в KDoc считалось запрещённой операцией).
+- **`42674945910` (`a155e79`) — success, 147 PASSED / 0 FAILED**, job `129353710310`,
+  артефакт `13700830595` (177 146 377 Б), `BUILD SUCCESSFUL in 2m 58s`.
+
+### Открыто
+
+1. 🟡 AVAS: на ГУ не проверялось — первый прогон покажет `AVAS_SAVE/AVAS_RESTORE` (или честный skip).
+2. 🟡 Авто-рестарт фреймворка раз за загрузку (§1.5) — новое поведение, проверяет владелец.
+3. ⛔ Не делалось: мута AVAS, смена sound type, правки системы/smali, изменения TTL-правил,
+   своя раскладка строки состояния.
