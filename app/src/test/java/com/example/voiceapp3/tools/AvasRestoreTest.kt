@@ -91,9 +91,13 @@ class AvasRestoreTest {
         for (bad in listOf("setAVASMode(0)", "setAVASMode(1)", "setAVASMode(2)", "setAVASMode(3)")) {
             assertTrue("константа в setAVASMode запрещена: $bad", !s.contains(bad))
         }
-        // Мута/смена sound type/audioserver — запрещены.
+        // Мута/смена sound type/звуковой демон — запрещены. Ищем ТОЛЬКО в коде:
+        // упоминание в KDoc («чего мы не делаем») — не операция и падать не должно.
+        val code = s.lineSequence()
+            .filterNot { it.trimStart().startsWith("*") || it.trimStart().startsWith("//") || it.trimStart().startsWith("/*") }
+            .joinToString("\n")
         for (bad in listOf("setSoundType", "audioserver", "avas_muted_saved", "setAVASMode(-1)")) {
-            assertTrue("запрещённая операция в AvasRestore: $bad", !s.contains(bad))
+            assertTrue("запрещённая операция в коде AvasRestore: $bad", !code.contains(bad))
         }
         // Отсутствие метода — skip, без падения и без ретраев.
         assertTrue("нужен честный skip no_getAVASMode", s.contains("no_getAVASMode"))
