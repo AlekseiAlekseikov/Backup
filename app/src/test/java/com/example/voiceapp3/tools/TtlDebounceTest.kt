@@ -57,7 +57,11 @@ class TtlDebounceTest {
         assertTrue(NetworkTtl.isNoUplink("uplink=none v4=0 v6=0"))
         assertTrue("успешный прогон не повторяем",
             !NetworkTtl.isNoUplink("TTL_TRY variant=uplink scope=\"-o wlan0\" carplay=p2p0,usb0"))
-        // Скрипт TTL не менялся: правила/санация/dedupe на месте.
-        assertTrue("dedupe на месте", s.contains("TTL_ADD_COUNT"))
+        // Скрипт TTL не менялся: правила/санация/dedupe на месте (файл TtlScript.kt).
+        val script = listOf(
+            File("src/main/java/com/example/voiceapp3/tools/TtlScript.kt"),
+            File("app/src/main/java/com/example/voiceapp3/tools/TtlScript.kt")
+        ).first { it.isFile }.readText()
+        assertTrue("dedupe на месте", script.contains("TTL_ADD_COUNT") && script.contains("dedupe()"))
     }
 }

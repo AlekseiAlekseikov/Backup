@@ -826,11 +826,9 @@ object AppPerformance {
         // iter33o §2.3: прежний текст «применится после перезагрузки ГУ» вводил в заблуждение —
         // `setprop dalvik.vm.usejit` НЕ персистентен, после ребута `runtime=false` — это норма.
         // Автовосстановление делает §1.5 (`jitBootRestoreArm`), здесь только факт и подсказка.
-        val state = if (runtime == "true") "on" else "off_after_reboot"
+        val stateLine = if (runtime == "true") JIT_STATE_ON_LINE else JIT_STATE_OFF_LINE
         AppLog.i(TAG, "JIT_BOOT: runtime=$runtime persist=${if (persist.isEmpty()) "empty" else persist} " +
-            "boot_tag=$bootTag jit=$state " +
-            (if (state == "off_after_reboot") "toggle_to_enable (setprop не персистентен; авто-восстановление — §1.5)"
-             else "nothing_to_do"))
+            "boot_tag=$bootTag $stateLine")
     }
 
     /**
@@ -879,12 +877,23 @@ object AppPerformance {
     /*
      * Механизм референса (`CentralWatchdogService.onCreate` переприменяет `jit_restaurar` /
      * `perf_auto_otimizar`): если тумблер включён, а runtime не поднят — приложение само
-     * прогоняет цепочку `AVAS_SAVE → setprop → ctl.restart zygote → AVAS_RESTORE`.
+     * прогоняет цепочку `AVAS_SAVE → setprop → перезапуск фреймворка → AVAS_RESTORE`.
      *
      * Правило владельца 09.11 разрешает это РОВНО один раз за загрузку ГУ: guard — persist-подобный
      * маркер в prefs, значение = boot_tag. Повторные старты приложения в той же загрузке
      * фреймворк НЕ перезапускают.
      */
+    /**
+     * iter33o §2.3 — состояние JIT в строке `JIT_BOOT:` после ребута.
+     *
+     * `setprop dalvik.vm.usejit` НЕ персистентен: после перезагрузки ГУ `runtime=false` — это НОРМА,
+     * а не поломка. Поэтому вместо прежнего «применится после перезагрузки ГУ» печатаем
+     * `jit=off_after_reboot toggle_to_enable` (или `jit=on nothing_to_do`, если уже поднят).
+     */
+    internal const val JIT_STATE_ON_LINE = "jit=on nothing_to_do"
+    internal const val JIT_STATE_OFF_LINE =
+        "jit=off_after_reboot toggle_to_enable (setprop не персистентен; авто-восстановление — §1.5)"
+
     internal const val JIT_BOOT_RESTORE_MARKER = "jit_boot_restore_done"
     internal const val JIT_BOOT_RESTORE_DELAY_MS = 30_000L
 

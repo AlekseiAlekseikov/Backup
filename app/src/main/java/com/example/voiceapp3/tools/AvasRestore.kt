@@ -11,7 +11,8 @@ import java.io.File
  * Что делает референс (подтверждено байткодом):
  *  • `Car.createCar` → `getCarManager("audio")` → `CarAudioManager`;
  *  • рефлексия `getAVASMode()` (`getMethod("getAVASMode", null)`), результат — `Integer`;
- *  • сохранение `avas_muted_saved` / `avas_mode_ativo` в prefs;
+ *  • сохранение пары «muted/sound type» в prefs (ключи `w0/zd`, `w0/qa`) — нам из этого нужно
+ *    только значение режима;
  *  • на загрузке — `setAVASMode(<сохранённое>)` (`getMethod("setAVASMode", Integer.TYPE)`).
  *
  * Зачем нам: перезапуск фреймворка (тумблер JIT / авто-восстановление JIT) сбрасывает AVAS-режим —
