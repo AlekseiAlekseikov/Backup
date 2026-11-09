@@ -154,6 +154,14 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
     @Volatile private var ttlInFlight = false
     @Volatile private var ttlLastRunAtMs: Long = 0L
 
+    /** iter33o §2.2 — повторы детекта uplink (только для ON), пауза 3 с. */
+    internal const val TTL_UPLINK_RETRIES = 2
+    internal const val TTL_UPLINK_RETRY_PAUSE_MS = 3_000L
+
+    /** Причина отказа TTL именно «нет uplink» — единственный случай, когда повторяем детект. */
+    internal fun isNoUplink(output: String): Boolean =
+        output.contains("reason=no_uplink") || output.contains("uplink=none")
+
     /**
      * iter33n-fix1 §3.1 — окно debounce для ПОВТОРНОГО ON: 3 с (было 30 с).
      * Приёмник сети (`TTL_RECEIVER`) продолжает жить со своим окном 30 с: там шторм
@@ -199,7 +207,28 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
             Prefs2.putBoolean(context, PREF_TTL_65_ACTIVE, enabled)
 
             val script = buildScript(enabled)
-            val (exitCode, output) = AdbClient.executeScript("ttl_script", script, 40000)
+            // iter33o §2.2: первый клик 09.11 «съело» тем, что Wi-Fi ещё подключался
+            // (`uplink=none, SRC_IP=none`), а через 50 с то же самое прошло. Правила и скрипт
+            // НЕ меняем — просто до двух повторов ДЕТЕКТА с паузой 3 с, и только для ON и только
+            // когда причина именно «нет uplink».
+            var (exitCode, output) = AdbClient.executeScript("ttl_script", script, 40000)
+            if (enabled) {
+                var attempt = 1
+                while (attempt <= TTL_UPLINK_RETRIES && isNoUplink(output)) {
+                    Prefs2.putBoolean(context, PREF_TTL_65_ACTIVE, enabled)
+                    AppLog.i(TAG, "TTL_UPLINK_RETRY attempt=$attempt/$TTL_UPLINK_RETRIES " +
+                        "reason=no_uplink pause_ms=$TTL_UPLINK_RETRY_PAUSE_MS")
+                    runCatching { Thread.sleep(TTL_UPLINK_RETRY_PAUSE_MS) }
+                    val again = AdbClient.executeScript("ttl_script", script, 40000)
+                    exitCode = again.first
+                    output = again.second
+                    AppLog.i(TAG, "TTL_UPLINK_RETRY attempt=$attempt/$TTL_UPLINK_RETRIES " +
+                        "result=" + output.lineSequence().firstOrNull { it.startsWith("TTL_TRY") }
+                            ?.let { if (it.contains("reason=no_uplink")) "no_uplink" else "uplink_ok" }
+                            ?: "no_try_line")
+                    attempt++
+                }
+            }
 
         // iter33m §1.2: санация и судьба каждого правила — отдельными строками лога.
         output.lineSequence().firstOrNull { it.startsWith("TTL_SANITIZED") }?.let { AppLog.i(TAG, it.trim()) }

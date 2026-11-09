@@ -43,4 +43,21 @@ class TtlDebounceTest {
         val toggle = s.substringAfter("fun setTtl65Active").substringBefore("synchronized(this)")
         assertTrue("в тумблере осталось окно 30 000 мс", !toggle.contains("30_000L"))
     }
+
+    // 4. iter33o §2.2 — повтор детекта uplink (только для ON) при «нет uplink».
+    @Test
+    fun uplinkRetryOnNoUplink() {
+        val s = netTtl()
+        assertTrue("нужно 2 повтора детекта", s.contains("TTL_UPLINK_RETRIES = 2"))
+        assertTrue("пауза 3 с", s.contains("TTL_UPLINK_RETRY_PAUSE_MS = 3_000L"))
+        assertTrue("повтор только для ON",
+            s.contains("if (enabled) {") && s.contains("while (attempt <= TTL_UPLINK_RETRIES && isNoUplink(output))"))
+        // Детект причины: обе формы строки из лога 09.11.
+        assertTrue(NetworkTtl.isNoUplink("TTL_TRY variant=none scope=\"\" v4=0 v6=0 reason=no_uplink"))
+        assertTrue(NetworkTtl.isNoUplink("uplink=none v4=0 v6=0"))
+        assertTrue("успешный прогон не повторяем",
+            !NetworkTtl.isNoUplink("TTL_TRY variant=uplink scope=\"-o wlan0\" carplay=p2p0,usb0"))
+        // Скрипт TTL не менялся: правила/санация/dedupe на месте.
+        assertTrue("dedupe на месте", s.contains("TTL_ADD_COUNT"))
+    }
 }

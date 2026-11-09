@@ -6,7 +6,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * iter33l — приёмка сборки: `BUILD: versionCode=59 versionName=1.0.59 commit=<X> ci_run=…`.
+ * iter33o — приёмка сборки: `BUILD: versionCode=60 versionName=1.0.60 commit=<X> ci_run=…`.
  *
  * Тест проверяет то, что печатается в лог при старте: версию проекта и источник SHA.
  * В CI `GITHUB_SHA`/`GITHUB_RUN_ID` подставляются Actions, локально — маркер
@@ -15,9 +15,9 @@ import org.junit.Test
 class BuildMarkerTest {
 
     @Test
-    fun versionIs59() {
-        assertEquals("versionCode", 59, BuildConfig.VERSION_CODE)
-        assertEquals("versionName", "1.0.59", BuildConfig.VERSION_NAME)
+    fun versionIs60() {
+        assertEquals("versionCode", 60, BuildConfig.VERSION_CODE)
+        assertEquals("versionName", "1.0.60", BuildConfig.VERSION_NAME)
     }
 
     @Test

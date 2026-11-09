@@ -182,6 +182,29 @@ object HvacDigitalPlugin {
         return Status(oemInstalled, mounted, mountLine, oemPath, mountReason, pmFailed, shadowed, apkSize, contentOk)
     }
 
+    /**
+     * iter33o §2.1 — `PLUGIN_DIAG md5=… expected_md5=… md5_match=yes|no phase=post_mount`.
+     *
+     * Зачем: ранняя (стартовая) диагностика видит СТОКОВЫЙ `/system`-файл и печатает
+     * `md5_match=no`, что читается как поломка. Итоговая правда — md5 того файла, который
+     * реально лежит в цели `pm path` ПОСЛЕ bind-монтирования. Вызывается в конце [enable]
+     * и в конце [bootInstall], печатает ровно одну строку.
+     */
+    fun md5Diag(reason: String) {
+        val (rc, out) = runCatching {
+            AdbClient.shellLocal(
+                "P=\$(pm path $OEM_PKG 2>/dev/null | sed 's/^package://' | head -n1); " +
+                    "echo MD5=\$(md5sum \"\$P\" 2>/dev/null | cut -d' ' -f1); echo PATH=\$P",
+                8000)
+        }.getOrDefault(Pair(1, ""))
+        val md5 = Regex("MD5=([^\\n]*)").find(out)?.groupValues?.get(1)?.trim().orEmpty()
+        val path = Regex("PATH=([^\\n]*)").find(out)?.groupValues?.get(1)?.trim().orEmpty()
+        val match = md5.isNotEmpty() && md5 == PLUGIN_APK_MD5
+        AppLog.i(TAG, "PLUGIN_DIAG md5=${md5.ifEmpty { "empty" }} expected_md5=$PLUGIN_APK_MD5 " +
+            "md5_match=${if (match) "yes" else "no"} phase=post_mount reason=$reason " +
+            "path=${path.ifEmpty { "none" }} version=1.4.1 rc=$rc")
+    }
+
     /** iter23 P2: путь заводского плагина без опоры на pm — простой ls по /system. */
     private fun systemPluginPathFallback(): String? {
         val (rc, out) = try {
@@ -495,6 +518,8 @@ object HvacDigitalPlugin {
         val post = checkStatus(ctx)
         steps += stepOf("post_check", "grep mounts", if (post.overlayMounted) ToolsStep.Status.OK else ToolsStep.Status.PARTIAL,
             expected = "mounted", actual = "mounted=${post.overlayMounted}", stdout = post.mountLine)
+        // iter33o §2.1: итоговый md5 — ПОСЛЕ маунта (именно он и есть правда о плагине).
+        runCatching { md5Diag("enable") }
         return ToolsResult("hvacdigital.plugin.enable", "Цифровой климат", steps)
     }
 
@@ -568,6 +593,8 @@ object HvacDigitalPlugin {
         AppLog.i(TAG, "HVAC_BOOT: attempt=1 reason=$reason kill=$kill result=${if (ok) "OK" else "FAILED"} " +
             "stored=$storedResult boot_tag=$bootTag ms=$dt")
         if (!ok) AppLog.i(TAG, "HVAC_BOOT: повторов в этой загрузке нет — включите тумблер вручную (это ожидаемо)")
+        // iter33o §2.1: после boot-монтирования — та же итоговая сверка md5 (phase=post_mount).
+        runCatching { md5Diag("boot_install") }
         if (rootFail) bootInstallDone.set(false)   // после возврата root — повтор разрешён (B2.2)
         return ok
     }

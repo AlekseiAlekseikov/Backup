@@ -530,6 +530,9 @@ internal object HvacFlagsApply {
     fun startupDiagnostics() {
         val names = EXT_NAMES + HvacDigitalProps.PROP_TEMP + HvacDigitalProps.PROP_BATT + HvacDigitalProps.PROP_VIA
         // iter33n-fix1 §1.3: сверка СМОНТИРОВАННОГО плагина с ожидаемым md5 1.4.1.
+        // iter33o §2.1: это РАННЯЯ диагностика (до boot-монтирования), поэтому в строке
+        // стоит `phase=pre_mount`: `md5_match=no` здесь — норма, сток ещё не подменён.
+        // Итоговая строка `phase=post_mount` печатается после маунта (HvacDigitalPlugin.md5Diag).
         val md5Cmd = "P=\$(pm path ${HvacDigitalPlugin.OEM_PKG} 2>/dev/null | sed 's/^package://' | head -n1); " +
             "echo \"PLUGIN_MD5=\$(md5sum \"\$P\" 2>/dev/null | cut -d' ' -f1) path=\$P\""
         val cmd = names.joinToString("; ") { "echo \"PROP $it=\$(getprop $it)\"" } + "; " +
@@ -554,7 +557,7 @@ internal object HvacFlagsApply {
                     val match = md5.isNotEmpty() && md5 == HvacDigitalPlugin.PLUGIN_APK_MD5
                     AppLog.i(TAG, "PLUGIN_DIAG md5=${md5.ifEmpty { "empty" }} " +
                         "expected_md5=${HvacDigitalPlugin.PLUGIN_APK_MD5} md5_match=${if (match) "yes" else "no"} " +
-                        "path=${path.ifEmpty { "none" }} version=1.4.1")
+                        "phase=pre_mount path=${path.ifEmpty { "none" }} (источник: /system-оригинал до bind)")
                 }
             }
         }

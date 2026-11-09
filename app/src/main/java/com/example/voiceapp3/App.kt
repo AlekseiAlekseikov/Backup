@@ -51,6 +51,12 @@ class App : Application() {
         BgWorker.post("AppPerformance.jitBootProbe") {
             runCatching { com.example.voiceapp3.tools.AppPerformance.jitBootProbe(this) }
         }
+        // iter33o §1.5: авто-восстановление JIT при загрузке (как референс: `jit_restaurar`
+        // переприменяется в onCreate watchdog-а). Не чаще одного раза за загрузку ГУ —
+        // guard по boot_tag внутри; при выключенном тумблере или уже поднятом runtime — skip.
+        BgWorker.post("AppPerformance.jitBootRestoreArm") {
+            runCatching { com.example.voiceapp3.tools.AppPerformance.jitBootRestoreArm(this) }
+        }
         // iter20: ОДИН BgWorker-пост — чтение screen_off_timeout ДО любых записей (с ретраем root-канала),
         // сразу же вердикт DURABLE_AFTER_REBOOT, и только потом ensureKeepAwake/runBootDiag.
         // Устранена гонка потоков из iter19 (два независимых поста на 4-поточном пуле).
