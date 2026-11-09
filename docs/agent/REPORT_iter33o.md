@@ -6,6 +6,8 @@
 **Версия:** `versionCode = 60`, `versionName = "1.0.60"` (`app/build.gradle.kts:78-79`), `BuildMarkerTest` обновлён.
 **CI:** прогон `42674945910` (`a155e79`) — **success, 147 PASSED / 0 FAILED**, job `129353710310`,
 артефакт `13700830595` (177 146 377 Б), `BUILD SUCCESSFUL in 2m 58s`.
+Handoff-прогон **`42676491595`** (`b03f999`: отчёт + WORKLOG + `SOURCE_SHA=a155e79`) — **success,
+147 PASSED / 0 FAILED**, job `129359129192`, артефакт `13700542836` (177 146 362 Б), `BUILD SUCCESSFUL in 3m 41s`.
 
 ---
 
