@@ -1036,3 +1036,5 @@
 - **`42676491595`** (`b03f999`, handoff: отчёт + WORKLOG + `SOURCE_SHA=a155e79`) — success,
   **147 PASSED / 0 FAILED**, job `129359129192`, артефакт `13700542836` (177 146 362 Б),
   `BUILD SUCCESSFUL in 3m 41s`.
+- **`42678317590`** (`bdfdd96`, HEAD; только правки отчёта/WORKLOG) — success, **147 PASSED / 0 FAILED**,
+  job `129365643214`, артефакт `13702710536` (177 146 364 Б).
