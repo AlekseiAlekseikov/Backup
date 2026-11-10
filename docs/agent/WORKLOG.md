@@ -1038,3 +1038,31 @@
   `BUILD SUCCESSFUL in 3m 41s`.
 - **`42678317590`** (`bdfdd96`, HEAD; только правки отчёта/WORKLOG) — success, **147 PASSED / 0 FAILED**,
   job `129365643214`, артефакт `13702710536` (177 146 364 Б).
+
+---
+
+## iter33p — 1.0.61 (база `c9c3e9f`, fix2)
+
+### Сделано
+
+- **§1 — авто-восстановление JIT при загрузке УДАЛЕНО** (решение владельца 09.11, как в референсе):
+  вырезаны `jitBootRestoreArm`, `bootRestoreDecision`, `JIT_BOOT_RESTORE_*`, `route="boot_restore"`,
+  `AvasRestore.Where.BOOT_RESTORE`, вызов из `App.kt`. `ctl.restart zygote` — один литерал
+  (`AppPerformance.kt:1078`) в блоке `JIT_ZYGOTE`, один call-site `jitApplyWithZygote` (`:217`).
+- **§2 — сеть вокруг zygote по референсу** (`tools/JitNet.kt`): сохранение `wifi/ap` до рестарта
+  (`JIT_NET_PRE wifi=… ap=…`), скрипт `svc wifi disable` → drain `oif wlan0` ≤20 с → `setprop usejit`
+  (`ip_rule_wait=… drained=…`), после подъёма — санация только `oif wlan0` (`JIT_NET_SANITIZE`),
+  Wi-Fi до 3 попыток × 3 с, AP через `startSoftAp` (`JIT_NET_RESTORE`). `svc wifi enable` из
+  watcher-скрипта убран (возврат — из приложения, с ретраями и read-back).
+- **§3 — AVAS как в референсе**: `AvasRestore` переписан — режим + sound type по областям {0,1},
+  восстановление по расписанию 5 с → 12 с → 30 с ×5, вердикт только по read-back, call-sites 2.
+- **§4 — лог-файлы по датам** (`tools/LogFiles.kt`): `voiceapp3-DD.MM.YYYY.log` в
+  `files/logs`, append в течение дня, retention 14 суток, хук в `AppLog.writeRaw`.
+- **Тесты**: `AvasRestoreTest` переписан (9), `JitBootTest` (6, без boot-restore),
+  новые `JitToggleChainTest` (5), `NetRestoreTest` (5), `LogFilesTest` (5), `BuildMarkerTest` → 61.
+
+### Открыто
+
+1. 🟡 sound type: id свойства в референсе нативный (`Politica.h(7)`) — при `reason=no_sound_prop`
+   режим AVAS всё равно восстанавливается; нужен один прогон владельца с логом.
+2. 🟡 AP-возврат зависит от наличия `startSoftAp` в прошивке (лог честный).

@@ -96,6 +96,12 @@ object AppLog {
                 inited = true
                 // iter33: выжимка app.ops.log + SESSION_START/LOG_INDEX в обоих файлах.
                 runCatching { LogKit.attach(appCtx, primary.parentFile ?: appCtx.filesDir) }
+                // iter33p §4: свой лог по датам — `voiceapp3-DD.MM.YYYY.log` в каталоге приложения
+                // (`files/logs`), retention 14 суток. Те же строки, что идут в logcat.
+                runCatching {
+                    val logDir = LogFiles.prepare(appCtx)
+                    Log.i(TAG_BASE, "AppLog.daily path=$logDir name=${LogFiles.fileNameFor(System.currentTimeMillis())}")
+                }
                 Log.i(TAG_BASE, "AppLog.init path=$primaryPath ok=true")
             } catch (t: Throwable) {
                 initErr = t
@@ -377,6 +383,9 @@ object AppLog {
                 primaryPath = target.absolutePath
             }
         }
+        // iter33p §4.3: та же строка уходит в дневной файл `voiceapp3-DD.MM.YYYY.log`
+        // (ошибки записи глушим — дневной лог не имеет права ломать приложение).
+        runCatching { LogFiles.append(c, line) }
     }
 
     private fun formatLine(lvl: String, tag: String, msg: String, _th: Throwable?): String {

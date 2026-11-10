@@ -824,8 +824,9 @@ object AppPerformance {
             persist = jitProps().second
         }
         // iter33o §2.3: прежний текст «применится после перезагрузки ГУ» вводил в заблуждение —
-        // `setprop dalvik.vm.usejit` НЕ персистентен, после ребута `runtime=false` — это норма.
-        // Автовосстановление делает §1.5 (`jitBootRestoreArm`), здесь только факт и подсказка.
+        // `setprop dalvik.vm.usejit` НЕ персистентен: после ребута `runtime=false` — это норма.
+        // iter33p §1: авто-восстановления при загрузке НЕТ (решение владельца 09.11, как в референсе) —
+        // после ребута тумблер просто off, включает владелец вручную.
         val stateLine = if (runtime == "true") JIT_STATE_ON_LINE else JIT_STATE_OFF_LINE
         AppLog.i(TAG, "JIT_BOOT: runtime=$runtime persist=${if (persist.isEmpty()) "empty" else persist} " +
             "boot_tag=$bootTag $stateLine")
@@ -868,21 +869,12 @@ object AppPerformance {
         // iter33n-fix1 §2.4(в): если перед рестартом фреймворка осталось намерение — дочитываем
         // итог здесь же (`JIT_APPLIED … via=pending_verify`), это первый старт после рестарта.
         runCatching { jitPendingVerify(context) }
-        // iter33o §1.3(б): обычный старт — если сохранённый режим AVAS остался невостребованным
-        // (например, процесс убили до сверки), возвращаем его. Без сохранённого файла это no-op.
-        runCatching { AvasRestore.restoreAfterRestart(context.applicationContext, AvasRestore.Where.APP_START) }
+        // iter33p §3.2/§3.4(б): обычный старт — если сохранённый режим AVAS остался невостребованным
+        // (например, процесс убили до сверки), планируем возврат по расписанию референса
+        // (5 с → 12 с → 30 с ×5). Без файла-намерения это no-op.
+        runCatching { AvasRestore.scheduleRestore(context.applicationContext, AvasRestore.Where.APP_START) }
     }
 
-    // ═══════════ iter33o §1.5 — автовосстановление JIT при загрузке ═══════════
-    /*
-     * Механизм референса (`CentralWatchdogService.onCreate` переприменяет `jit_restaurar` /
-     * `perf_auto_otimizar`): если тумблер включён, а runtime не поднят — приложение само
-     * прогоняет цепочку `AVAS_SAVE → setprop → перезапуск фреймворка → AVAS_RESTORE`.
-     *
-     * Правило владельца 09.11 разрешает это РОВНО один раз за загрузку ГУ: guard — persist-подобный
-     * маркер в prefs, значение = boot_tag. Повторные старты приложения в той же загрузке
-     * фреймворк НЕ перезапускают.
-     */
     /**
      * iter33o §2.3 — состояние JIT в строке `JIT_BOOT:` после ребута.
      *
@@ -892,65 +884,9 @@ object AppPerformance {
      */
     internal const val JIT_STATE_ON_LINE = "jit=on nothing_to_do"
     internal const val JIT_STATE_OFF_LINE =
-        "jit=off_after_reboot toggle_to_enable (setprop не персистентен; авто-восстановление — §1.5)"
+        "jit=off_after_reboot toggle_to_enable (setprop не персистентен — как у референса)"
 
-    internal const val JIT_BOOT_RESTORE_MARKER = "jit_boot_restore_done"
-    internal const val JIT_BOOT_RESTORE_DELAY_MS = 30_000L
-
-    /**
-     * Решение «нужно ли авто-восстановление» — чистая функция (тест `JitBootTest`).
-     * Возвращает причину: `run` | `skip_pref_off` | `skip_already_on` | `skip_same_boot`.
-     */
-    fun bootRestoreDecision(prefOn: Boolean, runtime: String, doneTag: String, currentTag: String): String = when {
-        !prefOn -> "skip_pref_off"
-        runtime == "true" -> "skip_already_on"
-        doneTag.isNotBlank() && JitBootMark.sameTag(doneTag, currentTag) -> "skip_same_boot"
-        else -> "run"
-    }
-
-    /**
-     * Планирование авто-восстановления JIT после загрузки ГУ (§1.5). Вызывать с фонового потока
-     * (из `App.onCreate` через `BgWorker`). Сама цепочка — [jitApplyWithZygote] с `route=boot_restore`.
-     */
-    fun jitBootRestoreArm(context: Context) {
-        BgWorker.assertNotMain("AppPerformance.jitBootRestoreArm")
-        val app = context.applicationContext
-        val prefOn = isAutoOptimizeEnabled(app)
-        val (runtime, persist) = jitProps()
-        val tag = currentBootTag()
-        val done = Prefs2.getString(app, JIT_BOOT_RESTORE_MARKER, "") ?: ""
-        when (val decision = bootRestoreDecision(prefOn, runtime, done, tag)) {
-            "run" -> Unit
-            else -> {
-                AppLog.i(TAG, "JIT_BOOT_RESTORE skipped reason=${decision.removePrefix("skip_")} " +
-                    "pref=${if (prefOn) "on" else "off"} runtime=${runtime.ifEmpty { "empty" }} " +
-                    "persist=${persist.ifEmpty { "empty" }} boot_tag=$tag")
-                return
-            }
-        }
-        // Маркер ставим ДО рестарта: после него мы уже в другом процессе и «эту загрузку»
-        // распознать иначе нечем.
-        Prefs2.putString(app, JIT_BOOT_RESTORE_MARKER, tag)
-        AppLog.i(TAG, "JIT_BOOT_RESTORE armed pref=on runtime=${runtime.ifEmpty { "empty" }} " +
-            "persist=${persist.ifEmpty { "empty" }} boot_tag=$tag in=${JIT_BOOT_RESTORE_DELAY_MS}ms " +
-            "route=boot_restore (как референс: jit_restaurar переприменяется при загрузке)")
-        BgWorker.postDelayed("AppPerformance.jitBootRestore", JIT_BOOT_RESTORE_DELAY_MS) {
-            runCatching {
-                if (!isAutoOptimizeEnabled(app)) {
-                    AppLog.i(TAG, "JIT_BOOT_RESTORE cancelled reason=pref_off (владелец выключил тумблер за 30 с)")
-                    return@postDelayed
-                }
-                val (rt2, ps2) = jitProps()
-                if (rt2 == "true") {
-                    AppLog.i(TAG, "JIT_BOOT_RESTORE cancelled reason=already_on runtime=true")
-                    return@postDelayed
-                }
-                jitApplyWithZygote(app, true, rt2, ps2, route = "boot_restore")
-            }.onFailure { AppLog.w(TAG, "JIT_BOOT_RESTORE failed: ${it.javaClass.simpleName}: ${it.message}") }
-        }
-    }
-
-    /** Одна проба за процесс (§3: строка ровно одна, без спама на каждый тик). */
+/** Одна проба за процесс (§3: строка ровно одна, без спама на каждый тик). */
     private val jitProbeDone = java.util.concurrent.atomic.AtomicBoolean(false)
 
     /**
@@ -991,14 +927,14 @@ object AppPerformance {
         val pending = runCatching { pendFile.readText().trim() }.getOrDefault("")
         val meta = runCatching { File(app.filesDir, JIT_PENDING_WANT_FILE).readText().trim() }
             .getOrDefault("")
-        // iter33o §1.5: в meta лежит `want=<true|false> route=<toggle|boot_restore>`.
-        // Старый формат (просто `true`) читается тоже — метаданные прошлых версий не ломают итог.
+        // в meta лежит `want=<true|false>`; старый формат (просто `true`) читается тоже —
+        // метаданные прошлых версий не ломают итог.
         val want = Regex("want=([a-z]+)").find(meta)?.groupValues?.get(1)?.trim()
             ?: meta.substringBefore(' ').trim()
-        val route = Regex("route=([a-z_]+)").find(meta)?.groupValues?.get(1)?.trim().orEmpty()
-        // §1.5: у авто-восстановления свой `via=boot_restore`, у клика — `via=pending_verify`.
-        val via = if (route == "boot_restore") "boot_restore" else "pending_verify"
-        val where = if (route == "boot_restore") AvasRestore.Where.BOOT_RESTORE else AvasRestore.Where.JIT_TOGGLE
+        // iter33p §1: маршрут остался один — тумблер JIT (`via=pending_verify`), поэтому
+        // поле маршрута больше не читается: старые файлы-намерения сверяются как обычные.
+        val via = "pending_verify"
+        val where = AvasRestore.Where.JIT_TOGGLE
         val tag = currentBootTag()
         when (JitBootMark.pendingDecision(pending, tag)) {
             JitBootMark.PendingDecision.NONE -> return false
@@ -1063,8 +999,19 @@ object AppPerformance {
         val maps = runCatching {
             File("/proc/self/maps").useLines { l -> l.any { it.contains("dalvik-jit-code-cache") } }
         }.getOrDefault(false)
-        // iter33o §1.2: возвращаем сохранённый режим AVAS (его сбросил рестарт фреймворка).
-        val avas = runCatching { AvasRestore.restoreAfterRestart(app, where) }.getOrDefault(false)
+        // iter33p §2.3: сеть после подъёма — санация зависших `oif wlan0`, возврат Wi-Fi и AP
+        // ТОЛЬКО из сохранённого перед рестартом состояния (механизм `w0/e2.run`).
+        val netSaved = JitNet.savedState(app)
+        val netOk = if (netSaved != null) {
+            runCatching { JitNet.restoreAfterRestart(app, netSaved) }.getOrDefault(false)
+        } else {
+            AppLog.i(TAG, "JIT_NET_RESTORE skipped reason=no_saved_state")
+            true
+        }
+        // iter33p §3.2: AVAS возвращаем НЕ сразу, а по расписанию референса (5 с → 12 с → 30 с ×5);
+        // успех снимает намерение, поэтому события здесь только планируются.
+        val avasPending = AvasRestore.hasPending(app)
+        if (avasPending) runCatching { AvasRestore.scheduleRestore(app, where) }
         val zygoteRestart = when {
             zr.contains("zygote_restart=ok") -> "ok"
             zr.isEmpty() -> "unknown"
@@ -1078,7 +1025,8 @@ object AppPerformance {
         }
         AppLog.i(TAG, "JIT_APPLIED runtime=${runtime.ifEmpty { "empty" }} want=${want.ifEmpty { "empty" }} " +
             "persist=${persist.ifEmpty { "empty" }} zygote_restart=$zygoteRestart maps=${if (maps) "yes" else "no"} " +
-            "result=$result via=$via detail=\"$detail\" avas_restore=${if (avas) "ok" else "none"}")
+            "result=$result via=$via detail=\"$detail\" net_restore=${if (netOk) "ok" else "failed"} " +
+            "avas_restore=${if (avasPending) "scheduled" else "none"}")
         if (zygoteRestart != "ok") {
             AppLog.i(TAG, "JIT_APPLIED runtime=${runtime.ifEmpty { "empty" }} zygote_restart=unknown " +
                 "reason=no_result_file (второй строки JIT_ZYGOTE_DONE нет в $JIT_ZYGOTE_RESULT_PATH — итог по getprop)")
@@ -1139,7 +1087,8 @@ object AppPerformance {
             sleep 5
             RT=${D}(getprop dalvik.vm.usejit)
             PS=${D}(getprop persist.dalvik.vm.usejit)
-            if [ "${D}WIFI" = "1" ]; then svc wifi enable >/dev/null 2>&1; sleep 1; fi
+            # iter33p §2.3: Wi-Fi/AP возвращает приложение по сохранённому состоянию
+            # (`JIT_NET_RESTORE`, до 3 попыток) — здесь только фиксируем факт.
             WF=${D}(settings get global wifi_on 2>/dev/null)
             {
               echo "JIT_ZYGOTE_DONE runtime=${D}RT persist=${D}PS want=${D}V zygote_restart=ok"
@@ -1157,30 +1106,32 @@ object AppPerformance {
         context: Context,
         enabled: Boolean,
         rtBefore: String,
-        psBefore: String,
-        route: String = "toggle"
+        psBefore: String
     ): List<ToolsStep> {
         BgWorker.assertNotMain("AppPerformance.jitApplyWithZygote")
         val app = context.applicationContext
         val want = if (enabled) "true" else "false"
         val t0 = System.currentTimeMillis()
-        val where = if (route == "boot_restore") AvasRestore.Where.BOOT_RESTORE else AvasRestore.Where.JIT_TOGGLE
-        // iter33o §1.1: ПЕРЕД рестартом сохраняем режим AVAS — рестарт фреймворка его сбрасывает
-        // (звук AVAS «проваливается» в салон). Только чтение; если Car API недоступен — честный skip.
+        // iter33p §1: маршрут один — тумблер JIT по явному клику (авто-восстановления нет).
+        val where = AvasRestore.Where.JIT_TOGGLE
+        // iter33o §1.1: ПЕРЕД рестартом сохраняем режим AVAS и его sound type — рестарт фреймворка
+        // их сбрасывает (звук AVAS «проваливается» в салон). Только чтение; недоступно — честный skip.
         val avasSaved = runCatching { AvasRestore.saveBeforeRestart(app, where) }.getOrNull()
+        // iter33p §2.1: состояние сети ДО рестарта (Wi-Fi + AP) — только чтение, лог `JIT_NET_PRE`.
+        val netSaved = runCatching { JitNet.saveBeforeRestart(app) }.getOrNull()
         // §2.4(а): намерение ДО рестарта — иначе после него результата ждать неоткуда.
-        // iter33o §1.5: в meta добавлен маршрут, чтобы итог печатался с правильным via=…
         runCatching {
             File(app.filesDir, JIT_PENDING_FILE)
                 .writeText(JitBootMark.format(currentBootTag(), android.os.SystemClock.uptimeMillis()))
-            File(app.filesDir, JIT_PENDING_WANT_FILE).writeText("want=$want route=$route")
+            File(app.filesDir, JIT_PENDING_WANT_FILE).writeText("want=$want")
         }
         val D = "$"
         val b64 = android.util.Base64.encodeToString(
             jitZygoteWatcherScript().toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP)
+        // iter33p §2.2: сеть вокруг zygote — как `w0/la.run`: svc wifi disable → drain `oif wlan0`
+        // (≤20 с) → setprop. Watcher с самим рестартом ставим только ПОСЛЕ этого.
+        val netPre = runCatching { JitNet.runPreRestart(app, want) }.getOrNull()
         val prep = """
-            setprop $PROP_USEJIT $want 2>/dev/null
-            setprop $PROP_USEJIT_PROFILES $want 2>/dev/null
             echo RT=${D}(getprop $PROP_USEJIT)
             echo PS=${D}(getprop $PROP_PERSIST_USEJIT_INIT)
             echo WIFI=${D}(settings get global wifi_on 2>/dev/null)
@@ -1190,10 +1141,11 @@ object AppPerformance {
         """.trimIndent()
         val ret = runCatching { runSuCommand(prep) }.getOrNull()
         val out = ret?.output ?: ""
-        val rootUnavailable = out.contains("ERR_ROOT_CHANNEL_UNAVAILABLE") || out.isBlank()
-        val rtNow = parseTag(out, "RT") ?: ""
-        val psNow = parseTag(out, "PS") ?: ""
-        val wifi = parseTag(out, "WIFI") ?: "?"
+        val netChannelOk = netPre != null && netPre.output.isNotBlank()
+        val rootUnavailable = !netChannelOk || out.contains("ERR_ROOT_CHANNEL_UNAVAILABLE") || out.isBlank()
+        val rtNow = parseTag(out, "RT") ?: netPre?.runtime ?: ""
+        val psNow = parseTag(out, "PS") ?: netPre?.persist ?: ""
+        val wifi = if (netSaved?.wifi == true) "1" else "0"
         val wsize = (parseTag(out, "WSIZE") ?: "0").toIntOrNull() ?: 0
         val watcherOk = wsize > 200
         if (rootUnavailable || !watcherOk) {
@@ -1202,7 +1154,7 @@ object AppPerformance {
             runCatching { File(app.filesDir, JIT_PENDING_WANT_FILE).delete() }
             val why = if (rootUnavailable) "reason=no_root_channel" else "reason=watcher_not_written"
             AppLog.i(TAG, "JIT_APPLIED runtime=${rtNow.ifEmpty { "empty" }} want=$want zygote_restart=not_started " +
-                "maps=unknown result=failed via=$route $why watcher_bytes=$wsize " +
+                "maps=unknown result=failed via=pending_verify $why watcher_bytes=$wsize " +
                 "avas_saved=${avasSaved ?: "none"} reason_avas=${if (avasSaved == null) AvasRestore.LAST_SAVE_REASON else "ok"}")
             return listOf(
                 ToolsStep(
@@ -1227,7 +1179,8 @@ object AppPerformance {
         AppLog.i(TAG, "JIT_APPLIED_REQUEST want=$want runtime_before=${rtBefore.ifEmpty { "empty" }} " +
             "persist_before=${psBefore.ifEmpty { "empty" }} runtime_now=${rtNow.ifEmpty { "empty" }} " +
             "persist_readback=${psNow.ifEmpty { "empty" }} wifi_before=$wifi watcher_bytes=$wsize " +
-            "launched=$launched route=$route avas_saved=${avasSaved ?: "none"} " +
+            "launched=$launched via=pending_verify avas_saved=${avasSaved ?: "none"} " +
+            "sound_saved=${AvasRestore.LAST_SOUND_REASON} net_saved=${netSaved?.wire() ?: "none"} " +
             "zygote_restart=armed in=${JIT_ZYGOTE_DELAY_S}s verify=next_start " +
             "warning=\"фреймворк перезапустится: экран гаснет на 10–20 с, приложения закрываются\"")
         return listOf(

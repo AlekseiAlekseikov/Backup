@@ -51,12 +51,9 @@ class App : Application() {
         BgWorker.post("AppPerformance.jitBootProbe") {
             runCatching { com.example.voiceapp3.tools.AppPerformance.jitBootProbe(this) }
         }
-        // iter33o §1.5: авто-восстановление JIT при загрузке (как референс: `jit_restaurar`
-        // переприменяется в onCreate watchdog-а). Не чаще одного раза за загрузку ГУ —
-        // guard по boot_tag внутри; при выключенном тумблере или уже поднятом runtime — skip.
-        BgWorker.post("AppPerformance.jitBootRestoreArm") {
-            runCatching { com.example.voiceapp3.tools.AppPerformance.jitBootRestoreArm(this) }
-        }
+        // iter33p §1 (решение владельца 09.11): авто-восстановления JIT при загрузке НЕТ.
+        // `setprop dalvik.vm.usejit` не персистентен — после ребута тумблер просто off,
+        // владелец включает его сам (как у референса: рестарт фреймворка только по клику).
         // iter20: ОДИН BgWorker-пост — чтение screen_off_timeout ДО любых записей (с ретраем root-канала),
         // сразу же вердикт DURABLE_AFTER_REBOOT, и только потом ensureKeepAwake/runBootDiag.
         // Устранена гонка потоков из iter19 (два независимых поста на 4-поточном пуле).
