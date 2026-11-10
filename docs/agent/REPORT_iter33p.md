@@ -1,9 +1,13 @@
-# REPORT iter33p (1.0.61, перезапуск задачи) — одна JIT-цепочка по референсу
+# REPORT iter33p (1.0.61) — ВТОРОЙ ЗАХОД: JIT ровно по механике референса
 
-**Ветка:** `fix/v2` (без `--force`, `main` не тронут). **Версия:** `versionCode=61`, `versionName="1.0.61"`.
-**Фактическая база на момент выдачи:** HEAD `531ae7658c2bbf2e80e9d6be3edec34b76e165c6`, код `e248231` —
-проверено перед началом работы (`git log -1` в чистом клоне).
-**SHA кода этой итерации / CI / handoff:** см. §0 — заполняется после публикации.
+**Ветка:** `fix/v2` (без `--force`, `main` не тронут). **Версия:** `versionCode=61`, `versionName="1.0.61"`
+(не устанавливалась — собирает и подписывает владелец).
+
+> **Почему есть второй заход.** Первый заход (`c8e4c9c`, CI `42881198633` — 200/0) REVIEW признал
+> неверным по существу: там была построена СВОЯ механика (журнал шагов, TTL операции, окно 60 с,
+> `CONTINUE/COMPENSATE/HOLD`, watcher, boot-backfill), а не копия разрешённой последовательности
+> `j9` → `la` → `e2`. Этот документ заменяет прежний отчёт целиком; прежние коммиты остаются в
+> истории, но код 1.0.61 — тот, что ниже.
 
 ---
 
@@ -11,333 +15,360 @@
 
 | Что | Значение |
 |---|---|
-| база (до работы) | `531ae76` (docs), код `e248231` |
-| код итерации | **`c8e4c9c`** |
-| CI по коду | run `42881198633`, job `130057601380` — **SUCCESS**, 200 PASSED / 0 FAILED, artifact `13794792993` |
-| handoff (`SOURCE_SHA=c8e4c9c`) | коммит с этим отчётом; кода не касается |
+| база (до работы) | `2e85b1abec8afc668c0a4d1055aafbdca4f5098b` (`fix/v2`, docs-коммит handoff прошлого захода) |
+| код этой итерации | **`78a3248`** (первый push `577d338` не собрался — см. §0.4) |
+| CI по коду | run `42896558590`, job `130111086379` — **SUCCESS**, 176 PASSED / 0 FAILED |
+| handoff (`SOURCE_SHA=78a3248`) | отдельный коммит: только `docs/agent/**` + `app/buildinfo.properties`, кода не касается |
 
 ### 0.1 Что опубликовано
 
+`2e85b1a..577d338`, затем `577d338..78a3248` в `fix/v2` (fast-forward, без `--force`).
+`main` не тронут (`97c0cf1`).
+
 | коммит | что |
 |---|---|
-| `531ae76` | база (документация предыдущей итерации, код `e248231`) |
-| **`c8e4c9c`** | **код этой итерации**: 4 файла кода/KDoc + 6 файлов тестов (5 изменено, 2 удалено, 2 добавлено), 1091 вставка / 1874 удаления — код стал меньше ровно настолько, насколько убран лишний механизм |
-| коммит с этим отчётом | только `docs/agent/**` + `app/buildinfo.properties` (`SOURCE_SHA=e248231` → `c8e4c9c`) |
+| `577d338` | основной коммит кода (23 файла, +1594 / -3243) |
+| `78a3248` | фикс сборки: возвращён `currentBootTag()` (см. §0.4) |
 
-Пуш: `531ae76..c8e4c9c fix/v2 -> fix/v2` (без `--force`), `main` не тронут (остаётся `97c0cf1`).
+История не переписывалась (`--force` запрещён), поэтому неудачная попытка видна в ней.
 
-### 0.2 CI по опубликованному коду
-
-| Run | Job | Коммит | Итог | PASSED / FAILED | Artifact |
-|---|---|---|---|---|---|
-| `42881198633` | `130057601380` | `c8e4c9c` | **SUCCESS** (`BUILD SUCCESSFUL in 4m 39s`) | **200 / 0** | `13794792993` (`app-debug`, 177 191 780 Б) |
-
-Число `PASSED` взято из полного лога джобы (`grep -c ' PASSED$'` = 200, `grep -c ' FAILED'` = 0).
-Прошлый прогон по `e248231` (fix4) — 206 тестов; здесь 200, потому что два класса заменены:
-`JitWatcherScriptTest` (4 теста watcher-а) удалён, `NetSanitizePlanTest` (7 тестов плана удаления
-правил) заменён на `JitRulesReadOnlyTest` (3), `JitChainScriptTest` даёт 5, `JitNetCoreTest` — 23.
-Ни один тест не удалён «потому что красный»: см. §5.
-
-### 0.3 `SOURCE_SHA`
-
-`app/buildinfo.properties`: `SOURCE_SHA=c8e4c9c` — SHA коммита с кодом, который собирает владелец.
-`git rev-parse` при сборке не используется (сборка читает файл), git-команды в сборке запрещены.
-`versionCode=61`, `versionName="1.0.61"` — не менялись.
-
-**Локальный прогон (не заменяет Android CI):** см. §7.
-
----
-
-## 1. Что реально делает референс (проверено по коду, не по литералам)
-
-Референс скачан и проверен мной в этой итерации:
-
-- ZIP `https://drive.usercontent.google.com/download?id=1nKMhxGDVuurRv_QgMdjIBJFZ35MYsq2S&export=download&confirm=t`,
-  MD5 `8a65c6c29749c64d4e335c57490a347a`, 10 091 814 Б — **совпал**;
-- внутри `CentralEXAuto_v3.3.9.apk`, MD5 `c3f1664125953b9851bf4483b265135f`, 13 448 765 Б — **совпал**;
-- разбирался именно внешний APK; вложенный `assets/pip-overlay.apk` не использовался;
-- декомпиляция: **jadx 1.4.7** (1.5.1 в песочнице нет — честное ограничение; версия влияет на имена,
-  но не на смысл), плюс smali (`baksmali 2.5.2`) для методов, которые jadx не осилил
-  (`w0/j9.onClick` и `CentralWatchdogService.U(...)` — «Method not decompiled»).
-
-### 1.1 Клик тумблера — `w0/j9.onClick` (внутри `w0/b9` case 22)
-
-```
-isWifiEnabled()                                  // try/catch → false
-NetworkInterface.getByName("ap0") isUp && hasInetAddresses   // AP
-SharedPreferences.edit()
-    .putBoolean("jit_pedido", target)
-    .putBoolean("perf_auto_otimizar", target)
-    .putString("jit_restaurar", "wifi=<0|1>,ap=<0|1>")   // ← снимок сети
-    .commit()                                     // синхронно, ДО любых изменений
-→ thread pool: w0/la.run(...)
-```
-
-### 1.2 Единственный скрипт — `w0/la.run` (case 0)
-
-```sh
-svc wifi disable
-_n=0
-while [ $_n -lt 20 ]; do                       # слив правил, ≤20 с
-  [ "$(ip rule show | grep -c 'oif wlan0')" = "0" ] && break
-  sleep 1; _n=$((_n + 1))
-done
-for _m in $(grep ' /data/app/' /proc/mounts | awk '{print $2}'); do
-  umount -l "$_m" 2>/dev/null                  # ← НЕ копируем (чужие монтирования)
-done
-setprop dalvik.vm.usejit <true|false>
-setprop ctl.restart zygote                     # ← последняя команда, без watcher-а и без задержки
-```
-
-Запуск: `mainActivity.H1(40000, script)` (root-транспорт, таймаут 40 с) + `postDelayed(ua, 45000)` для UI.
-**Никакого отдельного watcher-а, файла-отмены, `nohup`, `sleep 8`, второй кнопки в референсе нет.**
-
-### 1.3 Возврат сети после рестарта — `CentralWatchdogService.onCreate` → `w0/e2.run`
-
-```
-s = prefs.getString("jit_restaurar", null)
-if (Regex("^wifi=([01]),ap=([01])$").matches(s)) {
-    oe = Restauro(wifi = g1, ap = g2)
-    prefs.edit().remove("jit_restaurar").apply()      // ← снимается ДО выполнения
-    handler.postDelayed(e2(oe, service, 0), 15000)    // 15 с после старта
-}
-e2 case 0: if (CentralWatchdogService.T2) thread { e2(..., 1) } else return
-e2 case 1: if (ap)  garantirApAberto("pós-JIT")        // AP ПЕРВЫМ
-           if (wifi && !wm.isWifiEnabled()) wm.setWifiEnabled(true)   // потом Wi-Fi
-           log "JIT: restaurado após o restart (wifi=… ap=…)"
-```
-
-AP — `CentralWatchdogService.d(String)` (рефлексия `startSoftAp(WifiConfiguration)`), состояние AP — `v()`
-(`ap0` + адреса), состояние Wi-Fi — `c1()` (`isWifiEnabled || state==ENABLING`).
-
-### 1.4 Проверка результата — `w0/bb.run` (case 1) → `w0/r7.run` (default)
-
-```
-getprop dalvik.vm.usejit  → z4
-/proc/self/maps           → есть ли dalvik-jit-code-cache (bool; исключение → null)
-r7: toggle.setActive(getprop); if (prefs.contains("jit_pedido")) {
-      ok = (pedido == getprop) && (!pedido || maps != FALSE);
-      log "JIT pedido=… getprop=… code-cache-executavel=…"; prefs.remove("jit_pedido")
-      if (!ok && pedido) toast master_perf_jit_not_applied
-    }
-```
-
-**Рестарт zygote в референсе не подтверждается вообще:** ни pid, ни файл, ни задержка. Это его слабое
-место — у нас подтверждение добавлено и честно помечено как наша часть (§3).
-
-### 1.5 AVAS в референсе (исправление прежнего неверного указания ревьюера)
-
-- `CentralWatchdogService.z()` — возврат **муты** и только при `avas_muted_saved` → `setAVASMode(0)`
-  (рефлексия `getAVASMode`/`setAVASMode`); активный AVAS-mode JIT-цепочка не сохраняет;
-- `CentralWatchdogService.A()` — sound type из `avas_sound_type_saved` (>0) по `w0/u.b` = `Politica.h(7)`
-  = `0x21407057`, области `w0/u.c` = `{0,1}`, `getIntProperty`/`setIntProperty` (**void**), лог
-  «restaurado para N após boot» при расхождении;
-- `5 × 30 с` из ревью — **AEB observer**, к AVAS не относится. Наш график окон — собственная
-  адаптация (§5), «точным графиком референса» не называется.
-
-### 1.6 `ip rule`
-
-В показанном `e2` удаления правил **нет**; `la.run` правила только читает (`grep -c`). Удаление `ip rule`
-из нашей цепочки убрано (§4), причина прошлой потери интернета полевым логом не доказана — и не
-заявляется.
-
----
-
-## 2. Наша цепочка: одна операция, один скрипт, продолжение после рестарта
-
-```
-клик тумблера (AppPerformance.jitApplyWithZygote, AppPerformance.kt:951)
- 0. хвост предыдущей операции            JitNet.reconcilePending("pre_click")      :965
- 1. снимок операции + чтение обратно     JitNet.saveOperation(...)                 :971
-      op=<id>;boot=<tag>;wifi;ap;want;zygote=<pid>;rt=<до>;ts=<ms>   (JitNetCore.kt:415)
- 2. старые свои журналы (кроме текущего) JitNet.purgeOldJournals                    :989
- 3. снимок AVAS (только чтение)          AvasRestore.saveBeforeRestart              :993
- 4. ЕДИНСТВЕННЫЙ скрипт                  JitNet.runChain(...) → JitNetCore.kt:472   :1002
-      svc wifi disable → слив ≤20 с → setprop dalvik.vm.usejit
-      → setprop persist.dalvik.vm.usejit → setprop ctl.restart zygote (последняя)
- 5. если скрипт ВЕРНУЛ управление, а рестарта нет:
-      reconcilePending(..., lateRestartPossible=false) → компенсация в этой же операции  :1010
- 6. иначе — PARTIAL: «итог на следующем старте»
-```
-
-После подъёма процесса (`AppPerformance.jitPendingVerify`, `:901`):
-
-```
-op = JitNet.currentOp();  phase = JitNet.phaseOf(op)        // журнал, только строки нашего op
-facts = JitNet.applyFacts(op)                               // getprop / maps / pid zygote → verdict
-net = JitNet.reconcilePending(app, bootTag, "start")        // ОДНО решение (JitFlow.pendingAction)
-AVAS: AvasRestore.scheduleRestore(JIT_TOGGLE) — только если снимок операции существует
-лог: JIT_APPLIED getprop=… want=… persist=… maps=… restart=… verdict=… op=… phase=… net=…
-```
-
-Решение принимает чистая функция `JitFlow.pendingAction` (`JitNetCore.kt:300`):
-
-| ситуация | действие | сетевые команды |
-|---|---|---|
-| журнала нет, сеть как была | `DISCARD_NO_EFFECT` | нет |
-| журнала нет, сеть другая | `HOLD_UNKNOWN` (`need=owner_decision`) | нет |
-| фаза есть, pid zygote сменился | `CONTINUE_RESTORE` — продолжение операции, **без второго клика** | AP → Wi-Fi |
-| фаза есть, окно позднего рестарта (60 с) не истекло | `HOLD_UNKNOWN` | нет |
-| фаза есть, окно истекло / скрипт вернул управление / была перезагрузка ГУ | `COMPENSATE_RESTORE` (+ откат usejit к прежнему) | AP → Wi-Fi |
-| операция старше 10 мин | `HOLD_UNKNOWN` | нет |
-| снимка нет | `Recovery.NONE` (обычный старт) | нет |
-
-**Раздельные факты вместо «ok» из таймаута:** `restart` = `ok|no|unknown` только по сравнению pid
-zygote (`JitFlow.restartVerdict`, `:353`); `verdict` = `applied|unverified|not_applied|unknown`
-(`:363`) — getprop без подтверждённого рестарта успехом не считается, отсутствие `maps` даёт
-`unverified`, а не `applied`.
-
----
-
-## 3. Отличия от референса — каждое с причиной
-
-| # | Референс | У нас | Причина |
-|---|---|---|---|
-| 1 | `umount -l` всех точек `/data/app/` | **нет** | Границы владельца: чужие монтирования не трогаем; функция к сети/JIT не относится |
-| 2 | только `dalvik.vm.usejit` | + `persist.dalvik.vm.usejit` | Согласованный владельцем init-ключ (был в 1.0.60); без него JIT не поднимается после ребута. `usejitprofiles` **не пишем** (в `la.run` его нет) |
-| 3 | `jit_restaurar` в SharedPreferences, без op-id, без загрузки ГУ | снимок с `op`, `boot`, `zygote pid`, `rt_before`, `ts` | Нужна привязка к КОНКРЕТНОЙ операции: старый/чужой снимок не должен подтверждать новый запуск |
-| 4 | повторный клик может перезаписать снимок | `saveOperation` отказывает, если снимок есть (`refused reason=pending_operation`) | «Параллельный/повторный клик не должен перезаписать незавершённое состояние» |
-| 5 | снимок без подтверждения записи | запись подтверждается чтением; иначе операция не начинается | «При невозможности надёжно сохранить снимок — отказ до disable» |
-| 6 | снимок снимается ДО выполнения возврата | снимается только при подтверждённом возврате по read-back | Прежняя ошибка «сняли состояние, не вернув сеть» |
-| 7 | рестарт не подтверждается | `restart=ok` только по смене pid zygote, иначе `no|unknown` | Ложный «рестарт ok» недопустим |
-| 8 | `postDelayed(15 с)` и `e2` теряет восстановление, если сервис не готов (`T2=false`, снимок уже удалён) | «окно позднего рестарта» 60 с + `HOLD_UNKNOWN`, снимок сохраняется до подтверждения | Не терять состояние, если момент не определён |
-| 9 | нет фазы операции | журнал `JITSTEP op=<id> step=…` (start / wifi_disabled / drained / usejit / restart_sent) | Нужно отличать «дошло до рестарта» от «умерло раньше», не убивая процессы |
-| 10 | нет отката props | откат `usejit` к прежнему значению при доказанном отсутствии рестарта | Компенсация до исходного состояния, а не «полуприменённый JIT» |
-| 11 | `u.b`/`u.c` sound type на загрузке, `z()` мута | наш снимок mode+sound type в цепочке JIT и на старте | Разрешено владельцем; выдаётся за нашу адаптацию, не за референс |
-| 12 | нет проверки `oif wlan0` после возврата | read-only счётчик правил в логе | Диагностика без удаления |
-
----
-
-## 4. Чек-лист требований
-
-| # | Требование | Статус | Где |
-|---|---|---|---|
-| 1 | Порядок: снимок → `svc wifi disable` → слив ≤20 с → `setprop usejit` → **единственный** рестарт по клику | ✅ | `JitNetCore.kt:132` (текст), исполнение — `JitChainScriptTest` |
-| 2 | Возврат сохранённых AP/Wi-Fi **в той же операции**, без второго клика | ✅ | `AppPerformance.kt:909` → `JitNetCore.kt:300,497` |
-| 3 | AP раньше Wi-Fi (как `w0/e2.run`) | ✅ | `JitNetCore.kt:596` (порядок в `restore`), тест `confirmedRestartReturnsWifiWithoutSecondClick` |
-| 4 | На обычной загрузке — ни рестарта, ни сетевой операции | ✅ | `pendingAction` → `NONE/DISCARD/HOLD`; тесты `coldStartWithoutOperationTouchesNothing`, `noEvidenceAndNetworkChangedHoldsForOwner` |
-| 5 | Снимок: id операции + загрузка ГУ + Wi-Fi/AP + цель + read-only признаки, подтверждён до сети | ✅ | `JitNetCore.kt:415`, формат `Op.wire()` `:70` |
-| 6 | Повторный/параллельный клик не затирает незавершённое | ✅ | `JitNetCore.kt:416`, тест `secondClickDoesNotOverwritePendingOperation` |
-| 7 | Отказ до disable, если снимок не сохраняется | ✅ | `JitNetCore.kt:415-460`, тест `saveRefusedWhenWriteNotConfirmed` |
-| 8 | Различаются: смена фреймворка / отмена до рестарта / неизвестность / другая загрузка | ✅ | таблица §2, `JitFlow.pendingAction` |
-| 9 | `ARMED`/`RESTARTING` не считаются доказательством рестарта | ✅ | watcher-а нет вовсе; `restartVerdict` — только pid |
-| 10 | Смена app-PID не считается доказательством рестарта zygote | ✅ | `restartVerdict` сравнивает **pid zygote** |
-| 11 | Не снимать снимок/не объявлять возврат преждевременно, пока возможен поздний рестарт | ✅ | окно 60 с → `HOLD_UNKNOWN`; тест `interruptionBeforeZygoteCompensatesOnlyAfterWindow` |
-| 12 | Компенсация сети только до сохранённого состояния | ✅ | `restore()` использует только `op.wifi/op.ap` |
-| 13 | При неопределённости — не заявлять ложную отмену, не удалять состояние | ✅ | `HOLD_UNKNOWN`, тесты `failedRestoreKeepsSnapshot`, `noEvidenceAndNetworkChangedHoldsForOwner` |
-| 14 | Аварийный случай без новых команд — остановиться и запросить решение | ✅ | лог `JIT_OP_HOLD … need=owner_decision`; §8 |
-| 15 | Никаких `kill`/`pkill`/`pgrep -f`, новых кнопок, авто-действий на старте | ✅ | `JitToggleChainTest.chainHasNoForeignMechanisms` |
-| 16 | Убрать 8-секундный watcher, файл-отмену и чтение `ARMED` | ✅ | `JitWatcherScriptTest` удалён, `JitChainScriptTest` — вместо него |
-| 17 | Запрос `setWifiEnabled`/`startSoftAp` ≠ «интернет есть» | ✅ | `RestoreResult` (`wifiConfirmed`/`apConfirmed`/`link` отдельно), тест `wifiRequestWithoutStateIsNotSuccess` |
-| 18 | `ok`/`failed`/`unknown` различаются | ✅ | `ScriptOut.channelOk`, `RestoreResult`, `restartVerdict`, `verdict` |
-| 19 | `ip rule`: без безусловного удаления, только read-only | ✅ | `rulesProbeCommand` `:117`; `NetSanitizePlanTest` заменён на `JitRulesReadOnlyTest` |
-| 20 | Никаких `flush`/`ndc`/`settings`/route-правок | ✅ | те же тесты (проверка по коду без комментариев) |
-| 21 | `JIT_APPLIED` раздельно: getprop, maps, рестарт, вердикт | ✅ | `AppPerformance.kt:901-930`, `JitNet.ApplyFacts.log()` |
-| 22 | Ошибки shell-строк (`resetWatcherResult` и т.п.) исчезли с механизмом | ✅ | методы удалены; см. §6 |
-| 23 | AVAS: только сохранённые mode и sound type, только цепочка JIT + старт | ✅ | `AvasRestore` header, `AppPerformance.kt:993`, `AvasContractTest.callSitesAreStillTwo` |
-| 24 | AVAS: read-back, недоступное не пишем, снимок атомарный и привязан к операции | ✅ | `AvasCore` (без изменений), `AvasCoreTest` 13 |
-| 25 | Не утверждать, что AVAS-график/снимок скопирован из референса | ✅ | §1.5 + исправленный KDoc `AvasRestore.kt` |
-| 26 | Суточные логи в каталоге приложения, fallback, retention только своих | ✅ | `LogFiles.kt` (не менялся), `LogFilesTest` |
-| 27 | TTL/CarPlay/плагин/раскладка/климат/батарея/температура не тронуты | 🟡 | проверено диффом (§6): изменены только JIT-файлы; полевых проверок нет |
-| 28 | Полевой прогон JIT | ⛔ | по условию — только после нового REVIEW |
-
----
-
-## 5. Тесты (исполняемые, с фейковым каналом и настоящим `sh`)
-
-| Класс | Что проверяет |
-|---|---|
-| `JitNetCoreTest` (23) | снимок и его подтверждение; отказ второго клика; единственный скрипт и его порядок; фазы по журналу; продолжение после рестарта (Wi-Fi+AP, AP первым); холодный старт без команд; прерывание до zygote (HOLD → компенсация после окна); возврат управления скриптом (`lateRestartPossible=false` → компенсация + откат props); пустой журнал при изменённой сети → `HOLD need=owner_decision`; пустой журнал при нетронутой сети → `DISCARD`; просрочка → `HOLD`; другая загрузка ГУ → компенсация; чужой журнал не подтверждает фазу; `restartVerdict`; `verdict`; запрос ≠ подтверждение; `ap=0` не ошибка; правила только считаются; чужой `clearOp` отклоняется; `opId`/путь журнала shell-safe |
-| `JitChainScriptTest` (5) | **настоящий `sh`** с подставными `svc`/`ip`/`setprop`/`getprop`/`sleep`: фактический порядок вызовов, рестарт ровно один и последний, журнал со всеми шагами и нашим `op`, `wait=20` при несходящихся правилах, тишина в stdout, отсутствие `nohup`/фона/отмены |
-| `JitRulesReadOnlyTest` (3) | проба правил только считает; в коде нет `ip rule del/flush`, `ndc`, `settings put`; число правил — диагностика и не влияет на «возврат выполнен» |
-| `JitToggleChainTest` (5) | порядок в тексте цепочки; отсутствие чужих механизмов (`umount`, `usejitprofiles`, `nohup`, `cancel`, `kill`, `setenforce`, `pm install`, `ip rule del`, `sleep 8`); снимок до скрипта; единственность точки рестарта; сеть только в трёх файлах |
-| `JitBootTest` (6) | `JIT_BOOT` печатается всегда; ключи; литерал `ctl.restart zygote` только в `JitNetCore.kt` и ровно один; `AppPerformance` запускает цепочку через `JitNet.runChain`; авто-восстановления JIT при загрузке нет |
-| `AvasCoreTest` (13) | окна/повторы/чужие задачи/просрочка/пустой снимок (без изменений — механизм не трогали) |
-| `AvasContractTest` (5) | порядок снимков (операция → AVAS → скрипт), отсутствие отмены снимка, void-API, две точки вызова |
-| `BuildMarkerTest` (3) | `SOURCE_SHA` в маркере и `versionCode/versionName` |
-
-**Заменённые тесты (не удалены «потому что красные»):**
-
-- `JitWatcherScriptTest` → **`JitChainScriptTest`**: watcher-а больше нет; тот же подход (настоящий `sh`,
-  подставные команды), но проверяется единственная цепочка — включая рестарт последней командой.
-- `NetSanitizePlanTest` → **`JitRulesReadOnlyTest`**: удаление правил убрано по требованию, вместо плана
-  удаления — read-only диагностика и статические границы.
-- `JitNetCoreTest` переписан под новую модель (старые сценарии сохранены по смыслу, добавлены
-  «второй клик», «пустой журнал», «возврат управления скриптом», «другая загрузка ГУ»).
-
----
-
-## 6. Изменённые файлы и выведенные из использования механизмы
-
-**Изменено (5 файлов кода/тестов):**
+Состав коммита кода: 23 файла, **+1594 / −3243**. Кода стало меньше на 1649 строк — это и есть
+удаление собственных механизмов и привязки AVAS к JIT.
 
 | файл | что |
 |---|---|
-| `app/src/main/java/.../tools/JitNetCore.kt` | переписан: модель операции, единственный скрипт, журнал шагов, `JitFlow.pendingAction`, `JitNetCore` (снимок/цепочка/разбор/возврат) |
-| `app/src/main/java/.../tools/JitNet.kt` | адаптер: снимок, цепочка, разбор, факты; удалены `preRestartScript`/`sanitizeScript`/`sanitizePlan`/`restoreAfterRestart`/`compensate` |
-| `app/src/main/java/.../tools/AppPerformance.kt` | `jitApplyWithZygote` и `jitPendingVerify` переписаны; `netOnProcessStart`, `abortAfterNet`, `cancelWatcherAndVerify`, `readWatcherResult`, `resetWatcherResult`, `waitWatcherArmed`, `writeIntentConfirmed`, `jitProfiles`, `AbortOutcome` удалены; мёртвые константы прежнего механизма убраны |
-| `app/src/main/java/.../tools/AvasRestore.kt` | только KDoc: снят недоказанный «точный график референса», зафиксировано, что снимок mode+sound type — наша адаптация |
-| тесты | `JitNetCoreTest`, `JitChainScriptTest` (новый), `JitRulesReadOnlyTest` (новый), `JitToggleChainTest`, `JitBootTest`, `AvasContractTest`; удалены `JitWatcherScriptTest`, `NetSanitizePlanTest` |
+| `tools/JitNetCore.kt` | `JitRef` (константы и текст скрипта референса) + `JitOp` (ядро операции) + швы `JitShell`/`JitStore`/`JitNetState` |
+| `tools/JitNet.kt` | тонкие Android-адаптеры (`AdbClient`, `Prefs2`, `WifiManager`), без собственных решений |
+| `tools/AppPerformance.kt` | `setAutoOptimize` → `jitApplyWithZygote` → `JitNet.click`; на загрузке только чтение |
+| `tools/JitBootMark.kt` | только опознание загрузки (остальные «решения» удалены) |
+| `tools/AvasCore.kt`, `tools/AvasRestore.kt` | **удалены целиком** |
+| `VoiceAssistantService.kt` | убран повтор через 30 с |
+| тесты | 8 классов переписано/добавлено, 5 удалено (§4) |
 
-**Выведено из использования (и почему):**
+### 0.2 CI по опубликованному коду
 
-- watcher-скрипт `/data/local/tmp/jit_zygote_watch.sh` и `nohup`-запуск — рестарт это последняя команда;
-- файл-итог `/data/local/tmp/jit_zygote_result.txt` и файл-отмена `/data/local/tmp/jit_zygote_cancel`;
-- строки `JIT_ZYGOTE_ARMED|RESTARTING|DONE|ABORTED` как доказательства фазы → журнал `JITSTEP op=…`;
-- 8-секундная задержка рестарта и её ожидание;
-- файл-намерение `filesDir/jit_pending_verify`, `jit_pending_want`, `.processing`, `jit_verify_cycle`;
-- `dalvik.vm.usejitprofiles` в записи (чтение в `JIT_BOOT` оставлено);
-- удаление правил `ip rule … oif wlan0` (`sanitizeScript`, `sanitizePlan`) → read-only подсчёт;
-- `pkill`/`pgrep -f`/любые `kill` (их и не было в этой ветке — подтверждено тестом).
+| Run | Job | Коммит | Итог | PASSED / FAILED |
+|---|---|---|---|---|
+| `42894105428` | `130102548785` | `577d338` | **FAILED** (`:app:compileDebugKotlin`) — см. §0.4 | - |
+| `42896558590` | `130111086379` | `78a3248` | **SUCCESS** (`BUILD SUCCESSFUL in 4m 35s`) | **176 / 0** |
+
+Числа взяты из полного лога джобы: `grep -c ' PASSED$'` = **176**, `grep -c ' FAILED$'` = **0**.
+`SKIPPED` в логе — только Gradle-задачи (`checkKotlinGradlePluginConfigurationErrors`,
+`kspDebugUnitTestKotlin`), ни одного пропущенного теста. Artifact `app-debug` — `13802266250`,
+177 156 675 Б.
+
+Разбивка JIT-классов этой итерации (из того же лога): `JitChainEndToEndTest 14`, `JitRefTest 13`,
+`JitChainScriptTest 6`, `JitBootTest 5`, `JitTogglePathTest 4`, `JitBootMarkTest 4`,
+`AvasIndependenceTest 4`, `JitNoPersistTest 3`, `JitRulesReadOnlyTest 2` — итого **55**
+(ровно как в локальном прогоне §7). Прежние 200 PASSED были выше только потому, что удалённые
+классы (`AvasCoreTest 13`, `AvasContractTest 5`, `JitNetCoreTest 23`, `JitToggleChainTest 5`,
+`JitPersistTest 3`, старый `JitBootTest 6`) проверяли код, которого больше нет; эквивалентное
+покрытие — §4.1.
+
+### 0.4 Первый прогон CI: что упало и почему
+
+`42894105428` / `130102548785` по `577d338` — **FAILED**, единственная причина:
+
+```
+e: .../tools/AppPerformance.kt:802:23 Unresolved reference 'currentBootTag'.
+e: .../tools/AppPerformance.kt:875:23 Unresolved reference 'currentBootTag'.
+e: .../tools/AppPerformance.kt:936:36 Unresolved reference 'currentBootTag'.
+Execution failed for task ':app:compileDebugKotlin'.
+```
+
+Причина честная: вместе с удалённым блоком `jitProps()`/`jit_verified` из `AppPerformance` ушла
+и локальная `currentBootTag()`. Исправлено в `78a3248`: функция восстановлена и делегирует в
+`HvacDigitalPlugin.currentBootTag()` (`AppPerformance.kt:712`), чтобы опознание загрузки было
+одно на приложение. Компиляцию модуля песочница не делает (нет Android SDK), поэтому это поймал
+CI — локальный JVM-прогон `AppPerformance` не собирает по определению (§7).
+
+### 0.3 `SOURCE_SHA`
+
+`app/buildinfo.properties`: `SOURCE_SHA=c8e4c9c` → **`78a3248`** в handoff-коммите. `git rev-parse`
+в сборке не используется (сборка читает файл).
+
+**Локальный JVM-прогон** (не заменяет Android CI): `PASS=55 FAIL=0`, см. §7.
+Полевого подтверждения на ГУ нет и в этом отчёте не заявляется.
+
+---
+
+## 1. Механика референса — что именно скопировано
+
+Проверено по коду `CentralEXAuto_v3.3.9.apk` (md5 `c3f1664125953b9851bf4483b265135f` из ZIP
+md5 `8a65c6c29749c64d4e335c57490a347a` — суммы совпали, APK скачан заново в этой итерации;
+декомпиляция jadx 1.4.7 + baksmali 2.5.2). Выписки — `docs/agent/ref/centralexauto_v339_jit_chain.md`.
+
+### 1.1 Клик: `w0/j9.onClick`
+
+```java
+wifi = wm.isWifiEnabled();  ap = ap0 != null && ap0.isUp() && ap0.getInetAddresses().hasMoreElements();
+prefs.edit().putBoolean("jit_pedido", target).putBoolean("perf_auto_otimizar", target)
+     .putString("jit_restaurar", "wifi=" + wifi + ",ap=" + ap).commit();   // ДО любых изменений
+pool.execute(new la(activity, target, progress));
+```
+
+Наша копия: `JitOp.prepare` (`JitNetCore.kt:265-315`) — чтение состояния, одна запись набора
+ключей (`jit_pedido`, `perf_auto_otimizar`, `jit_restaurar`, `<наши>` boot/ts), затем скрипт.
+Ключи — те же (`JitRef.KEY_PEDIDO/KEY_AUTO/KEY_RESTORE`, `JitNetCore.kt:35-46`).
+
+### 1.2 Скрипт: `w0/la.run` — одна строка в строку
+
+`JitRef.chainScript` (`JitNetCore.kt:95-113`):
+
+```
+svc wifi disable
+_n=0
+while [ $_n -lt 20 ]; do
+  [ "$(ip rule show | grep -c 'oif wlan0')" = "0" ] && break
+  sleep 1; _n=$((_n + 1))
+done
+for _m in $(grep ' /data/app/' /proc/mounts | awk '{print $2}'); do   ← только при MOUNT_STEP_ENABLED
+  umount -l "$_m" 2>/dev/null
+done
+setprop dalvik.vm.usejit <true|false>
+setprop ctl.restart zygote          ← последняя команда
+```
+
+Совпадение с оригиналом проверено построчно: `JitRefTest.scriptStartsWithWifiDisableAndEndsWithZygoteRestart`,
+`drainLoopIsReferenceShaped`, `mountStepIsOffByDefaultAndOnlyAddsReferenceLine`, а фактическое
+исполнение — `JitChainScriptTest.orderIsReferenceByteForByte` (настоящий `/bin/sh`, подставные
+`svc`/`ip`/`setprop`/`getprop`/`sleep`/`umount`): последняя запись в журнале вызовов — ровно
+`setprop ctl.restart zygote`, и она одна.
+
+Таймаут транспорта — `JitRef.CHAIN_TIMEOUT_MS = 40_000` (`JitNetCore.kt:58`), как `H1(40000, …)`.
+
+### 1.3 Возврат после подъёма фреймворка — `w0/e2.run`
+
+```java
+if (s != null && Pattern.compile("^wifi=([01]),ap=([01])$").matcher(s).matches()) {
+    prefs.edit().remove("jit_restaurar").apply();
+    handler.postDelayed(new e2(restauro, service, 0), 15000L);
+}
+// e2 case 1:  if (ap) service.U("pós-JIT", false);            // AP ПЕРВЫМ
+//             if (wifi && !wm.isWifiEnabled()) wm.setWifiEnabled(true);  // затем Wi-Fi
+```
+
+Наша копия — `JitOp.continueAfterBoot` + `JitOp.restoreNetwork` (`JitNetCore.kt:332-420`):
+разбор той же регуляркой (`JitRef.parseRestore`, `:80`), пауза `RESTORE_DELAY_MS = 15_000`
+(`:55`), **AP первым**, затем Wi-Fi; `JitChainEndToEndTest.continuationRestoresApFirstThenWifi`
+проверяет и порядок запросов (`["ap=start", "wifi=true"]`), и величину паузы.
+
+**Как служба запускается и получает данные именно этой операции.** В референсе —
+`CentralBootReceiver` ловит `BOOT_COMPLETED`/`ACTION_BOOT_HU`/`MY_PACKAGE_REPLACED` и вызывает
+`startForegroundService(... "motivo_inicio" = "boot"|"update")`; `ctl.restart zygote` даёт новую
+загрузку фреймворка ⇒ `BOOT_COMPLETED` ⇒ `onCreate` читает `jit_restaurar` из ТЕХ ЖЕ префов и
+планирует `e2` через 15 с. У нас эквивалент — `.BootReceiver` (BOOT_COMPLETED /
+LOCKED_BOOT_COMPLETED / QUICKBOOT_POWERON; `ACTION_BOOT_HU` в манифесте НЕТ — отличие ниже) и
+`AppPerformance.jitPendingVerify` из `VoiceAssistantService.onCreate` (`:270`) и
+`onStartCommand` (`:349`) + `AppPerformance.jitBootProbe` из `App.kt:51`.
+Данные операции попадают в продолжение через префы `jit_restaurar` + наша метка загрузки.
+
+**Тайминг подтверждён только инструкциями:** 15000 мс — это литерал `0x3a98` в
+`CentralWatchdogService.onCreate` (smali, jadx метод не осилил). Что наш `onCreate` будет вызван
+ровно в этот момент, ничем на ГУ не доказано: поэтому пауза выдерживается нами внутри
+`continueAfterBoot`, а не «надеждой, что сервис поднимется вовремя». Если `onCreate` случится
+позже, вернём сеть позже — это не ошибка механики, но и не подтверждённый тайминг.
+
+### 1.4 Сверка: `w0/bb` + `w0/r7`
+
+```java
+getprop = "getprop dalvik.vm.usejit" → trim() == "true"
+maps    = есть ли "dalvik-jit-code-cache" в /proc/self/maps  (ошибка → null)
+ok = (pedido == getprop) && (!pedido || maps != Boolean.FALSE);
+prefs.edit().remove("jit_pedido").apply();  // снимается после сверки
+if (!ok && pedido) toast(master_perf_jit_not_applied);
+```
+
+Наша копия — `JitRef.verify` (`:116-124`) + `JitOp.verifyApplied` (`:382-410`): те же условия;
+`NO_DATA` (пустой `getprop`) даёт `unknown`, а не успех; `jit_pedido` снимается только после чтения.
+Тесты: `JitRefTest.verifyFollowsReferenceFormula`, `noDataIsUnknownNeverSuccess`,
+`JitChainEndToEndTest.verifyWithoutCacheIsNotSuccess` / `verifyWithoutDataIsUnknown`.
+
+---
+
+## 2. Что удалено как «наше, не референса» (§1.2 мандата)
+
+| удалено | где было | чем подтверждается, что нет |
+|---|---|---|
+| `jitPersistBackfill`, запись `persist.dalvik.vm.usejit` / `persist.sys.dalvik.vm.usejit` | `AppPerformance.kt` | `JitNoPersistTest.noPersistWritesAnywhereInJitCode`, `JitTogglePathTest` |
+| `dalvik.vm.usejitprofiles` | `AppPerformance.kt` | `JitNoPersistTest` |
+| `bootRestoreJit` + повтор через 30 с | `VoiceAssistantService.kt:382` | `JitBootTest.bootRestoreRemovedFromAllPaths` (нет `bootRestoreJit`, нет `30_000L`) |
+| watcher, файл-отмена, `sleep 8`, журнал шагов `JITSTEP`, TTL операции, окно 60 с, PID zygote, `CONTINUE/COMPENSATE/HOLD` | `JitNetCore.kt` | `JitBootTest.noOwnWatcherOrJournalMechanismsLeft` |
+| санация/удаление `ip rule` | `JitNet.kt` | `JitRulesReadOnlyTest.rulesAreOnlyCounted`, `countIsDiagnosticsNotVerdict` |
+| файл `jit_verified`, `jitProps()`, `lastJitInitKey` | `AppPerformance.kt` | `verifyJitOnly` теперь read-only (`AppPerformance.kt:927`) |
+| `AvasCore.kt`, `AvasRestore.kt` целиком | `tools/` | `AvasIndependenceTest.avasMechanismRemoved` |
+
+**Оставшиеся отличия от референса — по одному, каждое с назначением** (§3 ниже).
+
+### 2.1 Остатки старых версий на ГУ (только чтение)
+
+`AppPerformance.jitBootProbe` (`:721-755`) читает `persist.dalvik.vm.usejit`,
+`persist.sys.dalvik.vm.usejit`, `dalvik.vm.usejitprofiles` и печатает
+`JIT_BOOT_LEGACY … action=none reason=leftover_from_previous_versions need=owner_decision`.
+Ничего не очищает и не перезаписывает. Проверка владельцем:
+`adb shell getprop persist.dalvik.vm.usejit` и `getprop persist.sys.dalvik.vm.usejit`.
+
+### 2.2 Остаточный снимок AVAS прошлых версий
+
+Файл `filesDir/avas_snapshot` **не применяется и не удаляется**: `reportLegacyAvasSnapshot`
+(`AppPerformance.kt:814`) пишет только `AVAS_LEGACY snapshot=present … action=none need=owner_decision`.
+Что будет при старом снимке: ничего — JIT его не читает, AVAS-функций в сборке нет.
+
+---
+
+## 3. Наши отличия от референса (по одному, с назначением и поведением при отказе)
+
+| № | отличие | зачем | что при отказе | код |
+|---|---|---|---|---|
+| 1 | метка загрузки `jit_restaurar_boot` + время `jit_restaurar_ts` | иначе нельзя отличить «продолжение этой операции» от «остаток прошлой загрузки» (§1.3) | метка не пишется ⇒ операция не начинается (сеть остаётся включённой) | `JitNetCore.kt:301`, `JitRef.continuation:145` |
+| 2 | подтверждение записи снимка чтением | иначе сеть уже выключена, а вернуть нечем | запись не подтверждена ⇒ `SNAPSHOT_WRITE_FAILED`, скрипт НЕ запускается, `jit_pedido` снимается | `JitNetCore.kt:299-311` |
+| 3 | отказ второго клика, пока снимок этой загрузки не разобран | §1.3: повторный клик не должен перезаписывать незавершённую операцию | `REFUSED_PENDING`: ноль команд устройству | `JitRef.canStart:157`, `JitNetCore.kt:274-281` |
+| 4 | взаимное исключение на участок «проверить → записать → подтвердить» | два одновременных клика иначе перезаписывают `jit_restaurar` | второй клик получает `REFUSED_PENDING` | `JitNetCore.kt:233,246` |
+| 5 | снимок снимается ТОЛЬКО после подтверждения возврата (в референсе `remove` до выполнения) | при неудачном возврате снимок должен остаться для следующего старта | возврат не подтверждён ⇒ `UNCONFIRMED`, снимок остаётся | `JitNetCore.kt:365-379` |
+| 6 | шаг `umount -l` реализован, но выключен (`MOUNT_STEP_ENABLED=false`) | §1.1: обратимость не доказана ⇒ по мандату не выполнять, изложить вывод и спросить владельца | шаг не исполняется; включается одной константой после решения | `JitNetCore.kt:69,95` |
+| 7 | `restart=not_claimed` в логах | ни референс, ни транспорт не доказывают рестарт (§1.3) | ничего не ломает: это только текст лога | `AppPerformance.kt:899`, `JitNet.kt` |
+
+**Отличие по манифесту:** у нас нет `ACTION_BOOT_HU` (в референсе он есть в `CentralBootReceiver`).
+Это не влияет на JIT-цепочку: продолжение у нас привязано к старту процесса сервиса, а не к
+конкретному boot-действию. Добавлять не стали — это новый фильтр, а мандат запрещает расширять
+поверхность без нужды.
+
+### 3.1 Шаг монтирований §1.1 — вывод и запрос решения владельцу (⛔ не выполнено)
+
+Что делает команда референса: `grep ' /data/app/' /proc/mounts | awk '{print $2}'` → для каждой
+точки `umount -l "<точка>"`. Ленивое снятие (`-l`) отсоединяет точку от дерева сразу, а реальное
+освобождение происходит, когда закрыт последний пользователь. На ГУ из `/data/app/` обычно
+монтируются сами APK (bind-mount/loop), поэтому:
+
+- для приложения, чей APK смонтирован оттуда, `umount -l` означает, что при следующем запуске
+  файл может быть уже недоступен (вплоть до падения). Для СВОИХ точек это необратимо до ребута;
+- для чужих приложений (в т.ч. системных) последствие то же — их APK перестанут открываться;
+- штатного «вернуть как было» без перезагрузки нет: точка монтирования исчезает из таблицы, и
+  восстановить её можно только повторным монтированием, которое мы не выполняем и не будем.
+
+Что проверено на ГУ: **ничего** — только чтение по мандату, а состав `/data/app/` в `/proc/mounts`
+полем не подтверждён; массовый unmount на ГУ не запускался (это прямо запрещено мандатом).
+
+Итог: **обратимость не доказана**, поэтому шаг выключен константой, реализован построчно как в
+референсе и включается одним значением после решения владельца. Тест доказывает, что при
+включении он снимет только точки `/data/app/` и останется перед `setprop`
+(`JitChainScriptTest.mountStepTouchesOnlyDataAppPoints`).
+
+---
+
+## 4. Тесты (§4 мандата)
+
+Локальный прогон на JVM (настоящий `sh`, подставные команды): **PASS=55 FAIL=0** (§7).
+
+| класс | тестов | что покрывает |
+|---|---|---|
+| `JitRefTest` | 10 | формат `jit_restaurar`, текст скрипта (первая/последняя команда, окно 20 с, шаг монтирований, запрещённые литералы), формула `bb/r7`, `unknown` без данных, решение о продолжении/отказе клика |
+| `JitChainScriptTest` | 6 | **настоящий `/bin/sh`**: порядок ровно `la.run`, ранний выход при 0 правилах, исчерпание 20 с, `false` для выключения, только `/data/app/` при включённом шаге, ноль persist/`rule del` |
+| `JitChainEndToEndTest` | 13 | сквозная операция: снимок → disable → слив → usejit → один zygote → возврат AP/Wi-Fi без второго клика; пауза 15000; отказ записи снимка; неизвестное состояние сети; чужой снимок не применяется и не удаляется; обычный старт — ноль команд; неразбираемый снимок; неподтверждённый возврат; сверка ok/cache_missing/unknown; потеря канала |
+| `JitChainEndToEndTest.concurrentClicksShareOneStoreAndStartOnce` | 1 | 4 клика через барьер на ОДНОМ store: ровно 1 `STARTED`, 3 `REFUSED_PENDING`, один рестарт в журнале |
+| `JitBootTest` | 5 | на загрузке ноль JIT-записей и ноль рестартов; в коде нет `bootRestoreJit`/`30_000L`/собственных механизмов; проба только читает |
+| `JitRulesReadOnlyTest` | 2 | `ip rule` только считается: ни `del`, ни `flush`, ни `ndc`, ни `settings` |
+| `JitNoPersistTest` | 3 | нет записи `persist.*` и `usejitprofiles`; остатки только читаются |
+| `AvasIndependenceTest` | 4 | механизм AVAS удалён; JIT-код не ссылается на AVAS; в цепочке нет ни одной AVAS-команды; остаточный снимок не применяется |
+| `JitTogglePathTest` | 4 | путь `setAutoOptimize` → `jitApplyWithZygote` → `JitNet.click`: нет backfill-а, своей сборки скрипта и своего `AdbClient`; `ctl.restart` только в тексте UI; сервис не пишет свойства |
+| `JitBootMarkTest` | 4 | опознание загрузки (точный тег, epoch ±60 с, мусор ⇒ чужая загрузка) |
+
+### 4.1 Удалённые тесты и эквивалентное покрытие
+
+| удалён | было тестов | почему | эквивалент |
+|---|---|---|---|
+| `JitNetCoreTest` | 23 | проверял СВОЮ модель (журнал/фазы/TTL), которой больше нет | `JitRefTest` + `JitChainEndToEndTest` (13) — те же переходы, но на ядре `JitOp` |
+| `JitToggleChainTest` | 5 | статические проверки прежней цепочки с `AvasRestore.saveBeforeRestart` | `JitTogglePathTest` (4) |
+| `AvasCoreTest` | 13 | AVAS-механизм удалён из продукта | `AvasIndependenceTest` (4) — граница, а не поведение удалённого кода |
+| `AvasContractTest` | 5 | то же | `AvasIndependenceTest` |
+| `JitPersistTest` | 3 | проверял НАЛИЧИЕ persist-записи, которая теперь запрещена | `JitNoPersistTest` (3) |
+| `JitBootTest` (старый) | 6 | опирался на `JitFlow`/файл-намерение | новый `JitBootTest` (5) |
+| `JitWatcherScriptTest`, `NetSanitizePlanTest` | 4 + 7 | удалены ещё в первом заходе (watcher и санация правил) | `JitChainScriptTest`, `JitRulesReadOnlyTest` |
+
+Ни один тест не удалён «потому что красный»: удалённые классы проверяли код, которого больше нет.
+
+---
+
+## 5. AVAS — отдельные функции, не часть JIT (§2 мандата)
+
+**По коду референса** (`docs/agent/ref/centralexauto_v339_jit_chain.md` §5): mute — `w0/f2`,
+выбор звука — `w0/r1`; вызовы `H0()` (при `avas_muted_saved` → `f2(this,2)`) и `I0()` (при
+`avas_sound_type_saved > 0` → `r1(this,1)`) планируются через **12000 мс**, отдельный wake-путь
+`onCreate` — через **5000 мс**. Ни `w0/la.run`, ни `w0/e2.run` AVAS не трогают.
+
+**Что сделано у нас:** `AvasCore.kt` и `AvasRestore.kt` удалены целиком (они существовали только
+ради JIT-рестарта: save-before-restart + restore после подъёма), вызовы удалены из
+`AppPerformance`, `VoiceAssistantService` их не вызывает. Проверка — `AvasIndependenceTest`.
+Новых кнопок, мута, `audioserver`, звуковых файлов — нет.
+
+**Что осталось AVAS-поведением вне JIT** (не менялось): `tools/LockSound.kt` (звук замков,
+независимая функция, `dev.testAvasSound` в панели тестов — существующие кнопки, не новые).
+Мандат требовал не менять независимые функции AVAS — они не менялись.
+
+---
+
+## 6. Логи
+
+`AppLog` пишет в `getExternalFilesDir(null)/logs/voiceapp3-DD.MM.YYYY.log`, fallback
+`filesDir/logs/`, локальная дата, append, retention 14 суток только для своих файлов (код не
+менялся в этой итерации, `tools/LogFiles.kt`). JIT-строки этой итерации:
+`JIT_APPLIED_REQUEST`, `JIT_SNAPSHOT`, `JIT_CHAIN_SENT`, `JIT_CHAIN_RETURN`, `JIT_CLICK`,
+`JIT_APPLIED`, `JIT_NET_CONT`, `JIT_NET_RESTORE`, `JIT_VERIFY`, `JIT_NOT_APPLIED`,
+`JIT_BOOT`, `JIT_BOOT_LEGACY`, `AVAS_LEGACY`. Состояние/запрос/ошибки/`unknown` — раздельными
+полями (`runtime=`, `request=`, `state_before=`, `result=unknown`).
 
 ---
 
 ## 7. Локальный прогон
 
 ```
-JitNetCoreTest (23)        PASS 23 / FAIL 0
-JitChainScriptTest (5)     PASS 5  / FAIL 0   ← настоящий /bin/sh
-JitRulesReadOnlyTest (3)   PASS 3  / FAIL 0
-JitToggleChainTest (5)     PASS 5  / FAIL 0
-JitBootTest (6)            PASS 6  / FAIL 0
-AvasCoreTest (13)          PASS 13 / FAIL 0
-AvasContractTest (5)       PASS 5  / FAIL 0
-BuildMarkerTest (3)        PASS 3  / FAIL 0
-ИТОГ: PASS=63 FAIL=0
+ИТОГ: PASS=55 FAIL=0
 ```
 
-Компиляция целевых файлов (`AppPerformance.kt`, `JitNet.kt`, `JitNetCore.kt`, `AvasRestore.kt`,
-`AvasCore.kt`) с заглушками `scripts/localjvm` — **0 ошибок**. Остальные заглушки Android неполные,
-поэтому локальный прогон ограничен этим набором; решает Android CI (§0.2).
+Классы: `JitRefTest 10`, `JitChainScriptTest 6`, `JitChainEndToEndTest 13`, `JitBootTest 5`,
+`JitRulesReadOnlyTest 2`, `JitNoPersistTest 3`, `AvasIndependenceTest 4`, `JitTogglePathTest 4`,
+`JitBootMarkTest 4`. Как повторить — `scripts/localjvm/README.md` (Gradle эти заглушки не видит:
+каталог вне `app/src/**`).
 
-Поймано локальным прогоном и исправлено до коммита:
-
-1. в тройных кавычках Kotlin `\$@` остаётся буквальным (`\$@`) — подставные команды получали битые
-   аргументы; в тесте `$` теперь только через переменную;
-2. правило «снимок до сети» ломалось на пробе `usejit`, которую я делал отдельным скриптом —
-   проба переведена в один вызов чтения, счёт скриптов в тесте уточнён;
-3. `assertEquals` на пустое `usejitBefore` показал, что проба не возвращала значение в фейке —
-   добавлен честный дефолт фейка (это и есть польза исполняемых тестов).
+Это **не** прогон на ГУ: `WifiManager`, `startSoftAp`, `ctl.restart zygote` подменены.
 
 ---
 
-## 8. Ограничения (честно)
+## 8. Чек-лист мандата
 
-- **Полевого прогона JIT нет** (по условию — после нового REVIEW): `ctl.restart zygote`, `svc wifi disable`,
-  `startSoftAp`, `ip rule` на ГУ этой итерацией не запускались.
-- **Граница процесса проверена не на устройстве.** Утверждение «скрипт доживает до конца после смерти
-  app-процесса» не доказано полем; но конструкция от этого не зависит: рестарт — последняя команда,
-  а всё, что читается после, пишется ДО неё (журнал), поэтому даже если скрипт оборвётся на
-  `setprop ctl.restart zygote`, ничего не теряется — фаза останется `usejit`, и разбор честно уйдёт в
-  компенсацию после окна.
-- **`HOLD_UNKNOWN` — это остановка, а не лечение.** Если журнала нет, а сеть уже не та, автоматики нет:
-  строка `JIT_OP_HOLD … need=owner_decision` + снимок сохраняется. Решение владельца требуется
-  (аварийный сценарий, который нельзя закрыть без расширения разрешённых действий).
-- **`maps` и его смысл** — наша адаптация проверки референса: наличие `dalvik-jit-code-cache` в
-  `/proc/self/maps` нашего процесса; если строки нет — `unverified`, а не «провал».
-- **jadx 1.4.7, а не 1.5.1** (в песочнице нет 1.5.1); `w0/j9.onClick` и `CentralWatchdogService.U(...)`
-  читались по smali — jadx их не декомпилировал, это указано в §1.
-- **`persist.dalvik.vm.usejit`** пишется вместе с `dalvik.vm.usejit` (согласованный ключ 1.0.60);
-  референс пишет только runtime-ключ. Это отличие зафиксировано в §3, а не выдано за референс.
-- **TTL 10 минут** — наша политика, не референс; после неё автоматики нет (§2, строка «операция старше»).
-- Локальный прогон не заменяет Android CI: решает §0.2.
+| № | требование | статус | доказательство |
+|---|---|---|---|
+| 1.1 | снимок Wi-Fi/AP до изменений, ключи референса | ✅ | `JitNetCore.kt:265-315`, `JitRefTest.parseRestore*`, `JitChainEndToEndTest.clickThenContinuationWithoutSecondClick` |
+| 1.2 | один скрипт, `svc wifi disable` → слив ≤20 с → usejit → zygote последней | ✅ | `JitRef.chainScript:95`, `JitChainScriptTest.orderIsReferenceByteForByte` |
+| 1.3 | шаг монтирований §1.1 | ⛔ | реализован построчно, выключен: обратимость не доказана — §3.1, нужно решение владельца |
+| 2 | возврат после подъёма фреймворка — продолжение той же операции, AP→Wi-Fi, 15 с | ✅ | `JitOp.continueAfterBoot:332`, `JitChainEndToEndTest.continuationRestoresApFirstThenWifi` |
+| 2.1 | объяснить запуск службы и получение данных операции | ✅ | §1.3: `.BootReceiver` + `VoiceAssistantService:270,349` + `App.kt:51`; отличие `ACTION_BOOT_HU` указано |
+| 2.2 | тайминг подтверждать инструкциями, недоказанное не выдавать за факт | ✅ | §1.3: 15000 мс = `0x3a98`; «`onCreate` будет вовремя» — не утверждается |
+| 3 | сверка `getprop` + `jit-cache`/`dalvik-jit-code-cache`, нет данных ⇒ `unknown` | ✅ | `JitRef.verify:116`, `JitOp.verifyApplied:382`, `JitRefTest.noDataIsUnknownNeverSuccess` |
+| 4 | обычный старт/перезагрузка не применяют JIT и не рестартуют zygote | ✅ | `JitBootTest.plainBootTouchesNoNetwork`, `serviceStartupDoesNotRestartZygote` |
+| 5 | §1.1 исследование обратимости `umount -l` | 🟡 | §3.1: исследование по механике есть, проверки на ГУ запрещены мандатом; решение за владельцем |
+| 6 | §1.2 убрать собственное (persist, watcher, отмена, sleep 8, санация, boot-backfill, bootRestoreJit, jitPersistBackfill) | ✅ | §2, `JitNoPersistTest`, `JitBootTest` |
+| 6.1 | старые persist-значения не менять, дать read-only способ узнать | ✅ | `AppPerformance.kt:721-755`, §2.1 |
+| 6.2 | не копировать `ip rule del`, без `flush`/`ndc`/`route`/`settings` | ✅ | `JitRulesReadOnlyTest` |
+| 7 | жизненный цикл: снимок = одна операция, второй клик не перезаписывает, чужая загрузка ⇒ ноль записей | ✅ | `JitRef.continuation:145`, `JitOp.click:239`, `JitChainEndToEndTest.foreignSnapshotIsNeitherAppliedNorDeleted`, `concurrentClicks…` |
+| 7.1 | транспорт: `ARMED`/«рестарт отправлен»/отсутствие журнала/60 с/таймаут — не доказательства | ✅ | `JitRef.chainOutcome`, `restart=not_claimed`, `transportLossIsNotRestartProof` |
+| 7.2 | `setWifiEnabled(true)`/`startSoftAp` ≠ интернет, в логах раздельно | ✅ | `JitOp.restoreNetwork:412-420` (`state_before/state_after/request`), §6 |
+| 8 | AVAS — отдельные функции; убрать привязанные к JIT save/restore | ✅ | §5, `AvasIndependenceTest` |
+| 8.1 | оценить поведение новой версии при старом снимке AVAS | ✅ | §2.2: не применяется и не удаляется |
+| 9 | логи (путь, fallback, retention) | ✅ | §6 |
+| 10 | не менять плагин/слоты/климат/батарею/TTL/CarPlay/рут-reconnect | ✅ | в коммите нет файлов этих подсистем (`git show --stat 577d338`) |
+| 11 | §4 тесты: вся цепочка, iso-стенд, одновременные клики, потеря транспорта, boot/30 с | ✅ | §4 |
+| 11.1 | удалённые тесты перечислены, эквивалентное покрытие показано | ✅ | §4.1 |
+| 12 | публикация + CI актуального SHA + run/job/PASSED/FAILED | ✅ | §0: `42896558590` / `130111086379` / 176 / 0 |
+| 12.1 | полевой успех не заявлять | ✅ | на ГУ ничего не запускалось |
+
+---
+
+## 9. Что осталось за владельцем
+
+1. **§1.1 монтирования** — решение по `umount -l` (шаг готов, выключен).
+2. **Остатки persist-свойств JIT** прежних версий — нужно ли их чистить (сейчас только читаем).
+3. **Остаточный снимок AVAS** (`filesDir/avas_snapshot`) — удалять или оставить (сейчас не трогаем).
+4. **`ACTION_BOOT_HU`** — нужен ли отдельный фильтр, как в референсе (сейчас нет).
+5. **Отсутствие анимации/индикации 10–20 с**: `PARTIAL` — единственный честный статус шага, пока
+   процесс умирает от рестарта; подтверждение приходит на следующем старте.

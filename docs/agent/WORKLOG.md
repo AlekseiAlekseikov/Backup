@@ -1,5 +1,40 @@
 # WORKLOG
 
+## 2026-11-10 — iter33p, ВТОРОЙ ЗАХОД (1.0.61): JIT ровно по референсу
+
+**Почему второй заход.** Первый (`c8e4c9c`, CI 200/0) REVIEW признал неверным по существу:
+построена СВОЯ механика (журнал шагов, TTL операции, окно 60 с, CONTINUE/COMPENSATE/HOLD,
+watcher, boot-backfill) вместо копии `j9` → `la` → `e2`.
+
+**Что сделано.**
+
+1. `tools/JitNetCore.kt` — `JitRef` (константы и текст скрипта референса байт в строку,
+   разбор `jit_restaurar`, формула `bb/r7`, решение о продолжении) + `JitOp` (ядро операции на
+   швах `JitShell`/`JitStore`/`JitNetState`: клик, продолжение после zygote, возврат AP→Wi-Fi
+   через 15000 мс, сверка) + взаимное исключение на старт операции.
+2. `tools/JitNet.kt` — тонкие Android-адаптеры (`AdbClient`, `Prefs2`, `WifiManager`), без решений.
+3. `tools/AppPerformance.kt` — `setAutoOptimize` → `jitApplyWithZygote` → `JitNet.click`; удалены
+   `jitPersistBackfill`, `bootRestoreJit`, `jitProps()`, файл `jit_verified`, `lastJitInitKey`.
+   На загрузке — только чтение (`jitBootProbe` печатает остатки с `need=owner_decision`).
+4. `VoiceAssistantService.kt` — убран повтор через 30 с.
+5. **AVAS отсоединён от JIT**: `AvasCore.kt` и `AvasRestore.kt` удалены целиком (существовали
+   только ради JIT-рестарта); остаточный `filesDir/avas_snapshot` не применяется и не удаляется.
+6. Шаг `umount -l` точек `/data/app/` реализован построчно, но выключен
+   (`JitRef.MOUNT_STEP_ENABLED=false`): обратимость не доказана, нужно решение владельца.
+7. Тесты: 9 классов (55 тестов) — `JitRefTest`, `JitChainScriptTest` (настоящий `sh`),
+   `JitChainEndToEndTest` (сквозная операция + 4 одновременных клика), `JitBootTest`,
+   `JitRulesReadOnlyTest`, `JitNoPersistTest`, `AvasIndependenceTest`, `JitTogglePathTest`,
+   `JitBootMarkTest`; 5 классов удалено вместе с кодом (§4.1 отчёта).
+
+**Результат.** CI run `42896558590` / job `130111086379` по `78a3248` — SUCCESS, **176 PASSED /
+0 FAILED**, artifact `13802266250`. Локальный JVM-прогон: `PASS=55 FAIL=0`. На ГУ ничего не
+запускалось, полевого успеха не заявляю.
+
+**Грабли.** Первый прогон CI (`577d338`) упал на `Unresolved reference 'currentBootTag'` — при
+удалении блока `jitProps()` ушла и локальная `currentBootTag()`; восстановлена делегированием в
+`HvacDigitalPlugin.currentBootTag()`. Песочница не компилирует модуль (нет Android SDK), поэтому
+это ловит только CI.
+
 ## 2026-10-28
 
 ### P1/P2 — Main-thread ban + BgWorker
