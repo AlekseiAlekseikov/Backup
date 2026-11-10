@@ -8,15 +8,22 @@ package com.example.voiceapp3.tools
  * лямбды, поэтому сценарии «процесс убили между disable и компенсацией», «следующий старт»,
  * «Wi-Fi не поднялся», «ap0 отсутствует штатно» прогоняются обычными JVM-тестами.
  *
- * Инварианты:
+ * Инварианты (iter33p-fix3 + fix4; границы владельца — REVIEW iter33p-fix2 §3, уточнение fix3):
  *  1. состояние сети сохраняется ДО любых изменений и подтверждается чтением обратно;
- *  2. маркер `jit_net_saved` — это отдельное состояние НЕЗАВЕРШЁННОГО возврата: он снимается
- *     только когда запрошенное состояние подтверждено; пока он есть — следующий старт обязан
- *     попробовать возврат снова (даже если файла-намерения JIT уже нет);
+ *  2. возврат сети выполняется ТОЛЬКО как продолжение конкретной операции JIT:
+ *     • до рестарта — компенсация внутри той же операции ([restorePendingInChain], `why=compensate:*`);
+ *     • после рестарта — при следующем запуске НАШЕГО процесса, но только если есть
+ *       доказательство фазы этой операции ([JitFlow.bootNetAction] ← `JIT_ZYGOTE_ARMED|DONE|ABORTED
+ *       op=<id>` для id из файла-намерения);
+ *     • обычный холодный старт (нет намерения или фаза не доказана) — НИ ОДНОГО сетевого действия
+ *       ([pendingMarker] только читает маркер для честной строки в логе);
  *  3. «запрос ≠ состояние»: в логе отдельно `request=`, `state=`, `link=`;
- *  4. отсутствие `ap0` — ШТАТНЫЙ признак выключенной точки доступа, а не «неизвестно»;
- *     неизвестно — только когда канал не отвечает;
- *  5. подтверждение Wi-Fi/AP не равно «интернет есть»: `link=` и `sanitize_left=` пишутся отдельно.
+ *  4. отсутствие `ap0` — ШТАТНЫЙ признак выключенной точки доступа; неполный вывод пробы —
+ *     «неизвестно» (операция не начинается);
+ *  5. подтверждение Wi-Fi/AP не равно «интернет есть»: маркер снимается только при подтверждении
+ *     всего, что было запрошено (для сохранённого `wifi=0` наличие IPv4 не требуется);
+ *  6. отмена запуска watcher-а — только через СОБСТВЕННЫЙ файл-отмену с нашим `op=<id>` и
+ *     СОБСТВЕННЫЙ скрипт: ни `pkill`, ни `kill`, ни поиск по подстроке не используются.
  */
 object JitNetModel {
 
@@ -50,50 +57,48 @@ object JitNetModel {
         state.tsMs > 0L && nowMs - state.tsMs > ttlMs
 
     /**
-     * Что делать с ПРОСРОЧЕННЫМ маркером (REVIEW iter33p-fix1, 🟡 про 10-минутный TTL).
+     * Что означает ПРОСРОЧЕННЫЙ маркер (REVIEW iter33p-fix1 🟡 про TTL + fix2 §3).
      *
-     * Зачем TTL вообще: маркер — это «незавершённый возврат», а не «настройка навсегда». Если
-     * приложение не запускалось сутки, водитель уже мог сам поменять Wi-Fi/точку доступа, и
-     * молчаливая отмена его выбора — это уже вмешательство за пределами разрешённой операции.
+     * Зачем TTL: маркер — «незавершённый возврат», а не «настройка навсегда». За его пределами
+     * водитель мог сам поменять Wi-Fi/точку доступа, и откат его выбора — уже вмешательство за
+     * рамками разрешённой операции.
      *
-     * Почему TTL не может просто удалять данные:
-     *  • сохранено `wifi=1` — выключенный Wi-Fi это ГАРАНТИРЕННАЯ потеря связи, а включение
-     *    возвращает состояние, которое было ДО операции. Поэтому по истечении TTL такой маркер
-     *    исполняется в урезанном виде: Wi-Fi включаем, точку доступа (видимый пользователю
-     *    hotspot) уже НЕ поднимаем — это единственная часть, где просрочка действительно опасна;
-     *  • сохранено `wifi=0` — возвращать нечего, маркер выбрасываем (`DROP`);
-     *  • часы ушли назад (типично для ГУ сразу после загрузки, до синхронизации времени) —
-     *    это НЕ просрочка: `now < ts` не даёт права забыть незавершённый возврат.
+     * Политики БЕЗ сетевых действий:
+     *  • `FULL`    — маркер свежий: возврат допустим, но только как продолжение операции JIT;
+     *  • `EXPIRED` — маркер просрочен: он выбрасывается с честной строкой `reason=expired`,
+     *                сеть НЕ трогается.
+     * Часы назад (`now < ts`) и `ts=0` просрочкой не считаются: нет доказательства устаревания.
      */
-    enum class TtlPolicy { FULL, WIFI_ONLY, DROP }
+    enum class TtlPolicy { FULL, EXPIRED }
 
     fun ttlPolicy(state: State, nowMs: Long, ttlMs: Long = SAVED_TTL_MS): TtlPolicy = when {
         state.tsMs <= 0L -> TtlPolicy.FULL            // время неизвестно — не выдумываем просрочку
         nowMs < state.tsMs -> TtlPolicy.FULL          // часы назад — не просрочка
         nowMs - state.tsMs <= ttlMs -> TtlPolicy.FULL
-        state.wifi -> TtlPolicy.WIFI_ONLY
-        else -> TtlPolicy.DROP
+        else -> TtlPolicy.EXPIRED
     }
 
-    /** Политика просрочки в виде строки для лога (без неё непонятно, почему AP не поднимали). */
     fun ttlPolicyLabel(p: TtlPolicy): String = when (p) {
         TtlPolicy.FULL -> "full"
-        TtlPolicy.WIFI_ONLY -> "expired_wifi_only"
-        TtlPolicy.DROP -> "expired_drop"
+        TtlPolicy.EXPIRED -> "expired_drop"
     }
 
     /**
      * Разбор read-only пробы `ap0`:
      *   `P=1|0` — интерфейс существует; `OS=<operstate>`; `A=<1|0>` — есть ли IPv4.
-     * Возвращает `true` (AP поднят), `false` (AP выключен — в том числе когда интерфейса НЕТ,
-     * это штатный случай для выключенной точки доступа) или `null` (канал не ответил).
+     * Возвращает `true` (AP поднят), `false` (AP выключен — в т.ч. когда интерфейса НЕТ: для
+     * выключенной точки доступа это штатно) или `null` (неизвестно).
+     *
+     * REVIEW iter33p-fix2 🟡: неполный/битый вывод не должен молча означать «AP выключен».
+     * Поэтому обязательны ВСЕ три поля, а `P=1` без числового `A` — это `null`, а не ноль.
      */
     fun parseApProbe(out: String?): Boolean? {
         if (out.isNullOrBlank()) return null
         if (out.contains("ERR_")) return null
-        val p = Regex("P=([01])").find(out)?.groupValues?.get(1)?.toIntOrNull() ?: return null
+        if (!out.contains("P=") || !out.contains("OS=") || !out.contains("A=")) return null
+        val p = Regex("P=([01])\\b").find(out)?.groupValues?.get(1)?.toIntOrNull() ?: return null
         if (p == 0) return false
-        val a = Regex("A=([0-9]+)").find(out)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+        val a = Regex("A=([0-9]+)").find(out)?.groupValues?.get(1)?.toIntOrNull() ?: return null
         return a > 0
     }
 
@@ -103,6 +108,73 @@ object JitNetModel {
         return "echo P=${D}([ -d /sys/class/net/ap0 ] && echo 1 || echo 0); " +
             "echo OS=${D}(cat /sys/class/net/ap0/operstate 2>/dev/null); " +
             "echo A=${D}(ip -o -4 addr show ap0 2>/dev/null | grep -c 'inet ')"
+    }
+
+    // ─────────────── watcher рестарта: собственный скрипт, отмена без `kill` ───────────────
+
+    internal const val WATCHER_RESULT_PATH = "/data/local/tmp/jit_zygote_result.txt"
+    /** Файл-отмена: внутри обязан быть `op=<id>` операции, иначе отмена не считается своей. */
+    internal const val WATCHER_CANCEL_PATH = "/data/local/tmp/jit_zygote_cancel"
+    internal const val WATCHER_SCRIPT_PATH = "/data/local/tmp/jit_zygote_watch.sh"
+
+    internal const val WATCHER_ARMED = "JIT_ZYGOTE_ARMED"
+    internal const val WATCHER_ABORTED = "JIT_ZYGOTE_ABORTED"
+    /** Пишется непосредственно ПЕРЕД `ctl.restart` — доказательство, что отмена уже не успеет. */
+    internal const val WATCHER_RESTARTING = "JIT_ZYGOTE_RESTARTING"
+    internal const val WATCHER_DONE = "JIT_ZYGOTE_DONE"
+
+    /**
+     * Device-side watcher рестарта фреймворка.
+     *
+     * REVIEW iter33p-fix2 §1–§3 + fix3:
+     *  1. `JIT_ZYGOTE_ARMED op=<id>` — ПЕРВАЯ строка, ДО `sleep` и ДО `ctl.restart`;
+     *  2. каждая строка несёт `op=<id>`: старый результат не может подтвердить новую операцию;
+     *  3. отмена — только собственный файл, и его СОДЕРЖИМОЕ обязано содержать наш `op=<id>`
+     *     (`grep -q "op=$OP"`): чужой/пустой файл отменой не считается;
+     *  4. `JIT_ZYGOTE_RESTARTING op=<id>` пишется непосредственно перед `setprop ctl.restart zygote`:
+     *     это закрывает недоказуемую гонку «отмена пришла между проверкой и рестартом» — увидев
+     *     эту строку, приложение честно считает рестарт состоявшимся, а не отменённым;
+     *  5. итог после подъёма — `JIT_ZYGOTE_DONE op=<id> …`.
+     *
+     * Параметры запуска: `$1 = op id`, `$2 = want (true|false)`, `$3 = delay_s`, `$4 = settle_s`.
+     */
+    internal fun watcherScript(): String {
+        val D = "$"
+        return """
+            #!/system/bin/sh
+            # Собственный скрипт (не системный). Параметры: 1=op 2=want 3=delay_s 4=settle_s
+            OP=${D}1
+            V=${D}2
+            DELAY=${D}3
+            SETTLE=${D}4
+            OUT=$WATCHER_RESULT_PATH
+            CANCEL=$WATCHER_CANCEL_PATH
+            # 1) Подтверждение запуска — ДО задержки, чтобы приложение успело его прочитать.
+            echo "$WATCHER_ARMED op=${D}OP want=${D}V delay=${D}{DELAY:-8} pid=${D}${D}" > ${D}OUT
+            sleep ${D}{DELAY:-8}
+            # 2) Отмена: только наш собственный файл И только с нашим op. Ничего не убиваем.
+            if [ -f ${D}CANCEL ] && grep -q "op=${D}OP" ${D}CANCEL 2>/dev/null; then
+              echo "$WATCHER_ABORTED op=${D}OP reason=cancel_file" >> ${D}OUT
+              exit 0
+            fi
+            ZP0=${D}(pidof zygote 2>/dev/null)
+            SS0=${D}(pidof system_server 2>/dev/null)
+            # 3) Фиксируем момент перехода: после этой строки отмена уже невозможна.
+            echo "$WATCHER_RESTARTING op=${D}OP" >> ${D}OUT
+            setprop ctl.restart zygote
+            i=0
+            while [ ${D}i -lt 180 ]; do
+              sleep 1
+              i=${D}((i+1))
+              ZP=${D}(pidof zygote 2>/dev/null)
+              SS=${D}(pidof system_server 2>/dev/null)
+              if [ -n "${D}ZP" ] && [ "${D}ZP" != "${D}ZP0" ] && [ -n "${D}SS" ] && [ "${D}SS" != "${D}SS0" ]; then break; fi
+            done
+            sleep ${D}{SETTLE:-5}
+            RT=${D}(getprop dalvik.vm.usejit)
+            PS=${D}(getprop persist.dalvik.vm.usejit)
+            echo "$WATCHER_DONE op=${D}OP runtime=${D}RT persist=${D}PS want=${D}V zygote_restart=ok waited_s=${D}i" >> ${D}OUT
+        """.trimIndent()
     }
 
     /** Скрипт подготовки (`w0/la.run`): svc wifi disable → drain `oif wlan0` ≤20 с → setprop. */
@@ -212,16 +284,41 @@ data class RestoreResult(
     /** Запрошенное состояние подтверждено (это НЕ значит «интернет есть»). */
     val essentialsConfirmed: Boolean get() = wifiConfirmed && apConfirmed
 
-    /** Сеть в запрошенном состоянии и канал выглядит живым (`inet` на wlan0) и правила слиты. */
-    val fullyRestored: Boolean
-        get() = essentialsConfirmed && link == "up" && sanitizeLine && sanitizeLeft == 0
+    /**
+     * Нужно ли требовать живой канал (`inet` на `wlan0`).
+     *
+     * REVIEW iter33p-fix3 🟡: если сохранено `wifi=0` (Wi-Fi был выключен ДО операции), то
+     * отсутствие IPv4 — НЕ ошибка: сеть возвращена именно в то состояние, которое было. Требовать
+     * `link=up` в этом случае означало бы бесконечный ложный retry и попытки включить Wi-Fi,
+     * которого у водителя не было.
+     */
+    val linkRequired: Boolean get() = wifiWasRequested
 
-    /** Маркер можно снимать: запрошенное состояние подтверждено и link не «неизвестно». */
-    val canClearMarker: Boolean get() = essentialsConfirmed && link != "unknown"
+    /** То же для санации правил: без запрошенного Wi-Fi правила `oif wlan0` не наша забота. */
+    val sanitizeRequired: Boolean get() = wifiWasRequested
+
+    private val linkOk: Boolean get() = !linkRequired || link == "up"
+    private val sanitizeOk: Boolean get() = !sanitizeRequired || (sanitizeLine && sanitizeLeft == 0)
+
+    /**
+     * Сеть в запрошенном состоянии, и всё, что было запрошено, подтверждено.
+     *
+     * REVIEW iter33p-fix2 🟡: раньше маркер снимался при `link=down`/`sanitize_left>0`; теперь
+     * снятие требует полного подтверждения — но только по тем параметрам, которые реально
+     * менялись (см. [linkRequired]/[sanitizeRequired]).
+     */
+    val fullyRestored: Boolean get() = essentialsConfirmed && linkOk && sanitizeOk
+
+    /**
+     * Маркер незавершённого возврата можно снимать: подтверждено всё запрошенное, не подтвердилось —
+     * маркер остаётся, и возврат повторится при следующей операции JIT.
+     */
+    val canClearMarker: Boolean get() = fullyRestored
 
     fun log(): String = "wifi_confirmed=$wifiConfirmed ap_confirmed=$apConfirmed link=$link " +
         "sanitize=${if (sanitizeLine) "line" else "none"} sanitize_left=$sanitizeLeft " +
-        "essentials=$essentialsConfirmed fully=$fullyRestored"
+        "essentials=$essentialsConfirmed fully=$fullyRestored " +
+        "required=link:${if (linkRequired) 1 else 0},sanitize:${if (sanitizeRequired) 1 else 0}"
 }
 
 /** Что делать на старте с маркером незавершённого возврата. */
@@ -247,34 +344,109 @@ object JitFlow {
         else -> Gate.PROCEED
     }
 
-    /** Что обязано произойти при отказе на данном шаге. */
+    /**
+     * Что обязано произойти при отказе на данном шаге.
+     *
+     * `cancelWatcher` — НЕ `kill`: отмена делается файлом-отменой, который читает наш же скрипт
+     * (REVIEW iter33p-fix2 §3: `pkill`/`kill` и поиск по подстроке запрещены).
+     */
     data class AbortPlan(
-        val killWatcher: Boolean,
+        val cancelWatcher: Boolean,
         val rollbackProps: Boolean,
         val compensateNet: Boolean,
         val discardSnapshot: Boolean
     )
 
-    fun abortPlan(stage: Stage, propsTouched: Boolean): AbortPlan = when (stage) {
-        // Сеть не менялась: возвращать нечего, watcher-а нет, снимок AVAS не нужен.
+    fun abortPlan(stage: Stage, propsMaybeTouched: Boolean): AbortPlan = when (stage) {
         Stage.BEFORE_NET -> AbortPlan(false, false, false, true)
-        // Сеть уже погашена и props, возможно, изменены.
-        Stage.AFTER_NET_BEFORE_LAUNCH -> AbortPlan(true, propsTouched, true, true)
-        // Запуск не подтвердился — сначала гарантированно гасим watcher (иначе поздний рестарт).
-        Stage.LAUNCH_UNCONFIRMED -> AbortPlan(true, propsTouched, true, true)
+        Stage.AFTER_NET_BEFORE_LAUNCH -> AbortPlan(true, propsMaybeTouched, true, true)
+        Stage.LAUNCH_UNCONFIRMED -> AbortPlan(true, propsMaybeTouched, true, true)
+    }
+
+    // ─────────────────── идентичность операции (REVIEW iter33p-fix2 §2) ───────────────────
+
+    /** Id операции в шелл-безопасном виде; каждая строка watcher-а несёт `op=<id>`. */
+    fun opId(nowMs: Long, bootTag: String, salt: String): String {
+        val clean = { s: String -> s.filter { it.isLetterOrDigit() || it == '-' }.take(12) }
+        val tag = clean(bootTag).ifEmpty { "boot" }
+        val s = clean(salt).ifEmpty { "0" }
+        return "op-$tag-${nowMs.toString(36)}-$s"
     }
 
     /**
-     * Подтверждён ли запуск watcher-а. `pgrep` на прошивке может отсутствовать, поэтому
-     * единственный надёжный признак — первая строка самого watcher-а ([JitNetCore] не при чём:
-     * токен пишет скрипт `jitZygoteWatcherScript`).
+     * Строка с [token] и `op=<opId>` присутствует в выводе.
+     *
+     * Вывод делим и по `\n`, и по `|`: адаптер читает файл как `tr '\n' '|'`, иначе строки
+     * склеиваются и старый результат подтверждает новую операцию.
      */
-    fun launchConfirmed(resultFileContent: String?, armedToken: String): Boolean =
-        resultFileContent?.contains(armedToken) == true
+    private fun hasLine(out: String?, token: String, opId: String): Boolean =
+        out != null && out.split('\n', '|').any { it.contains(token) && it.contains("op=$opId") }
 
-    /** Итог гашения watcher-а: рестарт возможен только если процесс/скрипт не подтверждены снятыми. */
-    fun restartStillPossible(alivePid: String?, scriptPresent: Boolean?): Boolean =
-        !(alivePid.isNullOrBlank() && scriptPresent == false)
+    fun armedFor(resultFileContent: String?, opId: String): Boolean =
+        hasLine(resultFileContent, JitNetModel.WATCHER_ARMED, opId)
+
+    fun doneFor(resultFileContent: String?, opId: String): Boolean =
+        hasLine(resultFileContent, JitNetModel.WATCHER_DONE, opId)
+
+    fun abortedFor(resultFileContent: String?, opId: String): Boolean =
+        hasLine(resultFileContent, JitNetModel.WATCHER_ABORTED, opId)
+
+    fun restartingFor(resultFileContent: String?, opId: String): Boolean =
+        hasLine(resultFileContent, JitNetModel.WATCHER_RESTARTING, opId)
+
+    /**
+     * Итог отмены запуска.
+     *
+     * `UNKNOWN` — «доказать не могу»: ни отмены, ни перехода к рестарту, ни итога нашей операции
+     * в файле нет. В этом состоянии нельзя утверждать «рестарта не будет», поэтому маркер и
+     * снимок AVAS сохраняются.
+     */
+    enum class CancelOutcome { CANCELLED, RESTARTED, UNKNOWN }
+
+    /**
+     * Разбор файла итога для отмены. `RESTARTED` выставляется по строке `JIT_ZYGOTE_RESTARTING`,
+     * которую скрипт пишет НЕПОСРЕДСТВЕННО перед `setprop ctl.restart zygote`: так гонка «отмена
+     * пришла между проверкой файла и рестартом» перестаёт быть недоказуемой — она видна в файле.
+     */
+    fun cancelOutcome(resultFileContent: String?, opId: String): CancelOutcome = when {
+        abortedFor(resultFileContent, opId) -> CancelOutcome.CANCELLED
+        restartingFor(resultFileContent, opId) -> CancelOutcome.RESTARTED
+        doneFor(resultFileContent, opId) -> CancelOutcome.RESTARTED
+        else -> CancelOutcome.UNKNOWN
+    }
+
+    /** Возможен ли ещё поздний рестарт этой операции. */
+    fun restartStillPossible(outcome: CancelOutcome): Boolean = outcome != CancelOutcome.CANCELLED
+
+    /** Файл итога готов к новой операции: старого результата не осталось. */
+    fun resultFileReady(stillExists: Boolean?): Boolean = stillExists == false
+
+    // ─────────────── сеть как продолжение операции (REVIEW iter33p-fix3, уточнение) ───────────────
+
+    /** Что делать с сетью при запуске процесса. */
+    enum class BootNetAction {
+        /** Обычный холодный старт: намерения нет либо фаза операции не доказана — сеть не трогаем. */
+        NONE_COLD,
+        /** Продолжение конкретной операции JIT после рестарта zygote: возвращаем сохранённое. */
+        CONTINUE_OPERATION
+    }
+
+    /**
+     * Разрешён ли возврат сети при старте процесса.
+     *
+     * Рестарт zygote убивает наш процесс, поэтому продолжение операции физически происходит при
+     * следующем запуске — это часть той же операции, а не самостоятельная boot-функция.
+     * Условия (оба обязательны):
+     *  • [intentVerified] — файл-намерение наш и от ТЕКУЩЕЙ загрузки (`JitBootMark.pendingDecision`);
+     *  • [phaseProven] — в файле итога есть строка нашей операции: `ARMED` (рестарт планировался),
+     *    `RESTARTING`/`DONE` (рестарт состоялся) или `ABORTED` (рестарт отменён, но сеть могла
+     *    остаться изменённой — компенсация тоже нужна).
+     *
+     * Чего это НЕ разрешает: применять JIT, повторять `ctl.restart`, выполнять сетевые команды на
+     * обычной перезагрузке ГУ (там намерения нет либо загрузка другая → `NONE_COLD`).
+     */
+    fun bootNetAction(intentVerified: Boolean, phaseProven: Boolean): BootNetAction =
+        if (intentVerified && phaseProven) BootNetAction.CONTINUE_OPERATION else BootNetAction.NONE_COLD
 
     /** Можно ли снимать маркер незавершённого возврата сети. */
     fun canClearNetMarker(res: RestoreResult): Boolean = res.canClearMarker
@@ -355,16 +527,15 @@ class JitNetCore(
         val line = out.output.lineSequence().firstOrNull { it.contains("JIT_NET_PROPS_ROLLBACK") }
             ?.trim().orEmpty()
         log(line.ifEmpty { "JIT_NET_PROPS_ROLLBACK failed rc=${out.exitCode} channel=${if (out.channelOk) "ok" else "failed"}" })
-        return line.contains("rt=$usejitBefore") && line.contains("pr=$profilesBefore")
+        // Точное сравнение тегов: `want_rt=false` СОДЕРЖИТ `rt=false`, и подстрочная проверка
+        // считала неудавшийся откат успешным (ловушка найдена тестом `propsRollbackIsVerified`).
+        fun tag(name: String): String? =
+            Regex("(?:^|[\\s|])$name=([^\\s|]+)").find(line)?.groupValues?.get(1)
+        return tag("rt") == usejitBefore && tag("pr") == profilesBefore
     }
 
     /** Возврат сети ТОЛЬКО из сохранённого состояния. */
-    fun restore(
-        saved: JitNetModel.State,
-        why: String,
-        attempts: Int = wifiAttempts,
-        allowAp: Boolean = true
-    ): RestoreResult {
+    fun restore(saved: JitNetModel.State, why: String, attempts: Int = wifiAttempts): RestoreResult {
         val san = runScript(JitNetModel.sanitizeScript(), 25_000)
         val line = san.output.lineSequence().firstOrNull { it.contains("JIT_NET_SANITIZE removed=") }
         val left = Regex("left=([0-9]+)").find(line.orEmpty())?.groupValues?.get(1)?.toIntOrNull() ?: -1
@@ -375,11 +546,9 @@ class JitNetCore(
             log("JIT_NET_RESTORE wifi=0 state=skipped reason=was_off")
             true
         }
-        val apConfirmed = when {
-            !saved.ap -> { log("JIT_NET_RESTORE ap=0 state=skipped reason=was_off"); true }
-            // Просроченный маркер: hotspot не поднимаем (см. JitNetModel.ttlPolicy).
-            !allowAp -> { log("JIT_NET_RESTORE ap=1 state=skipped reason=ttl_expired"); true }
-            else -> restoreAp()
+        val apConfirmed = if (saved.ap) restoreAp() else {
+            log("JIT_NET_RESTORE ap=0 state=skipped reason=was_off")
+            true
         }
         val linkNow = link("wlan0")
         val res = RestoreResult(
@@ -431,32 +600,47 @@ class JitNetCore(
      * Старт приложения: если маркер незавершённого возврата есть — пробуем вернуть сеть.
      * Нет маркера — НИ ОДНОГО сетевого действия.
      */
-    fun recoverOnStart(reason: String): Recovery {
+    /**
+     * Возврат сохранённого состояния сети как продолжение операции JIT.
+     *
+     * Вызывается ТОЛЬКО из двух мест (оба — внутри цепочки тумблера):
+     *  • начало клика (`why=chain:pre`) — компенсация хвоста прошлой операции;
+     *  • старт нашего процесса, когда фаза операции доказана (`why=chain:post_zygote`,
+     *    решение принимает [JitFlow.bootNetAction]).
+     *
+     * Просроченный маркер НЕ возвращает сеть: он выбрасывается с `reason=expired`.
+     */
+    fun restorePendingInChain(reason: String): Recovery {
         val saved = savedState()
         if (saved == null) {
-            log("JIT_NET_RESTORE skipped reason=no_saved_state context=$reason")
+            log("JIT_NET_CHAIN skipped reason=no_saved_state context=$reason")
             return Recovery.NONE
         }
         val policy = JitNetModel.ttlPolicy(saved, now(), ttlMs)
-        if (policy == JitNetModel.TtlPolicy.DROP) {
+        if (policy == JitNetModel.TtlPolicy.EXPIRED) {
             clearSaved()
-            log("JIT_NET_RESTORE skipped reason=expired age_ms=${now() - saved.tsMs} " +
-                "policy=${JitNetModel.ttlPolicyLabel(policy)} saved=${saved.log()} context=$reason")
+            log("JIT_NET_CHAIN skipped reason=expired age_ms=${now() - saved.tsMs} " +
+                "policy=${JitNetModel.ttlPolicyLabel(policy)} saved=${saved.log()} context=$reason " +
+                "(просроченный маркер выбрасывается без сетевых действий)")
             return Recovery.EXPIRED
         }
-        if (policy == JitNetModel.TtlPolicy.WIFI_ONLY) {
-            log("JIT_NET_RESTORE policy=${JitNetModel.ttlPolicyLabel(policy)} " +
-                "age_ms=${now() - saved.tsMs} saved=${saved.log()} context=$reason " +
-                "(Wi-Fi возвращаем, AP не поднимаем)")
-        }
-        val res = restore(saved, "start:$reason", allowAp = policy == JitNetModel.TtlPolicy.FULL)
+        val res = restore(saved, "chain:$reason")
         prefs.put(JitNetModel.PREF_NET_LAST, "${res.log()} context=$reason")
         if (res.canClearMarker) {
             clearSaved()
-            log("JIT_NET_RESTORE done context=$reason marker=cleared retry=no")
+            log("JIT_NET_CHAIN done context=$reason marker=cleared retry=no")
             return Recovery.RESTORED
         }
-        log("JIT_NET_RESTORE keep_saved state=${res.log()} context=$reason (повторим на следующем старте)")
+        log("JIT_NET_CHAIN keep_saved state=${res.log()} context=$reason " +
+            "(маркер остаётся: повтор — при следующей операции JIT)")
         return Recovery.KEPT
     }
+
+    /**
+     * Только чтение: состояние маркера и что с ним будет. Сетевых действий нет — используется на
+     * обычном холодном старте для честной строки в логе.
+     */
+    fun pendingMarker(): Pair<JitNetModel.State, JitNetModel.TtlPolicy>? =
+        savedState()?.let { it to JitNetModel.ttlPolicy(it, now(), ttlMs) }
+
 }

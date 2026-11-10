@@ -8,19 +8,25 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * iter33p-fix2 §1/§2 — ПОВЕДЕНЧЕСКИЕ тесты сети (REVIEW iter33p-fix1, замечание 1).
+ * iter33p-fix3/4 — ПОВЕДЕНЧЕСКИЕ тесты сети (REVIEW iter33p-fix2 и iter33p-fix3).
  *
- * Здесь нет ни `contains`, ни `indexOf` по исходникам: тесты гоняют реальные переходы
- * [JitNetCore] и [JitFlow] на подставленных отказах (фейковый Wi-Fi, фейковые скрипты, фейковые
- * префы). Сценарии из ревью:
- *  1. ошибка сохранения состояния → операции нет вовсе (сеть не тронута);
- *  2. ошибка записи намерения → операции нет, маркер снят;
- *  3. отказ подготовки → компенсация в той же операции + откат props;
- *  4. отказ запуска watcher-а → сначала гасим watcher, потом компенсируем;
- *  5. неудачный возврат → маркер сохранён и следующий старт (новый экземпляр ядра на тех же
- *     префах = имитация гибели процесса) реально повторяет возврат;
- *  6. обычный старт без маркера → ни одного сетевого действия;
- *  7. отсутствие `ap0` — штатное «AP выключен», а не «неизвестно».
+ * Без `contains` по исходникам: гоняются реальные переходы [JitNetCore] и чистые решения
+ * [JitFlow] на подставленных отказах (фейковый Wi-Fi, фейковые скрипты, фейковые префы).
+ *
+ * Главное, что проверяется здесь (REVIEW iter33p-fix3, «Тест обязателен»):
+ *  1. клик → `saveBeforeRestart` (wifi=1) → `svc wifi disable` → успешный zygote (ARMED/RESTARTING/
+ *     DONE по id операции) → НОВЫЙ ПРОЦЕСС → возврат Wi-Fi по сохранённому состоянию,
+ *     БЕЗ второго клика;
+ *  2. обычный холодный старт без операции → НИ ОДНОГО сетевого действия;
+ *  3. прерывание ДО zygote (намерение есть, фазы нет) → сеть на старте не трогаем;
+ *  4. stale/чужой маркер (другая загрузка / другой op id) → сеть не трогаем;
+ *  5. отказ возврата после zygote → маркер сохранён, повтор при следующей операции JIT;
+ *  6. отмена рестарта сверяется по id операции и по строке RESTARTING.
+ *
+ * Как моделируются границы процессов: «новый процесс» — это НОВЫЙ экземпляр [JitNetCore] на тех же
+ * префах (маркер `jit_net_saved` живёт в префах = на диске), при этом состояние «железа» (Wi-Fi,
+ * правила) сохраняется в объекте [Harness]. Именно так выглядит переход «процесс убит рестартом →
+ * процесс поднялся заново»: память обнулилась, диск и состояние устройства — нет.
  */
 class JitNetCoreTest {
 
@@ -51,17 +57,20 @@ class JitNetCoreTest {
         var sleepCalls = 0
         var startApErr: Throwable? = UnsupportedOperationException("no_startSoftAp")
 
-        /** Ответ устройства на скрипт: по умолчанию всё «получилось». */
         var respond: (String) -> ScriptOut = { script ->
             when {
-                script.contains("JIT_NET_SANITIZE removed=") -> ScriptOut(0, "JIT_NET_SANITIZE removed=1 skipped=0 left=0 scope=oif_wlan0")
-                script.contains("ip_rule_wait=") -> ScriptOut(0, "JIT_NET_PRE ip_rule_wait=1 drained=yes oif_wlan0=0")
-                script.contains("JIT_NET_PROPS_ROLLBACK") -> ScriptOut(0, "JIT_NET_PROPS_ROLLBACK rt=false pr=false want_rt=false want_pr=false")
+                script.contains("JIT_NET_SANITIZE removed=") ->
+                    ScriptOut(0, "JIT_NET_SANITIZE removed=1 skipped=0 left=0 scope=oif_wlan0")
+                script.contains("ip_rule_wait=") ->
+                    ScriptOut(0, "JIT_NET_PRE ip_rule_wait=1 drained=yes oif_wlan0=0")
+                script.contains("JIT_NET_PROPS_ROLLBACK") ->
+                    ScriptOut(0, "JIT_NET_PROPS_ROLLBACK rt=false pr=false want_rt=false want_pr=false")
                 else -> ScriptOut(0, "OK")
             }
         }
 
-        fun core() = JitNetCore(
+        /** Новый экземпляр ядра = новый процесс (память новая, префы и «железо» те же). */
+        fun core(linkOverride: String? = null) = JitNetCore(
             prefs = prefs,
             readWifi = { wifi },
             setWifi = { on ->
@@ -70,7 +79,7 @@ class JitNetCoreTest {
                 if (wifi != null) wifi = on
             },
             apProbe = { apProbe },
-            link = { link },
+            link = { linkOverride ?: link },
             runScript = { script, _ -> scripts.add(script); respond(script) },
             log = { logs.add(it) },
             now = { nowMs },
@@ -80,291 +89,398 @@ class JitNetCoreTest {
         fun logText(): String = logs.joinToString("\n")
     }
 
-    // 1. Ошибка записи состояния — операции нет, сети не касаемся.
-    @Test
-    fun unknownStateAbortsWholeOperation() {
-        val h = Harness(apProbe = "ERR_ROOT_CHANNEL_UNAVAILABLE")
-        assertNull("состояние не должно считаться известным", h.core().saveBeforeRestart())
-        assertEquals("Wi-Fi не выключался", 0, h.setWifiCalls)
-        assertTrue(h.logText().contains("reason=state_unknown"))
+    private fun marker(h: Harness, wifi: Int, ap: Int, ts: Long) {
+        h.prefs.map[JitNetModel.PREF_NET_SAVED] = "wifi=$wifi,ap=$ap,ts=$ts"
     }
 
-    // 2. Отсутствие ap0 — штатное «AP выключен» (REVIEW §3), JIT не блокируется.
-    @Test
-    fun absentAp0IsOffNotUnknown() {
-        assertEquals(false, JitNetModel.parseApProbe("P=0\nOS=\nA=0"))
-        assertEquals(false, JitNetModel.parseApProbe("P=1\nOS=down\nA=0"))
-        assertEquals(true, JitNetModel.parseApProbe("P=1\nOS=up\nA=1"))
-        assertNull("канал молчит", JitNetModel.parseApProbe(""))
-        assertNull(JitNetModel.parseApProbe("ERR_ROOT_CHANNEL_UNAVAILABLE"))
+    /** Строки файла итога watcher-а для операции [op] на фазе «рестарт выполнен». */
+    private fun resultDone(op: String, want: String = "true"): String =
+        "${JitNetModel.WATCHER_ARMED} op=$op want=$want delay=8 pid=4242|" +
+            "${JitNetModel.WATCHER_RESTARTING} op=$op|" +
+            "${JitNetModel.WATCHER_DONE} op=$op runtime=$want persist= zygote_restart=ok waited_s=3|"
 
-        val h = Harness(apProbe = "P=0\nOS=\nA=0")
-        val st = h.core().saveBeforeRestart()
-        assertNotNull("операция обязана начинаться при отсутствующем ap0", st)
-        assertEquals(false, st!!.ap)
+    // ─────────────── 1. штатное продолжение операции после zygote (главный тест) ───────────────
+
+    /**
+     * click → wifi=1 сохранён → `svc wifi disable` → успешный zygote → НОВЫЙ ПРОЦЕСС →
+     * возврат Wi-Fi/AP БЕЗ второго клика.
+     */
+    @Test
+    fun zygoteContinuationRestoresWifiWithoutSecondClick() {
+        val h = Harness(wifi = true, apProbe = "P=0\nOS=\nA=0")
+        val first = h.core()
+
+        // ── шаги 1–2 операции: состояние сохранено и подтверждено ──
+        val saved = first.saveBeforeRestart()!!
+        assertEquals(true, saved.wifi)
+        val op = JitFlow.opId(h.nowMs, "boot-A", "aaa111")
+
+        // ── шаг 5: подготовка сети гасит Wi-Fi (как `svc wifi disable`) ──
+        first.runPreRestart("true")
+        h.wifi = false
+        h.link = "down"
+
+        // ── рестарт zygote состоялся: файл итога несёт ARMED/RESTARTING/DONE нашего op ──
+        val result = resultDone(op)
+        assertTrue(JitFlow.armedFor(result, op))
+        assertTrue(JitFlow.restartingFor(result, op))
+        assertTrue(JitFlow.doneFor(result, op))
+
+        // ── наш процесс убит рестартом; поднимается НОВЫЙ процесс ──
+        val intentVerified = true                       // намерение наше и от текущей загрузки
+        val phaseProven = JitFlow.armedFor(result, op) || JitFlow.restartingFor(result, op) ||
+            JitFlow.doneFor(result, op) || JitFlow.abortedFor(result, op)
+        assertEquals("после zygote сеть возвращается как продолжение операции",
+            JitFlow.BootNetAction.CONTINUE_OPERATION, JitFlow.bootNetAction(intentVerified, phaseProven))
+
+        h.link = "up"
+        val second = h.core()
+        assertEquals(Recovery.RESTORED, second.restorePendingInChain("post_zygote"))
+        assertEquals("Wi-Fi вернулся без второго клика", true, h.wifi)
+        assertEquals(true, h.requestedWifi)
+        assertNull("маркер снят по подтверждению", h.prefs.get(JitNetModel.PREF_NET_SAVED))
+        assertTrue(h.logText().contains("JIT_NET_RESTORE why=chain:post_zygote"))
+        assertTrue(h.logText().contains("JIT_NET_CHAIN done context=post_zygote"))
     }
 
-    // 3. Сохранение не подтвердилось чтением обратно — сеть не трогаем.
+    // 2. Обычный холодный старт без операции — ни одного сетевого действия.
+    @Test
+    fun coldStartDoesNoNetworkActions() {
+        val h = Harness()
+        val action = JitFlow.bootNetAction(intentVerified = false, phaseProven = false)
+        assertEquals(JitFlow.BootNetAction.NONE_COLD, action)
+        // Приложение в этом случае вызывает только чтение маркера:
+        assertNull(h.core().pendingMarker())
+        assertEquals(0, h.setWifiCalls)
+        assertTrue("ни одного скрипта на устройстве", h.scripts.isEmpty())
+    }
+
+    // 3. Прерывание ДО zygote: намерение есть, но фазы нет (ARMED не появился) → сеть не трогаем.
+    @Test
+    fun interruptionBeforeZygoteLeavesNetworkAlone() {
+        val h = Harness(wifi = false)
+        marker(h, wifi = 1, ap = 0, ts = h.nowMs)
+        val op = JitFlow.opId(h.nowMs, "boot-A", "bbb222")
+        val emptyResult = ""                    // watcher не успел ничего записать
+        val phaseProven = JitFlow.armedFor(emptyResult, op) || JitFlow.restartingFor(emptyResult, op) ||
+            JitFlow.doneFor(emptyResult, op) || JitFlow.abortedFor(emptyResult, op)
+        assertEquals(JitFlow.BootNetAction.NONE_COLD, JitFlow.bootNetAction(true, phaseProven))
+        assertEquals(0, h.setWifiCalls)
+        assertTrue(h.scripts.isEmpty())
+    }
+
+    // 4. Stale/чужой маркер: результат от ДРУГОГО op id фазу не доказывает.
+    @Test
+    fun foreignOperationResultDoesNotProvePhase() {
+        val ours = JitFlow.opId(1_000, "boot-A", "ccc333")
+        val other = JitFlow.opId(2_000, "boot-A", "ddd444")
+        val result = resultDone(other)
+        val phaseProven = JitFlow.armedFor(result, ours) || JitFlow.restartingFor(result, ours) ||
+            JitFlow.doneFor(result, ours) || JitFlow.abortedFor(result, ours)
+        assertFalse(phaseProven)
+        assertEquals(JitFlow.BootNetAction.NONE_COLD, JitFlow.bootNetAction(true, phaseProven))
+        // И «чужая загрузка» тоже не даёт права: intent_verified=false.
+        assertEquals(JitFlow.BootNetAction.NONE_COLD, JitFlow.bootNetAction(false, true))
+    }
+
+    // 4б. Отмена рестарта тоже считается продолжением: сеть могла остаться изменённой.
+    @Test
+    fun abortedOperationStillContinuesForCompensation() {
+        val op = JitFlow.opId(3_000, "boot-A", "eee555")
+        val result = "${JitNetModel.WATCHER_ARMED} op=$op want=true|" +
+            "${JitNetModel.WATCHER_ABORTED} op=$op reason=cancel_file|"
+        val phaseProven = JitFlow.armedFor(result, op) || JitFlow.abortedFor(result, op)
+        assertEquals(JitFlow.BootNetAction.CONTINUE_OPERATION, JitFlow.bootNetAction(true, phaseProven))
+        assertEquals(JitFlow.CancelOutcome.CANCELLED, JitFlow.cancelOutcome(result, op))
+    }
+
+    // 5. Отказ возврата после zygote: маркер сохранён, повтор — при следующей операции JIT.
+    @Test
+    fun failedPostZygoteRestoreKeepsMarker() {
+        val h = Harness(wifi = false, link = "down")
+        marker(h, wifi = 1, ap = 0, ts = h.nowMs)
+        val core = JitNetCore(
+            prefs = h.prefs, readWifi = { h.wifi }, setWifi = { h.setWifiCalls++ },
+            apProbe = { h.apProbe }, link = { "down" },
+            runScript = { s, _ -> h.scripts.add(s); h.respond(s) },
+            log = { h.logs.add(it) }, now = { h.nowMs }, sleep = { h.sleepCalls++ }
+        )
+        assertEquals(Recovery.KEPT, core.restorePendingInChain("post_zygote"))
+        assertNotNull("маркер обязан остаться", h.prefs.get(JitNetModel.PREF_NET_SAVED))
+        assertTrue(h.logText().contains("keep_saved"))
+
+        // Следующая операция JIT (начало клика, уже с исправной сетью) доводит возврат.
+        h.wifi = true
+        h.link = "up"
+        assertEquals(Recovery.RESTORED, h.core().restorePendingInChain("pre"))
+        assertNull(h.prefs.get(JitNetModel.PREF_NET_SAVED))
+    }
+
+    // ───────────────────────── 2. сохранение состояния и ворота ─────────────────────────
+
     @Test
     fun unconfirmedSaveAborts() {
         val h = Harness()
         h.prefs.failWrites = true
-        assertNull(h.core().saveBeforeRestart())
+        assertNull("без подтверждённой записи состояния операции нет", h.core().saveBeforeRestart())
         assertEquals(0, h.setWifiCalls)
-        assertTrue(h.logText().contains("save_not_confirmed"))
-        assertNull("маркер не должен остаться", h.prefs.get(JitNetModel.PREF_NET_SAVED))
+        assertTrue("ни одного device-скрипта", h.scripts.isEmpty())
+        assertTrue(h.logText().contains("JIT_NET_PRE failed"))
     }
 
-    // 4. Ворота операции: порядок «состояние сети → намерение» и оба отказа.
     @Test
     fun gateOrderAndAborts() {
-        assertEquals(JitFlow.Gate.ABORT_NO_NET_STATE, JitFlow.gate(netStateKnown = false, intentConfirmed = false))
-        assertEquals(JitFlow.Gate.ABORT_NO_NET_STATE, JitFlow.gate(netStateKnown = false, intentConfirmed = true))
-        assertEquals(JitFlow.Gate.ABORT_INTENT_WRITE, JitFlow.gate(netStateKnown = true, intentConfirmed = false))
-        assertEquals(JitFlow.Gate.PROCEED, JitFlow.gate(netStateKnown = true, intentConfirmed = true))
+        assertEquals(JitFlow.Gate.ABORT_NO_NET_STATE, JitFlow.gate(false, false))
+        assertEquals(JitFlow.Gate.ABORT_NO_NET_STATE, JitFlow.gate(false, true))
+        assertEquals(JitFlow.Gate.ABORT_INTENT_WRITE, JitFlow.gate(true, false))
+        assertEquals(JitFlow.Gate.PROCEED, JitFlow.gate(true, true))
+
+        val beforeNet = JitFlow.abortPlan(JitFlow.Stage.BEFORE_NET, propsMaybeTouched = true)
+        assertFalse(beforeNet.cancelWatcher)
+        assertFalse(beforeNet.rollbackProps)
+        assertFalse(beforeNet.compensateNet)
+        assertTrue(beforeNet.discardSnapshot)
+
+        val afterNet = JitFlow.abortPlan(JitFlow.Stage.AFTER_NET_BEFORE_LAUNCH, propsMaybeTouched = true)
+        assertTrue(afterNet.cancelWatcher)
+        assertTrue("props могли измениться — откат обязателен", afterNet.rollbackProps)
+        assertTrue(afterNet.compensateNet)
+
+        val unconfirmed = JitFlow.abortPlan(JitFlow.Stage.LAUNCH_UNCONFIRMED, propsMaybeTouched = false)
+        assertTrue(unconfirmed.cancelWatcher)
+        assertFalse(unconfirmed.rollbackProps)
+        assertTrue(unconfirmed.compensateNet)
     }
 
-    // 5. Успешный возврат: Wi-Fi включён по запросу, маркер снят, link подтверждён.
+    @Test
+    fun noNetStateAborts() {
+        val h = Harness(wifi = null)
+        assertNull(h.core().saveBeforeRestart())
+        assertTrue(h.logText().contains("state_unknown"))
+        assertTrue(h.scripts.isEmpty())
+    }
+
+    @Test
+    fun unknownStateAbortsWholeOperation() {
+        val h = Harness(apProbe = "ERR_ROOT_CHANNEL_UNAVAILABLE")
+        assertNull(h.core().saveBeforeRestart())
+        assertTrue(h.logText().contains("state_unknown"))
+    }
+
+    @Test
+    fun absentAp0IsOffNotUnknown() {
+        val h = Harness(apProbe = "P=0\nOS=\nA=0")
+        val st = h.core().saveBeforeRestart()
+        assertNotNull(st)
+        assertEquals(false, st!!.ap)
+        assertEquals(true, st.wifi)
+    }
+
+    @Test
+    fun partialApProbeIsUnknown() {
+        assertNull("P=1 без A=", JitNetModel.parseApProbe("P=1\nOS=up\n"))
+        assertNull("нет поля OS=", JitNetModel.parseApProbe("P=0\nA=0"))
+        assertNull("нет поля A=", JitNetModel.parseApProbe("P=0\nOS=\n"))
+        assertEquals(false, JitNetModel.parseApProbe("P=0\nOS=\nA=0"))
+        assertEquals(false, JitNetModel.parseApProbe("P=1\nOS=down\nA=0"))
+        assertEquals(true, JitNetModel.parseApProbe("P=1\nOS=up\nA=1"))
+
+        val h = Harness(apProbe = "P=1\nOS=up\n")
+        assertNull("неполная проба = неизвестно", h.core().saveBeforeRestart())
+        assertTrue(h.scripts.isEmpty())
+    }
+
+    // ───────────────────── 3. маркер: TTL, только чтение, цепочка ─────────────────────
+
+    @Test
+    fun plainChainTouchesNothing() {
+        val h = Harness()
+        assertEquals(Recovery.NONE, h.core().restorePendingInChain("pre"))
+        assertEquals(0, h.setWifiCalls)
+        assertTrue(h.scripts.isEmpty())
+        assertTrue(h.logText().contains("reason=no_saved_state"))
+    }
+
     @Test
     fun successfulRestoreClearsMarker() {
         val h = Harness()
         val core = h.core()
-        val saved = core.saveBeforeRestart()!!
-        // имитируем гашение Wi-Fi операцией
-        core.runPreRestart("true")
+        core.saveBeforeRestart()!!
         h.wifi = false
-        h.link = "down"
-        h.respond = { s ->
-            when {
-                s.contains("JIT_NET_SANITIZE removed=") -> ScriptOut(0, "JIT_NET_SANITIZE removed=1 skipped=0 left=0 scope=oif_wlan0")
-                s.contains("ip_rule_wait=") -> ScriptOut(0, "JIT_NET_PRE ip_rule_wait=0 drained=yes oif_wlan0=0")
-                else -> ScriptOut(0, "OK")
-            }
-        }
         h.link = "up"
-        val rec = core.recoverOnStart("boot")
-        assertEquals(Recovery.RESTORED, rec)
+        assertEquals(Recovery.RESTORED, core.restorePendingInChain("pre"))
         assertEquals(true, h.requestedWifi)
-        assertNull("маркер снят", h.prefs.get(JitNetModel.PREF_NET_SAVED))
-        assertTrue(h.logText().contains("JIT_NET_RESTORE wifi=1 attempt=1/3 request=setWifiEnabled(true) state=true"));
-    }
-
-    // 6. Wi-Fi не поднялся → маркер сохранён, и СЛЕДУЮЩИЙ СТАРТ реально повторяет возврат.
-    @Test
-    fun failedRestoreKeepsMarkerAndNextStartRetries() {
-        val h = Harness()
-        val core = h.core()
-        core.saveBeforeRestart()
-        h.wifi = false
-        h.respond = { s ->
-            if (s.contains("JIT_NET_SANITIZE removed=")) ScriptOut(0, "JIT_NET_SANITIZE removed=0 skipped=0 left=2 scope=oif_wlan0")
-            else ScriptOut(0, "OK")
-        }
-        // setWifiEnabled «не срабатывает»: запрос уходит, состояние остаётся false
-        val stuck = JitNetCore(
-            prefs = h.prefs,
-            readWifi = { h.wifi },
-            setWifi = { h.setWifiCalls++; h.requestedWifi = it },
-            apProbe = { h.apProbe },
-            link = { "down" },
-            runScript = { s, _ -> h.scripts.add(s); h.respond(s) },
-            log = { h.logs.add(it) },
-            now = { h.nowMs },
-            sleep = { h.sleepCalls++ }
-        )
-        assertEquals(Recovery.KEPT, stuck.recoverOnStart("boot"))
-        assertNotNull("маркер обязан остаться", h.prefs.get(JitNetModel.PREF_NET_SAVED))
-        assertEquals("все 3 попытки", 3, h.setWifiCalls)
-        assertTrue(h.logText().contains("keep_saved"))
-
-        // ── следующий старт: тот же диск/префы, новый процесс ──
-        h.wifi = true
-        h.logs.clear()
-        val next = JitNetCore(
-            prefs = h.prefs,
-            readWifi = { h.wifi },
-            setWifi = { on -> h.setWifiCalls++; h.requestedWifi = on },
-            apProbe = { h.apProbe },
-            link = { "up" },
-            runScript = { s, _ -> h.scripts.add(s); h.respond(s) },
-            log = { h.logs.add(it) },
-            now = { h.nowMs },
-            sleep = { h.sleepCalls++ }
-        )
-        assertEquals("повтор на следующем старте обязан случиться", Recovery.RESTORED, next.recoverOnStart("boot"))
         assertNull(h.prefs.get(JitNetModel.PREF_NET_SAVED))
     }
 
-    // 7. Обычный старт без маркера — ни одного сетевого действия.
     @Test
-    fun plainStartTouchesNothing() {
-        val h = Harness()
-        assertEquals(Recovery.NONE, h.core().recoverOnStart("boot"))
-        assertEquals(0, h.setWifiCalls)
-        assertTrue("ни одного скрипта на устройстве", h.scripts.isEmpty())
-        assertTrue(h.logText().contains("reason=no_saved_state"))
-    }
-
-    // 8. Просроченный маркер без предмета возврата (`wifi=0`) выбрасывается, сеть не трогаем.
-    //    Случай `wifi=1` намеренно решён иначе — см. тест 15: выключенный Wi-Fi это потеря связи.
-    @Test
-    fun expiredMarkerIsDroppedWhenNothingToRestore() {
-        val h = Harness()
-        h.prefs.map[JitNetModel.PREF_NET_SAVED] = "wifi=0,ap=0,ts=1000"
-        assertEquals(Recovery.EXPIRED, h.core().recoverOnStart("boot"))
-        assertEquals(0, h.setWifiCalls)
-        assertNull(h.prefs.get(JitNetModel.PREF_NET_SAVED))
-    }
-
-    // 9. Отказ ПОСЛЕ подготовки: план отмены — гасить watcher, откатывать props, компенсировать.
-    @Test
-    fun abortPlanAfterNetCoversEverything() {
-        val beforeNet = JitFlow.abortPlan(JitFlow.Stage.BEFORE_NET, propsTouched = false)
-        assertFalse("до сети возвращать нечего", beforeNet.compensateNet)
-        assertFalse(beforeNet.killWatcher)
-        assertTrue("снимок отменённой операции не нужен", beforeNet.discardSnapshot)
-
-        val afterNet = JitFlow.abortPlan(JitFlow.Stage.AFTER_NET_BEFORE_LAUNCH, propsTouched = true)
-        assertTrue(afterNet.compensateNet)
-        assertTrue(afterNet.rollbackProps)
-        assertTrue(afterNet.killWatcher)
-
-        val launch = JitFlow.abortPlan(JitFlow.Stage.LAUNCH_UNCONFIRMED, propsTouched = true)
-        assertTrue("неподтверждённый запуск обязан гаситься", launch.killWatcher)
-        assertTrue(launch.compensateNet)
-    }
-
-    // 10. Подтверждение запуска — по первой строке watcher-а, а не по pgrep.
-    @Test
-    fun launchConfirmationUsesWatcherMarker() {
-        assertFalse(JitFlow.launchConfirmed(null, "JIT_ZYGOTE_ARMED"))
-        assertFalse(JitFlow.launchConfirmed("LAUNCHED=1234", "JIT_ZYGOTE_ARMED"))
-        assertTrue(JitFlow.launchConfirmed(
-            "JIT_ZYGOTE_WATCH start JIT_ZYGOTE_ARMED pid=777 want=true|", "JIT_ZYGOTE_ARMED"))
-    }
-
-    // 11. Рестарт «возможен», пока не подтверждено, что watcher снят.
-    @Test
-    fun restartRiskIsOnlyClearedByConfirmedKill() {
-        assertTrue(JitFlow.restartStillPossible("123", true))
-        assertTrue(JitFlow.restartStillPossible("", true))
-        assertTrue(JitFlow.restartStillPossible("unknown", null))
-        assertFalse(JitFlow.restartStillPossible("", false))
-    }
-
-    // 12. Компенсация: подтверждение Wi-Fi/AP ≠ «интернет есть» (REVIEW 🟡).
-    @Test
-    fun restoreResultSeparatesEssentialsFromInternet() {
-        val ok = RestoreResult(true, true, false, true, "up", true, 0)
-        assertTrue(ok.essentialsConfirmed)
-        assertTrue(ok.fullyRestored)
-        assertTrue(ok.canClearMarker)
-
-        val noLink = RestoreResult(true, true, false, true, "down", true, 0)
-        assertTrue("запрос подтверждён", noLink.essentialsConfirmed)
-        assertFalse("но интернета нет — полным восстановлением не называем", noLink.fullyRestored)
-        assertTrue(noLink.canClearMarker)
-
-        val unknownLink = RestoreResult(true, true, false, true, "unknown", true, 0)
-        assertFalse("при неизвестном канале маркер не снимаем — нужен повтор", unknownLink.canClearMarker)
-
-        val dirtyRules = RestoreResult(true, true, false, true, "up", true, 2)
-        assertFalse("правила не слиты — не «полностью»", dirtyRules.fullyRestored)
-    }
-
-    // 13. Откат props возвращает прежние значения и подтверждается read-back.
-    @Test
-    fun propsRollbackIsVerified() {
-        val h = Harness()
-        val ok = h.core().rollbackProps("false", "")
-        assertTrue("откат подтверждён read-back", ok)
-        val script = h.scripts.last()
-        assertTrue(script.contains("setprop dalvik.vm.usejit \"false\""))
-        assertTrue(script.contains("setprop dalvik.vm.usejitprofiles \"\""))
-        assertTrue(script.contains("JIT_NET_PROPS_ROLLBACK"))
-        // только те же два ключа, что ставила подготовка
-        assertFalse(script.contains("persist."))
-    }
-
-    // 14. Санация: чужие правила не удаляются, при неоднозначности — отказ.
-    @Test
-    fun sanitizeKeepsForeignRules() {
-        val plan = JitNet.sanitizePlan(
-            """
-            0:	from all lookup local
-            11000:	from all oif wlan0 lookup 1022
-            11000:	from all fwmark 0x1 lookup 1033
-            12000:	from all oif wlan0.1 lookup 1044
-            """.trimIndent()
-        )
-        assertEquals(JitNet.RuleAction.SKIP_NOT_OIF_WLAN0, plan[0].action)
-        assertEquals(JitNet.RuleAction.SKIP_DUPLICATE_PRIORITY, plan[1].action)
-        assertEquals(JitNet.RuleAction.SKIP_NOT_OIF_WLAN0, plan[2].action)
-        assertEquals(JitNet.RuleAction.SKIP_NOT_OIF_WLAN0, plan[3].action)
-        assertTrue("ни одного удаления", plan.none { it.action == JitNet.RuleAction.DELETE })
-
-        val only = JitNet.sanitizePlan("11000:\tfrom all oif wlan0 lookup 1022").single()
-        assertEquals(JitNet.RuleAction.DELETE, only.action)
-        assertEquals("ip rule del from all oif wlan0 lookup 1022", only.command)
-    }
-
-    // ─────────────────── TTL маркера незавершённого возврата (🟡 ревью) ───────────────────
-    // Политика: просрочка НЕ выбрасывает данные, если сохранено `wifi=1` — выключенный Wi-Fi это
-    // гарантированная потеря связи; не поднимается только точка доступа (видимый hotspot).
-
-    private fun savedMarker(h: Harness, wifi: Int, ap: Int, ageMs: Long) {
-        h.prefs.map[JitNetModel.PREF_NET_SAVED] = "wifi=$wifi,ap=$ap,ts=${h.nowMs - ageMs}"
-    }
-
-    // 15. Просроченный маркер с `wifi=1`: Wi-Fi включаем, AP не поднимаем, маркер снимаем.
-    @Test
-    fun expiredMarkerRestoresWifiButNotAp() {
-        val h = Harness(wifi = false, apProbe = "P=0\nOS=\nA=0")
-        h.startApErr = null
-        savedMarker(h, wifi = 1, ap = 1, ageMs = JitNetModel.SAVED_TTL_MS + 1_000)
-        val rec = h.core().recoverOnStart("boot")
-        assertEquals(Recovery.RESTORED, rec)
-        assertEquals("Wi-Fi обязан включиться даже у просроченного маркера", true, h.wifi)
-        assertTrue("AP не поднимаем", h.logText().contains("ap=1 state=skipped reason=ttl_expired"))
-        assertFalse("запроса startSoftAp быть не должно", h.logText().contains("ap=1 request="))
-        assertNull("маркер снят по подтверждению", h.prefs.map[JitNetModel.PREF_NET_SAVED])
-    }
-
-    // 16. Просроченный маркер с `wifi=0`: возвращать нечего — данных не держим, сеть не трогаем.
-    @Test
-    fun expiredMarkerWithWifiOffIsDroppedWithoutNetActions() {
+    fun expiredMarkerDoesNoNetworkActions() {
         val h = Harness(wifi = false)
-        savedMarker(h, wifi = 0, ap = 0, ageMs = JitNetModel.SAVED_TTL_MS + 1_000)
-        val rec = h.core().recoverOnStart("boot")
-        assertEquals(Recovery.EXPIRED, rec)
-        assertEquals("сеть не трогали", 0, h.setWifiCalls)
-        assertNull(h.prefs.map[JitNetModel.PREF_NET_SAVED])
+        marker(h, wifi = 1, ap = 1, ts = h.nowMs - JitNetModel.SAVED_TTL_MS - 1_000)
+        assertEquals(Recovery.EXPIRED, h.core().restorePendingInChain("post_zygote"))
+        assertEquals("Wi-Fi НЕ включаем", 0, h.setWifiCalls)
+        assertTrue("ни одного скрипта", h.scripts.isEmpty())
+        assertNull("маркер выброшен", h.prefs.get(JitNetModel.PREF_NET_SAVED))
+        assertTrue(h.logText().contains("без сетевых действий"))
     }
 
-    // 17. Часы ушли назад (типично для ГУ до синхронизации времени) — это НЕ просрочка.
     @Test
     fun clockWentBackwardsIsNotExpiry() {
-        val h = Harness(wifi = false, apProbe = "P=0\nOS=\nA=0")
-        // ts в будущем на час: теперь `now - ts` отрицательно.
-        h.prefs.map[JitNetModel.PREF_NET_SAVED] = "wifi=1,ap=0,ts=${h.nowMs + 3_600_000}"
-        assertEquals(
-            "часы назад не дают права забыть незавершённый возврат",
-            JitNetModel.TtlPolicy.FULL,
-            JitNetModel.ttlPolicy(JitNetModel.parse(h.prefs.map[JitNetModel.PREF_NET_SAVED])!!, h.nowMs)
-        )
-        val rec = h.core().recoverOnStart("boot")
-        assertEquals(Recovery.RESTORED, rec)
+        val future = JitNetModel.State(wifi = true, ap = false, tsMs = 5_000_000)
+        assertEquals(JitNetModel.TtlPolicy.FULL, JitNetModel.ttlPolicy(future, 1_000_000))
+        val noTs = JitNetModel.State(wifi = true, ap = false, tsMs = 0)
+        assertEquals(JitNetModel.TtlPolicy.FULL, JitNetModel.ttlPolicy(noTs, 9_999_999))
+        val old = JitNetModel.State(wifi = true, ap = false, tsMs = 1_000)
+        assertEquals(JitNetModel.TtlPolicy.EXPIRED, JitNetModel.ttlPolicy(old, 1_000_000))
+
+        val h = Harness(wifi = false)
+        marker(h, wifi = 1, ap = 0, ts = h.nowMs + 3_600_000)
+        assertEquals(Recovery.RESTORED, h.core().restorePendingInChain("post_zygote"))
         assertEquals(true, h.wifi)
     }
 
-    // 18. Свежий маркер — обычная политика FULL.
     @Test
-    fun freshMarkerIsFullPolicy() {
-        val h = Harness(wifi = false, apProbe = "P=0\nOS=\nA=0")
-        savedMarker(h, wifi = 1, ap = 0, ageMs = 1_000)
-        val st = JitNetModel.parse(h.prefs.map[JitNetModel.PREF_NET_SAVED])!!
-        assertEquals(JitNetModel.TtlPolicy.FULL, JitNetModel.ttlPolicy(st, h.nowMs))
-        assertEquals(JitNetModel.TtlPolicy.WIFI_ONLY,
-            JitNetModel.ttlPolicy(st, h.nowMs + JitNetModel.SAVED_TTL_MS + 1))
+    fun pendingMarkerIsReadOnly() {
+        val h = Harness(wifi = false)
+        marker(h, wifi = 1, ap = 0, ts = h.nowMs)
+        val pending = h.core().pendingMarker()
+        assertNotNull(pending)
+        assertEquals(true, pending!!.first.wifi)
+        assertEquals(JitNetModel.TtlPolicy.FULL, pending.second)
+        assertEquals(0, h.setWifiCalls)
+        assertTrue("чтение маркера не трогает сеть", h.scripts.isEmpty())
+        assertNotNull("и не снимает маркер", h.prefs.get(JitNetModel.PREF_NET_SAVED))
+    }
+
+    // ───────────── 4. что считается подтверждённым возвратом (в т.ч. wifi=0) ─────────────
+
+    @Test
+    fun restoreResultSeparatesEssentialsFromInternet() {
+        val wifiOn = RestoreResult(true, true, false, true, "up", true, 0)
+        assertTrue(wifiOn.essentialsConfirmed)
+        assertTrue(wifiOn.fullyRestored)
+        assertTrue("маркер снимается при полном подтверждении", wifiOn.canClearMarker)
+
+        assertFalse("link=down — не доказательство", wifiOn.copy(link = "down").canClearMarker)
+        assertFalse("правила не удалились — маркер остаётся",
+            wifiOn.copy(sanitizeLeft = 2).canClearMarker)
+        assertFalse(wifiOn.copy(sanitizeLine = false).canClearMarker)
+        assertFalse(wifiOn.copy(wifiConfirmed = false).canClearMarker)
+
+        // REVIEW iter33p-fix3 🟡: сохранённый `wifi=0` — отсутствие IPv4 не ошибка и не повод
+        // включать Wi-Fi: сеть вернулась ровно в то состояние, что было.
+        val wifiOff = RestoreResult(false, true, false, true, "down", false, -1)
+        assertTrue("для wifi=0 канал не требуется", wifiOff.fullyRestored)
+        assertTrue(wifiOff.canClearMarker)
+
+        // AP-only: сохранён ap=1, wifi=0 — AP подтверждён, канал wlan0 не требуется.
+        val apOnly = RestoreResult(false, true, true, true, "down", false, -1)
+        assertTrue(apOnly.canClearMarker)
+
+        // wifi=1, но AP подтвердить не удалось — не снимаем.
+        assertFalse(RestoreResult(true, true, true, false, "up", true, 0).canClearMarker)
+    }
+
+    @Test
+    fun markerKeptWhenLinkNotUp() {
+        val h = Harness()
+        h.core().saveBeforeRestart()
+        h.wifi = false
+        h.link = "down"
+        assertEquals(Recovery.KEPT, h.core().restorePendingInChain("pre"))
+        assertNotNull(h.prefs.get(JitNetModel.PREF_NET_SAVED))
+    }
+
+    // ───────────────────── 5. идентичность операции и отмена ─────────────────────
+
+    @Test
+    fun opIdIsShellSafeAndUnique() {
+        val a = JitFlow.opId(1_000_000, "boot tag/../x", "abc123")
+        val b = JitFlow.opId(1_000_000, "boot tag/../x", "def456")
+        assertTrue("только [A-Za-z0-9-]: $a", a.matches(Regex("[A-Za-z0-9-]+")))
+        assertTrue("id операций различаются", a != b)
+        assertTrue(a.startsWith("op-"))
+    }
+
+    @Test
+    fun staleResultDoesNotConfirmNewLaunch() {
+        val oldOp = JitFlow.opId(1_000, "b1", "aaa111")
+        val newOp = JitFlow.opId(2_000, "b1", "bbb222")
+        val stale = "${JitNetModel.WATCHER_ARMED} op=$oldOp want=true|" +
+            "${JitNetModel.WATCHER_DONE} op=$oldOp runtime=true zygote_restart=ok|"
+        assertFalse("чужой ARMED не подтверждает наш запуск", JitFlow.armedFor(stale, newOp))
+        assertFalse(JitFlow.doneFor(stale, newOp))
+        assertTrue(JitFlow.armedFor(stale, oldOp))
+
+        val fresh = stale + "${JitNetModel.WATCHER_ARMED} op=$newOp want=true|"
+        assertTrue(JitFlow.armedFor(fresh, newOp))
+        assertFalse("до DONE нашей операции итог не подтверждён", JitFlow.doneFor(fresh, newOp))
+    }
+
+    @Test
+    fun cancelOutcomeDistinguishesStates() {
+        val op = JitFlow.opId(5_000, "b2", "ccc333")
+        val other = JitFlow.opId(6_000, "b2", "ddd444")
+        assertEquals(JitFlow.CancelOutcome.CANCELLED,
+            JitFlow.cancelOutcome("${JitNetModel.WATCHER_ABORTED} op=$op reason=cancel_file|", op))
+        // Строка RESTARTING — доказательство, что отмена не успела (гонка закрыта по факту).
+        assertEquals(JitFlow.CancelOutcome.RESTARTED,
+            JitFlow.cancelOutcome("${JitNetModel.WATCHER_RESTARTING} op=$op|", op))
+        assertEquals(JitFlow.CancelOutcome.RESTARTED,
+            JitFlow.cancelOutcome("${JitNetModel.WATCHER_DONE} op=$op zygote_restart=ok|", op))
+        assertEquals("чужой id не считается", JitFlow.CancelOutcome.UNKNOWN,
+            JitFlow.cancelOutcome("${JitNetModel.WATCHER_DONE} op=$other zygote_restart=ok|", op))
+        assertEquals(JitFlow.CancelOutcome.UNKNOWN, JitFlow.cancelOutcome("", op))
+        assertEquals(JitFlow.CancelOutcome.UNKNOWN, JitFlow.cancelOutcome(null, op))
+    }
+
+    @Test
+    fun restartRiskOnlyClearedByCancelled() {
+        assertFalse(JitFlow.restartStillPossible(JitFlow.CancelOutcome.CANCELLED))
+        assertTrue(JitFlow.restartStillPossible(JitFlow.CancelOutcome.UNKNOWN))
+        assertTrue(JitFlow.restartStillPossible(JitFlow.CancelOutcome.RESTARTED))
+    }
+
+    @Test
+    fun resultFileMustBeAbsentBeforeLaunch() {
+        assertTrue(JitFlow.resultFileReady(false))
+        assertFalse("файл ещё есть", JitFlow.resultFileReady(true))
+        assertFalse("неизвестно — не начинаем", JitFlow.resultFileReady(null))
+    }
+
+    // ───────────────────── 6. откат props и санация правил ─────────────────────
+
+    @Test
+    fun propsRollbackIsVerified() {
+        val h = Harness()
+        val core = h.core()
+        assertTrue("read-back совпал", core.rollbackProps("false", "false"))
+        assertTrue(h.logText().contains("rt=false") && h.logText().contains("pr=false"))
+
+        h.respond = { ScriptOut(0, "JIT_NET_PROPS_ROLLBACK rt=true pr=false want_rt=false want_pr=false") }
+        assertFalse("не совпало — это не успех", core.rollbackProps("false", "false"))
+
+        h.respond = { ScriptOut(0, "JIT_NET_PROPS_ROLLBACK rt=false pr=true want_rt=false want_pr=true") }
+        assertFalse("want_pr=true не равно pr=false", core.rollbackProps("false", "false"))
+
+        h.respond = { ScriptOut(0, "ERR_ROOT_CHANNEL_UNAVAILABLE") }
+        assertFalse("канала нет — тоже не успех", core.rollbackProps("false", "false"))
+    }
+
+    @Test
+    fun sanitizeKeepsForeignRules() {
+        val plan = JitNet.sanitizePlan(
+            "11000:\tfrom all oif wlan0 lookup 1022\n" +
+                "11001:\tfrom all oif wlan0.1 lookup 1022\n" +
+                "11002:\tfrom all oif wlan0 oif wlan1 lookup 5\n" +
+                "11003:\tlookup 1000\n"
+        )
+        val actions = plan.map { it.action }
+        assertEquals(JitNet.RuleAction.DELETE, actions[0])
+        assertEquals(JitNet.RuleAction.SKIP_NOT_OIF_WLAN0, actions[1])
+        assertEquals(JitNet.RuleAction.SKIP_MULTIPLE_OIF, actions[2])
+        assertEquals(JitNet.RuleAction.SKIP_NOT_OIF_WLAN0, actions[3])
+        assertEquals(listOf("ip rule del from all oif wlan0 lookup 1022"),
+            plan.mapNotNull { it.command })
     }
 }

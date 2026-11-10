@@ -1167,3 +1167,51 @@
   артефакт `13778445997`.
 - **`42856558762` (`4b04b64`, код iter33p-fix2) — ✅ success, job `129971052345`,
   193 PASSED / 0 FAILED, `BUILD SUCCESSFUL in 3m 57s`, артефакт `13783617402`** (177 194 978 Б).
+
+## iter33p-fix3 + fix4 (1.0.61) — закрытие REVIEW_iter33p-fix2 и REVIEW_iter33p-fix3
+
+Версия не менялась: `61` / `1.0.61`. Ветка `fix/v2`.
+
+### Почему fix3 не попал в ветку
+
+Песочница агента дважды откатывалась к старому снимку; git-токен жил только в URL remote-а и
+терялся вместе с `.git`, `git push` без него не проходит. Коммит fix3 существовал только локально
+и был потерян. fix3 и fix4 публикуются одним коммитом (нужен токен).
+
+### Сделано
+
+- **Сеть как продолжение операции после zygote** (`JitNetCore.kt:440` — `JitFlow.bootNetAction`,
+  `AppPerformance.kt:930` — `netOnProcessStart`, вызов `:984`): возврат Wi-Fi/AP и санации
+  выполняется при старте процесса, только если (а) намерение наше и от текущей загрузки и (б) в
+  файле итога есть строка `ARMED|RESTARTING|DONE|ABORTED op=<id>` нашей операции. Иначе
+  `NONE_COLD` — ноль сетевых действий (лог `JIT_NET_PENDING … action=none_cold_start`).
+  Второго клика не требуется, повторного `ctl.restart` нет.
+- **watcher-скрипт** (`JitNetCore.kt:145`): `ARMED op=<id>` — первая строка до `sleep`; отмена
+  проверяет СОДЕРЖИМОЕ файла (`grep -q "op=$OP"`); `JIT_ZYGOTE_RESTARTING op=<id>` пишется
+  непосредственно перед `setprop ctl.restart zygote` (закрывает гонку отмены); `DONE op=<id>` — итог.
+- **Идентичность операции** (`JitFlow.opId/armedFor/doneFor/abortedFor/restartingFor/cancelOutcome`,
+  `resetWatcherResult`): старый результат не подтверждает новый запуск (файл очищается и читается
+  обратно), `op` пишется в файл-намерение.
+- **Отмена без `pkill`**: `cancelWatcherAndVerify` — собственный файл-отмена, итог
+  `CANCELLED|RESTARTED|UNKNOWN`; `UNKNOWN` не считается успехом (маркер и снимок сохраняются).
+- **`canClearMarker`** (`JitNetCore.kt:250–310`): требования зависят от сохранённого состояния —
+  для `wifi=0` (и AP-only) наличие IPv4 не требуется, Wi-Fi не включается, маркер снимается.
+- **🟡** откат props по точному read-back (`tag("rt")/tag("pr")`), `AvasCore.scheduleRestore` под
+  `lock` + перепроверка снимка, неполная проба `ap0` = «неизвестно».
+- **Тесты**: `JitNetCoreTest` 26 (в т.ч. обязательный
+  `zygoteContinuationRestoresWifiWithoutSecondClick`, `coldStartDoesNoNetworkActions`,
+  `interruptionBeforeZygoteLeavesNetworkAlone`, `foreignOperationResultDoesNotProvePhase`,
+  `failedPostZygoteRestoreKeepsMarker`), `JitWatcherScriptTest` 4 (исполняет настоящий скрипт через
+  `/bin/sh`), `AvasCoreTest` 13. Локальный прогон: **63 PASS / 0 FAIL**.
+
+### Открыто
+
+- Публикация в `fix/v2` и CI по ней — **требуется git-токен**; до этого вердикт ревью
+  «код недоступен для проверки» остаётся в силе.
+- Полевой прогон JIT не выполнялся (по условию ревью — только после повторного REVIEW).
+
+### CI
+
+- Подтверждённый ранее: `42858741744` (`25eef00`, fix2) — ✅ 193 PASSED / 0 FAILED,
+  job `129978799323`, артефакт `13785111537`. К fix3/fix4 не относится.
+- По fix3+fix4 — после push.

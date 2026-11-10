@@ -101,14 +101,19 @@ class AvasCore(
     fun scheduleRestore(
         where: AvasRestore.Where,
         post: (String, Long, () -> Unit) -> Unit
-    ): Long? {
-        val snap = store.read() ?: return null
+    ): Long? = synchronized(lock) {
+        // REVIEW iter33p-fix2 🟡: «прочитать → проверить просрочку → удалить» шло ВНЕ блокировки,
+        // а `save` создаёт новый снимок ВНУТРИ неё — при наложении можно было удалить только что
+        // созданный снимок. Теперь весь переход под тем же lock + перепроверка снимка перед clear.
+        val snap = store.read() ?: return@synchronized null
         if (AvasRestore.isExpired(snap, now(), ttlMs)) {
-            store.clear()
-            log(AvasRestore.skipLine("expired", where, snap.mode, "age_ms=${now() - snap.tsMs}"))
-            return null
+            val stillSame = store.read()?.id == snap.id
+            if (stillSame) store.clear()
+            log(AvasRestore.skipLine("expired", where, snap.mode,
+                "age_ms=${now() - snap.tsMs} cleared=${if (stillSame) "yes" else "no"}"))
+            return@synchronized null
         }
-        if (!scheduledIds.add(snap.id)) return snap.id
+        if (!scheduledIds.add(snap.id)) return@synchronized snap.id
         log("AVAS_RESTORE scheduled id=${snap.id} attempts=${scheduleMs.size} " +
             "delays_ms=${scheduleMs.joinToString(",")} where=${where.label}")
         val id = snap.id
@@ -116,7 +121,7 @@ class AvasCore(
             val attempt = idx + 1
             post("AvasRestore.restore#$attempt", delay) { attempt(id, attempt, where) }
         }
-        return id
+        id
     }
 
     /**

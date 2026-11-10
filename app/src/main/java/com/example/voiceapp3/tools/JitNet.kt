@@ -5,19 +5,21 @@ import android.net.wifi.WifiConfiguration
 import android.net.wifi.WifiManager
 
 /**
- * iter33p-fix2 §1/§2 — сеть вокруг перезапуска фреймворка (Android-адаптер).
+ * iter33p-fix3/4 — сеть вокруг перезапуска фреймворка (Android-адаптер).
  *
  * Вся логика и переходы живут в [JitNetCore] (без `android.*`, покрыто поведенческими тестами
  * `JitNetCoreTest`). Здесь только связка с устройством: `WifiManager`, `AdbClient`, `AppLog`.
  *
- * Что изменилось после REVIEW iter33p-fix1:
- *  • маркер `jit_net_saved` — отдельное состояние НЕЗАВЕРШЁННОГО возврата: он снимается только по
- *    подтверждённому состоянию, а [recoverOnStart] вызывается на КАЖДОМ старте независимо от
- *    файла-намерения JIT (раньше возврат зависел от pending и «повторим на следующем старте»
- *    не выполнялось);
- *  • отсутствие `ap0` — штатный признак выключенного AP (проба `P=0`), а не «неизвестно»;
+ * Границы (REVIEW iter33p-fix2 §3 + уточнение fix3):
+ *  • сетевые действия выполняются ТОЛЬКО как продолжение операции JIT — до рестарта
+ *    (компенсация) или при старте процесса, когда фаза операции доказана
+ *    ([restorePendingInChain] ← [JitFlow.bootNetAction]);
+ *  • обычный холодный старт и обычная перезагрузка ГУ: сеть не трогается вообще, маркер лишь
+ *    читается ([pendingMarker], лог `JIT_NET_PENDING … action=none_cold_start`);
+ *  • просроченный маркер не выполняет сетевых действий (выбрасывается с `reason=expired`);
+ *  • отсутствие `ap0` — штатный признак выключенного AP; неполный вывод пробы — «неизвестно»;
  *  • подтверждение Wi-Fi/AP не выдаётся за «интернет восстановлен»: `link=` и `sanitize_left=`
- *    пишутся отдельными полями.
+ *    отдельные поля, маркер снимается только при подтверждении запрошенного.
  */
 object JitNet {
 
@@ -145,13 +147,17 @@ object JitNet {
         core(context).rollbackProps(usejitBefore, profilesBefore)
 
     /**
-     * Возврат сети на старте. Вызывается ВСЕГДА (маркер есть — возвращаем; маркера нет — ни одного
-     * сетевого действия). Не зависит от файла-намерения JIT.
+     * Возврат сохранённой сети как ПРОДОЛЖЕНИЕ операции JIT (не самостоятельная boot-функция).
+     * Вызывается только из цепочки тумблера: начало клика и старт процесса при доказанной фазе.
      */
-    fun recoverOnStart(context: Context, reason: String): Recovery {
-        BgWorker.assertNotMain("JitNet.recoverOnStart")
-        return core(context).recoverOnStart(reason)
+    fun restorePendingInChain(context: Context, reason: String): Recovery {
+        BgWorker.assertNotMain("JitNet.restorePendingInChain")
+        return core(context).restorePendingInChain(reason)
     }
+
+    /** Только чтение маркера (для честной строки в логе). Сеть не трогается. */
+    fun pendingMarker(context: Context): Pair<JitNetModel.State, JitNetModel.TtlPolicy>? =
+        core(context).pendingMarker()
 
     fun restoreAfterRestart(context: Context, saved: JitNetModel.State, attempts: Int = WIFI_RESTORE_ATTEMPTS): RestoreResult {
         BgWorker.assertNotMain("JitNet.restoreAfterRestart")

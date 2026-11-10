@@ -1,5 +1,8 @@
 package android.content.pm
-open class ApplicationInfo { var packageName: String = ""; var uid: Int = 0 }
+open class ApplicationInfo {
+    var packageName: String = ""; var uid: Int = 0; var flags: Int = 0
+    companion object { const val FLAG_SYSTEM = 1 }
+}
 open class PackageInfo
 open class PackageManager {
     open fun getInstalledApplications(f: Int): MutableList<ApplicationInfo> = mutableListOf()

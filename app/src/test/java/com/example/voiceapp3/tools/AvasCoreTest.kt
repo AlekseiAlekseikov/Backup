@@ -37,7 +37,7 @@ class AvasCoreTest {
         var writeSoundWorks = true
 
         // `log` идёт ПЕРЕД `now`, чтобы трейлинг-лямбда в тестах означала время, а не лог.
-        fun core(store: MemStore, log: (String) -> Unit = {}, now: () -> Long) = AvasCore(
+        fun core(store: SnapshotStore, log: (String) -> Unit = {}, now: () -> Long) = AvasCore(
             store = store,
             readMode = { mode },
             readSound = { if (readSoundFails) emptyList() else sound.map { AvasRestore.SoundValue(AvasRestore.PROP_SOUND_TYPE, it.key, it.value) } },
@@ -257,5 +257,29 @@ class AvasCoreTest {
         assertEquals(0x21407057, AvasRestore.PROP_SOUND_TYPE)
         assertEquals(listOf(0, 1), AvasRestore.AREAS.toList())
         assertEquals("режим пишется только сохранённым значением", true, true)
+    }
+
+    // 13. Просрочка одного снимка не должна удалить ДРУГОЙ (новый).
+    //     REVIEW iter33p-fix2 🟡: «прочитать → проверить → удалить» было вне блокировки.
+    @Test
+    fun expiredScheduleDoesNotDropForeignSnapshot() {
+        val old = AvasRestore.Snapshot(111L, 111L, "boot-A", 5, emptyList())
+        val fresh = AvasRestore.Snapshot(222L, 222L, "boot-B", 5, emptyList())
+        var reads = 0
+        val store = object : SnapshotStore {
+            var current: AvasRestore.Snapshot? = old
+            override fun read(): AvasRestore.Snapshot? {
+                reads++
+                current = if (reads == 1) old else fresh
+                return current
+            }
+            override fun write(snapshot: AvasRestore.Snapshot): Boolean { current = snapshot; return true }
+            override fun clear() { current = null }
+        }
+        val dev = Device()
+        val core = dev.core(store) { t0 + AvasRestore.SNAPSHOT_TTL_MS + 1 }
+        assertNull("просроченный снимок не планируется",
+            core.scheduleRestore(AvasRestore.Where.JIT_TOGGLE) { _, _, _ -> })
+        assertEquals("новый снимок обязан остаться", fresh, store.current)
     }
 }

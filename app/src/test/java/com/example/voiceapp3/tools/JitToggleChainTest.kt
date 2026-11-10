@@ -74,9 +74,13 @@ class JitToggleChainTest {
             apply.indexOf("JitNet.runPreRestart") < apply.indexOf("jitZygoteWatcherScript()"))
         assertTrue("watcher запускается последним",
             apply.indexOf("jitZygoteWatcherScript()") < apply.indexOf("val launch"))
-        // Сам рестарт живёт только в скрипте watcher-а.
-        val watcher = bodyOf(perf, "internal fun jitZygoteWatcherScript")
+        // Сам рестарт живёт только в скрипте watcher-а. Текст скрипта — в чистом ядре
+        // (`JitNetModel.watcherScript`); исполняемое поведение — в `JitWatcherScriptTest`.
+        val watcher = JitNetModel.watcherScript()
         assertTrue("рестарт обязан быть в watcher-е", watcher.contains("ctl.restart zygote"))
+        assertTrue("рестарт ровно один", watcher.split("ctl.restart zygote").size == 2)
+        assertTrue("в AppPerformance остался делегат",
+            bodyOf(perf, "internal fun jitZygoteWatcherScript").contains("JitNetModel.watcherScript()"))
     }
 
     // 4. Состояние сети сохраняется ДО рестарта (иначе возвращать нечего).
