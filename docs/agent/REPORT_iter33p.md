@@ -51,6 +51,7 @@
 |---|---|---|---|---|
 | `42894105428` | `130102548785` | `577d338` | **FAILED** (`:app:compileDebugKotlin`) — см. §0.4 | - |
 | `42896558590` | `130111086379` | `78a3248` | **SUCCESS** (`BUILD SUCCESSFUL in 4m 35s`) | **176 / 0** |
+| `42899434089` | `130121134202` | `163cb65` (handoff, только docs + `SOURCE_SHA`) | **SUCCESS** (`BUILD SUCCESSFUL in 3m 42s`) | **176 / 0** |
 
 Числа взяты из полного лога джобы: `grep -c ' PASSED$'` = **176**, `grep -c ' FAILED$'` = **0**.
 `SKIPPED` в логе — только Gradle-задачи (`checkKotlinGradlePluginConfigurationErrors`,
