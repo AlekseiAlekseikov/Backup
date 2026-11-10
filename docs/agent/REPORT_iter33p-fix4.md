@@ -1,37 +1,59 @@
-# REPORT iter33p-fix4 — ответ на REVIEW iter33p-fix3
-
-**Ветка:** `fix/v2`. **Версия:** `versionCode=61`, `versionName="1.0.61"` (не менялась).
-**SHA кода:** см. §0.1 — заполняется сразу после push (в этом отчёте заранее указан только
-предыдущий подтверждённый CI, см. §0.2).
+**SHA кода:** `e248231`. **SHA handoff-коммита:** `d5bf108` (только `SOURCE_SHA`, без правок кода).
+**CI по опубликованному коду:** run `42868979959`, job `130014821740` — `BUILD SUCCESSFUL`,
+**206 PASSED / 0 FAILED**, artifact `13789547156` (`app-debug`).
 
 ---
 
-## 0. Про передачу и CI — честно
+## 0. Передача, публикация и CI — по факту
 
-### 0.1 Что произошло с публикацией fix3
+### 0.1 Публикация (закрывает п.1 ревью)
 
-Код fix3 **не попал в `fix/v2`**: ревьюер прав, ветка по GitHub API указывала на `25eef00` (fix2).
-Причина техническая и моя: в этой сессии песочница дважды откатывалась к старому снимку, git-токен
-жил только в URL remote-а и терялся вместе с `.git`, а `git push` без токена не проходит
-(`could not read Username for 'https://github.com'`). Коммит fix3 существовал только локально и был
-потерян при откате. Поэтому:
+Код fix3+fix4 **опубликован** в `fix/v2` (без `--force`, `main` не тронут):
 
-- **в fix/v2 сейчас лежит fix2 (`25eef00`), а не fix3/fix4** — независимая проверка заявленного
-  кода до push невозможна, и я это не заявляю как проверенное;
-- fix3 и fix4 собраны в один набор изменений и будут опубликованы одним коммитом;
-- **нужен git-токен** (только в remote URL, в отчёт/доки не пишется). Без него публикации не будет,
-  и это единственная причина, по которой вердикт ревью «нельзя проверить» пока остаётся в силе.
+| Роль | Коммит | Что это |
+|---|---|---|
+| код (fix3+fix4) | `3d486e0` | 13 файлов, +1405 / −485 (первая публикация, CI по ней — красный, см. §0.3) |
+| код (итоговый) | `e248231` | `3d486e0` + правка устаревшего статического теста (§0.3); **это SHA, который собирается** |
+| handoff | `d5bf108` | только `app/buildinfo.properties`: `SOURCE_SHA=e248231`, кода не касается |
 
-### 0.2 CI
+Как опубликовано: shallow-клон `fix/v2` (`25eef00`) в `/home/user`-соседний каталог вне tmpfs,
+`git am /home/user/iter33p-fix4.patch`, `git push origin fix/v2` → `25eef00..3d486e0`, затем
+`3d486e0..e248231`, затем `e248231..d5bf108`. Токен — только в URL remote, в отчёт/доки/логи не писался.
 
-- Последний **подтверждённый** CI: `42858741744` (`25eef00`), job `129978799323`,
-  **193 PASSED / 0 FAILED**. Он относится к **fix2** и не является CI исправлений fix3/fix4 —
-  именно так, как указано в ревью.
-- CI по коду fix3+fix4: **ещё нет** (нет push). После публикации будет добавлен run/job и
-  фактическое число `PASSED`/`FAILED`.
-- Локальный прогон (не заменяет Android CI): **63 PASS / 0 FAIL**, см. §7.
+Причина прошлого срыва (ревью фиксировало её как «кода нет в ветке»): коммит существовал только
+локально, песочница откатывалась и стирала и рабочее дерево, и `.git` с токеном в remote.
+Теперь источник истины — patch-файл в рабочей папке, из него публикация воспроизводима.
 
----
+### 0.2 CI — именно по опубликованному коду
+
+| Run | Job | Коммит | Итог | PASSED / FAILED | Artifact |
+|---|---|---|---|---|---|
+| `42866873182` | `130007455625` | `3d486e0` | **FAILED** | — / 1 (`JitBootTest.zygoteRestartOnlyInsideJitToggleBlock`) | — |
+| `42868979959` | `130014821740` | `e248231` | **SUCCESS** (`BUILD SUCCESSFUL in 4m 26s`) | **206 / 0** | `13789547156` `app-debug`, 177 200 804 Б |
+
+Для сравнения: `42858741744` (`25eef00`, job `129978799323`, 193/0, artifact `13785111537`) —
+это CI **fix2**, он не относится к исправлениям и здесь приводится только как «до».
+
+Число 206 > 193 потому, что fix3/fix4 добавили тесты (`JitNetCoreTest` +26, `JitWatcherScriptTest` +4,
+`AvasCoreTest` +2 и т.д.).
+
+### 0.3 Честно про красный прогон `3d486e0`
+
+Первый же CI по опубликованному коду **упал**, и это надо знать ревьюеру:
+
+- тест `JitBootTest.zygoteRestartOnlyInsideJitToggleBlock` (написан в iter33n-fix1) требовал, чтобы
+  литерал `ctl.restart zygote` жил в `AppPerformance.kt`; fix3/fix4 перенесли текст watcher-скрипта
+  в чистое ядро `JitNetModel.watcherScript()` (`JitNetCore.kt:141`) — тест стал проверять
+  несуществующее место;
+- в локальном стенде `scripts/localjvm` этот класс не входил в мой обычный набор, поэтому локально
+  прогон был зелёным (63/0) — это и есть ограничение локальных заглушек: **зелёный локальный прогон
+  не заменяет Android CI**, ровно как сказано в ревью;
+- исправление — `e248231`: тест переписан по факту кода (литерал ровно один и только в теле
+  `watcherScript()`, `AppPerformance` делегирует текст и содержит лишь запись/запуск скрипта внутри
+  `JIT_ZYGOTE_BEGIN…END`). Кода продукта правка не касается (только `src/test`).
+
+Ни один пункт fix3/fix4 от этой правки не изменился; все 5 блокирующих требований §1–§5 проверяются
+тестами, которые прошли в run `42868979959`.
 
 ## 1. Блокирующее по существу: продолжение операции после zygote
 
@@ -40,7 +62,7 @@
 операции.
 
 **Исправлено именно так.** Введено явное решение о том, что делать с сетью при запуске процесса —
-`JitFlow.bootNetAction(intentVerified, phaseProven)` (`JitNetCore.kt:440`):
+`JitFlow.bootNetAction(intentVerified, phaseProven)` (`JitNetCore.kt:448`):
 
 | Условия | Действие |
 |---|---|
@@ -48,7 +70,7 @@
 | нет намерения, либо намерение от другой загрузки, либо фазы нет (ни одной строки нашей операции) | `NONE_COLD` — **ноль сетевых действий**, маркер только читается для лога |
 
 Реализация в оркестраторе — `AppPerformance.netOnProcessStart` (`AppPerformance.kt:930`),
-вызывается в начале `jitPendingVerify` (`:984`), т.е. на старте процесса:
+вызывается в начале `jitPendingVerify` (`AppPerformance.kt:970`, вызов `:984`), т.е. на старте процесса:
 
 ```
 JIT_NET_CONTINUE reason=post_zygote op=op-… phase_proven=yes (продолжение операции JIT)
@@ -98,7 +120,7 @@ JIT_NET_PENDING marker=wifi=1,ap=0 policy=full op=… intent_verified=false phas
 **Замечание:** в приведённом фрагменте watcher проверял только существование общего файла, а не
 содержимое; гонка между проверкой и `setprop ctl.restart` не обработана.
 
-**Исправлено** (`JitNetModel.watcherScript`, `JitNetCore.kt:145`):
+**Исправлено** (`JitNetModel.watcherScript`, `JitNetCore.kt:141`):
 
 ```sh
 echo "JIT_ZYGOTE_ARMED op=$OP want=$V delay=${DELAY:-8} pid=$$" > $OUT      # 1) до sleep
@@ -119,7 +141,7 @@ echo "JIT_ZYGOTE_DONE op=$OP runtime=$RT persist=$PS want=$V zygote_restart=ok w
   `cancelFileWithOurOpPreventsRestart` (рестарт не выполнялся, есть `ABORTED op=<наш id>`);
 - гонка «отмена пришла между проверкой файла и рестартом» больше не додумывается: строка
   `JIT_ZYGOTE_RESTARTING op=<id>` пишется непосредственно перед `setprop`. Разбор
-  (`JitFlow.cancelOutcome`, `JitNetCore.kt:403`) даёт `CANCELLED` только при `ABORTED` нашего id,
+  (`JitFlow.cancelOutcome`, `JitNetCore.kt:411`) даёт `CANCELLED` только при `ABORTED` нашего id,
   `RESTARTED` при `RESTARTING`/`DONE` нашего id, иначе `UNKNOWN`;
 - `UNKNOWN` не считается успехом: `restartStillPossible` = true, маркер сети и снимок AVAS
   сохраняются, в логе `restart_possible=yes`;
@@ -131,7 +153,7 @@ echo "JIT_ZYGOTE_DONE op=$OP runtime=$RT persist=$PS want=$V zygote_restart=ok w
 
 **Замечание:** требование `link=up` всегда — неверно для случая, когда Wi-Fi был выключен до операции.
 
-**Исправлено** (`RestoreResult`, `JitNetCore.kt:250–310`): требования зависят от того, что было
+**Исправлено** (`RestoreResult`, `JitNetCore.kt:275–320`, `canClearMarker` :316): требования зависят от того, что было
 сохранено:
 
 ```kotlin
@@ -164,7 +186,7 @@ val canClearMarker = fullyRestored
 
 - **Потеря ответа / частичное исполнение.** Уже в fix3: `propsMaybeTouched = true` сразу после
   отправки скрипта; откат attempt-ится всегда, успех — по **точному** разбору read-back
-  (`tag("rt")`/`tag("pr")`, `JitNetCore.kt:520`), а не по подстроке (`want_rt=false` больше не
+  (`tag("rt")`/`tag("pr")`, `JitNetCore.kt:525`), а не по подстроке (`want_rt=false` больше не
   выглядит как `rt=false`). Статусы: `props_rollback=ok|failed|skipped`, `cancel=CANCELLED|RESTARTED|UNKNOWN`,
   `net_marker=cleared|kept`. Тест `propsRollbackIsVerified` (4 случая, включая ловушку подстроки).
 - **Гонки AVAS.** `AvasCore.scheduleRestore` целиком под тем же `synchronized(lock)`, что и `save`,
@@ -186,17 +208,17 @@ val canClearMarker = fullyRestored
 
 | Что | Где |
 |---|---|
-| `ARMED` до задержки и до рестарта | `JitNetCore.kt:145` (`watcherScript`), шаг 1 |
+| `ARMED` до задержки и до рестарта | `JitNetCore.kt:141` (`watcherScript`), шаг 1 |
 | строки с `op=<id>` | там же: `ARMED`, `ABORTED`, `RESTARTING`, `DONE` |
 | отмена по содержимому файла | там же, шаг 2 (`grep -q "op=$OP"`) |
 | точка невозврата | там же, шаг 3 (`JIT_ZYGOTE_RESTARTING`), затем `setprop ctl.restart zygote` |
-| очистка старого результата | `AppPerformance.kt:1402` (`resetWatcherResult`), вызов `:1170` |
-| сверка по id | `JitNetCore.kt:380–420` (`armedFor/doneFor/abortedFor/restartingFor/cancelOutcome`) |
-| решение «сеть при старте» | `JitNetCore.kt:440` (`bootNetAction`), `AppPerformance.kt:930` |
-| возврат как продолжение операции | `JitNetCore.kt:601` (`restorePendingInChain`), вызовы `AppPerformance.kt:939`, `:1163` |
+| очистка старого результата | `AppPerformance.kt:1399` (`resetWatcherResult`), вызов `:1211` |
+| сверка по id | `JitNetCore.kt:375–430` (`armedFor/doneFor/abortedFor/restartingFor/cancelOutcome` :411) |
+| решение «сеть при старте» | `JitNetCore.kt:448` (`bootNetAction`), `AppPerformance.kt:930` |
+| возврат как продолжение операции | `JitNetCore.kt:613` (`restorePendingInChain`), `JitNet.kt:153`, вызовы `AppPerformance.kt:939`, `:1163` |
 | нет `pkill`/`pgrep`/`kill` | отсутствуют во всех `tools/*.kt` (grep) |
-| откат props по read-back | `JitNetCore.kt:505–530` |
-| маркер только при полном подтверждении | `JitNetCore.kt:250–310` |
+| откат props по read-back | `JitNetCore.kt:525–537` (`rollbackProps`) |
+| маркер только при полном подтверждении | `JitNetCore.kt:275–320` |
 
 ---
 
@@ -207,16 +229,16 @@ val canClearMarker = fullyRestored
 | # | Действие | Строка |
 |---|---|---|
 | 0 | `JitNet.restorePendingInChain("pre")` — хвост прошлой операции | `:1163` |
-| 1 | `JitNet.saveBeforeRestart()` — чтение Wi-Fi/AP + подтверждённая запись маркера | `:1166` |
-| 2 | `opId` + `writeIntentConfirmed(want, opId)` + ворота `JitFlow.gate` | `:1170–1172` |
-| 3 | `resetWatcherResult()` — `rm -f` итога/отмены + проверка чтением | `:1192` |
-| 4 | `AvasRestore.saveBeforeRestart()` + `jitProfiles()` | `:1218` |
-| 5 | `JitNet.runPreRestart()`: `svc wifi disable` → слив `oif wlan0` ≤20 с → `setprop` | `:1230` |
-| 6 | заливка скрипта watcher-а + `WSIZE` | `:1243` |
-| 7 | `nohup sh <watcher> <op> <want> 8 5 &` + `waitWatcherArmed(op)` | `:1296` |
-| 8 | при отказе: `cancelWatcherAndVerify(op)` → `abortAfterNet(...)` | `:1300–1325` |
-| 9 | `ToolsStep.PARTIAL` + лог `… net_return=post_zygote op=<id> verify=next_start` | `:1330` |
-| 10 | **после подъёма процесса**: `netOnProcessStart` → `CONTINUE_OPERATION` → возврат сети | `:930`, `:984` |
+| 1 | `JitNet.saveBeforeRestart()` — чтение Wi-Fi/AP + подтверждённая запись маркера | `:1167` |
+| 2 | `opId` + `writeIntentConfirmed(want, opId)` + ворота `JitFlow.gate` (`JitNetCore.kt:341`) | `:1171–1173` |
+| 3 | `resetWatcherResult()` — `rm -f` итога/отмены + проверка чтением | `:1211` |
+| 4 | `AvasRestore.saveBeforeRestart()` + `jitProfiles()` | `:1232` |
+| 5 | `JitNet.runPreRestart()`: `svc wifi disable` → слив `oif wlan0` ≤20 с → `setprop` (`JitNetCore.kt:181`) | `:1238` |
+| 6 | заливка скрипта watcher-а + `WSIZE` | `:1247` |
+| 7 | `nohup sh <watcher> <op> <want> 8 5 &` + `waitWatcherArmed(op)` (`:1465`) | `:1282`, `:1285` |
+| 8 | при отказе: `cancelWatcherAndVerify(op)` (`:1415`) → `abortAfterNet(...)` (`:1339`) | `:1287–1288` |
+| 9 | `ToolsStep.PARTIAL` + лог `… net_return=post_zygote op=<id> verify=next_start` | `:1314`, `:1327` |
+| 10 | **после подъёма процесса**: `netOnProcessStart` (def `:930`, чтение итога `:931`, возврат `:939`) → `CONTINUE_OPERATION` → сеть | `:984` |
 
 Разрешённый набор команд не расширен: `svc wifi disable`, `ip rule … oif wlan0`,
 `setprop dalvik.vm.usejit*`, `setprop ctl.restart zygote` (внутри watcher-а по клику),
@@ -225,19 +247,20 @@ val canClearMarker = fullyRestored
 
 ---
 
-## 7. Локальный прогон тестов
+## 7. Локальный прогон тестов (не заменяет CI)
 
 `scripts/localjvm/` (без Android SDK, заглушки `android.*`/`org.junit.*`; в Gradle не входит):
 
 ```
-JitNetCoreTest (26)      PASS 26 / FAIL 0
-AvasCoreTest (13)        PASS 13 / FAIL 0
-JitWatcherScriptTest (4) PASS 4  / FAIL 0   ← исполняет НАСТОЯЩИЙ sh-скрипт watcher-а
-AvasContractTest (5)     PASS 5  / FAIL 0
-JitToggleChainTest (5)   PASS 5  / FAIL 0
-NetSanitizePlanTest (7)  PASS 7  / FAIL 0
-BuildMarkerTest (3)      PASS 3  / FAIL 0
-ИТОГ: PASS=63 FAIL=0
+JitNetCoreTest (26)        PASS 26 / FAIL 0
+AvasCoreTest (13)          PASS 13 / FAIL 0
+JitWatcherScriptTest (4)   PASS 4  / FAIL 0   ← исполняет НАСТОЯЩИЙ sh-скрипт watcher-а
+AvasContractTest (5)       PASS 5  / FAIL 0
+JitToggleChainTest (5)     PASS 5  / FAIL 0
+NetSanitizePlanTest (7)    PASS 7  / FAIL 0
+BuildMarkerTest (3)        PASS 3  / FAIL 0
+JitBootTest (6)            PASS 6  / FAIL 0   ← добавлен после красного CI (§0.3)
+ИТОГ: PASS=69 FAIL=0
 ```
 
 Компиляцией (заглушки Android) проверено, что `AppPerformance.kt`, `JitNetCore.kt`, `JitNet.kt`,
@@ -250,7 +273,9 @@ BuildMarkerTest (3)      PASS 3  / FAIL 0
 3. в новом `RestoreResult` отсутствовало требование канала для `wifi=1` (проверено тестом);
 4. `AvasCoreTest` не компилировался (`SnapshotStore` vs `MemStore`).
 
----
+Поймано **только CI** (и это ограничение локального стенда, а не CI):
+5. `JitBootTest.zygoteRestartOnlyInsideJitToggleBlock` — статический тест на место литерала
+   `ctl.restart zygote` (§0.3), исправлено в `e248231`.
 
 ## 8. Ограничения (без них отчёт был бы нечестным)
 
@@ -263,4 +288,5 @@ BuildMarkerTest (3)      PASS 3  / FAIL 0
 - Отмена возможна только до строки `RESTARTING`; после неё честный статус — `RESTARTED`.
 - После `UNKNOWN`/`RESTARTED` снимок AVAS сохраняется и будет обработан по обычному расписанию
   `AvasRestore` (это существующий механизм, не новый).
-- `SOURCE_SHA` обновится handoff-коммитом; `git rev-parse` в сборке не используется.
+- `SOURCE_SHA=e248231` записан handoff-коммитом `d5bf108` (только `buildinfo.properties`);
+  `git rev-parse` в сборке не используется, git-команды при сборке запрещены и не вызываются.
