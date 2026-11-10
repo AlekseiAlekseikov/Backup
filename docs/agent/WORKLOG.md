@@ -1077,3 +1077,42 @@
   артефакт `13771533798` (177 172 323 Б), `BUILD SUCCESSFUL in 4m 17s`.
 - **`42832827628`** (`d33eaa5`, HEAD; только docs) — ✅ 164 PASSED / 0 FAILED, job `129887092945`,
   артефакт `13772668459` (177 172 241 Б).
+
+## iter33p-fix1 (1.0.62) — закрытие 4 блокирующих замечаний REVIEW_iter33p
+
+### Сделано
+
+- **§1 сеть при отказах** (`AppPerformance.kt:915-937,973,984,1147-1166,1203-1209`, `JitNet.kt:75-120,275-330`):
+  без подтверждённого сохранения состояние сети операция прерывается (`aborted reason=no_net_state`,
+  `ToolsStep.Status.BLOCKED`) ДО `svc wifi disable`; отказ после отключения Wi-Fi компенсируется в той же
+  операции (`JIT_NET_COMPENSATE`, zygote не перезапускается); возврат сети вызывается сразу после решения
+  «намерение наше» и в ветке `STALE` — до чтения props и до ожидания `JIT_ZYGOTE_DONE`; сохранение
+  снимается только по `allConfirmed`, иначе `keep_saved`; `request=`/`state=`/`link=` в логе разделены.
+- **§2 точное удаление `ip rule`** (`JitNet.kt:199-258`): решение — `sanitizePlan` (удаление только при
+  `oif == wlan0`, единственном `oif` и уникальном priority; иначе `SKIP_NOT_OIF_WLAN0|SKIP_MULTIPLE_OIF|
+  SKIP_DUPLICATE_PRIORITY`), скрипт перечитывает `ip rule show` перед каждым `ip rule del <полный spec>`,
+  `scope=oif_wlan0` в логе.
+- **§3 доказанный id AVAS** (`scripts/derive_avas_sound_prop.py`, `AvasRestore.kt:48,51`): разбор
+  `libexpolitica.so` + самопроверка на двух подряд идущих полевых id нашего кода
+  (`h(0x15)=0x2140A377` = `AC_AMBIENT_TEMP`, `h(0x16)=0x2140A379` = `AC_INSIDE_TEMP`) → `h(7)=0x21407057`,
+  области `{0,1}`.
+- **§4 сверка по read-back + контрольные окна** (`AvasRestore.kt:121-153,290-360`): `plan` пишет только
+  расхождения сохранёнными значениями; `verdict` — `ok|already_ok|unverified|failed`, нечитаемое = `unverified`;
+  снимок снимается только при подтверждении И последнем окне; расписание 5 с → 12 с → 30 с ×5 на КАЖДЫЙ
+  снимок (`id`), а не один раз за процесс.
+- **🟡**: единый атомарный снимок `avas_snapshot` (temp+rename, `AvasRestore.kt:252-266`), «запрос ≠
+  состояние» в `attemptLine`, `LogFiles.writable` + фоллбэк внутрь `filesDir/logs` (`LogFiles.kt:72-93,120-142`).
+- **Тесты 164 → 174**: новые/переписанные `NetSanitizePlanTest` (7), `NetRestoreTest` (7),
+  `AvasRestoreTest` (9), `LogFilesTest` (6, `unwritableDirIsDetected`), `BuildMarkerTest` → 62.
+
+### Открыто
+
+1. Полевой прогон JIT не выполнялся (условие ревьюера: только после повторного REVIEW и с логом).
+2. Гарантии восстановления сети/AVAS нет — механизм + честные логи; см. §8 отчёта.
+
+### CI
+
+- `42837804148` (`8f4ceba`) — ❌ 172 PASSED / 2 FAILED (`BuildMarkerTest.versionIs61` ждал 61,
+  `NetRestoreTest.abortWhenStateNotSaved` ловил слово `svc wifi disable` в комментарии) → исправлено.
+- **`42840556489` (`8b24928`, HEAD; код iter33p-fix1) — ✅ 174 PASSED / 0 FAILED**,
+  job `129914321552`, `BUILD SUCCESSFUL in 4m 16s`, артефакт `13775398418` (177 177 169 Б).
