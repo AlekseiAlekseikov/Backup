@@ -1126,11 +1126,12 @@ object AppPerformance {
             File(app.filesDir, JIT_PENDING_WANT_FILE).writeText("want=$want")
         }
         val D = "$"
-        val b64 = android.util.Base64.encodeToString(
-            jitZygoteWatcherScript().toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP)
         // iter33p §2.2: сеть вокруг zygote — как `w0/la.run`: svc wifi disable → drain `oif wlan0`
         // (≤20 с) → setprop. Watcher с самим рестартом ставим только ПОСЛЕ этого.
         val netPre = runCatching { JitNet.runPreRestart(app, want) }.getOrNull()
+        // Скрипт watcher-а собираем уже после сети: сначала слив правил, потом заливка и запуск.
+        val b64 = android.util.Base64.encodeToString(
+            jitZygoteWatcherScript().toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP)
         val prep = """
             echo RT=${D}(getprop $PROP_USEJIT)
             echo PS=${D}(getprop $PROP_PERSIST_USEJIT_INIT)

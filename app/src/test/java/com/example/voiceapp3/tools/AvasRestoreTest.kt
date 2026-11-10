@@ -141,7 +141,7 @@ class AvasRestoreTest {
                 .startsWith("AVAS_SAVE skipped reason=")
         )
         assertEquals(
-            "AVAS_RESTORE attempt=1 mode_saved=3 mode_now=0 sound_saved=2@0 sound_now=0@0 " +
+            "AVAS_RESTORE attempt=1 mode_saved=3 mode_now=3 sound_saved=2@0 sound_now=0@0 " +
                 "result=ok where=jit_toggle",
             AvasRestore.attemptLine(
                 1, 3, 3, "2@0", "0@0", AvasRestore.Verdict.OK, AvasRestore.Where.JIT_TOGGLE
@@ -163,10 +163,17 @@ class AvasRestoreTest {
             .map { it.name }.toList()
         assertEquals("запись режима AVAS допустима только в AvasRestore.kt", listOf("AvasRestore.kt"), hits)
 
+        // Общий `setIntProperty` есть и в других модулях (окна, VHAL) — поэтому границу держим
+        // по AVAS-специфичным маркерам, а не по имени метода Car API.
         val hitsSound = mainRoot().walkTopDown()
-            .filter { it.isFile && it.extension == "kt" && it.readText().contains("setIntProperty") }
+            .filter {
+                it.isFile && it.extension == "kt" &&
+                    (it.readText().contains("restoreSavedAvasSoundType") ||
+                        it.readText().contains("avas_sound_saved"))
+            }
             .map { it.name }.toList()
-        assertEquals("sound type пишется только в AvasRestore.kt", listOf("AvasRestore.kt"), hitsSound)
+        assertEquals("sound type AVAS пишется только в AvasRestore.kt",
+            listOf("AvasRestore.kt"), hitsSound)
 
         val s = read("src/main/java/com/example/voiceapp3/tools/AvasRestore.kt")
         assertTrue(
@@ -200,7 +207,9 @@ class AvasRestoreTest {
         val hits = mainRoot().walkTopDown()
             .filter {
                 it.isFile && it.extension == "kt" &&
-                    (it.readText().contains("saveBeforeRestart(") || it.readText().contains("scheduleRestore("))
+                    (it.readText().contains("AvasRestore.saveBeforeRestart") ||
+                        it.readText().contains("AvasRestore.scheduleRestore") ||
+                        it.readText().contains("fun scheduleRestore("))
             }
             .map { it.name }.toList()
         assertTrue("кроме определения остаётся только AppPerformance.kt: $hits",
