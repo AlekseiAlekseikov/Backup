@@ -786,3 +786,42 @@
 - `42866873182` / job `130007455625` (`3d486e0`) — ❌ 1 FAILED (старый статический тест).
 - `42858741744` (`25eef00`, fix2) — ✅ 193 PASSED / 0 FAILED, job `129978799323`,
   artifact `13785111537` (к fix3/fix4 не относится).
+
+## iter33p (1.0.61, перезапуск задачи) — одна JIT-цепочка по референсу
+
+**Референс проверен заново:** ZIP MD5 `8a65c6c29749c64d4e335c57490a347a`, внутренний APK MD5
+`c3f1664125953b9851bf4483b265135f` — обе суммы совпали; разбор внешнего APK, jadx 1.4.7 + smali
+(`w0/j9.onClick` и `CentralWatchdogService.U(...)` jadx не декомпилировал).
+
+**Что делает референс:** `j9.onClick` читает `isWifiEnabled()` и `ap0` → один `commit()` префов
+(`jit_pedido`, `perf_auto_otimizar`, `jit_restaurar="wifi=…,ap=…"`) → `la.run`: `svc wifi disable` →
+слив `ip rule … oif wlan0` ≤20 с → `setprop dalvik.vm.usejit` → `setprop ctl.restart zygote`
+**последней командой** (40 с, root-транспорт) → на старте сервиса `e2.run` (через 15 с) возвращает
+**AP первым**, затем Wi-Fi, если они были включены. Проверка результата — `r7.run`:
+`getprop` + `/proc/self/maps` + снятие `jit_pedido`; рестарт zygote в референсе **не подтверждается**.
+
+**У нас:** watcher, файл-отмена и чтение `ARMED` убраны. Одна операция = снимок (`op`, `boot`, `wifi`,
+`ap`, `want`, `zygote_pid`, `rt_before`, `ts`, подтверждение чтением) + один скрипт с журналом шагов
+`JITSTEP op=<id> step=…` + разбор на старте процесса через `JitFlow.pendingAction`:
+`CONTINUE_RESTORE` (pid zygote сменился — продолжение операции, без второго клика), `COMPENSATE_RESTORE`
+(рестарт доказанно не состоится: окно 60 с истекло / скрипт вернул управление / была перезагрузка ГУ),
+`DISCARD_NO_EFFECT` (сети не касались), `HOLD_UNKNOWN` (доказательств нет — ноль сетевых команд,
+`need=owner_decision`). `JIT_APPLIED` печатает getprop/maps/рестарт/вердикт раздельно; `restart=ok`
+только по смене pid zygote.
+
+**Убрано:** watcher `/data/local/tmp/jit_zygote_watch.sh`, `nohup`, 8-секундная задержка, файлы
+`jit_zygote_result.txt`/`jit_zygote_cancel`, файл-намерение `jit_pending_verify` (+`.processing`,
+`jit_verify_cycle`), `dalvik.vm.usejitprofiles` в записи, удаление `ip rule … oif wlan0`
+(теперь read-only подсчёт), `umount` не копировался.
+
+**Тесты:** `JitNetCoreTest` 23, `JitChainScriptTest` 5 (настоящий `/bin/sh` с подставными `svc`/`ip`/
+`setprop`/`getprop`/`sleep`), `JitRulesReadOnlyTest` 3, `JitToggleChainTest` 5, `JitBootTest` 6,
+`AvasCoreTest` 13, `AvasContractTest` 5, `BuildMarkerTest` 3 — **63 PASS / 0 FAIL** локально.
+`JitWatcherScriptTest` → `JitChainScriptTest`, `NetSanitizePlanTest` → `JitRulesReadOnlyTest`.
+
+**AVAS:** поведение не менялось (снимок mode+sound type, только цепочка JIT и старт приложения,
+read-back, привязка к операции); в KDoc снят недоказанный «точный график референса 5/12/30 с» —
+это AEB observer, а `z()` в референсе возвращает муту, а не mode.
+
+**Открыто:** полевого прогона JIT нет (по условию — после нового REVIEW); случай «снимок есть,
+журнала нет, сеть уже не та» намеренно останавливается на `HOLD_UNKNOWN` и ждёт решения владельца.

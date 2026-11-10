@@ -84,11 +84,13 @@ class AvasContractTest {
         val perf = src("src/main/java/com/example/voiceapp3/tools/AppPerformance.kt")
         val apply = perf.substringAfter("fun jitApplyWithZygote").substringBefore("JIT_ZYGOTE_END")
         assertTrue("снимок делается в цепочке тумблера", apply.contains("AvasRestore.saveBeforeRestart"))
-        assertTrue("снимок ПОСЛЕ сохранения сети (REVIEW §4)",
-            apply.indexOf("JitNet.saveBeforeRestart") < apply.indexOf("AvasRestore.saveBeforeRestart"))
-        assertTrue("снимок ПОСЛЕ подтверждения намерения",
-            apply.indexOf("writeIntentConfirmed") < apply.indexOf("AvasRestore.saveBeforeRestart"))
-        assertTrue("снимок отменяется при отмене операции", apply.contains("AvasRestore.discard"))
+        assertTrue("снимок ПОСЛЕ снимка операции (REVIEW §4)",
+            apply.indexOf("JitNet.saveOperation") < apply.indexOf("AvasRestore.saveBeforeRestart"))
+        assertTrue("снимок ДО единственного скрипта цепочки",
+            apply.indexOf("AvasRestore.saveBeforeRestart") < apply.indexOf("JitNet.runChain"))
+        // iter33p (1.0.61): отмены операции больше нет — рестарт это последняя команда скрипта,
+        // поэтому и «отменять» снимок в цепочке нечем; неудачная операция разбирается на старте.
+        assertTrue("в цепочке нет отмены снимка", !apply.contains("AvasRestore.discard"))
         val probe = perf.substringAfter("fun jitBootProbe(").substringBefore("JIT_ZYGOTE_BEGIN")
         assertTrue("на обычном старте — только планирование", probe.contains("AvasRestore.scheduleRestore"))
     }

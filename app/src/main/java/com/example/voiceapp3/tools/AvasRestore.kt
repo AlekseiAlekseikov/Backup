@@ -5,9 +5,17 @@ import android.content.Context
 import java.io.File
 
 /**
- * iter33p-fix2 §3/§4 — AVAS в точности по механизму референса (модель + Android-адаптер).
+ * iter33p — AVAS: возврат ТОЛЬКО сохранённых mode/sound type, в цепочке JIT и на старте приложения.
  *
- * Механизм референса CentralEXAuto 3.3.9 (байткод `classes.dex`):
+ * Что здесь НАША адаптация, а что взято из референса CentralEXAuto 3.3.9 (`classes.dex`) —
+ * важно не выдавать одно за другое:
+ *  • в референсе `CentralWatchdogService.z()` возвращает МУТУ и только при `avas_muted_saved`,
+ *    а `CentralWatchdogService.A()` возвращает sound type из `avas_sound_type_saved` на загрузке;
+ *    JIT-снимка «mode + sound type» там НЕТ — это наша разрешённая владельцем адаптация;
+ *  • ранее заявленный «точный AVAS-график референса 5/12/30 с» не подтверждён: найденные
+ *    `5 × 30 с` относятся к AEB observer, а не к AVAS. Наши окна — собственный минимум.
+ *
+ * Из референса действительно взяты только API и константы:
  *  • режим — `Car.createCar(ctx).getCarManager("audio")`: рефлексия `getAVASMode()` / `setAVASMode(int)`
  *    (`w0/d0`, `w0/df`, `w0/qa`);
  *  • sound type — `CarPropertyManager.getIntProperty(propId, area)` / `setIntProperty(propId, area, value)`
@@ -60,7 +68,14 @@ object AvasRestore {
      */
     internal const val SNAPSHOT_TTL_MS = 10 * 60_000L
 
-    /** Окна сверки: ~5 с, ~12 с, далее по 30 с (паттерн референса). */
+    /**
+     * Окна сверки — НАШ минимум, а не «график референса».
+     *
+     * Почему так: `ctl.restart zygote` поднимает фреймворк за 10–20 с, наш процесс стартует
+     * позже него; первые окна ~5 с и ~12 с покрывают быстрый старт, дальше — редкая сверка
+     * (42…162 с) на случай отложенного подъёма после сна. Всё ограничено и заканчивается:
+     * вечного watchdog-а нет, повторной записи без расхождения нет.
+     */
     internal val ATTEMPT_SCHEDULE_MS =
         longArrayOf(5_000, 12_000, 42_000, 72_000, 102_000, 132_000, 162_000)
 
