@@ -11,15 +11,16 @@ import java.io.File
  *
  * Прежняя версия выбирала строки `oif wlan0`, но удаляла по `priority`. Если одинаковый priority
  * имеют разные правила (или список изменился между чтением и удалением), сносилось чужое правило.
- * Теперь решение — чистая функция [JitNet.sanitizePlan] (её же повторяет on-device скрипт):
+ * Теперь решение — чистая функция [JitNet.sanitizePlan] (её же повторяет on-device скрипт
+ * `JitNetModel.sanitizeScript()`, который тест берёт не из текста, а вызывает):
  * удаляем только при однозначной идентификации полным набором селекторов, иначе отказ.
  */
 class NetSanitizePlanTest {
 
     private val src: String
         get() = listOf(
-            File("src/main/java/com/example/voiceapp3/tools/JitNet.kt"),
-            File("app/src/main/java/com/example/voiceapp3/tools/JitNet.kt")
+            File("src/main/java/com/example/voiceapp3/tools/JitNetCore.kt"),
+            File("app/src/main/java/com/example/voiceapp3/tools/JitNetCore.kt")
         ).first { it.isFile }.readText()
 
     // 1. Разбор строк `ip rule show`.
@@ -97,12 +98,12 @@ class NetSanitizePlanTest {
     @Test
     fun scriptReReadsAndRefusesAmbiguity() {
         val s = src
-        val script = s.substringAfter("internal fun sanitizeScript()").substringBefore("// ──")
+        val script = JitNetModel.sanitizeScript()
         assertTrue("список перечитывается в цикле", script.contains("ip rule show 2>/dev/null | grep 'oif wlan0'"))
         assertTrue("проверка дубликата priority", script.contains("duplicate_priority"))
         assertTrue("проверка нескольких oif", script.contains("multiple_oif"))
         assertTrue("проверка чужого интерфейса", script.contains("not_wlan0") || script.contains("why=not_wlan0"))
-        assertTrue("удаление по полному spec", script.contains("ip rule del \${D}spec"))
+        assertTrue("удаление по полному spec", script.contains("ip rule del \$spec"))
         assertTrue("удаления только по priority нет", !script.contains("ip rule del priority"))
         assertTrue("итог виден в логе", script.contains("scope=oif_wlan0"))
         for (bad in listOf("flush", "iptables", "ip6tables", "oif wlan1", "oif usb0")) {

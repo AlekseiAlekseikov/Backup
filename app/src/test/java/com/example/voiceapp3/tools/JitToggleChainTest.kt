@@ -8,6 +8,8 @@ import java.io.File
 /**
  * iter33p §2/§6 — цепочка тумблера JIT ровно по референсу (`w0/la.run` → `w0/e2.run`).
  *
+ * Поведение ядра — в [JitNetCoreTest]; здесь порядок в скрипте и границы файлов.
+ *
  * Порядок строгий: сохранить состояние сети → `svc wifi disable` → дождаться, пока уйдут правила
  * `ip rule … oif wlan0` (≤20 с) → `setprop dalvik.vm.usejit` → рестарт фреймворка (watcher).
  * Если рестарт уйдёт раньше слива правил, после подъёма останутся «висящие» `oif wlan0`
@@ -87,9 +89,9 @@ class JitToggleChainTest {
         assertTrue("сохранение ДО подготовки сети", save < apply.indexOf("JitNet.runPreRestart"))
         assertTrue("сохранение ДО watcher-а", save < apply.indexOf("jitZygoteWatcherScript()"))
         // Формат хранения — как `jit_restaurar` референса (+ метка времени для TTL).
-        assertEquals("wifi=1,ap=0,ts=0", JitNet.State(true, false, 0L).wire())
-        assertEquals(JitNet.State(true, false, 0L), JitNet.parse("wifi=1,ap=0"))
-        assertEquals(JitNet.State(false, true, 0L), JitNet.parse("wifi=0,ap=1"))
+        assertEquals("wifi=1,ap=0,ts=0", JitNetModel.State(true, false, 0L).wire())
+        assertEquals(JitNetModel.State(true, false, 0L), JitNet.parse("wifi=1,ap=0"))
+        assertEquals(JitNetModel.State(false, true, 0L), JitNet.parse("wifi=0,ap=1"))
     }
 
     // 5. Сетевые команды не выходят за цепочку тумблера: единственный потребитель — AppPerformance.
@@ -102,6 +104,11 @@ class JitToggleChainTest {
                     (it.readText().contains("JitNet.") || it.readText().contains("svc wifi disable"))
             }
             .map { it.name }.sorted().toList()
-        assertEquals("сеть живёт только в JitNet.kt и цепочке тумблера", listOf("AppPerformance.kt", "JitNet.kt"), users)
+        // JitNetCore.kt — чистая модель/скрипт санации (без Android API): он и есть текст сетевых
+        // команд, поэтому обязан быть в списке; кроме этих трёх файлов сеть не упоминает никто.
+        assertEquals(
+            "сеть живёт только в JitNet.kt, его чистом ядре и цепочке тумблера",
+            listOf("AppPerformance.kt", "JitNet.kt", "JitNetCore.kt"), users
+        )
     }
 }

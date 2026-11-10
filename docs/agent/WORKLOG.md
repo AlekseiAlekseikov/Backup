@@ -1116,3 +1116,53 @@
   `NetRestoreTest.abortWhenStateNotSaved` ловил слово `svc wifi disable` в комментарии) → исправлено.
 - **`42840556489` (`8b24928`, HEAD; код iter33p-fix1) — ✅ 174 PASSED / 0 FAILED**,
   job `129914321552`, `BUILD SUCCESSFUL in 4m 16s`, артефакт `13775398418` (177 177 169 Б).
+
+## iter33p-fix2 (1.0.61) — закрытие 5 блокирующих замечаний REVIEW_iter33p-fix1
+
+Версия возвращена к 61 / `1.0.61` (владелец подтвердил: 1.0.61 не устанавливалась).
+
+### Сделано
+
+- **§1 поведенческие тесты сети** — логика вынесена в чистое ядро `tools/JitNetCore.kt`
+  (`JitNetModel`, `JitFlow`, `JitNetCore`; ни одного `android.*`), `JitNet.kt` стал адаптером.
+  Текстовые `NetRestoreTest.kt` и `AvasRestoreTest.kt` удалены; вместо них `JitNetCoreTest` (18)
+  и `AvasCoreTest` (12) с фейковым окружением (префы/скрипты/Wi-Fi/часы) и сценариями гибели
+  процесса между шагами.
+- **§2 повтор сети** (`AppPerformance.kt:1127-1300`, `JitNetCore.kt:236-300`): ворота
+  `JitFlow.gate` (нет состояния сети → `ABORT_NO_NET_STATE`, не подтвердилось намерение →
+  `ABORT_INTENT_WRITE`, маркер снимается), подтверждённая запись намерения (`writeIntentConfirmed`),
+  отдельное подтверждение запуска watcher-а по строке `JIT_ZYGOTE_ARMED` (`waitWatcherArmed`),
+  `abortAfterNet` (гашение watcher → откат props по read-back → компенсация сети → снимок AVAS
+  удаляется только если рестарт невозможен), восстановление сети на старте независимо от pending
+  (`recoverNetOnStart` вызывается до чтения pending), маркер снимается только по `canClearMarker`.
+- **§3 `ap0`** (`JitNetCore.kt:91-107`): read-only проба `P=/OS=/A=`; отсутствие интерфейса —
+  штатное «AP выключен», `null` только при молчащем канале.
+- **§4 AVAS** (`AvasCore.kt`, `AvasRestore.kt:41,89,128`): каждая попытка привязана к id своего
+  снимка (`stale_task`), удаление только при `lastWindow` + «снимок мой» + подтверждение,
+  монотонный `nextId()`, все обращения к Car API под одним `lock`, пустой sound-снимок → `UNVERIFIED`
+  (не `already_ok`), нечитаемый режим → ничего не пишем и `UNVERIFIED`, снимок делается ПОСЛЕ ворот
+  сети/намерения.
+- **§5 скрипт AVAS** (`scripts/derive_avas_sound_prop.py`, `docs/agent/avas_identity.md`,
+  `docs/agent/ref/**`): формат входа определяется по содержимому (обёртка / APK / отказ), печатаются
+  md5+sha256 трёх уровней, `int[248]` восстанавливается мини-дизассемблером AArch64 из ветки `cmd=5`,
+  проверяются dex-строки и 10 smali-улик, в конце `САМОПРОВЕРКА: OK`. Прогон на обёртке, на самом APK
+  и корректный отказ на `assets/pip-overlay.apk`.
+- **🟡 TTL** (`JitNetCore.kt:60-90`, `AvasRestore.kt:41`): обоснование 10 минут; сеть — при
+  просрочке `wifi=1` Wi-Fi возвращается, AP не поднимается (`WIFI_ONLY`), при `wifi=0` — `DROP`;
+  часы назад (`now < ts`) просрочкой не считаются.
+- **🟡 «восстановлено» ≠ «интернет»** (`JitNetCore.kt:203-230`): `essentials`/`fully`/`link`/
+  `sanitize_left` разделены, снятие маркера по `canClearMarker`, а не по `fullyRestored`.
+- **Локальный прогон тестов без Android SDK**: `scripts/localjvm/` (заглушки + рефлексивный
+  Runner) — 50 PASS / 0 FAIL на этом коде; инструкция в `scripts/localjvm/README.md`.
+
+### Открыто
+
+1. Полевой прогон JIT на ГУ не выполнялся — не рекомендован до зелёного CI и повторного ревью.
+2. Совместимость `ip rule del <полный spec>` на целевой прошивке и приём AVAS-свойства
+   подтверждаются только полем (в логах `priority=/spec=` и `getIntProperty`).
+
+### CI
+
+- Предыдущий зелёный: `42843273431` (`6335ed0`) — ✅ 174 PASSED / 0 FAILED, job `129923870857`,
+  артефакт `13778445997`.
+- По iter33p-fix2 — заполняется после push (без job-id слово «PASSED» не используется).

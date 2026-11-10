@@ -906,30 +906,20 @@ object AppPerformance {
     }
 
     /**
-     * iter33p-fix1 §1/§3.2 — вернуть сеть по сохранённому состоянию и запланировать возврат AVAS.
+     * iter33p-fix2 §1 — возврат сети на старте.
      *
-     * Вызывается из [jitPendingVerify] ТОЛЬКО когда файл-намерение реально есть (то есть был
-     * незавершённый JIT-сценарий) — на обычном старте сетевых действий нет.
-     * Сохранённое состояние снимается лишь после подтверждённого возврата.
+     * Ключевое отличие от 1.0.62 (REVIEW §2): возврат больше НЕ привязан к файлу-намерения JIT.
+     * Маркер `jit_net_saved` — это самостоятельное состояние «возврат не завершён»: он пишется
+     * перед сетевыми изменениями и снимается только по подтверждённому состоянию. Поэтому
+     * «повторим на следующем старте» выполняется даже если pending-файл уже удалён (после STALE
+     * или после завершённой верификации).
+     *
+     * Нет маркера — ни одного сетевого действия (обычный старт ничего не трогает).
      */
-    private fun restoreNetAndScheduleAvas(app: Context, where: AvasRestore.Where, reason: String) {
-        val saved = JitNet.savedState(app)
-        if (saved == null) {
-            AppLog.i(TAG, "JIT_NET_RESTORE skipped reason=no_saved_state context=$reason")
-        } else if (JitNet.isExpired(saved, System.currentTimeMillis())) {
-            JitNet.clearSaved(app)
-            AppLog.i(TAG, "JIT_NET_RESTORE skipped reason=expired age_ms=" +
-                "${System.currentTimeMillis() - saved.tsMs} context=$reason")
-        } else {
-            val res = runCatching { JitNet.restoreAfterRestart(app, saved) }.getOrNull()
-            if (res?.allConfirmed == true) {
-                JitNet.clearSaved(app)
-            } else {
-                AppLog.i(TAG, "JIT_NET_RESTORE keep_saved state=" +
-                    "${res?.log() ?: "unknown"} context=$reason (повторим на следующем старте)")
-            }
-        }
-        runCatching { AvasRestore.scheduleRestore(app, where) }
+    private fun recoverNetOnStart(app: Context, reason: String) {
+        val rec = runCatching { JitNet.recoverOnStart(app, reason) }.getOrNull()
+        AppLog.i(TAG, "JIT_NET_START result=${rec?.name ?: "error"} context=$reason " +
+            "state=${JitNet.savedState(app)?.wire() ?: "none"}")
     }
 
     /** Одна сверка на процесс (иначе `onCreate` + `onStartCommand` дают две одинаковые строки). */
@@ -949,6 +939,9 @@ object AppPerformance {
     fun jitPendingVerify(context: Context): Boolean {
         if (!jitPendingDone.compareAndSet(false, true)) return false
         val app = context.applicationContext
+        // iter33p-fix2 §1: сеть возвращаем ДО всего остального и независимо от pending —
+        // незавершённый возврат определяется маркером `jit_net_saved`, а не файлом-намерением.
+        recoverNetOnStart(app, "boot")
         val pendFile = File(app.filesDir, JIT_PENDING_FILE)
         if (!pendFile.isFile) return false
         val pending = runCatching { pendFile.readText().trim() }.getOrDefault("")
@@ -968,9 +961,8 @@ object AppPerformance {
             JitBootMark.PendingDecision.STALE -> {
                 runCatching { pendFile.delete() }
                 runCatching { File(app.filesDir, JIT_PENDING_WANT_FILE).delete() }
-                // iter33p-fix1 §1 REVIEW: даже при устаревшем намерении сеть могла остаться
-                // выключенной прошлой операцией — возвращаем её (только из сохранённого состояния).
-                restoreNetAndScheduleAvas(app, where, "pending_stale")
+                // Сеть уже возвращена в начале функции (recoverNetOnStart) — здесь только план AVAS.
+                runCatching { AvasRestore.scheduleRestore(app, where) }
                 AppLog.i(TAG, "JIT_APPLIED runtime=unknown want=${want.ifEmpty { "empty" }} " +
                     "zygote_restart=unknown maps=unknown result=unknown via=pending_verify " +
                     "reason=pending_stale (намерение от другой загрузки — итог неизвестен)")
@@ -978,10 +970,9 @@ object AppPerformance {
             }
             JitBootMark.PendingDecision.VERIFY -> Unit
         }
-        // iter33p-fix1 §1 REVIEW: сеть возвращаем СРАЗУ после решения «намерение наше» — до чтения
-        // props и до ожидания `JIT_ZYGOTE_DONE` (до 45 с). Раньше возврат зависел от верификации,
-        // и при недоступном канале машина оставалась без Wi-Fi.
-        restoreNetAndScheduleAvas(app, where, "pending_verify")
+        // Сеть возвращена в начале функции (до чтения props и до ожидания `JIT_ZYGOTE_DONE`):
+        // верификация JIT на это больше не влияет. Здесь — только расписание AVAS.
+        runCatching { AvasRestore.scheduleRestore(app, where) }
         val read = {
             val (_, out) = runCatching {
                 AdbClient.execute(
@@ -1034,7 +1025,7 @@ object AppPerformance {
         val maps = runCatching {
             File("/proc/self/maps").useLines { l -> l.any { it.contains("dalvik-jit-code-cache") } }
         }.getOrDefault(false)
-        // Сеть и расписание AVAS уже обработаны выше (restoreNetAndScheduleAvas) — до верификации.
+        // Сеть возвращена в начале функции, расписание AVAS поставлено чуть выше — до верификации.
         val avasPending = AvasRestore.hasPending(app)
         val zygoteRestart = when {
             zr.contains("zygote_restart=ok") -> "ok"
@@ -1075,6 +1066,13 @@ object AppPerformance {
      * дочитывает его на следующем старте ([jitPendingVerify]).
      */
     private const val JIT_ZYGOTE_RESULT_PATH = "/data/local/tmp/jit_zygote_result.txt"
+
+    /** Первая строка watcher-а: пишется ДО `sleep`/`ctl.restart` — подтверждение запуска. */
+    internal const val WATCHER_ARMED_TOKEN = "JIT_ZYGOTE_ARMED"
+
+    /** Ожидание подтверждения запуска: 6 × 500 мс. */
+    internal const val WATCHER_ARM_ROUNDS = 6
+    internal const val WATCHER_ARM_PAUSE_MS = 500L
     private const val JIT_ZYGOTE_WATCH_PATH = "/data/local/tmp/jit_zygote_watch.sh"
     /** Задержка рестарта: успеваем записать маркер, лог и вернуть честный статус в UI. */
     private const val JIT_ZYGOTE_DELAY_S = 8
@@ -1098,7 +1096,7 @@ object AppPerformance {
             ZP0=${D}(pidof zygote 2>/dev/null)
             SS0=${D}(pidof system_server 2>/dev/null)
             sleep ${D}{DELAY:-8}
-            echo "JIT_ZYGOTE_WATCH start want=${D}V zygote_pid_before=${D}ZP0 system_server_before=${D}SS0" > ${D}OUT
+            echo "JIT_ZYGOTE_WATCH start $WATCHER_ARMED_TOKEN pid=${D}${D} want=${D}V zygote_pid_before=${D}ZP0 system_server_before=${D}SS0" > ${D}OUT
             setprop ctl.restart zygote
             i=0
             while [ ${D}i -lt 180 ]; do
@@ -1138,48 +1136,69 @@ object AppPerformance {
         val t0 = System.currentTimeMillis()
         // iter33p §1: маршрут один — тумблер JIT по явному клику (авто-восстановления нет).
         val where = AvasRestore.Where.JIT_TOGGLE
-        // iter33o §1.1: ПЕРЕД рестартом сохраняем режим AVAS и его sound type — рестарт фреймворка
-        // их сбрасывает (звук AVAS «проваливается» в салон). Только чтение; недоступно — честный skip.
+
+        // ── 1. Состояние сети ДО любых изменений (только чтение) ──────────────────────────────
+        // iter33p-fix2 §1.1: без подтверждённого сохранения операция не начинается вообще.
+        val netSaved = runCatching { JitNet.saveBeforeRestart(app) }.getOrNull()
+
+        // ── 2. Долговечное ПОДТВЕРЖДЁННОЕ намерение (файлы + чтение обратно) ─────────────────
+        // REVIEW §2: раньше ошибка записи игнорировалась, и Wi-Fi всё равно выключался.
+        val intentOk = netSaved != null && writeIntentConfirmed(app, want)
+        when (JitFlow.gate(netSaved != null, intentOk)) {
+            JitFlow.Gate.ABORT_NO_NET_STATE -> {
+                AppLog.i(TAG, "JIT_APPLIED_REQUEST aborted reason=no_net_state want=$want " +
+                    "(сеть не трогаем, рестарта не будет)")
+                return listOf(
+                    ToolsStep(
+                        step = "perf_zygote",
+                        command = "нет: состояние сети не сохранено",
+                        startedAtMs = t0, finishedAtMs = System.currentTimeMillis(),
+                        exitCode = 1,
+                        expected = "saved wifi/ap state",
+                        actual = "JIT_APPLIED_REQUEST aborted reason=no_net_state",
+                        stdout = "Wi-Fi/AP не выключались, рестарт фреймворка не запускался",
+                        status = ToolsStep.Status.BLOCKED
+                    )
+                )
+            }
+            JitFlow.Gate.ABORT_INTENT_WRITE -> {
+                JitNet.abandonSaved(app, "intent_write_failed")
+                AppLog.i(TAG, "JIT_APPLIED_REQUEST aborted reason=intent_write_failed want=$want " +
+                    "net_saved=cleared (сеть не трогаем, рестарта не будет)")
+                return listOf(
+                    ToolsStep(
+                        step = "perf_zygote",
+                        command = "нет: намерение не записалось",
+                        startedAtMs = t0, finishedAtMs = System.currentTimeMillis(),
+                        exitCode = 1,
+                        expected = "pending intent written+read back",
+                        actual = "JIT_APPLIED_REQUEST aborted reason=intent_write_failed",
+                        stdout = "Wi-Fi/AP не выключались, рестарт фреймворка не запускался",
+                        status = ToolsStep.Status.BLOCKED
+                    )
+                )
+            }
+            JitFlow.Gate.PROCEED -> Unit
+        }
+        val netState = netSaved ?: return emptyList()   // недостижимо: ворота выше
+
+        // ── 3. Снимок AVAS — только после того, как операция реально началась ────────────────
+        // REVIEW §4: раньше снимок делался ДО проверки сети и оставался от отменённой операции.
         val avasSaved = runCatching {
             AvasRestore.saveBeforeRestart(app, where, currentBootTag())
         }.getOrNull()
-        // iter33p §2.1: состояние сети ДО рестарта (Wi-Fi + AP) — только чтение, лог `JIT_NET_PRE`.
-        val netSaved = runCatching { JitNet.saveBeforeRestart(app) }.getOrNull()
-        if (netSaved == null) {
-            // iter33p-fix1 §1 REVIEW: без надёжно сохранённого состояния сети операцию НЕ начинаем —
-            // иначе `svc wifi disable` может оставить машину без Wi-Fi и без плана возврата.
-            AppLog.i(TAG, "JIT_APPLIED_REQUEST aborted reason=no_net_state want=$want " +
-                "avas_saved=${avasSaved ?: "none"} (сеть не трогаем, рестарта не будет)")
-            return listOf(
-                ToolsStep(
-                    step = "perf_zygote",
-                    command = "нет: состояние сети не сохранено",
-                    startedAtMs = t0, finishedAtMs = System.currentTimeMillis(),
-                    exitCode = 1,
-                    expected = "saved wifi/ap state",
-                    actual = "JIT_APPLIED_REQUEST aborted reason=no_net_state",
-                    stdout = "Wi-Fi/AP не выключались, рестарт фреймворка не запускался",
-                    status = ToolsStep.Status.BLOCKED
-                )
-            )
-        }
-        // §2.4(а): намерение ДО рестарта — иначе после него результата ждать неоткуда.
-        runCatching {
-            File(app.filesDir, JIT_PENDING_FILE)
-                .writeText(JitBootMark.format(currentBootTag(), android.os.SystemClock.uptimeMillis()))
-            File(app.filesDir, JIT_PENDING_WANT_FILE).writeText("want=$want")
-        }
+        val prBefore = runCatching { jitProfiles() }.getOrDefault("")
+
         val D = "$"
-        // iter33p §2.2: сеть вокруг zygote — как `w0/la.run`: svc wifi disable → drain `oif wlan0`
-        // (≤20 с) → setprop. Watcher с самим рестартом ставим только ПОСЛЕ этого.
+        // ── 4. Подготовка сети и props (как `w0/la.run`) ─────────────────────────────────────
         val netPre = runCatching { JitNet.runPreRestart(app, want) }.getOrNull()
+        val propsTouched = netPre != null && netPre.channelOk
         // Скрипт watcher-а собираем уже после сети: сначала слив правил, потом заливка и запуск.
         val b64 = android.util.Base64.encodeToString(
             jitZygoteWatcherScript().toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP)
         val prep = """
             echo RT=${D}(getprop $PROP_USEJIT)
             echo PS=${D}(getprop $PROP_PERSIST_USEJIT_INIT)
-            echo WIFI=${D}(settings get global wifi_on 2>/dev/null)
             echo '$b64' | base64 -d > $JIT_ZYGOTE_WATCH_PATH 2>/dev/null
             chmod 755 $JIT_ZYGOTE_WATCH_PATH 2>/dev/null
             echo WSIZE=${D}(wc -c < $JIT_ZYGOTE_WATCH_PATH 2>/dev/null | tr -d ' ')
@@ -1188,24 +1207,18 @@ object AppPerformance {
         val out = ret?.output ?: ""
         val netChannelOk = netPre != null && netPre.output.isNotBlank()
         val rootUnavailable = !netChannelOk || out.contains("ERR_ROOT_CHANNEL_UNAVAILABLE") || out.isBlank()
-        val rtNow = parseTag(out, "RT") ?: netPre?.runtime ?: ""
-        val psNow = parseTag(out, "PS") ?: netPre?.persist ?: ""
-        val wifi = if (netSaved?.wifi == true) "1" else "0"
+        val rtNow = parseTag(out, "RT") ?: ""
+        val psNow = parseTag(out, "PS") ?: ""
+        val wifi = if (netState.wifi) "1" else "0"
         val wsize = (parseTag(out, "WSIZE") ?: "0").toIntOrNull() ?: 0
         val watcherOk = wsize > 200
         if (rootUnavailable || !watcherOk) {
-            // Рестарт НЕ запускаем: без канала/скрипта это был бы прыжок в неизвестность.
-            runCatching { File(app.filesDir, JIT_PENDING_FILE).delete() }
-            runCatching { File(app.filesDir, JIT_PENDING_WANT_FILE).delete() }
             val why = if (rootUnavailable) "reason=no_root_channel" else "reason=watcher_not_written"
-            // iter33p-fix1 §1 REVIEW: отказ ПОСЛЕ отключения Wi-Fi обязан вернуть сеть в этой же
-            // операции (без рестарта zygote) — иначе машина останется без Wi-Fi до следующего старта.
-            val comp = runCatching { JitNet.compensate(app, netSaved, why) }.getOrNull()
-            if (comp?.allConfirmed == true) JitNet.clearSaved(app)
-            AppLog.i(TAG, "JIT_APPLIED runtime=${rtNow.ifEmpty { "empty" }} want=$want zygote_restart=not_started " +
-                "maps=unknown result=failed via=pending_verify $why watcher_bytes=$wsize " +
-                "net_compensate=${comp?.let { if (it.allConfirmed) "ok" else "failed" } ?: "skipped"} " +
-                "avas_saved=${avasSaved ?: "none"} reason_avas=${if (avasSaved == null) AvasRestore.LAST_SAVE_REASON else "ok"}")
+            val abort = abortAfterNet(app, netState, avasSaved, rtBefore, psBefore, prBefore,
+                JitFlow.Stage.AFTER_NET_BEFORE_LAUNCH, propsTouched)
+            AppLog.i(TAG, "JIT_APPLIED runtime=${rtNow.ifEmpty { "empty" }} want=$want " +
+                "zygote_restart=not_started maps=unknown result=failed via=pending_verify $why " +
+                "watcher_bytes=$wsize ${abort.log} restart_possible=no avas_saved=${avasSaved?.id ?: "none"}")
             return listOf(
                 ToolsStep(
                     step = "perf_zygote",
@@ -1219,19 +1232,45 @@ object AppPerformance {
                 )
             )
         }
+
+        // ── 5. Запуск watcher-а и ПОДТВЕРЖДЕНИЕ запуска ──────────────────────────────────────
         val launch = "( nohup sh $JIT_ZYGOTE_WATCH_PATH $want $wifi $JIT_ZYGOTE_DELAY_S " +
             ">/dev/null 2>&1 </dev/null & ) ; sleep 1; " +
             "echo LAUNCHED=${D}(pgrep -f jit_zygote_watch 2>/dev/null | head -n1 || echo unknown)"
         val lret = runCatching { runSuCommand(launch) }.getOrNull()
-        // pgrep может отсутствовать в прошивке — это НЕ провал запуска, поэтому статус не зависит
-        // от него: watcher уже detached, рестарт произойдёт по расписанию.
+        // REVIEW §2: `pgrep` есть не на всех прошивках, поэтому запуск подтверждаем ПЕРВОЙ строкой
+        // самого watcher-а (`JIT_ZYGOTE_ARMED`): он пишет её до `sleep`/`ctl.restart`.
+        val armed = waitWatcherArmed(app)
         val launched = (parseTag(lret?.output ?: "", "LAUNCHED") ?: "").ifEmpty { "unknown" }
+        if (!armed) {
+            // Не подтвердилось — считаем, что рестарт мог НЕ произойти, и убираем риск позднего
+            // неожиданного рестарта: гасим watcher и удаляем скрипт.
+            val abort = abortAfterNet(app, netState, avasSaved, rtBefore, psBefore, prBefore,
+                JitFlow.Stage.LAUNCH_UNCONFIRMED, propsTouched)
+            AppLog.i(TAG, "JIT_APPLIED runtime=${rtNow.ifEmpty { "empty" }} want=$want " +
+                "zygote_restart=${if (abort.restartPossible) "possible" else "not_started"} " +
+                "maps=unknown result=unknown via=pending_verify reason=watcher_not_armed " +
+                "launched=$launched ${abort.log} avas_saved=${avasSaved?.id ?: "none"}")
+            return listOf(
+                ToolsStep(
+                    step = "perf_zygote",
+                    command = "setprop dalvik.vm.usejit=$want · watcher не подтвердил запуск",
+                    startedAtMs = t0, finishedAtMs = System.currentTimeMillis(),
+                    exitCode = lret?.exitCode ?: 1,
+                    expected = "JIT_ZYGOTE_ARMED in $JIT_ZYGOTE_RESULT_PATH",
+                    actual = "zygote_restart=${if (abort.restartPossible) "possible" else "not_started"} " +
+                        "reason=watcher_not_armed",
+                    stdout = (lret?.output ?: "").take(600),
+                    status = ToolsStep.Status.FAILED
+                )
+            )
+        }
         AppLog.i(TAG, "JIT_APPLIED_REQUEST want=$want runtime_before=${rtBefore.ifEmpty { "empty" }} " +
-            "persist_before=${psBefore.ifEmpty { "empty" }} runtime_now=${rtNow.ifEmpty { "empty" }} " +
-            "persist_readback=${psNow.ifEmpty { "empty" }} wifi_before=$wifi watcher_bytes=$wsize " +
-            "launched=$launched via=pending_verify avas_saved=${avasSaved ?: "none"} " +
-            "sound_saved=${AvasRestore.LAST_SOUND_REASON} net_saved=${netSaved?.wire() ?: "none"} " +
-            "zygote_restart=armed in=${JIT_ZYGOTE_DELAY_S}s verify=next_start " +
+            "persist_before=${psBefore.ifEmpty { "empty" }} profiles_before=${prBefore.ifEmpty { "empty" }} " +
+            "runtime_now=${rtNow.ifEmpty { "empty" }} persist_readback=${psNow.ifEmpty { "empty" }} " +
+            "wifi_before=$wifi watcher_bytes=$wsize launched=$launched armed=yes via=pending_verify " +
+            "avas_saved=${avasSaved?.id ?: "none"} sound_saved=${AvasRestore.LAST_SOUND_REASON} " +
+            "net_saved=${netState.wire()} zygote_restart=armed in=${JIT_ZYGOTE_DELAY_S}s verify=next_start " +
             "warning=\"фреймворк перезапустится: экран гаснет на 10–20 с, приложения закрываются\"")
         return listOf(
             ToolsStep(
@@ -1240,13 +1279,126 @@ object AppPerformance {
                 startedAtMs = t0, finishedAtMs = System.currentTimeMillis(),
                 exitCode = lret?.exitCode ?: 0,
                 expected = "JIT_APPLIED runtime=$want zygote_restart=ok (следующий старт)",
-                actual = "zygote_restart=armed in=${JIT_ZYGOTE_DELAY_S}s launched=$launched " +
+                actual = "zygote_restart=armed in=${JIT_ZYGOTE_DELAY_S}s armed=yes " +
                     "runtime_now=${rtNow.ifEmpty { "empty" }} persist=$psNow",
                 stdout = "экран гаснет на 10–20 с · итог строкой JIT_APPLIED … via=pending_verify",
                 status = ToolsStep.Status.PARTIAL
             )
         )
     }
+
+    /** Итог отмены после сетевых изменений: что сделали и возможен ли ещё поздний рестарт. */
+    private class AbortOutcome(val restartPossible: Boolean, val log: String)
+
+    /**
+     * Отмена операции ПОСЛЕ подготовки сети (REVIEW §2):
+     *  1. гасим watcher и удаляем скрипт (чтобы не было позднего неожиданного рестарта);
+     *  2. возвращаем прежние runtime-props, если мы их уже изменили;
+     *  3. возвращаем сеть компенсацией; маркер снимается только по подтверждению;
+     *  4. снимок AVAS отменённой операции удаляем — но ТОЛЬКО если рестарт точно не произойдёт.
+     */
+    private fun abortAfterNet(
+        app: Context,
+        netSaved: JitNetModel.State,
+        avasSaved: AvasRestore.Snapshot?,
+        rtBefore: String,
+        psBefore: String,
+        prBefore: String,
+        stage: JitFlow.Stage,
+        propsTouched: Boolean
+    ): AbortOutcome {
+        val plan = JitFlow.abortPlan(stage, propsTouched)
+        val kill = if (plan.killWatcher) runCatching { killWatcherAndVerify() }.getOrNull() else null
+        val killed = kill?.first ?: true
+        val props = if (plan.rollbackProps) {
+            runCatching { JitNet.rollbackProps(app, rtBefore, prBefore) }.getOrDefault(false)
+        } else true
+        val comp = if (plan.compensateNet) {
+            runCatching { JitNet.compensate(app, netSaved, stage.name.lowercase()) }.getOrNull()
+        } else null
+        val snapshotAction = when {
+            avasSaved == null -> "none"
+            !plan.discardSnapshot -> "kept"
+            !killed -> "kept (рестарт ещё возможен)"
+            else -> if (AvasRestore.discard(app, avasSaved.id, stage.name.lowercase(), AvasRestore.Where.JIT_TOGGLE)) {
+                "discarded"
+            } else {
+                "kept"
+            }
+        }
+        return AbortOutcome(
+            restartPossible = !killed,
+            log = "net_compensate=${when {
+                comp == null -> "skipped"
+                comp.canClearMarker -> "ok"
+                else -> "failed"
+            }} net_marker=${if (comp?.canClearMarker == true) "cleared" else "kept"} " +
+                "props_rollback=${if (plan.rollbackProps) if (props) "ok" else "failed" else "skipped"} " +
+                "watcher_kill=${if (plan.killWatcher) if (killed) "ok" else "unknown" else "skipped"} " +
+                "avas_snapshot=$snapshotAction ${comp?.log() ?: ""}"
+        )
+    }
+
+    /** Гасим watcher и удаляем скрипт; подтверждение — по отсутствию процесса и файла. */
+    private fun killWatcherAndVerify(): Pair<Boolean, String> {
+        val cmd = "pkill -f jit_zygote_watch 2>/dev/null; rm -f $JIT_ZYGOTE_WATCH_PATH 2>/dev/null; " +
+            "sleep 1; echo ALIVE=\$(pgrep -f jit_zygote_watch 2>/dev/null | head -n1); " +
+            "echo SCRIPT=\$( [ -f $JIT_ZYGOTE_WATCH_PATH ] && echo yes || echo no )"
+        val out = runCatching { runSuCommand(cmd) }.getOrNull()?.output ?: ""
+        val alive = parseTag(out, "ALIVE") ?: "unknown"
+        val script = parseTag(out, "SCRIPT")
+        val ok = !JitFlow.restartStillPossible(alive, if (script == null) null else script == "yes")
+        AppLog.i(TAG, "JIT_ZYGOTE_KILL alive=${alive.ifEmpty { "none" }} script=$script result=${if (ok) "ok" else "unknown"}")
+        return Pair(ok, out)
+    }
+
+    /**
+     * Намерение ДО сетевых изменений: пишем оба файла и проверяем чтением обратно (REVIEW §2).
+     * Любая ошибка — false, и операция не начинается.
+     */
+    private fun writeIntentConfirmed(app: Context, want: String): Boolean = runCatching {
+        val pend = File(app.filesDir, JIT_PENDING_FILE)
+        val meta = File(app.filesDir, JIT_PENDING_WANT_FILE)
+        val body = JitBootMark.format(currentBootTag(), android.os.SystemClock.uptimeMillis())
+        pend.writeText(body)
+        meta.writeText("want=$want")
+        val okPend = pend.isFile && pend.readText().trim() == body.trim()
+        val okMeta = meta.isFile && meta.readText().trim() == "want=$want"
+        if (!(okPend && okMeta)) {
+            pend.delete(); meta.delete()
+            AppLog.i(TAG, "JIT_INTENT write failed pend=$okPend meta=$okMeta")
+        } else {
+            AppLog.i(TAG, "JIT_INTENT want=$want written=yes confirmed=yes")
+        }
+        okPend && okMeta
+    }.getOrElse {
+        runCatching { File(app.filesDir, JIT_PENDING_FILE).delete() }
+        runCatching { File(app.filesDir, JIT_PENDING_WANT_FILE).delete() }
+        AppLog.i(TAG, "JIT_INTENT write failed reason=${it.javaClass.simpleName}")
+        false
+    }
+
+    /** Ждём первую строку watcher-а (он пишет её ДО `sleep` и `ctl.restart`). */
+    private fun waitWatcherArmed(app: Context): Boolean {
+        repeat(WATCHER_ARM_ROUNDS) { round ->
+            val zr = runCatching {
+                AdbClient.execute("tr '\n' '|' < $JIT_ZYGOTE_RESULT_PATH 2>/dev/null", 4000, expectRoot = false).second
+            }.getOrDefault("")
+            if (JitFlow.launchConfirmed(zr, WATCHER_ARMED_TOKEN)) {
+                AppLog.i(TAG, "JIT_ZYGOTE_ARMED round=$round confirmed=yes")
+                return true
+            }
+            if (round < WATCHER_ARM_ROUNDS - 1) runCatching { Thread.sleep(WATCHER_ARM_PAUSE_MS) }
+        }
+        AppLog.i(TAG, "JIT_ZYGOTE_ARMED rounds=$WATCHER_ARM_ROUNDS confirmed=no (watcher не отметился)")
+        return false
+    }
+
+    /** Прежнее значение `dalvik.vm.usejitprofiles` (для отката отменённой операции). */
+    private fun jitProfiles(): String = runCatching {
+        AdbClient.execute("getprop $PROP_USEJIT_PROFILES", 4000, expectRoot = false).second.trim()
+    }.getOrDefault("")
+
     // ═══════════ JIT_ZYGOTE_END ═══════════
 
     fun verifyJitOnly(context: Context) {
