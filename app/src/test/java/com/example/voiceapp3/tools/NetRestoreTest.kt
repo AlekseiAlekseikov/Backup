@@ -75,8 +75,10 @@ class NetRestoreTest {
         assertTrue("нет проверки на null", apply.contains("if (netSaved == null)"))
         assertTrue("прерывание до подготовки сети",
             apply.indexOf("if (netSaved == null)") < apply.indexOf("JitNet.runPreRestart"))
+        val abort = bodyOf(apply.substring(apply.indexOf("if (netSaved == null)")), "if")
+            .lineSequence().filterNot { it.trimStart().startsWith("//") }.joinToString("\n")
         assertTrue("в отказе нет сетевых команд",
-            !bodyOf(apply.substring(apply.indexOf("if (netSaved == null)")), "if").contains("svc wifi disable"))
+            !abort.contains("svc wifi disable") && !abort.contains("JitNet."))
         assertTrue("отказ логируется", apply.contains("aborted reason=no_net_state"))
     }
 
