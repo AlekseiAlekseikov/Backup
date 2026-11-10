@@ -96,6 +96,9 @@ boot-restore добавлен страж `bootRestoreIsGone`).
 |---|---|---|
 | `42827223054` | `a36a2b7` | ❌ 160 PASSED / **5 FAILED** — стражи: `AvasRestoreTest.logLinesFollowReference` (ожидание `mode_now` в тесте), `AvasRestoreTest.writesOnlyInAvasRestoreAndOnlySavedValues` (слишком широкий поиск `setIntProperty` — он есть и в окнах/VHAL), `AvasRestoreTest.callSitesAreOnlyAllowed` (в выборку попадал одноимённый `JitNet.saveBeforeRestart`), `JitToggleChainTest.restartHappensAfterNetworkPrep` (base64 watcher-а собирался ДО подготовки сети) |
 | **`42828995241`** | **`8b6ee74`** | ✅ **164 PASSED / 0 FAILED**, job `129873731857`, артефакт `13771626397` (177 172 215 Б) |
+| **`42830831600`** | **`3646901` (HEAD)** | ✅ **164 PASSED / 0 FAILED**, job `129880075141`, артефакт `13771533798` (177 172 323 Б), `BUILD SUCCESSFUL in 4m 17s` |
+
+**Код итерации для сборки: `8b6ee74`** (маркер `SOURCE_SHA=8b6ee74`); коммиты `3646901` и далее — только docs (отчёт/WORKLOG).
 
 Исправления после прогона `42827223054` (коммит `8b6ee74`): base64-кодирование watcher-скрипта
 перенесено ПОСЛЕ `JitNet.runPreRestart` (`AppPerformance.kt:1133-1138`), границы sound type
