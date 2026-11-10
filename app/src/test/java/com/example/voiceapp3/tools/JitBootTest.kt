@@ -59,25 +59,42 @@ class JitBootTest {
      */
     @Test
     fun zygoteRestartOnlyInsideJitToggleBlock() {
+        // iter33p-fix3/4: текст watcher-а перенесён в чистое ядро (`JitNetModel.watcherScript`),
+        // поэтому литерал рестарта теперь живёт в JitNetCore.kt, а AppPerformance.kt содержит
+        // только делегат. Проверяем ровно это — и что литерал ровно один.
         val root = listOf(File("src/main/java"), File("app/src/main/java")).first { it.isDirectory }
         val withLiteral = root.walkTopDown()
             .filter { it.isFile && it.extension == "kt" && it.readText().contains("ctl.restart zygote") }
             .map { it.name }.toList()
-        assertEquals("рестарт фреймворка допустим только в AppPerformance.kt",
-            listOf("AppPerformance.kt"), withLiteral)
+        assertEquals("рестарт фреймворка допустим только в скрипте watcher-а (чистое ядро)",
+            listOf("JitNetCore.kt"), withLiteral)
+
+        val core = src("src/main/java/com/example/voiceapp3/tools/JitNetCore.kt")
+        val scriptAt = core.indexOf("internal fun watcherScript()")
+        assertTrue("нет watcherScript() в ядре", scriptAt > 0)
+        val scriptBody = core.substring(scriptAt, minOf(core.length, scriptAt + 5_000))
+        assertTrue("литерал рестарта обязан быть в теле watcherScript()",
+            scriptBody.contains("ctl.restart zygote"))
+        assertEquals("рестарт фреймворка в тексте скрипта ровно один",
+            1, Regex("setprop ctl\\.restart zygote").findAll(scriptBody).count())
 
         val perf = src("src/main/java/com/example/voiceapp3/tools/AppPerformance.kt")
+        assertTrue("AppPerformance не должен содержать сам литерал рестарта",
+            !perf.contains("ctl.restart zygote"))
+        assertTrue("AppPerformance обязан делегировать текст скрипта",
+            perf.contains("JitNetModel.watcherScript()"))
+        // Скрипт заливается на устройство ТОЛЬКО внутри блока JIT_ZYGOTE (цепочка тумблера).
         val begin = perf.indexOf("JIT_ZYGOTE_BEGIN")
         val end = perf.indexOf("JIT_ZYGOTE_END")
         assertTrue("нет маркеров блока JIT_ZYGOTE", begin > 0 && end > begin)
-        var idx = perf.indexOf("ctl.restart zygote")
+        var idx = perf.indexOf("JIT_ZYGOTE_WATCH_PATH")
         var count = 0
         while (idx >= 0) {
             count++
-            assertTrue("литерал вне блока JIT_ZYGOTE (позиция $idx)", idx in begin..end)
-            idx = perf.indexOf("ctl.restart zygote", idx + 1)
+            assertTrue("запись/запуск скрипта вне блока JIT_ZYGOTE (позиция $idx)", idx in begin..end)
+            idx = perf.indexOf("JIT_ZYGOTE_WATCH_PATH", idx + 1)
         }
-        assertTrue("в блоке должен быть вызов рестарта", count >= 1)
+        assertTrue("в блоке должна быть запись и запуск скрипта", count >= 2)
 
         assertTrue("тумблер JIT обязан вызывать jitApplyWithZygote",
             perf.contains("jitApplyWithZygote(context, enabled, rtBefore, psBefore)"))
