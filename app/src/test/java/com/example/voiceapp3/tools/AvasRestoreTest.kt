@@ -1,40 +1,36 @@
 package com.example.voiceapp3.tools
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
 
 /**
- * iter33p §3 — AVAS по механизму референса: режим (`getAVASMode`/`setAVASMode`) + sound type
- * (`CarPropertyManager` по областям {0,1}), восстановление НЕ сразу, а по расписанию
- * 5 с → 12 с → ретраи 30 с ×5.
+ * iter33p-fix1 §3/§4 (REVIEW замечания 3 и 4) — AVAS: доказанный id свойства, вердикт только по
+ * read-back, контрольные окна после раннего совпадения, планирование на каждый снимок.
  *
- * Правило владельца 09.11: пишем ТОЛЬКО то, что сами прочитали. Тест держит:
- *  1. решение «ничего / уже ок / вернуть / не смогли» и вердикт попытки (успех — по read-back);
- *  2. расписание попыток и формат строк лога;
- *  3. границы: `setAVASMode` и `setIntProperty` — только в `AvasRestore.kt` и только с сохранёнными
- *     значениями; муты/чужих значений/звуковых файлов нет;
- *  4. точки вызова — ровно две (§3.4).
+ * Тесты бьют по ПОВЕДЕНИЮ чистых функций (план попытки, вердикт, снимок, TTL, расписание), а не
+ * только по тексту файла.
  */
 class AvasRestoreTest {
 
-    private fun src(rel: String): File =
-        listOf(File(rel), File("app/$rel")).first { it.isFile }
-
-    private fun read(rel: String): String = src(rel).readText()
-
-    private fun mainRoot(): File = listOf(File("src/main/java"), File("app/src/main/java"))
+    private fun root(): File = listOf(File("src/main/java"), File("app/src/main/java"))
         .first { it.isDirectory }
 
-    /** Тело функции по балансу скобок (окно по indexOf давало ложные срабатывания). */
-    private fun bodyOf(source: String, fn: String): String {
-        val i = source.indexOf(fn)
+    private fun src(rel: String): String =
+        listOf(File(rel), File("app/$rel")).first { it.isFile }.readText()
+
+    private val file = "src/main/java/com/example/voiceapp3/tools/AvasRestore.kt"
+
+    /** Тело функции по её сигнатуре (баланс скобок) — проверяем поведение, а не соседний текст. */
+    private fun bodyOf(source: String, signature: String): String {
+        val i = source.indexOf(signature)
         if (i < 0) return ""
-        val j = source.indexOf('{', i)
-        if (j < 0) return ""
         var depth = 0
-        for (k in j until source.length) {
+        for (k in source.indexOf('{', i) until source.length) {
             when (source[k]) {
                 '{' -> depth++
                 '}' -> {
@@ -46,165 +42,160 @@ class AvasRestoreTest {
         return source.substring(i)
     }
 
-    // 1. Сохранённого нет — ничего не делаем.
+    private val sound = listOf(
+        AvasRestore.SoundValue(AvasRestore.PROP_SOUND_TYPE, 0, 2),
+        AvasRestore.SoundValue(AvasRestore.PROP_SOUND_TYPE, 1, 2)
+    )
+
+    private fun snap(mode: Int = 3, snd: List<AvasRestore.SoundValue> = sound, ts: Long = 1_000L) =
+        AvasRestore.Snapshot(id = ts, tsMs = ts, bootTag = "boot-A", mode = mode, sound = snd)
+
+    // 1. Доказанный id свойства sound type из референса (`Politica.h(7)`).
     @Test
-    fun withoutSavedNothingHappens() {
-        assertEquals(AvasRestore.Action.NONE, AvasRestore.decide(null, 3))
-        assertEquals(AvasRestore.Action.NONE, AvasRestore.decide(null, null))
+    fun soundPropIdIsProvenAndDocumented() {
+        assertEquals("id из нативной таблицы референса", 0x21407057, AvasRestore.PROP_SOUND_TYPE)
+        assertEquals("области как в байткоде w0/u.c", listOf(0, 1), AvasRestore.AREAS.toList())
+
+        val s = src(file)
+        assertTrue("в KDoc должно быть указано происхождение id", s.contains("Politica.h(7)"))
+        assertTrue("должна быть ссылка на воспроизводимый скрипт", s.contains("scripts/derive_avas_sound_prop.py"))
+        // Никакого «угадывания»: префы/поиск по имени больше не участвуют в записи.
+        assertFalse("преф-подсказка id запрещена", s.contains("avas_sound_prop_id"))
+        assertFalse("поиск свойства по имени запрещён", s.contains("getPropertyList"))
+        assertTrue("области перечислены явно", s.contains("AREAS = intArrayOf(0, 1)"))
     }
 
-    // 2. Режим совпал — только лог, никакой записи.
+    // 2. Снимок: атомарный единый формат, кодирование/декодирование без потерь.
     @Test
-    fun alreadyOkIsSkipped() {
-        assertEquals(AvasRestore.Action.ALREADY_OK, AvasRestore.decide(3, 3))
+    fun snapshotRoundTrip() {
+        val s = snap()
+        val text = AvasRestore.encode(s)
+        assertTrue("режим в одном файле со звуком", text.contains("mode=3") && text.contains("sound="))
+        val back = AvasRestore.decode(text)
+        assertNotNull(back)
+        assertEquals(s.mode, back!!.mode)
+        assertEquals(s.sound, back.sound)
+        assertEquals(s.bootTag, back.bootTag)
+        assertEquals(s.id, back.id)
+        assertNull("битый снимок не разбирается", AvasRestore.decode("v=1 mode=3"))
+        assertNull(AvasRestore.decode(null))
     }
 
-    // 3. Отличается — вернуть сохранённое (единственный «пишущий» исход).
+    // 3. Просроченный снимок не применяем (иначе откат ручных изменений через 10 минут).
     @Test
-    fun differentModeIsRestored() {
-        assertEquals(AvasRestore.Action.RESTORE, AvasRestore.decide(3, 0))
-        assertEquals(AvasRestore.Action.RESTORE, AvasRestore.decide(0, 3))
+    fun snapshotExpires() {
+        val s = snap(ts = 1_000L)
+        assertFalse(AvasRestore.isExpired(s, 1_000L + AvasRestore.SNAPSHOT_TTL_MS - 1))
+        assertTrue(AvasRestore.isExpired(s, 1_000L + AvasRestore.SNAPSHOT_TTL_MS + 1))
+        assertEquals("TTL 10 минут", 600_000L, AvasRestore.SNAPSHOT_TTL_MS)
     }
 
-    // 4. Сохранённое есть, а прочитать не смогли — честный fail без падения.
+    // 4. План попытки пишет ТОЛЬКО расхождения; нечитаемое не считается совпадением.
     @Test
-    fun unreadableModeIsFailNotCrash() {
-        assertEquals(AvasRestore.Action.FAIL, AvasRestore.decide(2, null))
-        assertEquals(
-            "AVAS_RESTORE skipped reason=no_getAVASMode mode=2 where=app_start",
-            AvasRestore.skipLine("no_getAVASMode", AvasRestore.Where.APP_START, 2)
-        )
+    fun planWritesOnlyDifferences() {
+        val s = snap()
+        val none = AvasRestore.plan(s, 3, sound)
+        assertFalse("совпало — не пишем режим", none.needMode)
+        assertTrue("совпало — не пишем звук", none.writeSound.isEmpty())
+        assertFalse(none.modeUnreadable)
+
+        val drift = AvasRestore.plan(s, 0, listOf(AvasRestore.SoundValue(AvasRestore.PROP_SOUND_TYPE, 0, 0),
+            AvasRestore.SoundValue(AvasRestore.PROP_SOUND_TYPE, 1, 2)))
+        assertTrue("режим разошёлся — пишем", drift.needMode)
+        assertEquals("пишем только разошедшуюся область", 1, drift.writeSound.size)
+        assertEquals(0, drift.writeSound.first().area)
+        assertEquals("пишем СОХРАНЁННОЕ значение", 2, drift.writeSound.first().value)
+
+        val unreadableSound = AvasRestore.plan(s, 3, listOf(AvasRestore.SoundValue(AvasRestore.PROP_SOUND_TYPE, 0, 2)))
+        assertTrue("нечитаемое не пишем", unreadableSound.writeSound.isEmpty())
+        assertEquals("нечитаемое отмечено", 1, unreadableSound.soundUnreadable.size)
+
+        val noMode = AvasRestore.plan(s, null, sound)
+        assertTrue("режим не прочитался", noMode.modeUnreadable)
+        assertFalse("и писать нечего", noMode.needMode)
     }
 
-    /**
-     * 5. Расписание (§3.2): первая попытка ~5 с, повтор ~12 с, дальше до 5 ретраев по 30 с.
-     * Ложный успех запрещён: `ok` только когда после записи факт совпал с сохранённым.
-     */
+    // 5. Вердикт: успех — только по read-back; нечитаемое — unverified, а не «совпало».
     @Test
-    fun scheduleMatchesReference() {
-        val s = AvasRestore.ATTEMPT_SCHEDULE_MS
-        assertEquals("первая попытка ~5 с", 5_000L, s[0])
-        assertEquals("повтор ~12 с", 12_000L, s[1])
-        assertEquals("всего 7 попыток (2 быстрые + 5 ретраев)", 7, s.size)
-        for (i in 2 until s.size) {
-            assertEquals("ретрай №${i - 1} через 30 с", 30_000L, s[i] - s[i - 1])
-        }
-        assertEquals("последний ретрай 162 с", 162_000L, s.last())
+    fun verdictIsReadBackBased() {
+        val s = snap()
+        assertEquals(AvasRestore.Verdict.ALREADY_OK, AvasRestore.verdict(s, wrote = false, modeAfter = 3, soundAfter = sound))
+        assertEquals(AvasRestore.Verdict.OK, AvasRestore.verdict(s, wrote = true, modeAfter = 3, soundAfter = sound))
+        assertEquals("read-back режима не совпал", AvasRestore.Verdict.FAILED,
+            AvasRestore.verdict(s, wrote = true, modeAfter = 1, soundAfter = sound))
+        assertEquals("звук не вернулся", AvasRestore.Verdict.FAILED,
+            AvasRestore.verdict(s, wrote = true, modeAfter = 3,
+                soundAfter = listOf(AvasRestore.SoundValue(AvasRestore.PROP_SOUND_TYPE, 0, 0),
+                    AvasRestore.SoundValue(AvasRestore.PROP_SOUND_TYPE, 1, 0))))
+        assertEquals("звук не читается — это НЕ успех", AvasRestore.Verdict.UNVERIFIED,
+            AvasRestore.verdict(s, wrote = false, modeAfter = 3, soundAfter = emptyList()))
+        assertEquals("частичное чтение — тоже unverified", AvasRestore.Verdict.UNVERIFIED,
+            AvasRestore.verdict(s, wrote = false, modeAfter = 3,
+                soundAfter = listOf(AvasRestore.SoundValue(AvasRestore.PROP_SOUND_TYPE, 0, 2))))
     }
 
-    // 6. Вердикт попытки: пишем только сохранённое, успех — строго по read-back.
+    // 6. Контрольные окна: 5 с → 12 с → 30 с ×5, и снимок НЕ снимается на первом совпадении.
     @Test
-    fun verdictRequiresReadBack() {
-        assertEquals(
-            "уже совпало — писать нечего",
-            AvasRestore.Verdict.ALREADY_OK,
-            AvasRestore.verdict(3, 3, 3, soundOk = true, wrote = false)
-        )
-        assertEquals(
-            "записали и перечитали сохранённое",
-            AvasRestore.Verdict.OK,
-            AvasRestore.verdict(3, 0, 3, soundOk = true, wrote = true)
-        )
-        assertEquals(
-            "read-back не совпал ⇒ failed",
-            AvasRestore.Verdict.FAILED,
-            AvasRestore.verdict(3, 0, 1, soundOk = true, wrote = true)
-        )
-        assertEquals(
-            "sound type не вернулся ⇒ failed",
-            AvasRestore.Verdict.FAILED,
-            AvasRestore.verdict(3, 0, 3, soundOk = false, wrote = true)
-        )
-        assertEquals(
-            "режим не читается ⇒ failed",
-            AvasRestore.Verdict.FAILED,
-            AvasRestore.verdict(3, null, null, soundOk = true, wrote = false)
-        )
+    fun controlWindowsSurviveEarlyMatch() {
+        val sched = AvasRestore.ATTEMPT_SCHEDULE_MS
+        assertEquals(5_000L, sched[0])
+        assertEquals(12_000L, sched[1])
+        assertEquals(7, sched.size)
+        for (i in 2 until sched.size) assertEquals(30_000L, sched[i] - sched[i - 1])
+
+        val s = src(file)
+        val attempt = s.substringAfter("fun restoreAttempt(").substringBefore("Car API через рефлексию")
+        assertTrue("снимок снимается только на последнем окне", attempt.contains("lastWindow"))
+        assertTrue("условие снятия — подтверждение И последнее окно",
+            attempt.contains("if (v == Verdict.OK || v == Verdict.ALREADY_OK)") &&
+                attempt.indexOf("lastWindow = attempt >= ATTEMPT_SCHEDULE_MS.size") <
+                attempt.indexOf("if (lastWindow) clear(app)"))
+        assertTrue("при unverified снимок сохраняется", !attempt.contains("Verdict.UNVERIFIED) clear"))
     }
 
-    // 7. Форматы строк лога (§3.1/§3.2).
+    // 7. Планирование — на каждый снимок (id), а не «один раз за процесс».
     @Test
-    fun logLinesFollowReference() {
-        val sound = listOf(AvasRestore.SoundValue(0x2140, 0, 2), AvasRestore.SoundValue(0x2140, 1, 2))
-        assertEquals(
-            "AVAS_SAVE mode=3 sound_type=2@0,2@1 prop=8512 where=jit_toggle",
-            AvasRestore.saveLine(3, sound, AvasRestore.Where.JIT_TOGGLE)
-        )
-        assertTrue(
-            "нет sound type — честный skipped-признак",
-            AvasRestore.saveLine(3, emptyList(), AvasRestore.Where.JIT_TOGGLE)
-                .contains("sound_type=unavailable")
-        )
-        assertTrue(
-            "метода нет — пропуск без падения",
-            AvasRestore.saveLine(null, emptyList(), AvasRestore.Where.JIT_TOGGLE)
-                .startsWith("AVAS_SAVE skipped reason=")
-        )
-        assertEquals(
-            "AVAS_RESTORE attempt=1 mode_saved=3 mode_now=3 sound_saved=2@0 sound_now=0@0 " +
-                "result=ok where=jit_toggle",
-            AvasRestore.attemptLine(
-                1, 3, 3, "2@0", "0@0", AvasRestore.Verdict.OK, AvasRestore.Where.JIT_TOGGLE
-            )
-        )
-        assertTrue(
-            "attempt обязателен в строке",
-            AvasRestore.attemptLine(
-                3, 3, 1, "2@0", "0@0", AvasRestore.Verdict.FAILED, AvasRestore.Where.APP_START
-            ).contains("attempt=3")
-        )
+    fun schedulingIsPerSnapshot() {
+        val s = src(file)
+        assertFalse("глобального одноразового флага больше нет", s.contains("scheduledOnce"))
+        assertTrue("планируем по id снимка", s.contains("if (scheduledId == snap.id) return"))
+        assertTrue("новый снимок — новое планирование", s.contains("scheduledId = snap.id"))
+        val ctor = s.substringAfter("fun scheduleRestore(")
+        assertTrue("просроченный снимок выбрасывается", ctor.contains("isExpired(snap, nowMs)"))
     }
 
-    // 8. `setAVASMode`/`setIntProperty` — только в AvasRestore.kt и только с сохранёнными значениями.
+    // 8. Запись: только сохранённые значения, void-API setIntProperty, никакой муты.
     @Test
-    fun writesOnlyInAvasRestoreAndOnlySavedValues() {
-        val hits = mainRoot().walkTopDown()
+    fun writesOnlySavedValues() {
+        val users = root().walkTopDown()
             .filter { it.isFile && it.extension == "kt" && it.readText().contains("setAVASMode") }
             .map { it.name }.toList()
-        assertEquals("запись режима AVAS допустима только в AvasRestore.kt", listOf("AvasRestore.kt"), hits)
+        assertEquals("режим пишется только в AvasRestore.kt", listOf("AvasRestore.kt"), users)
 
-        // Общий `setIntProperty` есть и в других модулях (окна, VHAL) — поэтому границу держим
-        // по AVAS-специфичным маркерам, а не по имени метода Car API.
-        val hitsSound = mainRoot().walkTopDown()
-            .filter {
-                it.isFile && it.extension == "kt" &&
-                    (it.readText().contains("restoreSavedAvasSoundType") ||
-                        it.readText().contains("avas_sound_saved"))
-            }
-            .map { it.name }.toList()
-        assertEquals("sound type AVAS пишется только в AvasRestore.kt",
-            listOf("AvasRestore.kt"), hitsSound)
-
-        val s = read("src/main/java/com/example/voiceapp3/tools/AvasRestore.kt")
-        assertTrue(
-            "setAVASMode вызывается только с сохранённым значением",
-            s.contains("getMethod(\"setAVASMode\", Int::class.javaPrimitiveType)") &&
-                s.contains("m.invoke(audio, value)")
-        )
+        val s = src(file)
+        assertTrue("setAVASMode вызывается с сохранённым значением",
+            s.contains("getMethod(\"setAVASMode\", Int::class.javaPrimitiveType)") && s.contains("invoke(audio, value)"))
         for (bad in listOf("setAVASMode(0)", "setAVASMode(1)", "setAVASMode(2)", "setAVASMode(-1)")) {
             assertTrue("константа в setAVASMode запрещена: $bad", !s.contains(bad))
         }
-        // Мута/чужие значения/звуковые файлы — запрещены. Ищем ТОЛЬКО в коде: упоминание
-        // запрета в KDoc («чего мы не делаем») операцией не является.
+        assertTrue("sound type пишется по доказанному id", s.contains("PROP_SOUND_TYPE"))
+        assertTrue("void-API: успех не по возврату, а по read-back",
+            s.contains("setIntProperty") && s.contains("**void**") && s.contains("read-back"))
+        assertFalse("Boolean-возврат у void-метода больше не парсится", s.contains("as? Boolean ?: false"))
+
         val code = s.lineSequence()
             .filterNot {
-                it.trimStart().startsWith("*") || it.trimStart().startsWith("//") ||
-                    it.trimStart().startsWith("/*")
-            }
-            .joinToString("\n")
+                it.trimStart().startsWith("*") || it.trimStart().startsWith("//") || it.trimStart().startsWith("/*")
+            }.joinToString("\n")
         for (bad in listOf("setSoundType", "audioserver", "avas_muted_saved", ".wav", "sound_type_")) {
-            assertTrue("запрещённая операция в коде AvasRestore: $bad", !code.contains(bad))
+            assertTrue("запрещённая операция в коде: $bad", !code.contains(bad))
         }
-        assertTrue("нужен честный skip no_getAVASMode", s.contains("no_getAVASMode"))
-        assertTrue("sound type берётся из CarPropertyManager", s.contains("getIntProperty"))
-        // Области — как в байткоде референса (w0/u.c = {0, 1}).
-        assertTrue("области {0, 1}", s.contains("AREAS = intArrayOf(0, 1)"))
     }
 
-    // 9. Точки вызова — ровно две (§3.4): цепочка тумблера JIT и старт приложения.
+    // 9. Call-sites — ровно две (§3.4): цепочка тумблера и старт приложения.
     @Test
-    fun callSitesAreOnlyAllowed() {
-        val hits = mainRoot().walkTopDown()
+    fun callSitesAreOnlyTwo() {
+        val hits = root().walkTopDown()
             .filter {
                 it.isFile && it.extension == "kt" &&
                     (it.readText().contains("AvasRestore.saveBeforeRestart") ||
@@ -212,22 +203,16 @@ class AvasRestoreTest {
                         it.readText().contains("fun scheduleRestore("))
             }
             .map { it.name }.toList()
-        assertTrue("кроме определения остаётся только AppPerformance.kt: $hits",
+        assertTrue("ожидаются только AvasRestore.kt и AppPerformance.kt: $hits",
             hits.containsAll(listOf("AvasRestore.kt", "AppPerformance.kt")) && hits.size == 2)
 
-        val perf = read("src/main/java/com/example/voiceapp3/tools/AppPerformance.kt")
-        // (а) цепочка тумблера JIT — сохранение ДО рестарта.
-        val apply = bodyOf(perf, "fun jitApplyWithZygote")
-        assertTrue("сохранение AVAS обязано быть в цепочке рестарта",
-            apply.contains("AvasRestore.saveBeforeRestart"))
-        assertTrue("сохранение ДО записи watcher-а",
-            apply.indexOf("AvasRestore.saveBeforeRestart") < apply.indexOf("jitZygoteWatcherScript()"))
-        // (б) восстановление — по расписанию, в pending-пути и на обычном старте.
-        val pending = bodyOf(perf, "fun jitPendingVerify")
-        assertTrue("после подъёма планируется возврат AVAS", pending.contains("AvasRestore.scheduleRestore"))
-        val probe = bodyOf(perf, "fun jitBootProbe")
-        assertTrue("на обычном старте — то же расписание", probe.contains("AvasRestore.scheduleRestore"))
-        assertTrue("AVAS не возвращается «сразу» (без расписания)",
-            !perf.contains("AvasRestore.restoreAttempt("))
+        val perf = src("src/main/java/com/example/voiceapp3/tools/AppPerformance.kt")
+        val apply = perf.substringAfter("fun jitApplyWithZygote").substringBefore("JIT_ZYGOTE_END")
+        assertTrue("сохранение в цепочке тумблера", apply.contains("AvasRestore.saveBeforeRestart"))
+        assertTrue("сохранение ДО подготовки сети",
+            apply.indexOf("AvasRestore.saveBeforeRestart") < apply.indexOf("JitNet.runPreRestart"))
+        val probe = bodyOf(perf, "fun jitBootProbe(context: Context)")
+        assertTrue("на обычном старте — только планирование", probe.contains("AvasRestore.scheduleRestore"))
+        assertFalse("AVAS не восстанавливается «сразу»", perf.contains("AvasRestore.restoreAttempt("))
     }
 }

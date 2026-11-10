@@ -86,10 +86,10 @@ class JitToggleChainTest {
         assertTrue("нужно сохранение сети", save >= 0)
         assertTrue("сохранение ДО подготовки сети", save < apply.indexOf("JitNet.runPreRestart"))
         assertTrue("сохранение ДО watcher-а", save < apply.indexOf("jitZygoteWatcherScript()"))
-        // Формат хранения — как `jit_restaurar` референса.
-        assertEquals("wifi=1,ap=0", JitNet.State(true, false).wire())
-        assertEquals(JitNet.State(true, false), JitNet.parse("wifi=1,ap=0"))
-        assertEquals(JitNet.State(false, true), JitNet.parse("wifi=0,ap=1"))
+        // Формат хранения — как `jit_restaurar` референса (+ метка времени для TTL).
+        assertEquals("wifi=1,ap=0,ts=0", JitNet.State(true, false, 0L).wire())
+        assertEquals(JitNet.State(true, false, 0L), JitNet.parse("wifi=1,ap=0"))
+        assertEquals(JitNet.State(false, true, 0L), JitNet.parse("wifi=0,ap=1"))
     }
 
     // 5. Сетевые команды не выходят за цепочку тумблера: единственный потребитель — AppPerformance.

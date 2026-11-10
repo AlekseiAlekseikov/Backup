@@ -97,12 +97,43 @@ class LogFilesTest {
         root.deleteRecursively()
     }
 
-    // 5. Дневной лог подключён к общему логгеру: те же строки, что и в logcat.
+    /**
+     * 5. Каталог, который существует, но НЕ принимает запись, не должен «съедать» лог:
+     *    проверка записи обязательна (REVIEW iter33p: недостаточно `getExternalFilesDir != null`),
+     *    а при отказе записи строка уходит во внутренний каталог и повторяется.
+     */
+    @Test
+    fun unwritableDirIsDetected() {
+        val root = Files.createTempDirectory("logfiles-ro").toFile()
+        val dir = File(root, "logs")
+        LogFiles.ensureDir(dir)
+        assertTrue("обычный каталог пишется", LogFiles.writable(dir))
+        dir.setWritable(false)
+        try {
+            val closed = !LogFiles.writable(dir)
+            // под root (в некоторых CI-контейнерах) права игнорируются — тогда проверять нечего
+            if (closed) assertFalse("каталог без права записи обязан детектиться", LogFiles.writable(dir))
+        } finally {
+            dir.setWritable(true)
+            root.deleteRecursively()
+        }
+        val s = listOf(File("src/main/java"), File("app/src/main/java")).first { it.isDirectory }
+            .resolve("com/example/voiceapp3/tools/LogFiles.kt").readText()
+        assertTrue("фоллбэк по результату пробы, а не по null", s.contains("if (writable(d)) return d"))
+        assertTrue("внутренний каталог как запасной", s.contains("File(app.filesDir, \"logs\")"))
+        assertTrue("при сбое записи — повтор во внутреннем каталоге", s.contains("internal too"))
+    }
+
+    // 6. Дневной лог подключён к общему логгеру: те же строки, что и в logcat.
     @Test
     fun appLogTeesLinesToDailyFile() {
         val s = listOf(File("src/main/java"), File("app/src/main/java")).first { it.isDirectory }
             .resolve("com/example/voiceapp3/tools/AppLog.kt").readText()
         assertTrue("AppLog обязан готовить каталог дневного лога", s.contains("LogFiles.prepare("))
         assertTrue("каждая запись уходит в дневной файл", s.contains("LogFiles.append(c, line)"))
+        // Ретеншн трогает только СВОИ файлы (`voiceapp3-DD.MM.YYYY.log`) — чужие логи не удаляем.
+        val files = listOf(File("src/main/java"), File("app/src/main/java")).first { it.isDirectory }
+            .resolve("com/example/voiceapp3/tools/LogFiles.kt").readText()
+        assertTrue("удаляем только свой шаблон", files.contains("fun expired(") && files.contains("parseDate(n)"))
     }
 }

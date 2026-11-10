@@ -62,12 +62,33 @@ object LogFiles {
         return d
     }
 
-    /** Каталог логов: внешний `files/logs`, при недоступности — `filesDir/logs`. */
+    /**
+     * Каталог логов: внешний `files/logs`, при недоступности — `filesDir/logs`.
+     *
+     * REVIEW iter33p: недостаточно проверить `getExternalFilesDir != null` — каталог может
+     * существовать, но не приниматься (`mkdirs`/запись падают). Поэтому каталог проверяется
+     * реальной пробной записью ([writable]).
+     */
     fun dirFor(context: Context): File {
         val app = context.applicationContext
         val ext = runCatching { app.getExternalFilesDir(null) }.getOrNull()
-        return ensureDir(File(ext ?: app.filesDir, "logs"))
+        val extDir = ext?.let { File(it, "logs") }
+        if (extDir != null) {
+            val d = ensureDir(extDir)
+            if (writable(d)) return d
+            Log.w(TAG, "LogFiles: внешний каталог недоступен для записи (${d.absolutePath}) — фоллбэк внутрь")
+        }
+        return ensureDir(File(app.filesDir, "logs"))
     }
+
+    /** Реальная проба записи: создать/дописать/удалить пробный файл. */
+    internal fun writable(dir: File): Boolean = runCatching {
+        if (!dir.isDirectory) return false
+        val probe = File(dir, ".probe")
+        probe.appendText("")
+        probe.delete()
+        true
+    }.getOrDefault(false)
 
     /** Удаление просроченных файлов в каталоге (не чаще одного раза за старт). */
     internal fun prune(dir: File, nowMs: Long): Int {
@@ -97,18 +118,34 @@ object LogFiles {
      * поэтому ошибки глушим молча (лог не имеет права ломать приложение).
      */
     fun append(context: Context, line: String) {
-        val d = dirRef ?: dirFor(context).also { dirRef = it }
+        val app = context.applicationContext
+        var d = dirRef ?: dirFor(app).also { dirRef = it }
         val now = System.currentTimeMillis()
-        val target = File(d, fileNameFor(now))
-        runCatching {
-            FileWriter(target, true).use { w ->
-                w.append(line)
-                w.append('\n')
-                w.flush()
-            }
-            if (pathRef != target.absolutePath) pathRef = target.absolutePath
-        }.onFailure {
+        var failed = false
+        runCatching { write(File(d, fileNameFor(now)), line) }.onFailure {
+            failed = true
             Log.w(TAG, "append failed: ${it.javaClass.simpleName}: ${it.message}")
+        }
+        if (failed) {
+            // Один раз переключаемся на внутренний каталог и пробуем снова (тихий фоллбэк).
+            val internal = ensureDir(File(app.filesDir, "logs"))
+            if (d.absolutePath != internal.absolutePath) {
+                dirRef = internal
+                d = internal
+                runCatching { write(File(d, fileNameFor(now)), line) }.onFailure {
+                    Log.w(TAG, "append failed (internal too): ${it.javaClass.simpleName}")
+                }
+            }
+        }
+        val target = File(d, fileNameFor(now))
+        if (pathRef != target.absolutePath) pathRef = target.absolutePath
+    }
+
+    private fun write(target: File, line: String) {
+        FileWriter(target, true).use { w ->
+            w.append(line)
+            w.append('\n')
+            w.flush()
         }
     }
 }

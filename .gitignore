@@ -12,3 +12,7 @@ app/.cxx/
 *.apk
 *.idsig
 !app/src/main/res/raw/*.apk
+
+# python (агентские скрипты разбора)
+__pycache__/
+*.pyc

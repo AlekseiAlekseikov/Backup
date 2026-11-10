@@ -1,16 +1,20 @@
 package com.example.voiceapp3.tools
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
 
 /**
- * iter33p §2.3/§6 — возврат сети после подъёма фреймворка.
+ * iter33p-fix1 §1 (REVIEW замечание 1) — сеть обязана быть возвращена в ЛЮБОМ сценарии.
  *
- * Правила: возвращаем ТОЛЬКО то, что было включено до рестарта (`wifi=1`/`ap=1` из сохранённого
- * состояния); Wi-Fi — до 3 попыток с паузой ~3 с; санация `ip rule` ограничена правилами
- * `oif wlan0` (чужие правила policy-routing не трогаем).
+ * Держим то, чего не хватало в 1.0.61:
+ *  1. без надёжно сохранённого состояния сеть не выключается вообще (операция прерывается);
+ *  2. отказ ПОСЛЕ отключения Wi-Fi компенсируется в той же операции (без рестарта zygote);
+ *  3. возврат сети не привязан к успешной JIT-верификации (в т.ч. STALE и «канала нет»);
+ *  4. сохранённое состояние не удаляется, пока возврат не подтверждён;
+ *  5. на обычном старте сети не касаемся.
  */
 class NetRestoreTest {
 
@@ -18,6 +22,7 @@ class NetRestoreTest {
         listOf(File(rel), File("app/$rel")).first { it.isFile }.readText()
 
     private val net = "src/main/java/com/example/voiceapp3/tools/JitNet.kt"
+    private val perf = "src/main/java/com/example/voiceapp3/tools/AppPerformance.kt"
 
     private fun bodyOf(source: String, fn: String): String {
         val i = source.indexOf(fn)
@@ -37,64 +42,105 @@ class NetRestoreTest {
         return source.substring(i)
     }
 
-    // 1. Разбор/формат сохранённого состояния; битая строка — не состояние, а null.
+    // 1. Формат сохранённого состояния: wifi/ap + метка времени, битое — null.
     @Test
     fun savedStateRoundTrip() {
-        assertEquals(JitNet.State(true, true), JitNet.parse(JitNet.State(true, true).wire()))
-        assertEquals(JitNet.State(false, false), JitNet.parse(JitNet.State(false, false).wire()))
-        assertEquals("битая строка — не состояние", null, JitNet.parse("ap=1"))
+        val st = JitNet.State(true, false, 1_000L)
+        assertEquals("wifi=1,ap=0,ts=1000", st.wire())
+        assertEquals(st, JitNet.parse(st.wire()))
+        assertEquals(null, JitNet.parse("ap=1"))
         assertEquals(null, JitNet.parse(null))
         assertEquals(null, JitNet.parse(""))
     }
 
-    // 2. Возврат идёт строго по сохранённому состоянию (§2.3).
+    // 2. Просроченное состояние не применяем (иначе откатим ручные изменения владельца).
     @Test
-    fun restoreUsesSavedStateOnly() {
-        val s = src(net)
-        val restore = bodyOf(s, "fun restoreAfterRestart")
-        assertTrue("нет возврата по сохранённому состоянию", restore.isNotEmpty())
-        assertTrue("Wi-Fi возвращаем только если был включён", restore.contains("if (saved.wifi)"))
-        assertTrue("AP возвращаем только если был поднят", restore.contains("if (saved.ap)"))
-        assertTrue("источник — параметр saved", restore.contains("saved: State"))
-        assertTrue("без сохранённого состояния — skip", restore.contains("reason=was_off"))
+    fun expiredStateIsNotApplied() {
+        val st = JitNet.State(true, true, 0L)
+        assertTrue("10 минут — граница", JitNet.isExpired(st.copy(tsMs = 1_000L), 1_000L + JitNet.SAVED_TTL_MS + 1))
+        assertFalse(JitNet.isExpired(st.copy(tsMs = 1_000L), 1_000L + 1_000L))
+        assertFalse("без метки времени не считаем просроченным", JitNet.isExpired(st, Long.MAX_VALUE / 2))
     }
 
-    // 3. Wi-Fi: не больше 3 попыток с паузой ~3 с (§2.3б).
+    // 3. Без подтверждённого сохранения — операция прерывается ДО сетевых изменений.
     @Test
-    fun wifiRetriesAreBounded() {
-        assertEquals("до 3 попыток", 3, JitNet.WIFI_RESTORE_ATTEMPTS)
-        assertEquals("пауза ~3 с", 3_000L, JitNet.WIFI_RESTORE_PAUSE_MS)
+    fun abortWhenStateNotSaved() {
         val s = src(net)
-        assertTrue("цикл попыток по константе",
-            s.contains("for (attempt in 1..WIFI_RESTORE_ATTEMPTS)"))
-        assertTrue("пауза между попытками", s.contains("Thread.sleep(WIFI_RESTORE_PAUSE_MS)"))
-        assertTrue("результат пишется в лог", s.contains("JIT_NET_RESTORE wifi=1 attempt="))
+        val save = bodyOf(s, "fun saveBeforeRestart")
+        assertTrue("состояние читается до записи", save.indexOf("readState(") in 0 until save.indexOf("Prefs2.putString"))
+        assertTrue("сохранение подтверждается чтением обратно", save.contains("savedState(app)"))
+        assertTrue("не подтвердилось — не трогаем сеть", save.contains("(сеть не трогаем)"))
+
+        val apply = bodyOf(src(perf), "fun jitApplyWithZygote")
+        assertTrue("нет проверки на null", apply.contains("if (netSaved == null)"))
+        assertTrue("прерывание до подготовки сети",
+            apply.indexOf("if (netSaved == null)") < apply.indexOf("JitNet.runPreRestart"))
+        assertTrue("в отказе нет сетевых команд",
+            !bodyOf(apply.substring(apply.indexOf("if (netSaved == null)")), "if").contains("svc wifi disable"))
+        assertTrue("отказ логируется", apply.contains("aborted reason=no_net_state"))
     }
 
-    // 4. Санация: только правила `oif wlan0`, чужие правила не трогаем.
+    // 4. Отказ после отключения Wi-Fi компенсируется в той же операции.
     @Test
-    fun sanitizeTouchesOnlyOifWlan0() {
-        val script = JitNet.sanitizeScript()
-        assertTrue("удаление идёт по выборке oif wlan0", script.contains("grep 'oif wlan0'"))
-        assertTrue("удаляем по приоритету из этой выборки", script.contains("ip rule del priority"))
-        assertTrue("итог санации в лог", script.contains("JIT_NET_SANITIZE removed="))
-        assertTrue("скоуп явно в логе", script.contains("scope=oif_wlan0"))
-        for (bad in listOf("iptables", "ip6tables", "flush", "oif wlan1", "oif usb0")) {
-            assertTrue("санация не должна трогать: $bad", !script.contains(bad))
-        }
-        // Правила/скрипт TTL не меняются — проверка, что санация не про TTL.
-        val ttl = src("src/main/java/com/example/voiceapp3/tools/TtlScript.kt")
-        assertTrue("TTL-скрипт остаётся отдельным", ttl.isNotEmpty() && !ttl.contains("JIT_NET_SANITIZE"))
+    fun failureAfterDisableCompensates() {
+        val apply = bodyOf(src(perf), "fun jitApplyWithZygote")
+        val compIdx = apply.indexOf("JitNet.compensate")
+        assertTrue("нужна компенсация", compIdx > 0)
+        assertTrue("компенсация после подготовки сети", compIdx > apply.indexOf("JitNet.runPreRestart"))
+        assertTrue("компенсация до выхода из функции", compIdx < apply.indexOf("JIT_APPLIED runtime="))
+        assertTrue("в отказе нет рестарта zygote",
+            !apply.substring(compIdx).substringBefore("return listOf").contains("ctl.restart"))
+
+        val s = src(net)
+        val comp = bodyOf(s, "fun compensate")
+        assertTrue("компенсация = возврат по сохранённому состоянию", comp.contains("restoreAfterRestart"))
+        assertTrue("в логе явно, что рестарта нет", comp.contains("zygote НЕ перезапускается"))
     }
 
-    // 5. AP: механизм референса, при недоступности — честный лог, без «лечения» системы.
+    // 5. Возврат сети не зависит от JIT-верификации: выполняется сразу после решения о намерении.
     @Test
-    fun apRestoreIsHonestWhenUnavailable() {
+    fun restoreIsIndependentOfVerification() {
+        val p = src(perf)
+        val pending = bodyOf(p, "fun jitPendingVerify")
+        val restoreIdx = pending.indexOf("restoreNetAndScheduleAvas(app, where, \"pending_verify\")")
+        assertTrue("нужен ранний возврат сети", restoreIdx > 0)
+        assertTrue("возврат ДО чтения props", restoreIdx < pending.indexOf("val read = {"))
+        assertTrue("возврат ДО ожидания DONE",
+            restoreIdx < pending.indexOf("while (!zr.contains(\"JIT_ZYGOTE_DONE\")"))
+        assertTrue("STALE тоже возвращает сеть", pending.contains("restoreNetAndScheduleAvas(app, where, \"pending_stale\")"))
+        assertTrue("в ветке «нет канала» сеть уже возвращена",
+            pending.contains("net_restore=done_before_verify"))
+
+        val helper = bodyOf(p, "fun restoreNetAndScheduleAvas")
+        assertTrue("берём только сохранённое состояние", helper.contains("JitNet.savedState(app)"))
+        assertTrue("просроченное — не применяем", helper.contains("JitNet.isExpired"))
+        assertTrue("снимаем сохранение ТОЛЬКО по подтверждению", helper.contains("if (res?.allConfirmed == true)"))
+        assertTrue("иначе сохраняем на следующий старт", helper.contains("keep_saved"))
+    }
+
+    // 6. На обычном старте сетевых действий нет: возврат живёт только в pending-пути.
+    @Test
+    fun noNetworkActionsOnPlainStart() {
+        val p = src(perf)
+        val probe = bodyOf(p, "fun jitBootProbe")
+        assertFalse("jitBootProbe не трогает сеть",
+            probe.contains("JitNet.") || probe.contains("svc wifi"))
+        val pending = bodyOf(p, "fun jitPendingVerify")
+        assertTrue("возврат только при наличии файла-намерения", pending.contains("if (!pendFile.isFile) return false"))
+        assertTrue("возврат вызывается из pending-пути", pending.contains("restoreNetAndScheduleAvas"))
+    }
+
+    // 7. Лог различает запрос и фактическое состояние; Wi-Fi — до 3 попыток.
+    @Test
+    fun restoreLogsRequestVsState() {
+        assertEquals("до 3 попыток", 3L, JitNet.WIFI_RESTORE_ATTEMPTS.toLong())
+        assertEquals("пауза 3 с", 3_000L, JitNet.WIFI_RESTORE_PAUSE_MS)
         val s = src(net)
-        assertTrue("AP поднимается через startSoftAp", s.contains("\"startSoftAp\""))
-        assertTrue("недоступность логируется", s.contains("no_startSoftAp"))
-        assertTrue("факт «уже поднят» тоже логируется", s.contains("result=already_up"))
-        for (bad in listOf("svc wifi enable", "setenforce", "pm install")) {
+        assertTrue("запрос и состояние в одной строке", s.contains("request=\${request") || s.contains("request=\$request"))
+        assertTrue("состояние интерфейса отдельно", s.contains("link=\$link"))
+        assertTrue("причина отказа AP честная", s.contains("reason=\${err?") || s.contains("reason="))
+        assertTrue("успех Wi-Fi — по факту, а не по запросу", s.contains("if (state == true) return true"))
+        for (bad in listOf("setenforce", "pm install", "svc wifi enable")) {
             assertTrue("запрещено в JitNet: $bad", !s.contains(bad))
         }
     }
