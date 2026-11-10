@@ -704,6 +704,13 @@ object AppPerformance {
     private val saidNoClaim = java.util.concurrent.atomic.AtomicBoolean(false)
 
 
+    /**
+     * Тег текущей загрузки ГУ. Реализация одна на приложение (`HvacDigitalPlugin.currentBootTag`:
+     * `/proc/sys/kernel/random/boot_id`, иначе `epoch…`), чтобы JIT и HVAC не расходились в
+     * опознании загрузки — иначе «продолжение операции» и «остаток прошлой загрузки» путались бы.
+     */
+    private fun currentBootTag(): String = HvacDigitalPlugin.currentBootTag()
+
     /** Одна boot-попытка на процесс (отдельный счётчик от HVAC и от JIT). */
     private val videoBootAttempted = java.util.concurrent.atomic.AtomicBoolean(false)
 
