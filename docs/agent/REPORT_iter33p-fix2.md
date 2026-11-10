@@ -28,8 +28,14 @@ job `129923870857`, artifact `13778445997`, 174 PASSED / 0 FAILED.
 **Локальный прогон поведенческих тестов (не только компиляция):** 50 PASS / 0 FAIL,
 воспроизведение — `scripts/localjvm/README.md` (см. §7).
 
-**CI по этому коммиту:** будет добавлен отдельным коммитом после прогона (в тот момент, когда
-появится job-id) — без лога джобы слово «PASSED» не используется.
+**CI по этому коммиту (код `4b04b64`):** run `42856558762` — **success**, job `129971052345`,
+`BUILD SUCCESSFUL in 3m 57s`, **193 PASSED / 0 FAILED**, артефакт `13783617402` (`app-debug`,
+177 194 978 Б). Рост с 174 объясняется новыми тестами: `JitNetCoreTest` 18, `AvasCoreTest` 12,
+`AvasContractTest` 5, минус удалённые текстовые `NetRestoreTest` (7) и `AvasRestoreTest` (9).
+В логе джобы видны все 18 `JitNetCoreTest` и все 12 `AvasCoreTest`, включая
+`expiredMarkerRestoresWifiButNotAp`, `clockWentBackwardsIsNotExpiry`,
+`failedRestoreKeepsMarkerAndNextStartRetries`, `staleTasksDoNotTouchNewSnapshot`,
+`unreadableDeviceWritesNothing`.
 
 ---
 
