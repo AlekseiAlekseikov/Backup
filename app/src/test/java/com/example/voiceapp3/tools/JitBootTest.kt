@@ -1,169 +1,90 @@
 package com.example.voiceapp3.tools
 
-import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
 
 /**
- * iter33n §3 — `JIT_BOOT` печатается ВСЕГДА (на каждом старте и после ребута).
+ * iter33p (1.0.61) — на обычном старте/загрузке ГУ ничего не применяется.
  *
- * Лог 08.11: единственная строка про JIT была `JIT_VERIFY: skipped reason=zygote_restart_removed`
- * — состояние JIT после перезагрузки ГУ по логу восстановить нельзя.
+ * Проверяется ИСПОЛНЯЕМО ([JitOp.continueAfterBoot] без снимка) и статически по коду стартовых
+ * путей: в них не должно остаться ни `bootRestoreJit`, ни повтора через 30 с, ни записи persist.
  */
 class JitBootTest {
 
-    private fun src(rel: String): String {
-        val f = listOf(File(rel), File("app/$rel")).firstOrNull { it.isFile }
-            ?: error("не найден $rel (cwd=${File(".").absolutePath})")
-        return f.readText()
-    }
+    private fun src(rel: String): String =
+        listOf(File(rel), File("app/$rel")).first { it.isFile }.readText()
+
+    private fun code(rel: String): String = src(rel).lines()
+        .filterNot {
+            val t = it.trim()
+            t.startsWith("*") || t.startsWith("//") || t.startsWith("/*")
+        }.joinToString("\n")
 
     @Test
-    fun jitBootLineIsUnconditional() {
-        val perf = src("src/main/java/com/example/voiceapp3/tools/AppPerformance.kt")
-        val i = perf.indexOf("fun jitBootProbe(")
-        assertTrue("нужна отдельная проба JIT_BOOT", i > 0)
-        val body = perf.substring(i, minOf(perf.length, i + 2600))
-        // до строки JIT_BOOT нет ранних выходов по префу/каналу
-        val beforeLine = body.substring(0, body.indexOf("JIT_BOOT runtime="))
-        assertTrue("ранний выход по префу запрещён", !beforeLine.contains("isAutoOptimizeEnabled(app) {"))
-        assertTrue("нет `if (!isAutoOptimizeEnabled", !beforeLine.contains("if (!isAutoOptimizeEnabled"))
-        for (f in listOf("runtime=", "persist=", "profiles=", "init=", "expect_runtime_true_after_reboot=")) {
-            assertTrue("в JIT_BOOT нет поля $f", body.contains(f))
-        }
-    }
-
-    @Test
-    fun keyIsPersistDalvikVmUsejit() {
-        val perf = src("src/main/java/com/example/voiceapp3/tools/AppPerformance.kt")
-        assertTrue("init-ключ остаётся persist.dalvik.vm.usejit",
-            perf.contains("PROP_PERSIST_USEJIT_INIT = \"persist.dalvik.vm.usejit\""))
-        assertTrue("runtime-ключ dalvik.vm.usejit", perf.contains("PROP_USEJIT = \"dalvik.vm.usejit\""))
-        assertTrue("profiles читается", perf.contains("dalvik.vm.usejitprofiles"))
-        assertTrue("причина init_did_not_carry", perf.contains("reason=init_did_not_carry"))
-    }
-
-    @Test
-    fun calledOnEveryStart() {
-        val app = src("src/main/java/com/example/voiceapp3/App.kt")
-        assertTrue("проба вызывается из App.onCreate через BgWorker",
-            app.contains("AppPerformance.jitBootProbe(this)"))
-    }
-
-    /**
-     * iter33n-fix1 §2/§4 — правило владельца 08.11: рестарт фреймворка разрешён ТОЛЬКО в тумблере
-     * JIT (по явному клику). Статический поиск call-sites: литерал есть ровно в одном файле и
-     * только внутри блока `JIT_ZYGOTE_BEGIN … JIT_ZYGOTE_END`, а сам блок вызывается из
-     * `setAutoOptimize` и НЕ вызывается из boot/фоновых путей.
-     */
-    @Test
-    fun zygoteRestartOnlyInsideJitToggleBlock() {
-        // iter33p (1.0.61): текст единственной цепочки живёт в чистом ядре
-        // (`JitNetModel.jitChainScript`), поэтому литерал рестарта обязан быть ТОЛЬКО там.
-        val root = listOf(File("src/main/java"), File("app/src/main/java")).first { it.isDirectory }
-        fun codeLines(f: File): String = f.readText().lines()
-            .filterNot { l ->
-                val t = l.trim()
-                t.startsWith("*") || t.startsWith("//") || t.startsWith("/*")
-            }
-            .joinToString("\n")
-        val withLiteral = root.walkTopDown()
-            .filter { it.isFile && it.extension == "kt" && codeLines(it).contains("ctl.restart zygote") }
-            .map { it.name }.toList()
-        assertEquals("рестарт фреймворка допустим только в цепочке ядра",
-            listOf("JitNetCore.kt"), withLiteral)
-
-        val chain = JitNetModel.jitChainScript("op-x", "true", JitNetModel.journalPath("op-x"))
-        assertEquals("в цепочке рестарт ровно один",
-            1, Regex("setprop ctl\\.restart zygote").findAll(chain).count())
-        assertTrue("рестарт последней командой",
-            chain.trimEnd().lines().last { it.isNotBlank() }.trim() == "setprop ctl.restart zygote")
-
-        val perf = src("src/main/java/com/example/voiceapp3/tools/AppPerformance.kt")
-        val perfFile = listOf(
-            File("src/main/java/com/example/voiceapp3/tools/AppPerformance.kt"),
-            File("app/src/main/java/com/example/voiceapp3/tools/AppPerformance.kt")
-        ).first { it.isFile }
-        assertFalse("AppPerformance не содержит литерал рестарта",
-            codeLines(perfFile).contains("ctl.restart zygote"))
-        assertTrue("AppPerformance запускает цепочку через адаптер", perf.contains("JitNet.runChain"))
-
-        val begin = perf.indexOf("JIT_ZYGOTE_BEGIN")
-        val end = perf.indexOf("JIT_ZYGOTE_END")
-        assertTrue("нет маркеров блока JIT_ZYGOTE", begin > 0 && end > begin)
-        val apply = bodyOf(perf, "fun jitApplyWithZygote")
-        assertTrue("точка клика внутри блока", begin < perf.indexOf("fun jitApplyWithZygote") && perf.indexOf("fun jitApplyWithZygote") < end)
-        assertTrue("в цепочке нет посторонних рестартов", !apply.contains("ctl.restart"))
-
-        assertTrue("тумблер JIT обязан вызывать jitApplyWithZygote",
-            perf.contains("jitApplyWithZygote(context, enabled, rtBefore, psBefore)"))
-        // iter33p §1: разрешённая точка ОДНА — клик тумблера (авто-восстановления при загрузке нет).
-        for (fn in listOf("fun jitBootProbe", "fun bootRestoreJit", "fun verifyJitOnly",
-                          "fun jitPendingVerify", "fun checkPendingZygoteVerify", "fun jitRound")) {
-            val body = bodyOf(perf, fn)
-            assertTrue("нет функции $fn", body.isNotEmpty())
-            assertTrue("$fn не должен запускать рестарт фреймворка", !body.contains("jitApplyWithZygote("))
-        }
-        // Больше вызовов нет: 1 определение + ровно 1 вызов (клик тумблера).
-        assertEquals("вызовов jitApplyWithZygote должно быть 1 (только тумблер)",
-            2, Regex("jitApplyWithZygote\\(").findAll(perf).count())
-    }
-
-    /**
-     * iter33p §1 — авто-восстановления JIT при загрузке БОЛЬШЕ НЕТ (решение владельца 09.11,
-     * как в референсе: `setprop dalvik.vm.usejit` только в цепочке клика).
-     *
-     * Держим статически: в коде нет ни одной части прежнего механизма, а `App.onCreate` его
-     * не планирует. Иначе скрытый рестарт фреймворка после загрузки снова сломает сеть.
-     */
-    @Test
-    fun bootRestoreIsGone() {
-        val perf = src("src/main/java/com/example/voiceapp3/tools/AppPerformance.kt")
-        for (gone in listOf(
-            "jitBootRestoreArm", "bootRestoreDecision", "JIT_BOOT_RESTORE_MARKER",
-            "JIT_BOOT_RESTORE_DELAY_MS", "boot_restore", "JIT_BOOT_RESTORE"
+    fun bootRestoreRemovedFromAllPaths() {
+        for (f in listOf(
+            "src/main/java/com/example/voiceapp3/tools/AppPerformance.kt",
+            "src/main/java/com/example/voiceapp3/VoiceAssistantService.kt"
         )) {
-            assertTrue("остаток авто-восстановления в коде: $gone", !perf.contains(gone))
+            val c = code(f)
+            assertFalse("$f: bootRestoreJit удалён", c.contains("bootRestoreJit"))
+            assertFalse("$f: boot-backfill удалён", c.contains("jitPersistBackfill"))
+            assertFalse("$f: нет повтора через 30 с", c.contains("30_000L"))
         }
-        val app = src("src/main/java/com/example/voiceapp3/App.kt")
-        assertTrue("App.onCreate не должен планировать авто-восстановление",
-            !app.contains("jitBootRestoreArm"))
-        // Единственный путь к рестарту — jitApplyWithZygote из клика тумблера.
-        assertTrue("клик тумблера остаётся точкой вызова",
-            perf.contains("jitApplyWithZygote(context, enabled, rtBefore, psBefore)"))
     }
 
-    // iter33o §2.3 — устаревшего текста «применится после перезагрузки ГУ» больше нет.
     @Test
-    fun bootLineExplainsOffAfterReboot() {
-        val perf = src("src/main/java/com/example/voiceapp3/tools/AppPerformance.kt")
-        assertTrue("нужен jit=off_after_reboot", perf.contains("jit=off_after_reboot"))
-        assertTrue("нужна подсказка toggle_to_enable", perf.contains("toggle_to_enable"))
-        assertTrue("старый текст убран",
-            !perf.contains("apply=\\\"применится после перезагрузки ГУ\\\""))
+    fun serviceStartupDoesNotRestartZygote() {
+        val c = code("src/main/java/com/example/voiceapp3/VoiceAssistantService.kt")
+        assertFalse("сервис не просит рестарт фреймворка", c.contains("ctl.restart zygote"))
+        assertFalse("сервис не пишет dalvik.vm.usejit", c.contains("setprop dalvik.vm.usejit"))
     }
 
-    /**
-     * Тело функции по балансу фигурных скобок: `indexOf` + N символов давал ложные срабатывания
-     * (соседняя функция попадала в окно).
-     */
-    private fun bodyOf(src: String, fn: String): String {
-        val i = src.indexOf(fn)
-        if (i < 0) return ""
-        val j = src.indexOf('{', i)
-        if (j < 0) return ""
-        var depth = 0
-        for (k in j until src.length) {
-            when (src[k]) {
-                '{' -> depth++
-                '}' -> {
-                    depth--
-                    if (depth == 0) return src.substring(i, k + 1)
-                }
+    @Test
+    fun plainBootTouchesNoNetwork() {
+        val stand = JitIsoStand(rules = 0)
+        val store = object : JitStore {
+            val m = LinkedHashMap<String, String?>()
+            override fun get(key: String): String? = m[key]
+            override fun put(key: String, value: String?): Boolean { m[key] = value; return true }
+            override fun getBool(key: String, def: Boolean): Boolean = def
+            override fun putBool(key: String, value: Boolean): Boolean { m[key] = value.toString(); return true }
+        }
+        val net = object : JitNetState {
+            val requests = mutableListOf<String>()
+            override fun wifiOn(): Boolean? = true
+            override fun apUp(): Boolean? = false
+            override fun setWifi(on: Boolean): Boolean { requests += "wifi"; return true }
+            override fun startAp(): Boolean { requests += "ap"; return true }
+        }
+        val res = JitOp.continueAfterBoot(store, net, bootTag = "boot-1", sleep = {})
+        assertTrue("обычный старт: снимка нет", res == JitOp.RestoreResult.NO_RESTORE)
+        assertTrue("ноль запросов сети", net.requests.isEmpty())
+        assertTrue("ноль shell-команд", stand.calls().isEmpty())
+    }
+
+    @Test
+    fun bootProbeIsReadOnlyAndReportsLeftovers() {
+        val c = code("src/main/java/com/example/voiceapp3/tools/AppPerformance.kt")
+        assertTrue("проба читает runtime", c.contains("echo RT="))
+        assertTrue("проба сообщает об остатках прежних версий",
+            c.contains("JIT_BOOT_LEGACY") && c.contains("need=owner_decision"))
+        assertTrue("проба прямо пишет, что ничего не пишет", c.contains("write=none"))
+        assertFalse("проба не пишет persist.dalvik.vm.usejit",
+            c.contains("setprop \$PROP_PERSIST_USEJIT_INIT"))
+        assertFalse("проба не пишет маркер", c.contains("setprop \$PROP_PERSIST_USEJIT"))
+    }
+
+    @Test
+    fun noOwnWatcherOrJournalMechanismsLeft() {
+        for (f in listOf("JitNetCore.kt", "JitNet.kt", "AppPerformance.kt")) {
+            val c = code("src/main/java/com/example/voiceapp3/tools/$f")
+            for (bad in listOf("JITSTEP", "OPERATION_TTL", "watcher", "cancelFile", "discardNoEffect",
+                "COMPENSATE_RESTORE", "HOLD_UNKNOWN", "sleep 8", "jit_pending_verify")) {
+                assertFalse("$f: собственный механизм «$bad» удалён", c.contains(bad))
             }
         }
-        return src.substring(i)
     }
 }

@@ -208,13 +208,10 @@ object AppPerformance {
                 )
             )
 
-            val valStr = if (enabled) "true" else "false"
-            // iter33n-fix1 §2 — механизм референса (`w0/bb.run`): prop → рестарт фреймворка →
-            // сверка на следующем старте. Рестарт фреймворка разрешён владельцем (08.11)
-            // ТОЛЬКО здесь — в потоке тумблера JIT по явному клику (см. блок JIT_ZYGOTE).
-            val (rtBefore, psBefore) = jitProps()
-            jitPersistBackfill(valStr, "toggle")
-            val zygotePatch = jitApplyWithZygote(context, enabled, rtBefore, psBefore)
+            // iter33p (1.0.61): механизм референса — только `dalvik.vm.usejit` + рестарт zygote по
+            // клику. Persist-свойства JIT (`persist.dalvik.vm.usejit`, `persist.sys.dalvik.vm.usejit`)
+            // НЕ пишутся (в `w0/la.run` их нет), boot-backfill удалён.
+            val zygotePatch = jitApplyWithZygote(context, enabled)
             steps.addAll(zygotePatch)
 
             if (enabled) {
@@ -700,12 +697,6 @@ object AppPerformance {
      */
     private const val PROP_PERSIST_USEJIT = "persist.sys.dalvik.vm.usejit"
     private const val PROP_PERSIST_USEJIT_INIT = "persist.dalvik.vm.usejit"
-    private const val JIT_BOOT_MARKER = "jit_boot_attempt"
-    /** iter33e A4: bootTag, для которого положительный `JIT_PROBE` уже напечатан. */
-    private const val JIT_VERIFIED_FILE = "jit_verified"
-
-
-
     /**
      * iter33g C2: `claim none` печатаем один раз за процесс — при обычном открытии приложения
      * `onCreate` + `onStartCommand` давали две одинаковые строки шума.
@@ -713,101 +704,8 @@ object AppPerformance {
     private val saidNoClaim = java.util.concurrent.atomic.AtomicBoolean(false)
 
 
-    /**
-     * iter33f B3: в JIT-строках пустое значение печатается как `empty`.
-     * `LogKit.kv("")` даёт `-`, а голое `runtime_after=` читается как обрезанная строка.
-     */
-    private fun kvE(s: String): String = if (s.isEmpty()) "empty" else LogKit.kv(s)
-
-    /** Один короткий read-only вызов: runtime + маркер + init-ключ (три строки, iter33l §3.5). */
-    private fun jitProps(): Pair<String, String> {
-        val (_, out) = runCatching {
-            AdbClient.execute(
-                "echo RT=\$(getprop $PROP_USEJIT); echo PS=\$(getprop $PROP_PERSIST_USEJIT); " +
-                    "echo PI=\$(getprop $PROP_PERSIST_USEJIT_INIT)",
-                5000, expectRoot = false)
-        }.getOrDefault(Pair(1, ""))
-        lastJitInitKey = Regex("PI=([^\\n]*)").find(out)?.groupValues?.get(1)?.trim().orEmpty()
-        return Pair(
-            Regex("RT=([^\\n]*)").find(out)?.groupValues?.get(1)?.trim().orEmpty(),
-            Regex("PS=([^\\n]*)").find(out)?.groupValues?.get(1)?.trim().orEmpty()
-        )
-    }
-
-    /** Значение init-ключа из последнего [jitProps] — только для строк лога. */
-    @Volatile private var lastJitInitKey: String = ""
-
     /** Одна boot-попытка на процесс (отдельный счётчик от HVAC и от JIT). */
     private val videoBootAttempted = java.util.concurrent.atomic.AtomicBoolean(false)
-
-    /**
-     * Единственная разрешённая persist-запись — `persist.sys.dalvik.vm.usejit`
-     * (правило владельца: только флаги `hvacdigital.*` + этот маркер).
-     * Пишется по клику (`reason=toggle`) и на boot как backfill (`reason=boot_backfill`),
-     * всегда с чтением обратно — без readback строка не доказательство.
-     */
-    private fun jitPersistBackfill(value: String, reason: String): String {
-        val ret = runCatching {
-            runSuCommand("setprop $PROP_PERSIST_USEJIT_INIT $value; " +
-                "setprop $PROP_PERSIST_USEJIT $value; " +
-                "echo JIT_PERSIST_READBACK=\$(getprop $PROP_PERSIST_USEJIT_INIT); " +
-                "echo JIT_PERSIST_MARKER=\$(getprop $PROP_PERSIST_USEJIT)")
-        }.getOrNull()
-        val rb = ret?.let { parseTag(it.output, "JIT_PERSIST_READBACK") } ?: "?"
-        val marker = ret?.let { parseTag(it.output, "JIT_PERSIST_MARKER") } ?: "?"
-        AppLog.i(TAG, "JIT_PERSIST_SET desired=$value readback_init=$rb marker=$marker reason=$reason " +
-            "key=$PROP_PERSIST_USEJIT_INIT (init поднимет dalvik.vm.usejit при загрузке)")
-        return rb
-    }
-
-    /** iter33d A2: идентификатор текущей загрузки (кэш на процесс). */
-    @Volatile private var bootTag: String? = null
-
-    private fun currentBootTag(): String {
-        bootTag?.let { return it }
-        val id = runCatching { File("/proc/sys/kernel/random/boot_id").readText().trim() }
-            .getOrDefault("")
-        if (id.isNotEmpty()) { bootTag = id; return id }
-        val epochMs = System.currentTimeMillis() - android.os.SystemClock.elapsedRealtime()
-        val tag = JitBootMark.epochTag(epochMs)
-        bootTag = tag
-        return tag
-    }
-
-    /**
-     * iter33j §4.1 — восстановление JIT после ребута БЕЗ перезапуска zygote.
-     *
-     * Механизм референса (`jit_pedido` / `jit_restaurar`, dex 3.3.9): переключатель — только
-     * prop; zygote там не перезапускается никогда. Поэтому на boot мы:
-     *  • читаем runtime/persist; при расхождении пишем ТОЛЬКО persist-маркер (одна запись);
-     *  • печатаем одну строку с честным «применится после перезагрузки ГУ»;
-     *  • не делаем `pidof zygote`, рестартов zygote, файлов-намерений и postDelayed-сверок —
-     *    ждать нечего, потому что рестарта нет (владелец 06.11: zygote ложит root и CarPlay).
-     */
-    fun bootRestoreJit(context: Context, secondPass: Boolean = false) {
-        BgWorker.assertNotMain("AppPerformance.bootRestoreJit")
-        val app = context.applicationContext
-        if (!isAutoOptimizeEnabled(app)) {
-            if (!secondPass) AppLog.i(TAG, "JIT_BOOT: pref=off (no attempt)")
-            return
-        }
-        // Один проход: второй нужен был только для проверки «поднялся ли runtime после zygote».
-        if (!secondPass) return
-        val bootTag = currentBootTag()
-        var (runtime, persist) = jitProps()
-        if (persist != "true") {
-            val reason = if (persist.isEmpty()) "boot_backfill" else "boot_mismatch"
-            jitPersistBackfill("true", reason)
-            persist = jitProps().second
-        }
-        // iter33o §2.3: прежний текст «применится после перезагрузки ГУ» вводил в заблуждение —
-        // `setprop dalvik.vm.usejit` НЕ персистентен: после ребута `runtime=false` — это норма.
-        // iter33p §1: авто-восстановления при загрузке НЕТ (решение владельца 09.11, как в референсе) —
-        // после ребута тумблер просто off, включает владелец вручную.
-        val stateLine = if (runtime == "true") JIT_STATE_ON_LINE else JIT_STATE_OFF_LINE
-        AppLog.i(TAG, "JIT_BOOT: runtime=$runtime persist=${if (persist.isEmpty()) "empty" else persist} " +
-            "boot_tag=$bootTag $stateLine")
-    }
 
     /**
      * iter33n §3 — проба JIT на КАЖДОМ старте, БЕЗ условий (ни преф, ни runtime не влияют).
@@ -831,33 +729,33 @@ object AppPerformance {
             Regex("$tag=([^\\n]*)").find(out)?.groupValues?.get(1)?.trim().orEmpty()
         val runtime = read("RT").ifEmpty { "empty" }
         val persist = read("PS").ifEmpty { "empty" }        // persist.dalvik.vm.usejit (init-ключ)
-        val marker = read("MK").ifEmpty { "empty" }         // persist.sys.dalvik.vm.usejit (наш маркер)
+        val marker = read("MK").ifEmpty { "empty" }         // persist.sys.dalvik.vm.usejit (маркер старых версий)
         val profiles = read("PR").ifEmpty { "empty" }
-        val init = persist                                   // мандат §3.1: init = тот же ключ
+        val init = persist                                   // init = тот же ключ
         val expect = init == "true" || marker == "true"
         val pref = if (isAutoOptimizeEnabled(context)) "on" else "off"
         AppLog.i(TAG, "JIT_BOOT runtime=$runtime persist=$persist profiles=$profiles init=$init " +
-            "expect_runtime_true_after_reboot=$expect marker=$marker key=$PROP_PERSIST_USEJIT_INIT pref=$pref")
-        if (runtime != "true" && (persist == "true" || marker == "true")) {
-            // §3.2: persist-ключ стоит, а init значение в runtime не поднял — диагностика для след. шага.
-            AppLog.i(TAG, "JIT_BOOT runtime=$runtime persist=$persist reason=init_did_not_carry " +
-                "marker=$marker (persist есть, runtime не true)")
+            "expect_runtime_true_after_reboot=$expect marker=$marker key=$PROP_PERSIST_USEJIT_INIT pref=$pref " +
+            "write=none (только чтение: JIT на старте не применяется)")
+        // iter33p (1.0.61): остатки прежних версий только ЧИТАЕМ и не трогаем — очистка persist-флагов
+        // это запись в систему, на которую нужно решение владельца (см. §2.1 отчёта).
+        if (persist == "true" || marker == "true") {
+            AppLog.i(TAG, "JIT_BOOT_LEGACY persist=${persist} marker=$marker action=none " +
+                "reason=leftover_from_previous_versions need=owner_decision " +
+                "(read-only способ проверки: getprop $PROP_PERSIST_USEJIT_INIT / getprop $PROP_PERSIST_USEJIT)")
         }
-        // iter33n-fix1 §2.4(в): если перед рестартом фреймворка осталось намерение — дочитываем
-        // итог здесь же (`JIT_APPLIED … via=pending_verify`), это первый старт после рестарта.
+        // Сверка результата операции (getprop + кэш) и продолжение операции — оба ТОЛЬКО читают,
+        // если снимка этой загрузки нет (см. [jitPendingVerify]).
         runCatching { jitPendingVerify(context) }
-        // iter33p §3.2/§3.4(б): обычный старт — если сохранённый режим AVAS остался невостребованным
-        // (например, процесс убили до сверки), планируем возврат по расписанию референса
-        // (5 с → 12 с → 30 с ×5). Без файла-намерения это no-op.
-        runCatching { AvasRestore.scheduleRestore(context.applicationContext, AvasRestore.Where.APP_START) }
+        // AVAS: прежняя JIT-привязка удалена (§2 мандата: mute/sound type — самостоятельные функции
+        // референса, `w0/la.run`/`w0/e2.run` их не трогают). Остаточный снимок AVAS старых версий
+        // только ФИКСИРУЕТСЯ строкой: не применяем, не удаляем, значений на устройстве не меняем.
+        runCatching { reportLegacyAvasSnapshot(context.applicationContext) }
     }
 
     /**
-     * iter33o §2.3 — состояние JIT в строке `JIT_BOOT:` после ребута.
-     *
-     * `setprop dalvik.vm.usejit` НЕ персистентен: после перезагрузки ГУ `runtime=false` — это НОРМА,
-     * а не поломка. Поэтому вместо прежнего «применится после перезагрузки ГУ» печатаем
-     * `jit=off_after_reboot toggle_to_enable` (или `jit=on nothing_to_do`, если уже поднят).
+     * Строки состояния JIT для UI. `setprop dalvik.vm.usejit` НЕ персистентен: после перезагрузки ГУ
+     * `runtime=false` — это норма, а не поломка (в референсе так же, `la.run` пишет то же свойство).
      */
     internal const val JIT_STATE_ON_LINE = "jit=on nothing_to_do"
     internal const val JIT_STATE_OFF_LINE =
@@ -885,185 +783,157 @@ object AppPerformance {
     private val jitPendingDone = java.util.concurrent.atomic.AtomicBoolean(false)
 
     /**
-     * Сверка итога операции JIT на старте процесса (iter33p, 1.0.61).
+     * Сверка результата операции JIT и продолжение операции — по референсу.
      *
-     * Порядок и границы:
-     *  1. читается снимок операции ([JitNet.currentOp]) и РАЗДЕЛЬНЫЕ факты
-     *     (`getprop` / `maps` / смена pid zygote) — до любых действий;
-     *  2. сеть разбирается ТОЛЬКО через [JitNet.reconcilePending] (решение
-     *     [JitFlow.pendingAction]): продолжение операции после подтверждённого рестарта,
-     *     компенсация при доказанном отсутствии рестарта, `discard` если сети не касались,
-     *     `hold` если доказательств нет (тогда сетевых команд нет вообще);
-     *  3. AVAS — только если снимок операции существует (он привязан к операции в `AvasRestore`);
-     *  4. `JIT_APPLIED` печатает getprop, maps, рестарт и общий вердикт отдельными полями;
-     *     «нет данных» не превращается в успех.
+     * 1. `jit_restaurar` (сеть). `CentralWatchdogService.onCreate` → `w0/e2.run`: снимок разбирается
+     *    регуляркой `^wifi=([01]),ap=([01])$`, возврат планируется через `postDelayed(15000)` и идёт
+     *    **AP первым**, затем Wi-Fi. У нас ту же роль играет старт процесса: снимок читается, и если
+     *    он из ТЕКУЩЕЙ загрузки ГУ — это продолжение той же операции ([JitRef.Continuation.CONTINUE]).
+     *    Снимок другой загрузки не применяется и не удаляется: `need=owner_decision`.
+     * 2. `jit_pedido` (применение). `w0/bb` + `w0/r7`: `getprop dalvik.vm.usejit` + `dalvik-jit-code-cache`
+     *    в `/proc/self/maps`; `ok = (pedido == getprop) && (!pedido || cache != false)`. После сверки
+     *    `jit_pedido` снимается (`remove` в `r7`).
+     * 3. Рестарт фреймворка НЕ подтверждается и не заявляется: ни журнал, ни ответ транспорта, ни
+     *    истечение времени не считаются доказательством (§1.3 мандата). В логе — только факты.
      */
     fun jitPendingVerify(context: Context): Boolean {
         if (!jitPendingDone.compareAndSet(false, true)) return false
         val app = context.applicationContext
         val bootTag = currentBootTag()
-        val op = runCatching { JitNet.currentOp(app) }.getOrNull()
-        val phase = if (op == null) JitFlow.Phase.NONE else
-            runCatching { JitNet.phaseOf(app, op) }.getOrDefault(JitFlow.Phase.NONE)
-        val facts = runCatching { JitNet.applyFacts(app, op) }.getOrNull()
-        val net = runCatching { JitNet.reconcilePending(app, bootTag, "start") }.getOrNull()
-        if (op != null) {
-            runCatching { AvasRestore.scheduleRestore(app, AvasRestore.Where.JIT_TOGGLE) }
-        }
-        AppLog.i(TAG, "JIT_APPLIED " + (facts?.log() ?: "getprop=empty want=empty persist=empty " +
-            "maps=unknown restart=unknown verdict=unknown") +
-            " result=${facts?.verdict ?: "unknown"} zygote_restart=${facts?.restart ?: "unknown"} " +
-            "runtime=${facts?.getprop?.ifEmpty { "empty" } ?: "empty"} " +
-            "want=${op?.want ?: "none"} op=${op?.id ?: "none"} phase=${JitFlow.phaseLabel(phase)} " +
-            "via=start net=${net?.name?.lowercase() ?: "error"} " +
-            "avas_restore=${if (op != null) "scheduled" else "none"} " +
-            "boot_tag=$bootTag")
-        if (op == null) {
-            AppLog.i(TAG, "JIT_APPLIED runtime=${facts?.getprop?.ifEmpty { "empty" } ?: "empty"} " +
-                "result=unknown reason=no_operation (снимка операции нет: обычный старт, сеть не трогаем)")
-        }
+        continueNetworkOnStart(app, bootTag)
+        verifyAppliedState(app)
         return true
+    }
+
+    /**
+     * Read-only отчёт об остатке снимка AVAS прошлых версий (файл `filesDir/avas_snapshot`).
+     *
+     * Ничего не читает в Car API, ничего не пишет и не удаляет: снимок — чужое намерение прошлой
+     * версии, решение о нём за владельцем (§2 мандата, пункт про остатки).
+     */
+    private fun reportLegacyAvasSnapshot(app: Context) {
+        val f = java.io.File(app.filesDir, "avas_snapshot")
+        if (!f.isFile) return
+        AppLog.i(TAG, "AVAS_LEGACY snapshot=present size=${f.length()} action=none " +
+            "reason=not_jit_related need=owner_decision " +
+            "(не применяем и не удаляем: AVAS — отдельная функция, JIT её не касается)")
+    }
+
+    /**
+     * Продолжение ТОЙ ЖЕ операции после подъёма фреймворка — без второго клика (референс
+     * `CentralWatchdogService.onCreate` → `w0/e2.run`): пауза 15000 мс, затем AP, затем Wi-Fi.
+     * Снимок другой загрузки не применяется и не удаляется (`need=owner_decision`).
+     */
+    private fun continueNetworkOnStart(app: Context, bootTag: String) {
+        val res = runCatching { JitNet.continueAfterBoot(app, bootTag) }.getOrNull()
+        AppLog.i(TAG, "JIT_NET_CONT result=${res?.let { JitOp.restoreResultLabel(it) } ?: "error"} " +
+            "boot=$bootTag (сеть трогаем ТОЛЬКО при совпадении метки загрузки)")
+    }
+
+    /** Сверка применения (`bb`/`r7`): `getprop` + `dalvik-jit-code-cache`, затем снятие `jit_pedido`. */
+    private fun verifyAppliedState(app: Context) {
+        val st = runCatching { JitNet.verifyApplied(app, isAutoOptimizeEnabled(app)) }.getOrNull()
+        val toggle = when {
+            st == null -> "unknown"
+            st.runtime.trim() == "true" -> "on"
+            st.runtime.isBlank() -> "unknown"
+            else -> "off"
+        }
+        AppLog.i(TAG, "JIT_VERIFY result=${st?.let { JitRef.verifyLabel(it.verdict) } ?: "unknown"} " +
+            "toggle=$toggle restart=not_claimed " +
+            "(нет данных ⇒ unknown, а не успех; рестарт фреймворка здесь не подтверждается)")
+        if (st != null && (st.verdict == JitRef.Verify.NOT_APPLIED || st.verdict == JitRef.Verify.CACHE_MISSING)) {
+            AppLog.i(TAG, "JIT_NOT_APPLIED reason=${JitRef.verifyLabel(st.verdict)} pedido=${st.pedido} " +
+                "getprop=${st.runtime.ifEmpty { "empty" }} cache=${st.cache?.toString() ?: "unknown"} " +
+                "(факт, а не предположение; ничего не дозаписываем)")
+        }
     }
 
     // ═══════════ JIT_ZYGOTE_BEGIN ═══════════
     /*
      * ЕДИНСТВЕННОЕ место в коде, где разрешён перезапуск фреймворка (владелец, 08.11):
-     * только тумблер JIT по явному клику. Механизм — ОДНА цепочка по референсу
-     * (`w0/j9.onClick` → `w0/la.run` → `w0/e2.run`), без отдельного watcher-а:
+     * только тумблер JIT по явному клику. Механика — точно по референсу:
+     *   `w0/j9.onClick` (снимок Wi-Fi/AP в один commit) → `w0/la.run` (один скрипт, `ctl.restart
+     *   zygote` последней командой) → `CentralWatchdogService.onCreate` → `w0/e2.run`
+     *   (возврат AP, затем Wi-Fi) → `w0/bb`/`w0/r7` (getprop + `dalvik-jit-code-cache`).
      *
-     *   снимок операции (id + загрузка ГУ + исходные Wi-Fi/AP + цель JIT + pid zygote)
-     *     → один shell-скрипт: `svc wifi disable` → слив `oif wlan0` ≤20 с →
-     *       `setprop dalvik.vm.usejit` (+ согласованный `persist.dalvik.vm.usejit`) →
-     *       `setprop ctl.restart zygote` ПОСЛЕДНЕЙ командой
-     *     → после подъёма процесса: продолжение операции ([jitPendingVerify] →
-     *       [JitFlow.pendingAction] → возврат сохранённых AP и Wi-Fi, без второго клика).
-     *
-     * Почему нет watcher-а: рестарт — последняя команда скрипта, после неё нам ничего не нужно,
-     * а весь разбор делается на старте нового процесса по журналу шагов и смене pid zygote.
+     * Наши отличия — только те, без которых требование §1.3 не выполнить: метка загрузки в снимке,
+     * подтверждение записи чтением, отказ второго клика, выключенный шаг монтирований (§3 отчёта).
      */
 
     /**
-     * Применение JIT по клику тумблера. Возвращает шаги для UI.
+     * Применение JIT по клику тумблера — один вызов ядра [JitOp.click] (референс `w0/j9.onClick`
+     * → `w0/la.run`). Своей логики здесь нет: только строка статуса шага.
      *
-     * Статус честный: `PARTIAL` — «рестарт отправлен, итог на следующем старте», потому что
-     * прочитать `getprop`/`maps` из процесса, который сейчас умрёт, невозможно.
+     * Статус честный: `PARTIAL` — «скрипт отправлен, итог дочитается на следующем старте», потому
+     * что `getprop`/`maps` из процесса, который умрёт от рестарта zygote, прочитать нельзя.
      */
-    fun jitApplyWithZygote(
-        context: Context,
-        enabled: Boolean,
-        rtBefore: String,
-        psBefore: String
-    ): List<ToolsStep> {
+    fun jitApplyWithZygote(context: Context, enabled: Boolean): List<ToolsStep> {
         BgWorker.assertNotMain("AppPerformance.jitApplyWithZygote")
         val app = context.applicationContext
-        val want = if (enabled) "true" else "false"
         val t0 = System.currentTimeMillis()
-        val where = AvasRestore.Where.JIT_TOGGLE
         val bootTag = currentBootTag()
-
-        // ── 0. Хвост ПРЕДЫДУЩЕЙ операции — только внутри этой же цепочки ────────────────────
-        val prev = runCatching { JitNet.reconcilePending(app, bootTag, "pre_click") }.getOrNull()
-        AppLog.i(TAG, "JIT_NET_CHAIN previous=${prev?.name?.lowercase() ?: "error"} " +
-            "(сеть трогается только внутри тумблера)")
-
-        // ── 1. Снимок операции ДО сетевых изменений, с подтверждением чтением ───────────────
-        val opId = JitFlow.opId(t0, bootTag, java.util.UUID.randomUUID().toString().take(6))
-        val op = runCatching { JitNet.saveOperation(app, bootTag, want, opId) }.getOrNull()
-        if (op == null) {
-            AppLog.i(TAG, "JIT_APPLIED_REQUEST aborted reason=op_save_failed want=$want op=$opId " +
-                "runtime_before=${rtBefore.ifEmpty { "empty" }} persist_before=${psBefore.ifEmpty { "empty" }} " +
-                "(Wi-Fi/AP не выключались, рестарт фреймворка не запускался)")
-            return listOf(
-                ToolsStep(
-                    step = "perf_zygote",
-                    command = "нет: снимок операции не подтверждён",
-                    startedAtMs = t0, finishedAtMs = System.currentTimeMillis(),
-                    exitCode = 1,
-                    expected = "op snapshot written+read back",
-                    actual = "JIT_APPLIED_REQUEST aborted reason=op_save_failed",
-                    stdout = "Wi-Fi/AP не выключались, рестарт фреймворка не запускался",
-                    status = ToolsStep.Status.BLOCKED
-                )
-            )
-        }
-
-        // ── 2. Свои старые журналы (кроме текущего) + снимок AVAS (только чтение) ───────────
-        runCatching { JitNet.purgeOldJournals(app, op.id) }
-        val avasSaved = runCatching {
-            AvasRestore.saveBeforeRestart(app, where, bootTag)
-        }.getOrNull()
-
-        // ── 3. ЕДИНСТВЕННЫЙ скрипт операции ────────────────────────────────────────────────
-        AppLog.i(TAG, "JIT_APPLIED_REQUEST want=$want op=${op.id} runtime_before=${rtBefore.ifEmpty { "empty" }} " +
-            "persist_before=${psBefore.ifEmpty { "empty" }} net_saved=${op.log()} " +
-            "avas_saved=${avasSaved?.id ?: "none"} sound_saved=${AvasRestore.LAST_SOUND_REASON} " +
-            "journal=${JitNet.journalPath(op.id)} net_return=post_zygote op=${op.id} " +
+        AppLog.i(TAG, "JIT_APPLIED_REQUEST want=$enabled boot=$bootTag " +
+            "mount_step=${if (JitRef.MOUNT_STEP_ENABLED) "on" else "off (§1.1: обратимость не доказана, решение владельца)"} " +
             "warning=\"фреймворк перезапустится: экран гаснет на 10–20 с, приложения закрываются\"")
-        val chain = runCatching { JitNet.runChain(app, op) }.getOrNull()
-
-        // ── 4. Если скрипт ВЕРНУЛ управление, позднего рестарта быть не может ──────────────
-        //        Разбор честный: рестарт считается состоявшимся только по смене pid zygote.
-        val phase = runCatching { JitNet.phaseOf(app, op) }.getOrDefault(JitFlow.Phase.NONE)
-        val returned = chain != null
-        if (returned && phase != JitFlow.Phase.RESTART_SENT) {
-            val rec = runCatching {
-                JitNet.reconcilePending(app, bootTag, "chain_returned", lateRestartPossible = false)
-            }.getOrNull()
-            AppLog.i(TAG, "JIT_APPLIED_REQUEST aborted op=${op.id} reason=chain_not_reached_restart " +
-                "phase=${JitFlow.phaseLabel(phase)} rc=${chain?.exitCode} " +
-                "channel=${if (chain?.channelOk == true) "ok" else "failed"} net=${rec?.name?.lowercase()} " +
-                "(рестарт не отправлен — компенсация в этой же операции)")
-            return listOf(
-                ToolsStep(
-                    step = "perf_zygote",
-                    command = "setprop $PROP_USEJIT=$want · рестарт не отправлен",
-                    startedAtMs = t0, finishedAtMs = System.currentTimeMillis(),
-                    exitCode = chain?.exitCode ?: 1,
-                    expected = "journal step=restart_sent",
-                    actual = "phase=${JitFlow.phaseLabel(phase)} net=${rec?.name?.lowercase()}",
-                    stdout = (chain?.output ?: "").take(600),
-                    status = ToolsStep.Status.FAILED
-                )
-            )
+        val click = runCatching { JitNet.click(app, enabled, bootTag, t0) }
+            .getOrElse { JitOp.Click(JitOp.ClickResult.SNAPSHOT_WRITE_FAILED, null, null, false) }
+        val runtime = runCatching { JitNet.usejitNow(app) }.getOrDefault("")
+        val why = when (click.result) {
+            JitOp.ClickResult.STARTED -> "PARTIAL"
+            JitOp.ClickResult.REFUSED_PENDING ->
+                "не запускалось: незавершённая операция (restore=${click.net?.log() ?: "unknown"})"
+            JitOp.ClickResult.STATE_UNKNOWN -> "не запускалось: состояние сети неизвестно"
+            JitOp.ClickResult.SNAPSHOT_WRITE_FAILED -> "не запускалось: снимок не подтверждён записью"
         }
-
+        AppLog.i(TAG, "JIT_APPLIED runtime=${runtime.ifEmpty { "empty" }} want=$enabled " +
+            "pedido=1 code_cache_executavel=unknown result=unknown restart=not_claimed " +
+            "via=toggle click=${click.result.name.lowercase()} rc=${click.run?.exitCode ?: -1} " +
+            "outcome=${click.run?.let { JitRef.chainOutcomeLabel(it.outcome) } ?: "none"} " +
+            "net_return=post_zygote marker=${click.net?.log() ?: "none"} " +
+            "(итог дочитается на следующем старте: getprop + dalvik-jit-code-cache)")
         return listOf(
             ToolsStep(
                 step = "perf_zygote",
-                command = "setprop $PROP_USEJIT=$want · перезапуск фреймворка (тумблер JIT)",
+                command = if (click.result == JitOp.ClickResult.STARTED)
+                    "setprop $PROP_USEJIT=${if (enabled) "true" else "false"} · " +
+                        "setprop ctl.restart zygote (скрипт референса)"
+                else "нет: ${why}",
                 startedAtMs = t0, finishedAtMs = System.currentTimeMillis(),
-                exitCode = chain?.exitCode ?: 0,
-                expected = "JIT_APPLIED ... restart=ok (следующий старт)",
-                actual = "restart_sent op=${op.id} phase=${JitFlow.phaseLabel(phase)}",
-                stdout = "экран гаснет на 10–20 с · сеть вернётся автоматически после подъёма " +
-                    "фреймворка (продолжение этой операции, op=${op.id})",
-                status = ToolsStep.Status.PARTIAL
+                exitCode = if (click.result == JitOp.ClickResult.STARTED) (click.run?.exitCode ?: 1) else 1,
+                expected = "JIT_APPLIED result=ok на следующем старте",
+                actual = "click=${click.result.name.lowercase()} " +
+                    "rc=${click.run?.exitCode ?: -1} " +
+                    "outcome=${click.run?.let { JitRef.chainOutcomeLabel(it.outcome) } ?: "none"} " +
+                    "runtime=${runtime.ifEmpty { "empty" }} restart=not_claimed",
+                stdout = if (click.result == JitOp.ClickResult.STARTED)
+                    "экран гаснет на 10–20 с · сеть вернётся после подъёма фреймворка " +
+                        "(продолжение этой операции; AP, затем Wi-Fi — как e2)"
+                else why,
+                status = if (click.result == JitOp.ClickResult.STARTED) ToolsStep.Status.PARTIAL
+                else ToolsStep.Status.BLOCKED
             )
         )
     }
 
     // ═══════════ JIT_ZYGOTE_END ═══════════
 
+    /**
+     * read-only проба состояния JIT (без файлов-маркеров и без записей).
+     *
+     * Нужна только для лога: в референсе проверка — это `w0/bb`+`w0/r7` (`getprop` + `dalvik-jit-code-cache`),
+     * она выполняется после операции. Здесь ничего не пишем и рестартов не просим.
+     */
     fun verifyJitOnly(context: Context) {
         val app = context.applicationContext
         if (!isAutoOptimizeEnabled(app)) return
-        val (runtime, persist) = jitProps()
-        if (runtime != "true") {
-            AppLog.i(TAG, "JIT_PROBE: runtime=$runtime persist=$persist init=${lastJitInitKey.ifEmpty { "empty" }} " +
-                "desired=true (read-only, без записи)")
-            // iter33l §3.5: boot-проверка — что в runtime сейчас и поднимется ли он из init-ключа.
-            AppLog.i(TAG, "JIT_BOOT runtime=${runtime.ifEmpty { "empty" }} " +
-                "persist=${persist.ifEmpty { "empty" }} init=${lastJitInitKey.ifEmpty { "empty" }} " +
-                "expect_runtime_true_after_reboot=${lastJitInitKey == "true" || persist == "true"} " +
-                "key=persist.dalvik.vm.usejit")
-            return
-        }
-        val tagNow = currentBootTag()
-        val verifiedFile = File(app.filesDir, JIT_VERIFIED_FILE)
-        val seen = runCatching { verifiedFile.readText().trim() }.getOrDefault("")
-        if (seen == tagNow) return
-        runCatching { verifiedFile.writeText(tagNow) }
-        AppLog.i(TAG, "JIT_PROBE: runtime=true persist=$persist (уже поднят, read-only) boot_tag=$tagNow")
+        val runtime = runCatching { JitNet.usejitNow(app) }.getOrDefault("")
+        val cache = runCatching { JitNet.codeCacheVisible() }.getOrNull()
+        val want = isAutoOptimizeEnabled(app)
+        val state = JitRef.verify(want, runtime, cache)
+        AppLog.i(TAG, "JIT_PROBE runtime=${runtime.ifEmpty { "empty" }} want=$want " +
+            "code_cache_executavel=${cache?.toString() ?: "unknown"} result=${JitRef.verifyLabel(state)} " +
+            "write=none boot_tag=${currentBootTag()}")
     }
 
     private fun runSuCommand(command: String): ExecResult {

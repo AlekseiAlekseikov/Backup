@@ -379,14 +379,9 @@ class VoiceAssistantService : Service() {
                 // iter33b A2а: одна попытка привести «Видео 60 fps» в соответствие с тумблером
                 // (mount --bind ребут не переживает). При уже применённом — SKIP и ноль записи.
                 runCatching { AppPerformance.bootRestoreVideo(app) }
-                // iter33b A2б: JIT после ребута — маршрут 1 (persist-дублёр) → маршрут 2 (zygote) → отказ.
-                runCatching { AppPerformance.bootRestoreJit(app, secondPass = false) }
-                // Второе чтение через 30 с: zygote мог подняться уже ПОСЛЕ нашей записи persist.
-                handler.postDelayed({
-                    BgWorker.post("VoiceAssistant.jitSecondPass") {
-                        runCatching { AppPerformance.bootRestoreJit(app, secondPass = true) }
-                    }
-                }, 30_000L)
+                // iter33p (1.0.61): авто-восстановления JIT на загрузке НЕТ (как в референсе).
+                // Прежние `bootRestoreJit` (persist-backfill + повтор через 30 с) удалены вместе с
+                // записью persist-свойств: JIT применяется только по явному клику тумблера.
                 runCatching { AppPerformance.applyKeepAliveOnBoot(app) }
                 runCatching { NetworkTtl.registerNetworkReceiver(app) }
                 AppLog.i(TAG, "bootRestore complete (BgWorker)")
