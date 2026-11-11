@@ -487,8 +487,12 @@ object AdbClient {
         override fun execRoot(cmd: String, timeoutMs: Int): Pair<Int, String> =
             execAdbSocket(cmd, workingPort.get(), timeoutMs)
 
-        override fun execUnix(cmd: String, timeoutMs: Int): Pair<Int, String> =
-            execAdbLocalSocket(cmd, timeoutMs)
+        override fun execUnix(cmd: String, timeoutMs: Int): Pair<Int, String> {
+            // `execAdbLocalSocket` отдаёт только вывод (код возврата сокета — в [lastUnixRc]),
+            // поэтому rc берём отдельно и честно: -1 = «код не получен».
+            val out = execAdbLocalSocket(cmd, timeoutMs)
+            return Pair(lastUnixRc, out)
+        }
 
         override fun execShell(cmd: String, timeoutMs: Int): Pair<Int, String> =
             runShellFallbackWithRc(cmd, timeoutMs)
