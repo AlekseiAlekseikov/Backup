@@ -3,7 +3,7 @@
 **Ветка:** `fix/v2` · **HEAD с кодом:** `e4f9ce6bb73b887a583ddb21b1efa3fd3e639d78` (`e4f9ce6`)
 **Версия:** `versionCode=61`, `versionName="1.0.61"` — не менялись.
 **CI (полный, на коммите с кодом):** run `43065985922`, job `130680937719` (`build`) — **SUCCESS**, **257 PASSED / 0 FAILED**, `BUILD SUCCESSFUL in 3m 10s`.
-**CI (полный, на итоговом HEAD с документацией):** run `43067834255`, job `130687421984` (`build`) — **SUCCESS**, **257 PASSED / 0 FAILED**, `BUILD SUCCESSFUL in 4m 33s`.
+**CI (полный, на итоговом HEAD ветки с этим отчётом):** run `43069966627`, job `130694868256` (`build`) — **SUCCESS**, **257 PASSED / 0 FAILED**, `BUILD SUCCESSFUL in 3m 12s`.
 **Локальный прогон (`/home/user/runtests.sh`, JVM: core + адаптеры + стабы):** `OK (142 tests)`.
 
 > Первый прогон CI на этом же коммите (`fc5a36a`, run `43063651378`, job `130672672285`) **упал**: 15 из 17 тестов `JitPersistenceTest` падали с `RuntimeException` — в JVM-тестах `android.util.Log` является заглушкой, а логгер адаптера вызывался внутри решения. Исправлено (`JitNet.kt:36–41`: запись в лог обёрнута так, что невозможность логировать не влияет на решение), повторный прогон на `e4f9ce6` — **257/0**. Этот провал не скрыт и остаётся в истории CI.
@@ -105,7 +105,7 @@
 ## Артефакты и индексы
 
 - Код: `e4f9ce6bb73b887a583ddb21b1efa3fd3e639d78`, `SOURCE_SHA=e4f9ce6`.
-- Итоговый HEAD ветки `fix/v2` (код + этот отчёт + WORKLOG + `SOURCE_SHA`): `d1afe1ec087aeacc7da1d81116ddb8c90634ecf3`.
+- Итоговый HEAD ветки `fix/v2` — последний коммит ветки, содержащий этот отчёт, `WORKLOG` и `SOURCE_SHA=e4f9ce6` (SHA самого коммита с отчётом в файле не фиксируется, чтобы отчёт не ссылался на себя).
 - CI run `43065985922` / job `130680937719`: **PASSED 257 / FAILED 0**; предыдущий прогон `43063651378` / `130672672285` — FAILED (15 падений, причина устранена).
 - Локально: `OK (142 tests)` (`/home/user/runtests.sh`).
 - Артефакты вне `build/out/dist/target`: этот отчёт `/home/user/REPORT_iter37_jit_1.0.61.md`, копия `docs/agent/REPORT_iter37_jit_1.0.61.md`, блок в `docs/agent/WORKLOG.md`.
