@@ -72,7 +72,10 @@ class JitLogsCancelTest {
     @Test
     fun restoreOnlyTurnsWifiOn() {
         // Старый снимок с ap=1 читается, но ни одного вызова AP не делает (решение владельца).
-        val store = JitFake.Store().apply { set(JitRef.KEY_RESTORE, "wifi=1,ap=1") }
+        val store = JitFake.Store().apply {
+            setIn(0, JitRef.KEY_RESTORE, "wifi=1,ap=1")
+            setIn(0, JitRef.KEY_MARK, JitRef.OpMark.of("op-legacy", true, JitRef.OpMark.REPLIED).wire())
+        }
         val net = JitFake.Net(wifi = false)
         JitOp.onProcessStart(store, net, JitFake.Scheduler().apply { runInline = true })
         assertEquals("единственный запрос — включение клиентского Wi-Fi",

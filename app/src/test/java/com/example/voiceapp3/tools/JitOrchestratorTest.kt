@@ -37,6 +37,23 @@ class JitOrchestratorTest {
 
     private fun stand() = JitIsoStand(rules = 0)
 
+    /**
+     * Опознанный снимок прошлой операции: `jit_restaurar` + наша отметка `jit_op_mark`.
+     * Без отметки снимок считается неопознанным (legacy) — см. `legacyOrUnknownSnapshotIsNotExecuted`.
+     */
+    private fun JitFake.Store.seedOp(
+        snap: String = "wifi=1",
+        want: Boolean = true,
+        op: String = "op-prev",
+        state: String = JitRef.OpMark.REPLIED
+    ) = apply {
+        setIn(0, JitRef.KEY_RESTORE, snap)
+        setIn(1, JitRef.KEY_RESTORE, snap)
+        val mark = JitRef.OpMark.of(op, want, state, 0L).wire()
+        setIn(0, JitRef.KEY_MARK, mark)
+        setIn(1, JitRef.KEY_MARK, mark)
+    }
+
     // ─────────────────────────── 1. сохранность снимка ───────────────────────────
 
     @Test
@@ -82,7 +99,7 @@ class JitOrchestratorTest {
         assertTrue("shell не вызван ни разу", shell.pending.isEmpty())
         assertFalse("сеть не выключалась", net.requests.contains("wifi=false"))
         assertTrue(lines().contains("blocked=snapshot_not_saved"))
-        assertTrue(lines().contains("auto_key=untouched"))
+        assertTrue("видно восстановление прежних значений", lines().contains("prev_restore="))
     }
 
     @Test
@@ -308,75 +325,173 @@ class JitOrchestratorTest {
     }
 
     @Test
-    fun definiteReplyClearsUndefinedState() {
+    fun undefinedOutcomeBlocksSecondClickInBothDirections() {
+        // Первая команда удерживается в транспорте, ответа нет (таймаут), и Wi-Fi уже изменён ею.
+        // Второй клик — в ОБЕ стороны — не отправляет вторую цепочку и не перезаписывает снимок
+        // состоянием после `svc wifi disable`.
         val store = JitFake.Store()
         val net = JitFake.Net(wifi = true)
-        val lost = JitFake.QueueShell(stand())
-        JitOp.click(store, net, lost, want = true, log = ::log)
-        assertTrue(JitOp.chainUndefined())
+        val held = JitFake.BlockingShell()
+        var first: JitOp.Click? = null
+        val done = CountDownLatch(1)
+        Thread {
+            first = JitOp.click(store, net, held, want = true, log = ::log)
+            done.countDown()
+        }.start()
+        assertTrue(held.entered.await(5, TimeUnit.SECONDS))
+        net.wifi = false                        // первая команда уже выключила Wi-Fi
+        held.result = 137 to "ERR_ADB_TIMEOUT"  // ответа транспорта нет
+        held.release.countDown()
+        assertTrue(done.await(5, TimeUnit.SECONDS))
+        assertTrue("исход неопределён", JitOp.chainUndefined())
+        assertNotNull(first)
+        assertTrue("первая цепочка ушла", first!!.sent)
+        val snapshotAfterFirst = store.rawRestore()
+        val writesAfterFirst = store.writeCount()
 
-        val ok = JitFake.QueueShell(stand()).apply { runInline = 1 }
-        val c = JitOp.click(store, net, ok, want = true, log = ::log)
-        assertTrue(c.sent)
-        assertEquals(JitRef.ChainOutcome.REPLY_RECEIVED, c.outcome)
-        assertFalse("определённый ответ снимает неопределённость", JitOp.chainUndefined())
-        assertTrue("прошлый неопределённый исход отмечен", c.previousUndefined)
+        val a = JitOp.click(store, net, JitFake.QueueShell(stand()), want = false, log = ::log)
+        assertEquals("вторая цепочка отклонена (want=false)", "chain_undefined", a.blocked)
+        val b = JitOp.click(store, net, JitFake.QueueShell(stand()), want = true, log = ::log)
+        assertEquals("вторая цепочка отклонена (want=true)", "chain_undefined", b.blocked)
+        assertEquals("ни одной записи вторым кликом", writesAfterFirst, store.writeCount())
+        assertEquals("снимок не перезаписан", snapshotAfterFirst, store.rawRestore())
+        assertTrue(lines().contains("blocked=chain_undefined"))
+        assertTrue(lines().contains("blocked=chain_undefined action=none commands=0"))
+    }
+
+    @Test
+    fun lateExecutionOfFirstCommandDoesNotOverwriteOriginalSnapshot() {
+        // Позднее исполнение: команда, чей ответ потерян, всё равно отключает Wi-Fi уже после
+        // таймаута. Снимок обязан остаться состоянием ДО операции.
+        val store = JitFake.Store()
+        val net = JitFake.Net(wifi = true)
+        val held = JitFake.BlockingShell()
+        val done = CountDownLatch(1)
+        Thread {
+            JitOp.click(store, net, held, want = true, log = ::log)
+            done.countDown()
+        }.start()
+        assertTrue(held.entered.await(5, TimeUnit.SECONDS))
+        held.result = 137 to "ERR_ADB_TIMEOUT"
+        held.release.countDown()
+        assertTrue(done.await(5, TimeUnit.SECONDS))
+
+        net.wifi = false                      // «позднее исполнение» первой команды
+        val c = JitOp.click(store, net, JitFake.QueueShell(stand()), want = true, log = ::log)
+        assertEquals("chain_undefined", c.blocked)
+        assertEquals("снимок остался исходным", "wifi=1", store.rawRestore())
+    }
+
+    @Test
+    fun blockedClickRollsBackPreviousValuesOfAllKeys() {
+        // §1.3: неудачная запись не должна оставлять за собой изменённые пользовательские ключи.
+        val store = JitFake.Store().apply {
+            setIn(0, JitRef.KEY_AUTO, false)       // прежняя настройка драйвера
+            setIn(0, JitRef.KEY_PEDIDO, true)
+            setIn(0, JitRef.KEY_RESTORE, "wifi=0")
+            commitFails += 0
+            commitFails += 1
+            writeDespiteFalse = true               // commit=false, но память изменилась
+        }
+        val net = JitFake.Net(wifi = true)
+        val shell = JitFake.QueueShell(stand())
+        val c = JitOp.click(store, net, shell, want = true, log = ::log)
+
+        assertEquals("snapshot_not_saved", c.blocked)
+        assertEquals("прежняя настройка восстановлена", false, store.maps[0][JitRef.KEY_AUTO])
+        assertEquals("прежний снимок восстановлен", "wifi=0", store.maps[0][JitRef.KEY_RESTORE])
+        assertTrue("прежнее намерение восстановлено", store.maps[0][JitRef.KEY_PEDIDO] == true)
+        assertFalse("нашей отметки не осталось", store.maps[0].containsKey(JitRef.KEY_MARK))
+        assertTrue("shell не вызван", shell.pending.isEmpty())
+    }
+
+    @Test
+    fun failedRollbackIsReportedAndClickStaysBlocked() {
+        val store = JitFake.Store().apply {
+            setIn(0, JitRef.KEY_AUTO, false)
+            commitFails += 0
+            commitFails += 1
+            writeDespiteFalse = true
+            rollbackFails += 0
+        }
+        val net = JitFake.Net(wifi = true)
+        val shell = JitFake.QueueShell(stand())
+        val c = JitOp.click(store, net, shell, want = true, log = ::log)
+        assertEquals("snapshot_not_saved", c.blocked)
+        assertTrue("отказ восстановления виден в логе", lines().contains("prev_restore=1/2"))
+        assertTrue(lines().contains("prev_restore_detail="))
+        assertTrue("shell не вызван", shell.pending.isEmpty())
     }
 
     // ─────────────────────────── 3. продолжение и старая задача ───────────────────────────
 
     @Test
-    fun snapshotRemovedSynchronouslyAndRestoreScheduled15s() {
-        val store = JitFake.Store().apply { set(JitRef.KEY_RESTORE, "wifi=1") }
+    fun snapshotKeptUntilRestoreRunsThenRemoved() {
+        val store = JitFake.Store().seedOp("wifi=1")
         val net = JitFake.Net(wifi = false)
         val sched = JitFake.Scheduler()
         val out = JitOp.onProcessStart(store, net, sched, ::log)
         assertTrue(out.scheduled)
         assertEquals(listOf(15_000L), sched.delays())
-        assertFalse(store.contains(JitRef.KEY_RESTORE))
+        assertTrue("снимок НЕ удалён до фактического возврата", store.contains(JitRef.KEY_RESTORE))
+        assertTrue("отметка операции на месте", store.contains(JitRef.KEY_MARK))
         assertTrue(net.requests.isEmpty())
+
+        sched.drain()
+        assertEquals(listOf("wifi=true"), net.requests)
+        assertFalse("после возврата снимок снят", store.contains(JitRef.KEY_RESTORE))
+        assertFalse("и отметка снята", store.contains(JitRef.KEY_MARK))
     }
 
     @Test
-    fun oldTaskDoesNotDeleteNewerSnapshotWithSameValue() {
-        val store = JitFake.Store().apply { set(JitRef.KEY_RESTORE, "wifi=1") }
+    fun clickDuringScheduledRestoreIsRejectedInBothDirections() {
+        // §1.2: старая отложенная задача не должна выполняться посреди новой цепочки, а новый клик
+        // не должен перезаписывать снимок, который эта задача ещё не отработала.
+        val store = JitFake.Store().seedOp("wifi=1")
         val net = JitFake.Net(wifi = false)
         val sched = JitFake.Scheduler()
-        JitOp.onProcessStart(store, net, sched, ::log)   // старый снимок снят, задача стоит
+        JitOp.onProcessStart(store, net, sched, ::log)
+        val snapshotBefore = store.rawRestore()
 
-        // Новый клик записал ТАКОЙ ЖЕ снимок (Wi-Fi ещё включён) и новое намерение.
-        net.wifi = true
-        val shell = JitFake.QueueShell(stand()).apply { runInline = 1 }
-        val c = JitOp.click(store, net, shell, want = true, log = ::log)
-        assertTrue(c.sent)
+        val a = JitOp.click(store, net, JitFake.QueueShell(stand()), want = false, log = ::log)
+        assertEquals("restore_pending", a.blocked)
+        val b = JitOp.click(store, net, JitFake.QueueShell(stand()), want = true, log = ::log)
+        assertEquals("restore_pending", b.blocked)
+        assertEquals("снимок не перезаписан", snapshotBefore, store.rawRestore())
+        assertTrue("и цепочка не отправлялась", b.exitCode == -1)
+        assertTrue(lines().contains("blocked=restore_pending"))
 
-        sched.drain()   // старая задача исполнилась
-
-        assertEquals("снимок нового клика не стёрт", "wifi=1", store.rawRestore())
-        assertTrue("намерение нового клика на месте", store.contains(JitRef.KEY_PEDIDO))
+        sched.drain()
+        // После выполнения отложенного возврата клик снова возможен.
+        val c = JitOp.click(store, net, JitFake.QueueShell(stand()).apply { runInline = 1 },
+            want = false, log = ::log)
+        assertNull(c.blocked)
     }
 
     @Test
-    fun oldTaskDoesNotDeleteNewerSnapshotWithDifferentValue() {
-        val store = JitFake.Store().apply { set(JitRef.KEY_RESTORE, "wifi=1") }
-        val net = JitFake.Net(wifi = true)
+    fun oldRestoreCallbackDoesNotTouchSnapshotOfNewOperation() {
+        // Пока задача стояла, записалась ДРУГАЯ (новая) операция со своим снимком и отметкой.
+        val store = JitFake.Store().seedOp("wifi=1", op = "op-old")
+        val net = JitFake.Net(wifi = false)
         val sched = JitFake.Scheduler()
         JitOp.onProcessStart(store, net, sched, ::log)
 
-        val shell = JitFake.QueueShell(stand()).apply { runInline = 1 }
-        JitOp.click(store, net, shell, want = false, log = ::log)
-        // Снимок нового клика отличается: Wi-Fi уже выключен первым скриптом.
+        val newMark = JitRef.OpMark.of("op-new", want = false, state = JitRef.OpMark.REPLIED).wire()
         store.setIn(0, JitRef.KEY_RESTORE, "wifi=0")
         store.setIn(1, JitRef.KEY_RESTORE, "wifi=0")
+        store.setIn(0, JitRef.KEY_MARK, newMark)
+        store.setIn(1, JitRef.KEY_MARK, newMark)
 
         sched.drain()
 
-        assertEquals("чужой/новый снимок не подменён", "wifi=0", store.rawRestore())
+        assertEquals("снимок новой операции не удалён", "wifi=0", store.rawRestore())
+        assertEquals("отметка новой операции не удалена", newMark, store.getString(JitRef.KEY_MARK))
+        assertTrue(lines().contains("cleanup=skipped reason=snapshot_belongs_to_other_op"))
     }
 
     @Test
     fun duplicatePreventionIsPerTaskNotPerProcess() {
-        val store = JitFake.Store().apply { set(JitRef.KEY_RESTORE, "wifi=1") }
+        val store = JitFake.Store().seedOp("wifi=1")
         val net = JitFake.Net(wifi = false)
         val sched = JitFake.Scheduler()
 
@@ -387,60 +502,96 @@ class JitOrchestratorTest {
         assertEquals("duplicate", b.reason)
         assertEquals(1, sched.scheduled.size)
 
-        // Задача выполнилась — и новый снимок в том же процессе снова планируется.
+        // Задача выполнилась (снимок снят) — новый снимок в том же процессе снова планируется.
         sched.drain()
-        store.set(JitRef.KEY_RESTORE, "wifi=1")
+        store.seedOp("wifi=1", op = "op-next")
         val d = JitOp.onProcessStart(store, net, sched, ::log)
         assertTrue("флаг не «на весь процесс»", d.scheduled)
         assertEquals(1, sched.scheduled.size)
     }
 
     @Test
-    fun duplicateWithUnconfirmedRemovalStillSchedulesOnce() {
-        val store = JitFake.Store().apply {
-            set(JitRef.KEY_RESTORE, "wifi=1")
-            commitFails += listOf(0, 1)
-        }
+    fun duplicateWhileTaskPendingKeepsSnapshot() {
+        val store = JitFake.Store().seedOp("wifi=1")
         val net = JitFake.Net(wifi = false)
         val sched = JitFake.Scheduler()
         val a = JitOp.onProcessStart(store, net, sched, ::log)
         val b = JitOp.onProcessStart(store, net, sched, ::log)
         assertTrue(a.scheduled)
-        assertFalse(b.scheduled)
         assertEquals("duplicate", b.reason)
         assertEquals(1, sched.scheduled.size)
-        assertTrue(lines().contains("removal_unconfirmed=true"))
+        assertTrue("снимок всё ещё на месте до выполнения", store.contains(JitRef.KEY_RESTORE))
     }
 
     @Test
-    fun schedulerFailureIsReportedHonestly() {
-        val store = JitFake.Store().apply { set(JitRef.KEY_RESTORE, "wifi=1") }
+    fun removalRefusedKeepsSnapshotForNextStart() {
+        val store = JitFake.Store().seedOp("wifi=1")
+        val net = JitFake.Net(wifi = false)
+        val sched = JitFake.Scheduler()
+        JitOp.onProcessStart(store, net, sched, ::log)
+        store.commitFails += listOf(0, 1)   // удаление не подтвердится
+        sched.drain()
+        assertTrue("снимок остался (удаление не подтверждено)", store.contains(JitRef.KEY_RESTORE))
+        assertTrue(lines().contains("still_present=true"))
+        // Следующий старт увидит тот же опознанный снимок и повторит возврат (setWifiEnabled идемпотентен).
+        store.commitFails.clear()
+        val sched2 = JitFake.Scheduler()
+        val again = JitOp.onProcessStart(store, net, sched2, ::log)
+        assertTrue(again.scheduled)
+    }
+
+    @Test
+    fun schedulerFailureIsReportedHonestlyAndSnapshotSurvives() {
+        val store = JitFake.Store().seedOp("wifi=1")
         val net = JitFake.Net(wifi = false)
         val sched = JitFake.Scheduler().apply { failWith = IllegalStateException("no scheduler") }
         val out = JitOp.onProcessStart(store, net, sched, ::log)
         assertFalse(out.scheduled)
         assertEquals("scheduler_failed", out.reason)
         assertTrue(lines().contains("scheduler=failed"))
-        // Следующая попытка в том же процессе возможна: слот задачи освобождён.
+        assertTrue("снимок сохранён — продолжение не потеряно", store.contains(JitRef.KEY_RESTORE))
+        // Следующая попытка в том же процессе возможна и продолжит ту же операцию.
         sched.failWith = null
-        store.set(JitRef.KEY_RESTORE, "wifi=1")
-        assertTrue(JitOp.onProcessStart(store, net, sched, ::log).scheduled)
+        val again = JitOp.onProcessStart(store, net, sched, ::log)
+        assertTrue(again.scheduled)
+        assertEquals("op-prev", again.mark?.op)
     }
 
     @Test
-    fun deathBeforeScheduledTaskLeavesNetworkUntouched() {
-        val store = JitFake.Store().apply { set(JitRef.KEY_RESTORE, "wifi=1") }
+    fun processDeathBeforeCallbackIsRecoveredOnNextStart() {
+        // Смерть процесса после планирования, но до выполнения: «новый процесс» видит тот же
+        // опознанный снимок и продолжает операцию.
+        val store = JitFake.Store().seedOp("wifi=1")
+        val net = JitFake.Net(wifi = false)
+        JitOp.onProcessStart(store, net, JitFake.Scheduler(), ::log)   // задача не выполнилась
+        JitOp.resetStateForTest()                                      // «процесс умер»
+        val sched2 = JitFake.Scheduler()
+        val out = JitOp.onProcessStart(store, net, sched2, ::log)
+        assertTrue(out.scheduled)
+        assertEquals("op-prev", out.mark?.op)
+        sched2.drain()
+        assertEquals(listOf("wifi=true"), net.requests)
+    }
+
+    @Test
+    fun legacyOrUnknownSnapshotIsNotExecutedAndKept() {
+        // §4: снимок 1.0.60 (без нашей отметки) не выполняется и НЕ удаляется.
+        val store = JitFake.Store().apply { setIn(0, JitRef.KEY_RESTORE, "wifi=1") }
         val net = JitFake.Net(wifi = false)
         val sched = JitFake.Scheduler()
-        JitOp.onProcessStart(store, net, sched, ::log)
-        assertFalse(store.contains(JitRef.KEY_RESTORE))
+        val out = JitOp.onProcessStart(store, net, sched, ::log)
+        assertEquals("legacy_or_unknown", out.reason)
+        assertFalse(out.scheduled)
+        assertTrue(sched.scheduled.isEmpty())
+        assertEquals("данные сохранены", "wifi=1", store.rawRestore())
+        assertEquals("ни одной записи/удаления", 0, store.writeCount())
         assertTrue(net.requests.isEmpty())
-        assertTrue(logs.any { it.contains("смерть процесса") })
+        assertTrue(lines().contains("reason=legacy_or_unknown"))
     }
 
     @Test
     fun brokenSnapshotIsNotExecuted() {
-        val store = JitFake.Store().apply { set(JitRef.KEY_RESTORE, "wifi=1,ap=0,extra=1") }
+        val store = JitFake.Store().apply { setIn(0, JitRef.KEY_RESTORE, "wifi=1,ap=0,extra=1") }
         val net = JitFake.Net(wifi = true)
         val sched = JitFake.Scheduler()
         val out = JitOp.onProcessStart(store, net, sched, ::log)
@@ -451,8 +602,11 @@ class JitOrchestratorTest {
     }
 
     @Test
-    fun legacySnapshotIsMigratedAndNeverTurnsWifiOnBlindly() {
-        val store = JitFake.Store().apply { set(JitRef.KEY_RESTORE, "wifi=0,ap=1") }
+    fun legacyFormatIsReadOnlyByWifiAndNeverTurnsWifiOnBlindly() {
+        val store = JitFake.Store().apply {
+            setIn(0, JitRef.KEY_RESTORE, "wifi=0,ap=1")
+            setIn(0, JitRef.KEY_MARK, JitRef.OpMark.of("op-legacy", want = false, state = JitRef.OpMark.REPLIED).wire())
+        }
         val net = JitFake.Net(wifi = true)
         val sched = JitFake.Scheduler()
         val out = JitOp.onProcessStart(store, net, sched, ::log)
@@ -465,7 +619,7 @@ class JitOrchestratorTest {
 
     @Test
     fun restoreAcceptedIsNotProofOfInternet() {
-        val store = JitFake.Store().apply { set(JitRef.KEY_RESTORE, "wifi=1") }
+        val store = JitFake.Store().seedOp("wifi=1")
         val net = JitFake.Net(wifi = false, setWifiResult = true, address = true)
         val sched = JitFake.Scheduler()
         JitOp.onProcessStart(store, net, sched, ::log)
@@ -478,7 +632,7 @@ class JitOrchestratorTest {
 
     @Test
     fun restoreRefusedIsNotCalledAccepted() {
-        val store = JitFake.Store().apply { set(JitRef.KEY_RESTORE, "wifi=1") }
+        val store = JitFake.Store().seedOp("wifi=1")
         val net = JitFake.Net(wifi = false, setWifiResult = false)
         val sched = JitFake.Scheduler()
         JitOp.onProcessStart(store, net, sched, ::log)
@@ -490,7 +644,7 @@ class JitOrchestratorTest {
 
     @Test
     fun restoreUnknownReturnValueIsUnknownNotAccepted() {
-        val store = JitFake.Store().apply { set(JitRef.KEY_RESTORE, "wifi=1") }
+        val store = JitFake.Store().seedOp("wifi=1")
         val net = JitFake.Net(wifi = false, setWifiResult = null)
         val sched = JitFake.Scheduler()
         JitOp.onProcessStart(store, net, sched, ::log)
@@ -501,7 +655,7 @@ class JitOrchestratorTest {
 
     @Test
     fun restoreExceptionIsReportedAsException() {
-        val store = JitFake.Store().apply { set(JitRef.KEY_RESTORE, "wifi=1") }
+        val store = JitFake.Store().seedOp("wifi=1")
         val net = JitFake.Net(wifi = false, setWifiThrows = true)
         val sched = JitFake.Scheduler()
         JitOp.onProcessStart(store, net, sched, ::log)
@@ -512,14 +666,14 @@ class JitOrchestratorTest {
 
     @Test
     fun restoreSkipsWhenAlreadyOnOrWasOff() {
-        val s1 = JitFake.Store().apply { set(JitRef.KEY_RESTORE, "wifi=1") }
+        val s1 = JitFake.Store().seedOp("wifi=1")
         val n1 = JitFake.Net(wifi = true)
         val sc1 = JitFake.Scheduler()
         JitOp.onProcessStart(s1, n1, sc1, ::log)
         sc1.drain()
         assertTrue("уже включён — запроса нет", n1.requests.isEmpty())
 
-        val s2 = JitFake.Store().apply { set(JitRef.KEY_RESTORE, "wifi=0") }
+        val s2 = JitFake.Store().seedOp("wifi=0", want = false)
         val n2 = JitFake.Net(wifi = false)
         val sc2 = JitFake.Scheduler()
         JitOp.onProcessStart(s2, n2, sc2, ::log)
@@ -529,7 +683,7 @@ class JitOrchestratorTest {
 
     @Test
     fun restoreWithUnreadableWifiDoesNotSendRequest() {
-        val store = JitFake.Store().apply { set(JitRef.KEY_RESTORE, "wifi=1") }
+        val store = JitFake.Store().seedOp("wifi=1")
         val net = JitFake.Net(wifiUnreadable = true)
         val sched = JitFake.Scheduler()
         JitOp.onProcessStart(store, net, sched, ::log)

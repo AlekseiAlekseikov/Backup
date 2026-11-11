@@ -130,6 +130,9 @@ object JitFake {
         var writeDespiteFalse = false
         var skipKey: String? = null
 
+        /** Хранилища, которые отказывают в отккате (`rollback` возвращает отказ). */
+        val rollbackFails = mutableSetOf<Int>()
+
         /** Порядок чтения (по умолчанию — как CPS→DPS). */
         var readOrder: List<Int> = maps.indices.toList()
 
@@ -151,7 +154,21 @@ object JitFake {
 
         override fun contains(key: String): Boolean = maps.any { it.containsKey(key) }
 
-        override fun putSnapshot(want: Boolean, snap: JitRef.WifiSnapshot): JitRef.SnapshotWrite {
+        override fun readSnapshotState(): List<JitRef.StorePrev> =
+            maps.mapIndexed { i, m ->
+                JitRef.StorePrev(
+                    name(i),
+                    listOf(JitRef.KEY_PEDIDO, JitRef.KEY_AUTO, JitRef.KEY_RESTORE, JitRef.KEY_MARK).map { k ->
+                        JitRef.KeyPrev(k, m.containsKey(k), m[k] as? Boolean, m[k] as? String)
+                    }
+                )
+            }
+
+        override fun putSnapshot(
+            want: Boolean,
+            snap: JitRef.WifiSnapshot,
+            mark: JitRef.OpMark
+        ): JitRef.SnapshotWrite {
             val reports = mutableListOf<JitRef.StoreReport>()
             for ((i, m) in maps.withIndex()) {
                 if (i in throwOn) {
@@ -165,14 +182,52 @@ object JitFake {
                 m[JitRef.KEY_PEDIDO] = want
                 m[JitRef.KEY_AUTO] = want
                 m[JitRef.KEY_RESTORE] = snap.wire()
+                m[JitRef.KEY_MARK] = mark.wire()
                 skipKey?.let { m.remove(it) }
                 ops += "snapshot:$i"
                 val readback = m[JitRef.KEY_PEDIDO] == want && m[JitRef.KEY_AUTO] == want &&
-                    m[JitRef.KEY_RESTORE] == snap.wire()
+                    m[JitRef.KEY_RESTORE] == snap.wire() && m[JitRef.KEY_MARK] == mark.wire()
                 val commit = if (i in commitFails) "false" else "ok"
                 reports += JitRef.StoreReport(name(i), commit, readback)
             }
             return JitRef.SnapshotWrite(want, snap, reports)
+        }
+
+        override fun updateMark(mark: JitRef.OpMark): JitRef.WriteResult {
+            var ok = 0
+            val failed = mutableListOf<String>()
+            for ((i, m) in maps.withIndex()) {
+                if (i in throwOn || (i in commitFails && !writeDespiteFalse)) { failed += "${name(i)}:commit_false"; continue }
+                m[JitRef.KEY_MARK] = mark.wire()
+                ok++
+            }
+            ops += "mark:${mark.state}"
+            return JitRef.WriteResult(maps.size, ok, failed.joinToString(",").ifEmpty { "all_ok" })
+        }
+
+        override fun restorePrevious(prev: List<JitRef.StorePrev>): JitRef.WriteResult {
+            if (prev.isEmpty()) return JitRef.WriteResult.none("no_previous_state")
+            var ok = 0
+            val failed = mutableListOf<String>()
+            for (p in prev) {
+                val i = maps.indices.firstOrNull { name(it) == p.name } ?: -1
+                if (i < 0) { failed += "${p.name}:store_absent"; continue }
+                if (i in rollbackFails || i in throwOn || (i in commitFails && !writeDespiteFalse)) {
+                    failed += "${p.name}:refused"
+                    continue
+                }
+                for (k in p.keys) {
+                    if (!k.present) maps[i].remove(k.key)
+                    else when {
+                        k.str != null -> maps[i][k.key] = k.str
+                        k.bool != null -> maps[i][k.key] = k.bool
+                        else -> maps[i].remove(k.key)
+                    }
+                }
+                ok++
+                ops += "rollback:$i"
+            }
+            return JitRef.WriteResult(prev.size, ok, failed.joinToString(",").ifEmpty { "all_ok" })
         }
 
         override fun readRestore(): JitRef.SnapshotRead {

@@ -523,6 +523,12 @@ object AdbClient {
 
         ready = true
         readyLatch.countDown()
+        // Однократные обработчики готовности: каждый выполняется ровно раз и снимается.
+        runCatching {
+            val hooks = readyHooks.toList()
+            readyHooks.clear()
+            hooks.forEach { h -> runCatching { BgWorker.post("AdbClient.readyHook") { h() } } }
+        }
 
         while (true) {
             val job = try { queue.take() } catch (_: InterruptedException) { return }
@@ -2125,6 +2131,23 @@ object AdbClient {
      * ждать в рабочем потоке запрещено, а честный статус `root_unavailable` нужен).
      */
     fun isChannelReady(): Boolean = ready
+
+    /** Ожидающие однократного события готовности канала (для одноразовой диагностики). */
+    private val readyHooks = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
+
+    /**
+     * Выполнить [hook] ОДИН раз, когда существующий канал станет готовым (или сразу, если готов).
+     *
+     * Это не новый сторож и не повтор: обработчик снимается при первом же срабатывании. Нужен,
+     * чтобы одноразовая read-only диагностика не занимала рабочий поток ожиданием `awaitReady`.
+     */
+    fun onChannelReadyOnce(hook: () -> Unit) {
+        if (ready) {
+            runCatching { hook() }
+            return
+        }
+        readyHooks += hook
+    }
 
     /** Дождаться готовности канала (вызывающий поток блокируется до ready). */
     fun awaitReady(timeoutMs: Long = 15000): Boolean {

@@ -22,6 +22,7 @@ object JitNet {
     internal const val KEY_PEDIDO = JitRef.KEY_PEDIDO
     internal const val KEY_AUTO = JitRef.KEY_AUTO
     internal const val KEY_RESTORE = JitRef.KEY_RESTORE
+    internal const val KEY_MARK = JitRef.KEY_MARK
     internal const val PROP_USEJIT = JitRef.PROP_USEJIT
     internal const val RESTORE_DELAY_MS = JitRef.RESTORE_DELAY_MS
     internal const val CHAIN_TIMEOUT_MS = JitRef.CHAIN_TIMEOUT_MS
@@ -117,7 +118,85 @@ object JitNet {
         override fun contains(key: String): Boolean =
             runCatching { stores().any { it.second.contains(key) } }.getOrDefault(false)
 
-        override fun putSnapshot(want: Boolean, snap: JitRef.WifiSnapshot): JitRef.SnapshotWrite {
+        /**
+         * Прежнее состояние ключей операции по каждому хранилищу, в порядке чтения (CPS→DPS).
+         * Снимается ДО записи; при неудаче оно же возвращается отккатом.
+         */
+        override fun readSnapshotState(): List<JitRef.StorePrev> = stores().map { (name, s) ->
+            JitRef.StorePrev(
+                name,
+                JitRef.SNAPSHOT_KEYS.plus(KEY_MARK).map { key ->
+                    val present = runCatching { s.contains(key) }.getOrDefault(false)
+                    val str = runCatching { s.getString(key, null) }.getOrNull()
+                    val bool = runCatching {
+                        if (present && (key == KEY_PEDIDO || key == KEY_AUTO)) s.getBoolean(key, false) else null
+                    }.getOrNull()
+                    JitRef.KeyPrev(key, present, bool, str)
+                }
+            )
+        }
+
+        /**
+         * Вернуть прежние значения. Один `commit()` на хранилище; отчёт — по каждому.
+         *
+         * Чего это НЕ даёт: атомарности между CPS и DPS и гарантии от аппаратного сбоя. Если
+         * откат не прошёл, это видно вызывающему (`ok/attempted` + `detail`), и он остаётся
+         * заблокированным — «как будто ничего не писали» не заявляется.
+         */
+        override fun restorePrevious(prev: List<JitRef.StorePrev>): JitRef.WriteResult {
+            if (prev.isEmpty()) return JitRef.WriteResult.none("no_previous_state")
+            var ok = 0
+            val detail = StringBuilder()
+            for (p in prev) {
+                val s = stores().firstOrNull { it.first == p.name }?.second
+                if (s == null) {
+                    detail.append(if (detail.isEmpty()) "" else ",").append("${p.name}:store_absent")
+                    continue
+                }
+                val good = runCatching {
+                    val e = s.edit()
+                    for (k in p.keys) {
+                        when {
+                            !k.present -> e.remove(k.key)
+                            k.str != null -> e.putString(k.key, k.str)
+                            k.bool != null -> e.putBoolean(k.key, k.bool)
+                            else -> e.remove(k.key)
+                        }
+                    }
+                    e.commit()
+                }.getOrElse { t ->
+                    log("JIT_STORE restore_previous store=${p.name} exception=${t.javaClass.simpleName}")
+                    false
+                }
+                if (good) ok++ else detail.append(if (detail.isEmpty()) "" else ",")
+                    .append("${p.name}:commit_false")
+            }
+            val r = JitRef.WriteResult(prev.size, ok, detail.ifEmpty { "all_ok" }.toString())
+            log("JIT_STORE restore_previous attempted=${r.attempted} ok=${r.ok} detail=${r.detail}")
+            return r
+        }
+
+        /** Обновить ТОЛЬКО отметку операции (`sending` → `replied`/`undefined`). */
+        override fun updateMark(mark: JitRef.OpMark): JitRef.WriteResult {
+            val all = stores()
+            if (all.isEmpty()) return JitRef.WriteResult.none("no_store")
+            var ok = 0
+            val detail = StringBuilder()
+            for ((name, s) in all) {
+                val good = runCatching { s.edit().putString(KEY_MARK, mark.wire()).commit() }.getOrElse { t ->
+                    log("JIT_STORE mark store=$name exception=${t.javaClass.simpleName}")
+                    false
+                }
+                if (good) ok++ else detail.append(if (detail.isEmpty()) "" else ",").append("$name:commit_false")
+            }
+            return JitRef.WriteResult(all.size, ok, detail.ifEmpty { "all_ok" }.toString())
+        }
+
+        override fun putSnapshot(
+            want: Boolean,
+            snap: JitRef.WifiSnapshot,
+            mark: JitRef.OpMark
+        ): JitRef.SnapshotWrite {
             val all = stores()
             if (all.isEmpty()) {
                 log("JIT_STORE snapshot attempted=0 reason=no_store")
@@ -133,6 +212,7 @@ object JitNet {
                             .putBoolean(KEY_PEDIDO, want)
                             .putBoolean(KEY_AUTO, want)
                             .putString(KEY_RESTORE, snap.wire())
+                            .putString(KEY_MARK, mark.wire())
                             .commit()
                     ) "ok" else "false"
                 } catch (t: Throwable) {
@@ -144,13 +224,15 @@ object JitNet {
                     val pedidoOk = s.contains(KEY_PEDIDO) && s.getBoolean(KEY_PEDIDO, !want) == want
                     val autoOk = s.contains(KEY_AUTO) && s.getBoolean(KEY_AUTO, !want) == want
                     val restoreOk = s.getString(KEY_RESTORE, null) == snap.wire()
-                    pedidoOk && autoOk && restoreOk
+                    val markOk = s.getString(KEY_MARK, null) == mark.wire()
+                    pedidoOk && autoOk && restoreOk && markOk
                 }.getOrDefault(false)
                 reports += JitRef.StoreReport(name, commit, readback, err)
             }
             val w = JitRef.SnapshotWrite(want, snap, reports)
             log(
-                "JIT_STORE snapshot keys=$KEY_PEDIDO,$KEY_AUTO,$KEY_RESTORE value=${snap.wire()} " +
+                "JIT_STORE snapshot keys=$KEY_PEDIDO,$KEY_AUTO,$KEY_RESTORE,$KEY_MARK op=${mark.op} " +
+                    "value=${snap.wire()} " +
                     "attempted=${w.attempted} committed=${w.committed} confirmed=${w.confirmed} " +
                     "detail=${w.detail} (как j9: один commit на хранилище)"
             )
@@ -289,43 +371,91 @@ object JitNet {
     /** Есть ли незавершённое намерение — дешёвая локальная проверка, без shell. */
     fun hasPendingPedido(app: Context): Boolean = AndroidStore(app).contains(KEY_PEDIDO)
 
-    // ─────────────────────────── одноразовая read-only диагностика монтирований ───────────────────────────
+    // ─────────────────────────── одноразовая read-only диагностика ───────────────────────────
 
     /** Процессный флаг: попытка сбора была (не чаще одной за процесс). */
-    private val mountDiagAttempted = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val diagAttempted = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** Процессный флаг: сбор УЖЕ выполнен (успешный или честно-неуспешный — второй не начинаем). */
+    private val diagRan = java.util.concurrent.atomic.AtomicBoolean(false)
 
     /**
-     * Одноразовый **read-only** сбор данных о монтированиях в датированный лог приложения.
+     * Одноразовая **read-only** диагностика: монтирования ([JitMountDiag]) и сеть ([InternetDiag]).
      *
      * Требования, которые здесь соблюдены: запуск в фоне (не UI-поток), не чаще одной попытки за
-     * процесс, без ожидания готовности канала в рабочем потоке, без кнопок и без связи с кликом JIT,
-     * без записи в систему. Транспорт — тот же [AndroidShell], что и у JIT-цепочки, поэтому данные
-     * относятся к тому же каналу и правам.
+     * процесс, без удержания рабочего потока ожиданием канала, без кнопок, без связи с кликом JIT,
+     * без единой изменяющей команды. У каждой части свои метки `*_BEGIN/_SECTION/_DATA/_END` и
+     * свои ошибки: провал одной не рушит вторую.
+     *
+     * Готовность канала: если он ещё не готов, ставится ОДИН обработчик существующего события
+     * готовности (`AdbClient.onChannelReadyOnce`) и одна отложенная проверка на 30 с. Бесконечных
+     * повторов и нового сторожа нет; при неготовности пишется честный `channel_not_ready`, а не
+     * «нет root» и не «нет интернета».
      */
-    fun requestMountDiagOnce(app: Context, source: String, delayMs: Long = 0L) {
-        if (!markMountDiagAttempted()) return
-        val task: () -> Unit = {
-            BgWorker.assertNotMain("JitNet.requestMountDiagOnce")
-            if (!runCatching { AdbClient.isChannelReady() }.getOrDefault(false)) {
-                AppLog.i(TAG, "JIT_MOUNT_DIAG source=$source status=root_unavailable action=none " +
-                    "(канал не готов на момент единственной попытки; повторов и ожидания в потоке нет)")
-            } else {
-                runCatching { JitMountDiag.collect(AndroidShell, log, source) }
+    fun requestDiagOnce(
+        app: Context,
+        source: String,
+        delayMs: Long = 0L,
+        netInfo: InternetDiag.NetInfo? = null
+    ) {
+        if (!markDiagAttempted()) return
+        val appVersion = runCatching {
+            app.packageManager.getPackageInfo(app.packageName, 0).versionName
+        }.getOrNull() ?: "unknown"
+
+        val runBoth: (String) -> Unit = { via ->
+            if (diagRan.compareAndSet(false, true)) {
+                runCatching { JitMountDiag.collect(AndroidShell, true, log, "$source/$via") }
                     .onFailure { t ->
-                        AppLog.i(TAG, "JIT_MOUNT_DIAG source=$source status=unknown " +
-                            "reason=${t.javaClass.simpleName}")
+                        AppLog.i(TAG, "JIT_MOUNT_DIAG source=$source/$via status=unknown " +
+                            "reason=${t.javaClass.simpleName} (сбой сборщика, не результат чтения)")
+                    }
+                runCatching { InternetDiag.collect(AndroidShell, true, netInfo, log, "$source/$via", appVersion) }
+                    .onFailure { t ->
+                        AppLog.i(TAG, "INTERNET_DIAG source=$source/$via status=unknown " +
+                            "reason=${t.javaClass.simpleName} (сбой сборщика, сеть не менялась)")
                     }
             }
         }
-        if (delayMs > 0) BgWorker.postDelayed("JitNet.mountDiag", delayMs, task)
-        else BgWorker.post("JitNet.mountDiag", task)
+        val treatNotReady: (String) -> Unit = { why ->
+            if (diagRan.compareAndSet(false, true)) {
+                runCatching { JitMountDiag.collect(AndroidShell, false, log, source) }
+                    .onFailure { t -> AppLog.i(TAG, "JIT_MOUNT_DIAG status=unknown reason=${t.javaClass.simpleName}") }
+                runCatching { InternetDiag.collectChannelNotReady(log, source, why) }
+                    .onFailure { t -> AppLog.i(TAG, "INTERNET_DIAG status=unknown reason=${t.javaClass.simpleName}") }
+            }
+        }
+
+        val task: () -> Unit = {
+            BgWorker.assertNotMain("JitNet.requestDiagOnce")
+            val ready = runCatching { AdbClient.isChannelReady() }.getOrDefault(false)
+            if (ready) {
+                runBoth("immediate")
+            } else {
+                AppLog.i(TAG, "DIAG source=$source status=channel_not_ready action=wait_event " +
+                    "(канал приложения ещё не готов: это НЕ отсутствие root; ждём существующее " +
+                    "событие готовности, повторов нет)")
+                runCatching {
+                    AdbClient.onChannelReadyOnce {
+                        BgWorker.post("JitNet.diagOnReady") { runBoth("after_ready_event") }
+                    }
+                }
+                // Одна отложенная проверка: если канал так и не поднялся, статус будет честным.
+                BgWorker.postDelayed("JitNet.diagFallback", 30_000L) {
+                    treatNotReady("channel_not_ready_after_30s")
+                }
+            }
+        }
+        if (delayMs > 0) BgWorker.postDelayed("JitNet.diag", delayMs, task)
+        else BgWorker.post("JitNet.diag", task)
     }
 
     /** Занять единственную попытку сбора в этом процессе (одноразовый флаг, без повторов). */
-    internal fun markMountDiagAttempted(): Boolean = mountDiagAttempted.compareAndSet(false, true)
+    internal fun markDiagAttempted(): Boolean = diagAttempted.compareAndSet(false, true)
 
-    /** Только для тестов: сбросить процессный флаг одноразового сбора. */
-    internal fun resetMountDiagForTest() {
-        mountDiagAttempted.set(false)
+    /** Только для тестов: сбросить процессные флаги одноразового сбора. */
+    internal fun resetDiagForTest() {
+        diagAttempted.set(false)
+        diagRan.set(false)
     }
 }

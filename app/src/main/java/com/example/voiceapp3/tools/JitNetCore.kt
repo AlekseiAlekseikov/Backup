@@ -57,6 +57,21 @@ object JitRef {
 
     internal const val PROP_USEJIT = "dalvik.vm.usejit"
 
+    /**
+     * Отметка КОНКРЕТНОЙ операции — наш собственный ключ, в референсе его нет.
+     *
+     * Зачем он нужен (iter38 §1.2/§1.4/§4): `jit_restaurar` — просто строка `wifi=0|1`, одинаковая
+     * у разных операций и у данных 1.0.60. По ней НЕЛЬЗЯ отличить «наш опознанный снимок, который
+     * надо продолжить» от «неизвестного остатка прошлой версии», и нельзя понять, чья это запись,
+     * когда старая отложенная задача просыпается уже после нового клика. Поэтому рядом с снимком
+     * пишется `jit_op_mark=op=<id>;ts=<ms>;want=<0|1>;state=<sending|replied|undefined>`.
+     *
+     * Ключ пишется тем же `commit()`, что и три ключа референса, и удаляется вместе со снимком —
+     * ПОСЛЕ фактического возврата сети. Отсутствие ключа = операция не опознана (legacy 1.0.60 или
+     * запись до этого обновления) ⇒ продолжение не выполняется, данные сохраняются.
+     */
+    internal const val KEY_MARK = "jit_restore_marker"
+
     /** Все три ключа одной операции — проверяются вместе (согласованность записи). */
     internal val SNAPSHOT_KEYS = listOf(KEY_PEDIDO, KEY_AUTO, KEY_RESTORE)
 
@@ -170,8 +185,26 @@ object JitRef {
         fun getBool(key: String): Boolean?
         fun contains(key: String): Boolean
 
-        /** Три ключа референса ОДНИМ `commit()` на каждое хранилище, с отчётом по каждому. */
-        fun putSnapshot(want: Boolean, snap: WifiSnapshot): SnapshotWrite
+        /**
+         * Прежнее состояние четырёх ключей операции (три референса + [KEY_MARK]) по каждому
+         * доступному хранилищу, в порядке будущего чтения. Снимается ДО записи.
+         */
+        fun readSnapshotState(): List<StorePrev>
+
+        /**
+         * Три ключа референса + [KEY_MARK] ОДНИМ `commit()` на каждое хранилище, с отчётом по
+         * каждому (commit + readback всех ключей).
+         */
+        fun putSnapshot(want: Boolean, snap: WifiSnapshot, mark: OpMark): SnapshotWrite
+
+        /** Обновить только [KEY_MARK] (состояние `sending` → `replied`/`undefined`). */
+        fun updateMark(mark: OpMark): WriteResult
+
+        /**
+         * Вернуть прежние значения ключей операции (best-effort, по одному `commit()` на
+         * хранилище). Атомарности между CPS и DPS НЕ обещаем: каждый `commit()` независим.
+         */
+        fun restorePrevious(prev: List<StorePrev>): WriteResult
 
         /** Значение, которое увидит продолжение, + конфликты между хранилищами. */
         fun readRestore(): SnapshotRead
@@ -208,6 +241,66 @@ object JitRef {
 
     /** Разобранный снимок + в каком формате он лежал (для честного лога миграции). */
     data class Restore(val snap: WifiSnapshot, val format: String)
+
+    /**
+     * Отметка конкретной операции ([KEY_MARK]).
+     *
+     * @param op    идентификатор операции (уникален в пределах устройства: время + счётчик + случайное)
+     * @param ts    время записи снимка (мс) — только для лога/пересылки владельцу, НЕ TTL
+     * @param state `sending` — снимок записан, ответа транспорта ещё нет; `replied` — транспорт
+     *              ответил целиком (это НЕ доказательство рестарта zygote); `undefined` — ответа не
+     *              было (команда могла остаться в очереди)
+     */
+    data class OpMark(val op: String, val ts: Long, val want: Boolean, val state: String) {
+        fun wire(): String =
+            "op=$op;ts=$ts;want=${if (want) 1 else 0};state=$state"
+
+        companion object {
+            const val SENDING = "sending"
+            const val REPLIED = "replied"
+            const val UNDEFINED = "undefined"
+
+            private val RE = Regex("^op=([A-Za-z0-9_.-]{1,48});ts=(\\d{1,19});want=([01]);state=(sending|replied|undefined)$")
+
+            /** `null` — отметки нет или она не нашего формата (значит операция не опознана). */
+            fun parse(raw: String?): OpMark? {
+                if (raw == null) return null
+                val m = RE.matchEntire(raw) ?: return null
+                return OpMark(
+                    op = m.groupValues[1],
+                    ts = m.groupValues[2].toLongOrNull() ?: 0L,
+                    want = m.groupValues[3] == "1",
+                    state = m.groupValues[4]
+                )
+            }
+
+            /** Отметка для тестов/адаптеров, где идентификатор задаётся явно. */
+            fun of(op: String, want: Boolean, state: String = SENDING, ts: Long = 0L) =
+                OpMark(op, ts, want, state)
+        }
+    }
+
+    /**
+     * Прежнее состояние ОДНОГО ключа в ОДНОМ хранилище (снимается ДО записи снимка).
+     *
+     * Нужно, чтобы неудачная запись не оставляла за собой «полузаписанные» значения: `commit=false`
+     * тоже может изменить память, а удаление новой записи не возвращает прежнюю.
+     */
+    data class KeyPrev(val key: String, val present: Boolean, val bool: Boolean?, val str: String?)
+
+    /** Прежнее состояние ключей операции в одном хранилище. */
+    data class StorePrev(val name: String, val keys: List<KeyPrev>) {
+        fun has(key: String): Boolean = keys.any { it.key == key && it.present }
+        fun brief(): String = keys.joinToString("") { k ->
+            val v = when {
+                !k.present -> "none"
+                k.str != null -> "\"${k.str.take(28)}\""
+                k.bool != null -> k.bool.toString()
+                else -> "value"
+            }
+            "${k.key}=$v;"
+        }
+    }
 
     /**
      * Разбор `jit_restaurar`.
@@ -437,6 +530,9 @@ object JitOp {
      */
     private var scheduledTask: Any? = null
 
+    /** Счётчик операций в этом процессе (часть идентификатора). */
+    private val opSeq = java.util.concurrent.atomic.AtomicInteger(0)
+
     /** Сброс процессного состояния. Нужен только тестам (в бою это поля на жизнь процесса). */
     @Synchronized
     internal fun resetStateForTest() {
@@ -447,6 +543,18 @@ object JitOp {
     }
 
     internal fun generation(): Int = PEDIDO_GEN.get()
+
+    /**
+     * Идентификатор операции: время + счётчик процесса + случайная часть. Нужен только для того,
+     * чтобы отличить «свою» запись от чужой/новой (не для TTL и не для проверок по часам).
+     */
+    private fun newOpId(): String =
+        java.lang.Long.toString(System.currentTimeMillis(), 36) + "-" +
+            java.lang.Integer.toString(opSeq.incrementAndGet(), 36) + "-" +
+            java.lang.Long.toString((Math.random() * 0x7FFFFFFFL).toLong() and 0xFFFFFFFL, 36)
+
+    private fun briefPrev(prev: List<JitRef.StorePrev>): String =
+        prev.joinToString(",") { "${it.name}:${it.brief()}" }.ifEmpty { "none" }
 
     internal fun clickBusy(): Boolean = CLICK_SLOT.get() != null
 
@@ -504,12 +612,35 @@ object JitOp {
         }
         val previousUndefined = CHAIN_UNDEFINED.get()
         try {
+            // ── iter38 §1.1: исход прошлой команды не установлен ⇒ новой цепочки НЕТ ──
+            //
+            // Почему именно так: команда, у которой потерян ответ транспорта, может всё ещё лежать
+            // в очереди и выполниться ПОЗЖЕ — уже после того, как мы снимем новый снимок Wi-Fi.
+            // Тогда `svc wifi disable` из старой команды отработает при снимке «Wi-Fi был
+            // включён», и `e2` вернёт сеть, которой никто не выключал, либо наоборот. Никакого
+            // доказательства «выполнено/не выполнено» у нас нет: таймаут, новое чтение getprop,
+            // смена процесса и boot id ничего не доказывают (см. отчёт iter38 §1.1).
             if (previousUndefined) {
                 log(
-                    "JIT_CLICK previous=undefined action=continue_note " +
-                        "(у прошлой команды не было ответа: она могла остаться в очереди — исход " +
-                        "прошлого действия не подтверждён и не опровергнут)"
+                    "JIT_CLICK want=$want blocked=chain_undefined action=none commands=0 " +
+                        "(у прошлой команды не было ответа транспорта: она могла остаться в очереди " +
+                        "и выполниться позже. Пока исход не установлен, вторая цепочка НЕ " +
+                        "отправляется и снимок не перезаписывается. Доказательства выполнения или " +
+                        "невыполнения получить нечем: таймаут, getprop, boot id и новый процесс " +
+                        "таким доказательством не являются. Блокировка живёт до конца процесса; " +
+                        "после следующего старта решение принимает опознанный снимок, а не догадка)"
                 )
+                return Click(want, null, null, null, -1, "", "chain_undefined", previousUndefined)
+            }
+            // ── iter38 §1.2: отложенный возврат по прошлому снимку ещё не выполнен ──
+            if (scheduledTask != null) {
+                log(
+                    "JIT_CLICK want=$want blocked=restore_pending action=none commands=0 " +
+                        "(возврат клиентского Wi-Fi по прошлому снимку уже запланирован и ещё не " +
+                        "выполнен: новый клик сейчас перезаписал бы снимок и мог бы поставить " +
+                        "вторую цепочку поверх отложенного возврата)"
+                )
+                return Click(want, null, null, null, -1, "", "restore_pending")
             }
             // Три состояния, без подмены «неизвестно» на «выключено».
             val wifi = runCatching { netState.wifiOn() }.getOrNull()
@@ -522,19 +653,26 @@ object JitOp {
                 return Click(want, null, null, null, -1, "", "wifi_unknown", previousUndefined)
             }
             val snap = JitRef.WifiSnapshot(wifi)
+            val opId = newOpId()
+            val mark = JitRef.OpMark(opId, System.currentTimeMillis(), want, JitRef.OpMark.SENDING)
+            val prev: List<JitRef.StorePrev>
             val write: JitRef.SnapshotWrite
             val read: JitRef.SnapshotRead
             synchronized(INTENT_LOCK) {
+                // Прежнее состояние — ДО записи: иначе неудачную запись нечем вернуть (§1.3).
+                prev = runCatching { store.readSnapshotState() }.getOrDefault(emptyList())
                 PEDIDO_GEN.incrementAndGet()
-                write = store.putSnapshot(want, snap)
+                write = store.putSnapshot(want, snap, mark)
                 read = store.readRestore()
             }
             log(
-                "JIT_CLICK want=$want restore=${snap.wire()} attempted=${write.attempted} " +
+                "JIT_CLICK want=$want op=$opId restore=${snap.wire()} attempted=${write.attempted} " +
                     "committed=${write.committed} confirmed=${write.confirmed} " +
                     "stores=«${write.detail}» read=${read.value ?: "none"} " +
                     "conflicts=${read.conflicts.ifEmpty { listOf("none") }.joinToString(",")} " +
-                    "(снимок ДО любых изменений; формат wifi_only — AP не снимается и не поднимается)"
+                    "previous=«${briefPrev(prev)}» " +
+                    "(снимок ДО любых изменений; формат wifi_only — AP не снимается и не поднимается; " +
+                    "прежние значения сняты для честного откката)"
             )
             val blocked = when {
                 write.attempted == 0 -> "snapshot_not_saved"
@@ -553,41 +691,56 @@ object JitOp {
                             "порядку чтения — снимок неоднозначен, поэтому не отправляем)"
                     )
                 }
-                // Прежние ключи не стираем: снимаем только там, где НАША запись прошла.
-                val durable = write.durableNames()
-                val rp = runCatching { store.remove(JitRef.KEY_PEDIDO, durable) }
-                val rr = runCatching { store.remove(JitRef.KEY_RESTORE, durable) }
+                // Восстановление прежних: возвращаем ПРЕЖНИЕ значения всех четырёх ключей там, где это возможно.
+                // Отказ восстановления не скрывается; атомарности между CPS и DPS не обещаем.
+                val rb = synchronized(INTENT_LOCK) {
+                    runCatching { store.restorePrevious(prev) }
+                        .getOrElse { t -> JitRef.WriteResult.none("exception:${t.javaClass.simpleName}") }
+                }
+                val leftPedido = runCatching { store.contains(JitRef.KEY_PEDIDO) }.getOrDefault(false)
+                val leftRestore = runCatching { store.getString(JitRef.KEY_RESTORE) }.getOrNull()
                 log(
-                    "JIT_CLICK want=$want blocked=$blocked confirmed=${write.confirmed} " +
+                    "JIT_CLICK want=$want op=$opId blocked=$blocked confirmed=${write.confirmed} " +
                         "committed=${write.committed} read=${read.value ?: "none"} " +
-                        "cleanup=pedido:${rp.getOrNull()?.let { "${it.ok}/${it.attempted}" } ?: "exception"}" +
-                        "/restore:${rr.getOrNull()?.let { "${it.ok}/${it.attempted}" } ?: "exception"} " +
-                        "auto_key=untouched action=none commands=0 " +
+                        "prev_restore=${rb.ok}/${rb.attempted} prev_restore_detail=${rb.detail} " +
+                        "left_pedido=$leftPedido left_restore=${leftRestore ?: "none"} " +
+                        "action=none commands=0 " +
                         "(сеть и системные свойства НЕ менялись; commit=false сам по себе не " +
-                        "доказывает отсутствия значения в памяти, поэтому решение — по readback " +
-                        "и по будущему чтению; perf_auto_otimizar не трогаем)"
+                        "доказывает отсутствия значения в памяти, поэтому решение — по readback и " +
+                        "по будущему чтению. Прежние значения восстановлены там, где хранилище " +
+                        "приняло запись; если восстановление не прошло — это видно здесь и в left_*, " +
+                        "и клик остаётся заблокированным)"
                 )
                 return Click(want, snap, write, read, -1, "", blocked, previousUndefined)
             }
             log("dalvik.vm.usejit -> $want; reiniciando o framework")
             log(
-                "JIT_CHAIN_SENT ${JitRef.mountStepNote()} timeout_ms=${JitRef.CHAIN_TIMEOUT_MS} " +
+                "JIT_CHAIN_SENT op=$opId ${JitRef.mountStepNote()} timeout_ms=${JitRef.CHAIN_TIMEOUT_MS} " +
                     "restart=not_claimed command=w0/la.run (литерал референса)"
             )
             val (rc, out) = shell.exec(JitRef.chainScript(want), JitRef.CHAIN_TIMEOUT_MS)
             val outcome = JitRef.chainOutcome(rc, out)
-            CHAIN_UNDEFINED.set(outcome != JitRef.ChainOutcome.REPLY_RECEIVED)
+            val undefined = outcome != JitRef.ChainOutcome.REPLY_RECEIVED
+            CHAIN_UNDEFINED.set(undefined)
+            // Состояние операции в отметке: `replied`/`undefined`. Пишется best-effort: если
+            // запись не прошла, это честно видно в логе, но решение уже принято по ответу
+            // транспорта (он в памяти этого процесса).
+            val state = if (undefined) JitRef.OpMark.UNDEFINED else JitRef.OpMark.REPLIED
+            val markUpd = runCatching { store.updateMark(mark.copy(state = state)) }
+                .getOrElse { t -> JitRef.WriteResult.none("exception:${t.javaClass.simpleName}") }
             log(
-                "JIT_CHAIN_RETURN rc=$rc outcome=${JitRef.chainOutcomeLabel(outcome)} " +
+                "JIT_CHAIN_RETURN op=$opId rc=$rc outcome=${JitRef.chainOutcomeLabel(outcome)} " +
                     "restart=not_claimed internet=not_checked wifi_before=${snap.wire()} " +
+                    "mark_state=$state mark_write=${markUpd.ok}/${markUpd.attempted} " +
                     "out=${out.trim().take(200).ifEmpty { "empty" }} " +
                     "(ответ транспорта ≠ подтверждение рестарта zygote; состояние покажет сверка)"
             )
-            if (outcome != JitRef.ChainOutcome.REPLY_RECEIVED) {
+            if (undefined) {
                 log(
-                    "JIT_CHAIN_ERROR rc=$rc reason=channel_lost action=none " +
-                        "(команда могла остаться в очереди: это НЕ «не выполнено» и НЕ «выполнено»; " +
-                        "сверка не снимает намерение до определённого исхода)"
+                    "JIT_CHAIN_ERROR op=$opId rc=$rc reason=channel_lost action=none " +
+                        "(команда могла остаться в очереди: это НЕ «не выполнено» и НЕ «выполнено». " +
+                        "Повторный клик в этом процессе будет отклонён (blocked=chain_undefined), " +
+                        "пока исход не установлен; удаления намерения сверкой тоже не будет)"
                 )
             }
             return Click(want, snap, write, read, rc, out, null, previousUndefined)
@@ -602,29 +755,40 @@ object JitOp {
         val snapshot: JitRef.WifiSnapshot?,
         val rawSnapshot: String?,
         val format: String?,
+        /**
+         * Всегда `null` на старте: снимок БОЛЬШЕ НЕ удаляется до выполнения (iter38 §1.4).
+         * Удаление происходит в задаче возврата — и только своей операции (по [JitRef.KEY_MARK]).
+         */
         val removed: JitRef.WriteResult?,
         /** `true`, если возврат Wi-Fi запланирован (а не выполнен: выполнение — в фоне через 15 с). */
         val scheduled: Boolean,
-        val reason: String
+        /**
+         * `scheduled` · `duplicate` · `no_snapshot` · `legacy_or_unknown` (снимок есть, но
+         * конкретная операция не опознана — действия нет, данные сохранены) · `scheduler_failed`.
+         */
+        val reason: String,
+        /** Опознанная отметка операции (если она была). */
+        val mark: JitRef.OpMark? = null
     )
 
     /**
-     * Продолжение операции на старте процесса — `CentralWatchdogService.onCreate`:
-     * прочитать `jit_restaurar` → разобрать → `remove()` **до** запуска → `postDelayed(e2, 15000)`.
+     * Продолжение операции на старте процесса — `CentralWatchdogService.onCreate`.
      *
-     * ОТЛИЧИЕ (структурное, поведение то же): планировщик — [JitRef.JitScheduler] поверх
-     * `BgWorker.postDelayed`. Поток пула ожиданием не занят, второго сторожа нет.
+     * Порядок (минимальное обоснованное отступление от референса, см. отчёт iter38 §1.4):
+     *  1. прочитать `jit_restaurar` → разобрать (битое не выполняется);
+     *  2. прочитать [JitRef.KEY_MARK]. Нет отметки ⇒ операция НЕ опознана (`legacy_or_unknown`):
+     *     ничего не удаляем, ничего не планируем, пишем в лог ⛔ и оставляем данные владельцу;
+     *  3. запланировать возврат через 15 с. **Снимок не удаляется** — иначе смерть процесса в эти
+     *     15 с (или отказ планировщика) теряла бы продолжение навсегда;
+     *  4. снимок и отметка удаляются в самой задаче, ПОСЛЕ фактического возврата, и только если
+     *     отметка всё ещё принадлежит этой операции (иначе данные нового клика не трогаются).
      *
-     * Дубль предотвращается для ОДНОЙ конкретной задачи ([scheduledTask]), а не «на весь процесс»:
-     * после её выполнения (или неудачного планирования) новый снимок в том же процессе снова может
-     * быть запланирован.
+     * Дубль предотвращается для ОДНОЙ задачи ([scheduledTask]); после её выполнения новый снимок в
+     * том же процессе снова может быть запланирован.
      *
-     * Снимок после выполнения задачи повторно НЕ удаляется: строка `wifi=1` не доказывает
-     * принадлежность операции, и слепое удаление стёрло бы снимок нового клика.
-     *
-     * Сохранён и честно назван риск референса: снимок снимается ДО 15-секундной паузы, поэтому
-     * смерть процесса в эти 15 с отменяет возврат; запуск приложения после `ctl.restart zygote`
-     * ничем не гарантирован (это не `BOOT_COMPLETED`, и `START_STICKY` этого не обещает).
+     * Чего это НЕ даёт: гарантии, что приложение запустится после `ctl.restart zygote`
+     * (`START_STICKY` этого не обещает). Если оно не запустится, снимок останется на диске и
+     * продолжение выполнится при следующем обычном запуске — тогда же, когда владелец увидит панель.
      */
     fun onProcessStart(
         store: JitRef.JitStore,
@@ -634,9 +798,6 @@ object JitOp {
     ): StartOutcome {
         synchronized(INTENT_LOCK) {
             val raw = runCatching { store.getString(JitRef.KEY_RESTORE) }.getOrNull()
-            // Антидубль — на ОДНУ задачу: если задача уже стоит (onCreate + onStartCommand одного
-            // и того же снимка), второй вызов ничего не делает и снимок не трогает. Проверяется до
-            // разбора: снимок мог быть уже снят первым вызовом.
             if (scheduledTask != null) {
                 val known = JitRef.parseSnapshot(raw)
                 log(
@@ -655,45 +816,27 @@ object JitOp {
                 )
                 return StartOutcome(null, raw, null, null, false, "no_snapshot")
             }
-            // `remove("jit_restaurar").apply()` — ДО выполнения, как в onCreate.
-            val removed = runCatching { store.remove(JitRef.KEY_RESTORE) }
-                .getOrDefault(JitRef.WriteResult.none("exception"))
-            val stillThere = runCatching { store.contains(JitRef.KEY_RESTORE) }.getOrDefault(false)
-            log(
-                "JIT_START snapshot=${restore.snap.wire()} format=${restore.format} " +
-                    "removed=${removed.allOk} stores=${removed.ok}/${removed.attempted} " +
-                    "still_present=$stillThere delay_ms=${JitRef.RESTORE_DELAY_MS} " +
-                    "action=restore_scheduled internet=not_checked " +
-                    "(remove → postDelayed(e2, 15000); снимок снят до выполнения — смерть процесса в " +
-                    "эти 15 с отменяет возврат, это риск референса)"
-            )
-            if (stillThere) {
+            val markRaw = runCatching { store.getString(JitRef.KEY_MARK) }.getOrNull()
+            val mark = JitRef.OpMark.parse(markRaw)
+            if (mark == null) {
                 log(
-                    "JIT_START removal_unconfirmed=true action=restore_scheduled_once " +
-                        "(снимок всё ещё читается: повторного действия в этом процессе не будет; " +
-                        "после смерти процесса старт может вернуть Wi-Fi ещё раз — setWifiEnabled " +
-                        "идемпотентен, но это не гарантия; снимок после задачи НЕ удаляется, чтобы " +
-                        "не стереть данные нового клика)"
+                    "JIT_START snapshot=${restore.snap.wire()} format=${restore.format} " +
+                        "identification=none mark=\"${markRaw?.take(60) ?: "none"}\" action=none " +
+                        "reason=legacy_or_unknown write=none " +
+                        "(ОТКАЗ, а не «сеть не вернулась из-за JIT»: снимок есть, но КОНКРЕТНАЯ " +
+                        "операция не опознана — так выглядят данные 1.0.60 и записи до обновления. " +
+                        "Ничего не удаляем и не выполняем: продолжить нечем доказать, что это наш " +
+                        "подтверждённый снимок. Данные сохранены; решение — за владельцем после " +
+                        "разбора логов)"
                 )
+                return StartOutcome(restore.snap, raw, restore.format, null, false, "legacy_or_unknown")
             }
             val token = Any()
             val prev = scheduledTask
             scheduledTask = token
             val scheduled = try {
                 scheduler.postDelayed(JitRef.RESTORE_DELAY_MS) {
-                    try {
-                        runCatching { restoreWifi(netState, restore.snap, log) }
-                            .onFailure {
-                                log(
-                                    "JIT_NET_RESTORE exception=${it.javaClass.simpleName} " +
-                                        "(как e2: возврат прерван)"
-                                )
-                            }
-                    } finally {
-                        synchronized(INTENT_LOCK) {
-                            if (scheduledTask === token) scheduledTask = null
-                        }
-                    }
+                    runScheduledRestore(store, netState, restore.snap, mark.op, token, log)
                 }
                 true
             } catch (t: Throwable) {
@@ -701,20 +844,101 @@ object JitOp {
                     if (scheduledTask === token) scheduledTask = null
                 }
                 log(
-                    "JIT_START scheduler=failed reason=${t.javaClass.simpleName} " +
-                        "action=none (задача не поставлена; снимок уже снят — это ограничение " +
-                        "референса, повторно не планируем)"
+                    "JIT_START op=${mark.op} scheduler=failed reason=${t.javaClass.simpleName} " +
+                        "action=none removed=none (задача не поставлена; снимок и отметка ОСТАВЛЕНЫ: " +
+                        "следующий обычный запуск продолжит эту же опознанную операцию — потери " +
+                        "продолжения больше нет)"
                 )
                 false
             }
-            if (!scheduled) {
-                return StartOutcome(restore.snap, raw, restore.format, removed, false, "scheduler_failed")
-            }
+            log(
+                "JIT_START snapshot=${restore.snap.wire()} format=${restore.format} op=${mark.op} " +
+                    "mark_state=${mark.state} mark_ts=${mark.ts} identification=ok removed=none " +
+                    "delay_ms=${JitRef.RESTORE_DELAY_MS} scheduled=$scheduled " +
+                    "action=${if (scheduled) "restore_scheduled" else "none"} internet=not_checked " +
+                    "(снимок НЕ удаляется до фактического возврата: смерть процесса в эти 15 с больше " +
+                    "не отменяет продолжение — следующий старт увидит тот же опознанный снимок)"
+            )
             if (prev != null) {
                 log("JIT_START note=previous_task_replaced (предыдущая задача уже завершилась)")
             }
-            return StartOutcome(restore.snap, raw, restore.format, removed, true, "scheduled")
+            if (!scheduled) {
+                return StartOutcome(restore.snap, raw, restore.format, null, false,
+                    "scheduler_failed", mark)
+            }
+            return StartOutcome(restore.snap, raw, restore.format, null, true, "scheduled", mark)
         }
+    }
+
+    /**
+     * Тело отложенной задачи возврата (референс `w0/e2.execute`).
+     *
+     * Что здесь важно (iter38 §1.2/§1.4):
+     *  • пока идёт клик, возврат не выполняется (`click_in_flight`) — старая задача не меняет Wi-Fi
+     *    посреди новой цепочки;
+     *  • снимок и отметка удаляются ТОЛЬКО если отметка всё ещё принадлежит этой операции;
+     *  • при исключении/неудаче возврата снимок остаётся — следующий старт повторит (не «успех»).
+     */
+    private fun runScheduledRestore(
+        store: JitRef.JitStore,
+        netState: JitRef.JitNetState,
+        snap: JitRef.WifiSnapshot,
+        opId: String,
+        token: Any,
+        log: (String) -> Unit
+    ) {
+        var report: WifiRestoreReport? = null
+        var skipped: String? = null
+        try {
+            if (CLICK_SLOT.get() != null) {
+                skipped = "click_in_flight"
+                log(
+                    "JIT_NET_RESTORE skipped reason=click_in_flight action=none op=$opId " +
+                        "(уже идёт новый клик: старый возврат не меняет Wi-Fi посреди новой цепочки; " +
+                        "снимок не тронут — его продолжит следующий обычный запуск)"
+                )
+                return
+            }
+            report = runCatching { restoreWifi(netState, snap, log) }.getOrElse { t ->
+                log(
+                    "JIT_NET_RESTORE exception=${t.javaClass.simpleName} action=none op=$opId " +
+                        "(как e2: возврат прерван; снимок оставлен, следующий запуск попробует снова)"
+                )
+                null
+            }
+        } finally {
+            synchronized(INTENT_LOCK) {
+                if (scheduledTask === token) scheduledTask = null
+                if (skipped == null && report != null) {
+                    cleanupOwnSnapshot(store, opId, log)
+                }
+            }
+        }
+    }
+
+    /** Удалить снимок и отметку, если они всё ещё принадлежат операции [opId]. */
+    private fun cleanupOwnSnapshot(store: JitRef.JitStore, opId: String, log: (String) -> Unit) {
+        val cur = JitRef.OpMark.parse(runCatching { store.getString(JitRef.KEY_MARK) }.getOrNull())
+        if (cur == null || cur.op != opId) {
+            log(
+                "JIT_RESTORE_DONE op=$opId cleanup=skipped reason=snapshot_belongs_to_other_op " +
+                    "current=${cur?.op ?: "none"} write=none " +
+                    "(данные другой/новой операции не тронуты; если это остаток без отметки — " +
+                    "он сохранён для разбора, а не вычищен)"
+            )
+            return
+        }
+        val r = runCatching { store.remove(JitRef.KEY_RESTORE) }
+            .getOrElse { JitRef.WriteResult.none("exception") }
+        val m = runCatching { store.remove(JitRef.KEY_MARK) }
+            .getOrElse { JitRef.WriteResult.none("exception") }
+        val left = runCatching { store.contains(JitRef.KEY_RESTORE) }.getOrDefault(false)
+        log(
+            "JIT_RESTORE_DONE op=$opId cleanup=restore:${r.ok}/${r.attempted}" +
+                "/mark:${m.ok}/${m.attempted} still_present=$left write=remove " +
+                "(снимок снят ПОСЛЕ фактического возврата; при отказе удаления он останется и " +
+                "следующий запуск повторит возврат — это видно по still_present)"
+        )
     }
 
     // ─────────────────────────── 3. возврат клиентского Wi-Fi: `e2` ───────────────────────────
