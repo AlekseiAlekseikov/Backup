@@ -909,8 +909,10 @@ id `13826483630`, 177 171 113 Б.
 
 **База:** `6436be8`. **Код:** `61bfddd` (`61bfddd0c55352156c34a55706c2811ae07e9634`) + `1d64e54`
 (правка компиляции одной строки в `ToolsPanel.addOneShot`), `fix/v2`, fast-forward, без `--force`.
-**CI:** run `42962463984`, job `130331961735` — `BUILD SUCCESSFUL in 3m 5s`, **210 PASSED / 0 FAILED**
-(`grep -c 'Z .* PASSED$'` = 210, `FAILED$` = 0), artifact `app-debug` id `13829668249`, 177 178 359 Б.
+**CI:** итоговый прогон run `42965830756`, job `130342717357` (SHA `1ec62f1`) — `BUILD SUCCESSFUL
+in 3m`, **210 PASSED / 0 FAILED**; до него run `42962463984`, job `130331961735` (`1d64e54`) —
+тот же результат
+(`grep -c 'Z .* PASSED$'` = 210, `FAILED$` = 0), artifact `app-debug` id `13831162922`, 177 178 299 Б.
 Промежуточный прогон `42960987191` по `25ff688` упал на `:app:compileDebugKotlin`
 (`ToolsPanel.kt:923 Unresolved reference 'jitConfirmed'` — лишняя вставка при патче, убрана).
 
@@ -946,7 +948,7 @@ CPS/DPS), +`JitUiStateTest` (5), +`JitLifecycleShell`; переписаны `Jit
 переходит в рабочую копию (`cd $W`) и компилирует `JitNet.kt` + стабы, иначе source-тесты падали
 на чужом cwd.
 
-**SOURCE_SHA** в handoff-коммите: `6436be8` → `1d64e54` (последний коммит кода) (`app/buildinfo.properties`).
+**SOURCE_SHA** в handoff-коммите: `6436be8` → `1ec62f1` (последний коммит кода, прошедший CI) (`app/buildinfo.properties`).
 
 **Открыто:** решение владельца по шагу монтирований (в §3.2 отчёта даны четыре read-only команды:
 mountinfo root-транспорта + сравнение namespace с PID 1; `cat /proc/mounts` сам по себе ничего не

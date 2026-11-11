@@ -35,11 +35,12 @@
 | **код правки 2** | **`61bfddd`** (`61bfddd0c55352156c34a55706c2811ae07e9634`) — только JIT-файлы, UI-строка и тесты |
 | handoff правки 2 | `25ff688` — только `docs/agent/**` + `app/buildinfo.properties` |
 | **правка компиляции** | **`1d64e54`** — в `ToolsPanel.addOneShot` осталась ссылка на локальную `jitConfirmed` (лишняя вставка при патче): CI `42960987191` по `25ff688` упал на `:app:compileDebugKotlin`, `e: ToolsPanel.kt:923:49 Unresolved reference 'jitConfirmed'`. Строка убрана, поведение не менялось |
-| **CI по коду правки 2** | run **`42962463984`**, job **`130331961735`** (SHA `1d64e54`) — **SUCCESS**, `BUILD SUCCESSFUL in 3m 5s` |
+| CI по коду правки 2 (промежуточный) | run **`42962463984`**, job **`130331961735`** (SHA `1d64e54`) — **SUCCESS**, `BUILD SUCCESSFUL in 3m 5s`, 210/0 |
+| **CI итоговый (актуальный SHA)** | **`1ec62f1`** — run **`42965830756`**, job **`130342717357`** — **SUCCESS**, `BUILD SUCCESSFUL in 3m` |
 | тесты в CI | **210 PASSED / 0 FAILED** (`grep -c 'Z .* PASSED$'` = 210, `FAILED$` = 0 по полному логу джобы); из них JIT/лог — те же 95, что локально (§0.1) |
-| artifact | `app-debug`, id `13829668249`, 177 178 359 Б |
+| artifact | `app-debug` для `1ec62f1`, id **`13831162922`**, 177 178 299 Б |
 | прогон handoff-коммита `cf3b6b0` | run `42963567210` — **FAILED**: `JitLifecycleTest > clickAndStartNeverOverlap` (тест был нестабилен: ожидал «ровно один `STARTED`» и конкретный набор исходов, а порядок двух потоков решает планировщик). Тест переписан на инварианты, не зависящие от порядка (см. §4): клик ∈ {`STARTED`, `BUSY`}; старт ∈ {`IDLE`, `HOLD_UNSAFE_PHASE`, `RESTORE`, `NOTHING_TO_RESTORE`, `DONE`}; ноль сетевых запросов; при `STARTED` снимок не потерян и остался снимком включения; при `BUSY` — ноль записей и снимка нет. Локально 3 прогона подряд — `OK (95 tests)` |
-| `SOURCE_SHA` | **`1d64e54`** — последний коммит кода, прошедший CI (§0.3) |
+| `SOURCE_SHA` | **`1ec62f1`** — последний коммит кода, прошедший CI (§0.3) |
 | локальный прогон | **`OK (95 tests)`** @ `61bfddd`/`1d64e54` — JIT/лог-подмножество на стабах и настоящем `/bin/sh` (§7) |
 
 `SKIPPED` в логе — только Gradle-задачи (`checkKotlinGradlePluginConfigurationErrors`,
@@ -85,10 +86,15 @@
 
 ### 0.3 `SOURCE_SHA`
 
-`app/buildinfo.properties` → `SOURCE_SHA=1d64e54` — последний коммит КОДА, прошедший CI
-(`42962463984`, 210/0). `git rev-parse` в сборке не используется: значение читает
-`app/build.gradle.kts` и кладёт в `BuildConfig.GIT_COMMIT`. Коммит `61bfddd` — та же логика,
-`1d64e54` отличается только удалением одной ошибочной строки в `ToolsPanel.addOneShot`.
+`app/buildinfo.properties` → `SOURCE_SHA=1ec62f1` — последний коммит КОДА, прошедший CI
+(`42965830756`, job `130342717357`, 210/0). `git rev-parse` в сборке не используется: значение
+читает `app/build.gradle.kts` и кладёт в `BuildConfig.GIT_COMMIT`.
+
+История кода этой правки: `61bfddd` (сама правка) → `1d64e54` (убрана лишняя строка в
+`ToolsPanel.addOneShot`, из-за которой CI `42960987191` упал на компиляции) → `1ec62f1` (тест
+`clickAndStartNeverOverlap` переписан без зависимости от порядка потоков: CI `42963567210` упал
+на нём, хотя локально он проходил). Ни одна из двух правок не меняет логику JIT; версия
+`versionCode=61`/`versionName="1.0.61"` не менялась.
 
 ### 0.4 История: замечания REVIEW к `78a3248` (правка 1, `aed18fb`)
 
