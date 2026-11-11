@@ -22,7 +22,8 @@
 | CI по коду | run **`42954771103`**, job **`130307151164`** — **SUCCESS**, `BUILD SUCCESSFUL in 4m 27s` |
 | тесты в CI | **186 PASSED / 0 FAILED** (`grep -c ' PASSED$'` = 186, `grep -c ' FAILED$'` = 0 по полному логу) |
 | artifact | `app-debug`, id `13826483630`, 177 171 113 Б |
-| handoff | отдельный коммит: только `docs/agent/**` + `app/buildinfo.properties` (`SOURCE_SHA=aed18fb`) |
+| handoff | **`297f1ef`** — только `docs/agent/**` + `app/buildinfo.properties` (`SOURCE_SHA=aed18fb`) |
+| CI по handoff | run **`42956152521`**, job **`130311632733`** — **SUCCESS**, `BUILD SUCCESSFUL in 2m 57s`, **186 PASSED / 0 FAILED**, artifact `13827676157` (177 170 921 Б) |
 
 `SKIPPED` в логе — только Gradle-задачи (`checkKotlinGradlePluginConfigurationErrors`,
 `kspDebugUnitTestKotlin`), ни одного пропущенного теста.
