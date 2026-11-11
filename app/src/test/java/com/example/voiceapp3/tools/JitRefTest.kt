@@ -124,28 +124,56 @@ class JitRefTest {
     }
 
     @Test
-    fun startDecisionRequiresEvidence() {
+    fun startDecisionRequiresProvenShellCompletion() {
         val id = "8f1c2b44-1c2d-4e5f-9a0b-11c2d3e4f5a6"
-        val op = JitRef.Op(JitRef.Phase.ARMED, true, JitRef.Net(true, false), id, 10L)
+        val op = JitRef.Op(JitRef.Phase.SENT, true, JitRef.Net(true, false), id, 10L)
+        // Сеть выключена «как в снимке» — это НЕ доказательство (сеть мог выключить кто угодно,
+        // а svc wifi disable — первая команда скрипта).
         assertEquals(
-            "только boot ID + 15 с — НЕ основание возвращать сеть",
-            JitRef.StartDecision.WAIT_NO_EVIDENCE, JitRef.startDecision(op, id, evidence = false)
+            "нет ответа транспорта ⇒ ничего не делаем, даже если сеть уже выключена",
+            JitRef.StartDecision.HOLD_UNSAFE_PHASE, JitRef.startDecision(op, id)
         )
-        assertEquals(JitRef.StartDecision.RESTORE, JitRef.startDecision(op, id, evidence = true))
+        assertEquals(
+            "таймаут транспорта — тоже не доказательство",
+            JitRef.StartDecision.HOLD_UNSAFE_PHASE,
+            JitRef.startDecision(op.copy(shell = JitRef.Shell.LOST), id)
+        )
+        assertEquals(
+            "ответ транспорта на наш скрипт ⇒ можно возвращать сохранённую сеть",
+            JitRef.StartDecision.RESTORE,
+            JitRef.startDecision(op.copy(shell = JitRef.Shell.REPLIED), id)
+        )
         assertEquals(
             JitRef.StartDecision.KEEP_PREVIOUS_BOOT,
-            JitRef.startDecision(op, "0a9b8c7d-6e5f-4a3b-2c1d-0e9f8a7b6c5d", evidence = true)
+            JitRef.startDecision(op.copy(shell = JitRef.Shell.REPLIED),
+                "0a9b8c7d-6e5f-4a3b-2c1d-0e9f8a7b6c5d")
         )
         assertEquals(
             JitRef.StartDecision.KEEP_UNKNOWN_BOOT,
-            JitRef.startDecision(op, "epoch1700000000", evidence = true)
+            JitRef.startDecision(op.copy(shell = JitRef.Shell.REPLIED), "epoch1700000000")
         )
-        val done = op.copy(phase = JitRef.Phase.DONE)
-        assertEquals(JitRef.StartDecision.DONE, JitRef.startDecision(done, id, evidence = true))
+        assertEquals(JitRef.StartDecision.DONE,
+            JitRef.startDecision(op.copy(phase = JitRef.Phase.DONE, shell = JitRef.Shell.REPLIED), id))
+        // Оба радио выключены: завершение фиксируется только по ответу транспорта.
         val nothing = op.copy(net = JitRef.Net(false, false))
-        assertEquals("нечего возвращать — сеть не трогаем", JitRef.StartDecision.DONE,
-            JitRef.startDecision(nothing, id, evidence = true))
-        assertEquals(JitRef.StartDecision.IDLE, JitRef.startDecision(null, id, evidence = true))
+        assertEquals("без ответа транспорта — не «завершено», а «небезопасная фаза»",
+            JitRef.StartDecision.HOLD_UNSAFE_PHASE, JitRef.startDecision(nothing, id))
+        assertEquals(JitRef.StartDecision.NOTHING_TO_RESTORE,
+            JitRef.startDecision(nothing.copy(shell = JitRef.Shell.REPLIED), id))
+        assertEquals(JitRef.StartDecision.IDLE, JitRef.startDecision(null, id))
+    }
+
+    @Test
+    fun shellFieldRoundTripsAndOldSnapshotIsUnknown() {
+        val id = "8f1c2b44-1c2d-4e5f-9a0b-11c2d3e4f5a6"
+        val op = JitRef.Op(JitRef.Phase.SENT, true, JitRef.Net(true, false), id, 5L,
+            shell = JitRef.Shell.REPLIED)
+        assertEquals(op, JitRef.decodeOp(op.encode()))
+        // Снимок прежней версии (без поля shell) читается как UNKNOWN — «выполнение не доказано».
+        val legacy = "v=1;phase=SENT;want=1;wifi=1;ap=0;boot=$id;ts=5;checked=0;note="
+        assertEquals(JitRef.Shell.UNKNOWN, JitRef.decodeOp(legacy)!!.shell)
+        // Мусорное значение shell — снимок не разбираем (не трогаем).
+        assertNull(JitRef.decodeOp(legacy.replace(";note=", ";shell=WHAT;note=")))
     }
 
     @Test

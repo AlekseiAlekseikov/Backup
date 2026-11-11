@@ -64,9 +64,8 @@ class JitLogsCancelTest {
     fun restoreOnlyTurnsNetworkOn() {
         val store = JitFake.Store()
         val net = JitFake.Net(wifi = true, ap = true)
-        val shell = JitFake.QueueShell(stand())
+        val shell = JitFake.QueueShell(stand()).apply { runInline = 1 }
         JitOp.click(store, net, shell, true, BOOT, 7L)
-        shell.drain()
         net.wifi = false
         net.ap = false
         net.requests.clear()
@@ -85,8 +84,10 @@ class JitLogsCancelTest {
                 }.joinToString("\n")
         for (f in listOf("JitNetCore.kt", "JitNet.kt", "AppPerformance.kt")) {
             val c = code("src/main/java/com/example/voiceapp3/tools/$f")
-            for (bad in listOf("fun cancel", "COMPENSATE", "compensat", "DISCARD", "HOLD",
-                "jit_cancel", "abortOperation")) {
+            // HOLD_UNSAFE_PHASE — не механизм отмены, а честный отказ действовать без доказательств
+            // (см. отчёт §3); запрещены именно компенсация/отмена/фиктивные решения.
+            for (bad in listOf("fun cancel", "COMPENSATE", "compensat", "DISCARD",
+                "jit_cancel", "abortOperation", "rollback")) {
                 assertFalse("$f: нет механизма отмены «$bad»", c.contains(bad))
             }
         }

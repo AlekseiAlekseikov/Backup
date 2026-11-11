@@ -815,11 +815,12 @@ object AppPerformance {
      * → `w0/e2.run`, затем `w0/bb`/`w0/r7`).
      *
      * Возврат сети выполняется ТОЛЬКО когда доказаны две вещи: снимок относится к этой загрузке
-     * (`boot_id`, не `epoch`) И есть признаки того, что цепочка уже выполнила `svc wifi disable`
-     * (Wi-Fi/AP, включённые в снимке, сейчас выключены) — см. [JitRef.startDecision] и
-     * [JitOp.evidenceOfChainRun]. Совпадение `getprop` признаком выполнения НЕ считается: свойство
-     * могло остаться от прошлой операции, а скрипт при этом ещё стоять в очереди транспорта.
-     * Совпадения boot ID и 15 секунд ожидания для этого недостаточно (REVIEW §0.1(1)).
+     * (`boot_id`, не `epoch`) И скрипт доказанно завершился — транспорт ответил на НАШ вызов
+     * (`shell=replied`, см. [JitRef.Shell]). Не считаются доказательством: выключенный Wi-Fi/AP
+     * (его мог выключить кто угодно, а `svc wifi disable` — первая команда скрипта), совпадение
+     * `getprop`, истёкшее время, `ARMED`/`SENT`, смерть приложения, пустой журнал, `rc=137`.
+     * Если доказательства нет — `HOLD_UNSAFE_PHASE`: ноль записей, ноль сети, решение за владельцем
+     * (REVIEW 3-го захода, пп.1,2,6).
      *
      * Блокировки «одна попытка на процесс» больше нет: решение принимается на каждом старте по
      * фактам, а не по факту «мы уже пробовали» (§0.1(2)).
@@ -835,7 +836,15 @@ object AppPerformance {
         AppLog.i(TAG, "JIT_START_RESULT decision=${out.decision.name.lowercase()} " +
             "op=${out.op?.log() ?: "none"} boot=$bootTag " +
             "verify=${out.verify?.verdict?.let { JitRef.verifyLabel(it) } ?: "none"} " +
-            "restore=${out.restore?.summary ?: "none"}")
+            "restore=${out.restore?.summary ?: "none"} internet=not_checked " +
+            "action=${when (out.decision) {
+                JitRef.StartDecision.RESTORE -> "net_restore_begin"
+                JitRef.StartDecision.HOLD_UNSAFE_PHASE -> "none_need_owner_decision"
+                JitRef.StartDecision.NOTHING_TO_RESTORE -> "none_nothing_to_restore"
+                JitRef.StartDecision.KEEP_PREVIOUS_BOOT, JitRef.StartDecision.KEEP_UNKNOWN_BOOT ->
+                    "none_need_owner_decision"
+                JitRef.StartDecision.IDLE, JitRef.StartDecision.DONE -> "none"
+            }}")
         return out.decision == JitRef.StartDecision.RESTORE
     }
 
@@ -853,15 +862,42 @@ object AppPerformance {
     /** Последний прочитанный факт (или `null`, если ещё не читали). Для UI — без shell-вызовов. */
     fun jitRuntimeFactCached(): JitRef.PropFact? = LAST_JIT_FACT
 
-    /** Обновить факт в фоне (не чаще раза в 5 с) — панель вызывает при открытии. */
-    fun refreshJitRuntimeAsync(context: Context) {
+    /**
+     * Подтверждённое состояние для ТУМБЛЕРА: `on` / `off` / `unknown`.
+     *
+     * ЧЕСТНОЕ ПРАВИЛО (REVIEW 3-го захода, п.5): `off` нельзя показывать по одному preference и
+     * нельзя выводить из «не прочитали». Поэтому:
+     *  • runtime прочитан и `true` ⇒ `on` (факт);
+     *  • runtime прочитан и `false` И есть подтверждённая операция с `want=false`
+     *    (phase=DONE) ⇒ `off` (факт, а не обещание);
+     *  • всё остальное, включая ошибку транспорта и «ещё не читали» ⇒ `unknown`.
+     *
+     * Значение читается из кэша: shell из UI-потока не вызывается.
+     */
+    fun jitConfirmedState(context: Context): String {
+        val op = runCatching { readJitOp(context.applicationContext) }.getOrNull()
+        return JitRef.confirmedState(LAST_JIT_FACT, op)
+    }
+
+    /**
+     * Асинхронное чтение факта с гарантированным обновлением UI.
+     *
+     * Раньше панель запускала фоновое чтение и больше ничего не делала (REVIEW 3-го захода, п.5):
+     * ответ приходил, кэш обновлялся, но виджет оставался с прежним значением. Теперь после чтения
+     * вызывается [onDone] ровно один раз (на главном потоке его обработает вызывающий).
+     */
+    fun refreshJitRuntimeAsync(context: Context, minIntervalMs: Long = 5_000L, onDone: (JitRef.PropFact) -> Unit = {}) {
         val app = context.applicationContext
         val now = System.currentTimeMillis()
-        if (now - lastJitFactAt < 5_000L) return
+        if (now - lastJitFactAt < minIntervalMs) {
+            LAST_JIT_FACT?.let(onDone)
+            return
+        }
         lastJitFactAt = now
         BgWorker.post("AppPerformance.jitFact") {
-            runCatching { jitRuntimeFact(app) }
-            Unit
+            val fact = runCatching { jitRuntimeFact(app) }
+                .getOrDefault(JitRef.PropFact(JitRef.Prop.UNKNOWN, "", 1, "exception"))
+            runCatching { onDone(fact) }
         }
     }
 
@@ -903,8 +939,12 @@ object AppPerformance {
         val started = click.result == JitOp.ClickResult.STARTED
         val why = when (click.result) {
             JitOp.ClickResult.STARTED -> ""
+            JitOp.ClickResult.BUSY ->
+                "не запускалось: прямо сейчас идёт другая операция JIT (клик или продолжение после " +
+                    "рестарта фреймворка) — повторный клик не перезаписывает снимок"
             JitOp.ClickResult.REFUSED_PENDING ->
-                "не запускалось: незавершённая операция (${click.op?.log() ?: "снимок этой загрузки"})"
+                "не запускалось: незавершённая операция (${click.op?.log() ?: "снимок этой загрузки"}); " +
+                    "завершение скрипта не подтверждено — нужно решение владельца (см. лог)"
             JitOp.ClickResult.REFUSED_UNRESOLVED ->
                 "не запускалось: снимок повреждён — нужно решение владельца (см. JIT_APPLIED_REQUEST в логе)"
             JitOp.ClickResult.REFUSED_STATE_UNKNOWN -> "не запускалось: состояние сети неизвестно"
@@ -919,7 +959,8 @@ object AppPerformance {
                 step = "perf_zygote",
                 command = if (started)
                     "setprop $PROP_USEJIT=${if (enabled) "true" else "false"} · " +
-                        "setprop ctl.restart zygote (скрипт референса)"
+                        "setprop ctl.restart zygote (скрипт референса; " +
+                        "завершение: ${click.op?.shell?.name?.lowercase() ?: "unknown"})"
                 else "нет: $why",
                 startedAtMs = t0, finishedAtMs = System.currentTimeMillis(),
                 exitCode = if (started) (click.run?.exitCode ?: 1) else 1,
@@ -927,9 +968,15 @@ object AppPerformance {
                 actual = "click=${click.result.name.lowercase()} " +
                     "getprop=${fact.raw.ifEmpty { "unknown" }} fact=${fact.value.name.lowercase()} " +
                     "rc=${click.run?.exitCode ?: -1} restart=not_claimed",
-                stdout = if (started)
-                    "экран гаснет на 10–20 с · сеть вернётся, только если продолжение операции подтвердит состояние " +
-                        "(AP, затем Wi-Fi — как e2); иначе в логе будет JIT_NET_CONT с причиной"
+                stdout = if (started && click.op?.shell == JitRef.Shell.REPLIED)
+                    "экран гаснет на 10–20 с · скрипт ответил целиком; сеть вернётся при следующем " +
+                        "запуске как продолжение этой операции (AP, затем Wi-Fi — как e2). Если приложение " +
+                        "не запустится, сеть останется выключенной — это ограничение референса, " +
+                        "см. отчёт §9"
+                else if (started)
+                    "команда отправлена, но ответа транспорта нет (${click.run?.exitCode ?: -1}): " +
+                        "поздняя команда и рестарт фреймворка возможны. Возврат сети и второй клик " +
+                        "заблокированы до решения владельца (JIT_NET_CONT reason=unsafe_phase)"
                 else why,
                 status = if (started) ToolsStep.Status.PARTIAL else ToolsStep.Status.BLOCKED
             )

@@ -920,7 +920,9 @@ class ToolsPanel(
             setPadding(0, dp(10f), 0, dp(10f))
         }
         val info = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
-        info.addView(text(title, 14.5f, palette.ink, bold = true))
+        val titleText = if (key == "perfJit" && jitConfirmed == "unknown") "$title · состояние неизвестно"
+                        else title
+        info.addView(text(titleText, 14.5f, palette.ink, bold = true))
         info.addView(text(desc, 12f, palette.muted, bold = false))
         oneShotNote(info, actionPrefix)
         row.addView(info, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
@@ -959,14 +961,19 @@ class ToolsPanel(
     }
 
     private fun addToggle(key: String, title: String, descKey: String?, def: Boolean) {
-        val on = boolState(key) ?: def
+        // iter33p §0.0(5): у JIT тумблер показывает ПОДТВЕРЖДЁННЫЙ факт (`on`/`off`), а при
+        // недоступном property — `unknown` с явной пометкой, а не ложное «выключено».
+        val jitConfirmed = if (key == "perfJit") strState("perfJitConfirmed") else null
+        val on = if (key == "perfJit" && jitConfirmed != "on") false else (boolState(key) ?: def)
         val row = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(0, dp(10f), 0, dp(10f))
         }
         val info = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
-        info.addView(text(title, 14.5f, palette.ink, bold = true))
+        val titleText = if (key == "perfJit" && jitConfirmed == "unknown") "$title · состояние неизвестно"
+                        else title
+        info.addView(text(titleText, 14.5f, palette.ink, bold = true))
         descKey?.let { ToolsCatalog.TEXT[it] }?.let { info.addView(text(it, 12f, palette.muted, bold = false)) }
         addNote(info, key)
         row.addView(info, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
@@ -1122,25 +1129,39 @@ class ToolsPanel(
         return box
     }
 
-    /** Read-only строка фактического состояния JIT (не кнопка, не тумблер). */
+    /**
+     * Read-only строка фактического состояния JIT (не кнопка, не тумблер).
+     *
+     * Обновление виджета после ответа (REVIEW 3-го захода, п.5): строка создаётся с кэшем, затем
+     * фоновое чтение по готовности ПЕРЕПИСЫВАЕТ текст на главном потоке. Если прочитать нельзя —
+     * остаётся `unknown`, ложного «выключено» нет.
+     */
     private fun addJitRuntimeLine() {
-        // Только кэш: shell из UI-потока не вызываем, факт обновляется в фоне.
         val fact = runCatching { AppPerformance.jitRuntimeFactCached() }.getOrNull()
-        runCatching { AppPerformance.refreshJitRuntimeAsync(activity) }
-        val shown = when (fact?.value) {
-            JitRef.Prop.TRUE -> "включён (getprop dalvik.vm.usejit = true)"
-            JitRef.Prop.FALSE -> "выключен (getprop dalvik.vm.usejit = false)"
-            null -> "ещё не прочитано — значение появится после фоновой проверки"
-            JitRef.Prop.UNKNOWN -> "неизвестно (getprop не прочитан: ${fact.reason})"
+        val view = text(jitRuntimeLineText(fact), 11.5f, palette.muted, bold = false)
+        page.addView(view, matchWrap())
+        runCatching {
+            AppPerformance.refreshJitRuntimeAsync(activity) { fresh ->
+                handler.post {
+                    runCatching { view.text = jitRuntimeLineText(fresh) }
+                    Unit
+                }
+            }
+        }
+    }
+
+    private fun jitRuntimeLineText(fact: JitRef.PropFact?): String {
+        val shown = when {
+            fact == null -> "ещё не прочитано — значение появится после фоновой проверки"
+            fact.value == JitRef.Prop.TRUE -> "включён (getprop dalvik.vm.usejit = true)"
+            fact.value == JitRef.Prop.FALSE -> "выключен (getprop dalvik.vm.usejit = false)"
+            else -> "неизвестно (getprop не прочитан: ${fact.reason})"
         }
         val op = runCatching { AppPerformance.readJitOp(activity) }.getOrNull()
-        val opLine = if (op == null) "" else " · операция: ${op.phase.name.lowercase()}, сеть была ${op.net.wire()}"
-        val box = LinearLayout(activity).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(2f), 0, dp(2f), dp(8f))
-        }
-        box.addView(text("Сейчас на устройстве: $shown$opLine", 11.5f, palette.muted, bold = false))
-        page.addView(box, matchWrap())
+        val opLine = if (op == null) ""
+        else " · операция: ${op.phase.name.lowercase()}, скрипт: ${op.shell.name.lowercase()}, " +
+            "сеть была ${op.net.wire()}"
+        return "Сейчас на устройстве: $shown$opLine"
     }
 
     private fun addText(title: String, body: String) {

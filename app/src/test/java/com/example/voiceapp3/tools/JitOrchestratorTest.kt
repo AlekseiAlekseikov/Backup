@@ -143,30 +143,42 @@ class JitOrchestratorTest {
 
         // процесс перезапустился (по любой причине), загрузка та же, сеть ещё не менялась
         val log = mutableListOf<String>()
+        val before = store.rawOp()
+        val writes = store.writeCount()
         val out = start(store, net, shell, log = log)
         assertEquals(
-            "признаков выполнения нет ⇒ сеть НЕ возвращаем и снимок не трогаем",
-            JitRef.StartDecision.WAIT_NO_EVIDENCE, out.decision
+            "нет ответа транспорта ⇒ НЕ возвращаем сеть и ничего не пишем",
+            JitRef.StartDecision.HOLD_UNSAFE_PHASE, out.decision
         )
         assertTrue("ни одного сетевого запроса", net.requests.isEmpty())
-        assertNotNull("снимок сохранён", store.op())
-        assertTrue(log.any { it.contains("reason=no_evidence_of_chain") })
+        assertEquals("снимок сохранён и не переписан", before, store.rawOp())
+        assertEquals("ноль записей в префы", writes, store.writeCount())
+        assertTrue(log.any { it.contains("reason=unsafe_phase") })
+        // поздняя команда всё-таки доехала: сеть выключена, но повторного возврата не будет,
+        // пока владелец не разберётся с фазой — это и есть честный блок вместо фиктивного успеха
+        shell.drain()
+        net.wifi = false
+        val again = start(store, net, shell)
+        assertEquals(JitRef.StartDecision.HOLD_UNSAFE_PHASE, again.decision)
+        assertTrue(net.requests.isEmpty())
     }
 
     @Test
-    fun lateShellThenRestoreOnNextStart() {
+    fun repliedChainThenRestoreOnNextStart() {
         val stand = stand()
         val store = JitFake.Store()
         val net = JitFake.Net(wifi = true, ap = false)
-        val shell = JitFake.QueueShell(stand)
-        click(store, net, shell)
+        val shell = JitFake.QueueShell(stand).apply { runInline = 1 }  // транспорт ОТВЕТИЛ
 
-        // сценарий REVIEW §0.1(1): очередь доехала позже и выключила Wi-Fi
-        val drained = shell.drain()
-        assertEquals(1, drained)
+        val res = click(store, net, shell)
+        assertEquals(JitOp.ClickResult.STARTED, res.result)
+        assertEquals("скрипт дошёл до конца", JitRef.ChainOutcome.REPLY_RECEIVED, res.run!!.outcome)
+        assertEquals("фаза записана с доказанным завершением",
+            JitRef.Shell.REPLIED, store.op()!!.shell)
+
+        // скрипт выполнился: Wi-Fi выключен (это наблюдение, а не доказательство)
         net.wifi = false
 
-        // следующий старт: признаки выполнения есть ⇒ возвращаем сохранённое
         val waiter = JitFake.Waiter()
         val out = start(store, net, shell, waiter = waiter)
         assertEquals(JitRef.StartDecision.RESTORE, out.decision)
@@ -174,6 +186,59 @@ class JitOrchestratorTest {
         assertTrue("Wi-Fi возвращён", net.wifi)
         assertEquals(listOf("wifi=true"), net.requests)
         assertEquals(JitRef.Phase.RESTORED, store.op()!!.phase)
+    }
+
+    @Test
+    fun lostChainNeverRestoresEvenWhenNetworkIsDown() {
+        // Ровно сценарий REVIEW: снимок → `svc wifi disable` → shell задержан → процесс погиб →
+        // старт → сеть выключена. Раньше это давало RESTORE; теперь — честный блок.
+        val stand = stand()
+        val store = JitFake.Store()
+        val net = JitFake.Net(wifi = true, ap = false)
+        val shell = JitFake.QueueShell(stand)          // всё в очередь: ответа нет
+        click(store, net, shell)
+        net.wifi = false                                // «сеть уже выключена» — не доказательство
+        val log = mutableListOf<String>()
+        val out = start(store, net, shell, log = log)
+        assertEquals(JitRef.StartDecision.HOLD_UNSAFE_PHASE, out.decision)
+        assertTrue("ни одного сетевого запроса", net.requests.isEmpty())
+        assertTrue("снимок сохранён как есть", store.op()!!.shell == JitRef.Shell.LOST)
+        assertTrue(log.any { it.contains("write=none need=owner_decision") })
+    }
+
+    @Test
+    fun bothRadiosOffWaitsForProvenCompletion() {
+        val stand = stand()
+        val store = JitFake.Store()
+        val net = JitFake.Net(wifi = false, ap = false)
+        val shell = JitFake.QueueShell(stand)          // нет ответа транспорта
+        val res = click(store, net, shell)
+        assertEquals(JitOp.ClickResult.STARTED, res.result)
+        assertEquals("операция НЕ объявлена завершённой", JitRef.Phase.SENT, store.op()!!.phase)
+        val again = click(store, net, shell)
+        assertEquals("второй клик запрещён: shell мог остаться в очереди",
+            JitOp.ClickResult.REFUSED_PENDING, again.result)
+        assertEquals("в очередь ушёл ровно один скрипт", 1, shell.pending.size)
+        val out = start(store, net, shell)
+        assertEquals(JitRef.StartDecision.HOLD_UNSAFE_PHASE, out.decision)
+        assertTrue(net.requests.isEmpty())
+    }
+
+    @Test
+    fun bothRadiosOffWithRepliedChainIsDoneAndNextClickAllowed() {
+        val stand = stand()
+        val store = JitFake.Store()
+        val net = JitFake.Net(wifi = false, ap = false)
+        val shell = JitFake.QueueShell(stand).apply { runInline = 1 }
+        click(store, net, shell)
+        assertEquals("завершение объявляется только на разборе старта",
+            JitRef.Phase.SENT, store.op()!!.phase)
+        val out = start(store, net, shell)
+        assertEquals(JitRef.StartDecision.NOTHING_TO_RESTORE, out.decision)
+        assertEquals("завершение зафиксировано по ответу транспорта", JitRef.Phase.DONE, store.op()!!.phase)
+        assertTrue("сеть не трогали", net.requests.isEmpty())
+        val again = click(store, net, shell, want = false)
+        assertEquals("новый клик разрешён только теперь", JitOp.ClickResult.STARTED, again.result)
     }
 
     @Test
@@ -262,12 +327,14 @@ class JitOrchestratorTest {
         val stand = stand()
         val store = JitFake.Store()
         val net = JitFake.Net(wifi = false, ap = false)
-        val res = click(store, net, stand.Shell())
+        val shell = JitFake.QueueShell(stand).apply { runInline = 1 }
+        val res = click(store, net, shell)
         assertEquals(JitOp.ClickResult.STARTED, res.result)
+        assertEquals("сразу после клика операция НЕ завершена", JitRef.Phase.SENT, store.op()!!.phase)
+        val out = start(store, net, shell)
+        assertEquals(JitRef.StartDecision.NOTHING_TO_RESTORE, out.decision)
         assertEquals(JitRef.Phase.DONE, store.op()!!.phase)
-        val out = start(store, net, stand.Shell())
-        assertEquals(JitRef.StartDecision.DONE, out.decision)
-        assertTrue(net.requests.isEmpty())
+        assertTrue("сеть не трогали ни разу", net.requests.isEmpty())
     }
 
     // ─────────────────────────── 4. асинхронный возврат сети ───────────────────────────
@@ -277,9 +344,8 @@ class JitOrchestratorTest {
         val stand = stand()
         val store = JitFake.Store()
         val net = JitFake.Net(wifi = true, ap = true, wifiAppliesAfterReads = 2, apAppliesAfterReads = 3)
-        val shell = JitFake.QueueShell(stand)
+        val shell = JitFake.QueueShell(stand).apply { runInline = 1 }
         click(store, net, shell)
-        shell.drain()
         net.wifi = false
         net.ap = false
 
@@ -298,18 +364,18 @@ class JitOrchestratorTest {
     fun apiRefusalIsNotReportedAsRestored() {
         val stand = stand()
         val store = JitFake.Store()
-        val net = JitFake.Net(wifi = true, ap = true, apiBroken = true)
-        val shell = JitFake.QueueShell(stand)
+        val net = JitFake.Net(wifi = true, ap = true, apiRejects = true)
+        val shell = JitFake.QueueShell(stand).apply { runInline = 1 }
         click(store, net, shell)
-        shell.drain()
         net.wifi = false
         net.ap = false
         val log = mutableListOf<String>()
         val out = start(store, net, shell, log = log)
         val rep = out.restore!!
         assertFalse("API отказал — состояние не подтверждено", rep.confirmed)
-        assertEquals("не подтверждён AP", "not_up_after_20s", rep.apReason)
-        assertEquals("не подтверждён Wi-Fi", "still_off_after_10s", rep.wifiReason)
+        assertEquals("вызов прошёл, но запрос отклонён — и состояние не подтверждено",
+            "request_rejected_not_up_20s", rep.apReason)
+        assertEquals("не подтверждён Wi-Fi", "request_rejected_still_off_10s", rep.wifiReason)
         assertEquals("снимок остаётся незавершённым", JitRef.Phase.SENT, store.op()!!.phase)
         assertTrue(log.any { it.contains("JIT_NET_RESTORE result ap=false") })
     }
@@ -319,9 +385,8 @@ class JitOrchestratorTest {
         val stand = stand()
         val store = JitFake.Store()
         val net = JitFake.Net(wifi = true, ap = false, apiBroken = true)
-        val shell = JitFake.QueueShell(stand)
+        val shell = JitFake.QueueShell(stand).apply { runInline = 1 }
         click(store, net, shell)
-        shell.drain()
         net.wifi = false
         val first = start(store, net, shell)
         assertFalse("первая попытка не подтвердилась", first.restore!!.confirmed)
@@ -338,9 +403,8 @@ class JitOrchestratorTest {
         val stand = stand()
         val store = JitFake.Store()
         val net = JitFake.Net(wifi = true, ap = false)
-        val shell = JitFake.QueueShell(stand)
+        val shell = JitFake.QueueShell(stand).apply { runInline = 1 }
         click(store, net, shell)
-        shell.drain()
         net.wifi = false
         start(store, net, shell)
         net.requests.clear()
@@ -418,7 +482,10 @@ class JitOrchestratorTest {
         pool.shutdown()
         assertTrue(pool.awaitTermination(20, java.util.concurrent.TimeUnit.SECONDS))
         assertEquals(1, results.count { it == JitOp.ClickResult.STARTED })
-        assertEquals(5, results.count { it == JitOp.ClickResult.REFUSED_PENDING })
+        assertEquals("все остальные отказаны (PENDING или BUSY), ни один не начал операцию",
+            5, results.count {
+                it == JitOp.ClickResult.REFUSED_PENDING || it == JitOp.ClickResult.BUSY
+            })
         assertEquals("в очередь ушёл ровно один скрипт", 1, shell.pending.size)
         assertEquals("снимок один", JitRef.Net(true, true), store.op()!!.net)
     }
@@ -428,9 +495,8 @@ class JitOrchestratorTest {
         val stand = stand()
         val store = JitFake.Store()
         val net = JitFake.Net(wifi = true, ap = false)
-        val shell = JitFake.QueueShell(stand)
+        val shell = JitFake.QueueShell(stand).apply { runInline = 1 }
         click(store, net, shell)
-        shell.drain()
         net.wifi = false
         val pool = java.util.concurrent.Executors.newFixedThreadPool(4)
         repeat(4) { pool.submit { JitOp.onProcessStart(store, net, shell, BOOT, JitFake.Waiter()) } }

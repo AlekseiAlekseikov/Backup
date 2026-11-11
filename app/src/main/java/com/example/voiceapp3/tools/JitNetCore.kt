@@ -87,6 +87,24 @@ object JitRef {
 
     private val RESTORE_RE = Regex("^wifi=([01]),ap=([01])$")
 
+    /**
+     * Результат ЗАПРОСА к Wi-Fi API — три разных факта, которые нельзя смешивать:
+     *  • `invoked` — метод вообще удалось вызвать (нет исключения/нет метода);
+     *  • `accepted` — API вернул «принято» (для `setWifiEnabled` — его boolean, для
+     *    `startSoftAp` — `true`/`null` без исключения; `false` = отказ);
+     *  • `detail` — сырой текст/имя метода для лога.
+     *
+     * Состояние сети читается ОТДЕЛЬНО (`wifiOn`/`apUp`) и только оно считается подтверждением.
+     */
+    data class Request(val invoked: Boolean, val accepted: Boolean, val detail: String) {
+        fun log(): String = "invoked=$invoked accepted=$accepted detail=$detail"
+        companion object {
+            fun notInvoked(detail: String) = Request(false, false, detail)
+            fun rejected(detail: String) = Request(true, false, detail)
+            fun accepted(detail: String) = Request(true, true, detail)
+        }
+    }
+
     /** Состояние сети до операции (формат референса). */
     data class Net(val wifi: Boolean, val ap: Boolean) {
         fun wire(): String = "wifi=${if (wifi) 1 else 0},ap=${if (ap) 1 else 0}"
@@ -169,6 +187,19 @@ object JitRef {
         return if (cache == true) Verify.OK else if (cache == false) Verify.CACHE_MISSING else Verify.UNKNOWN
     }
 
+    /**
+     * Подтверждённое состояние для тумблера: `on` / `off` / `unknown` (REVIEW 3-го захода, п.5).
+     *
+     * `off` — только факт: property прочитан как `false` И есть завершённая (`DONE`) операция с
+     * `want=false`. Всё остальное, включая ошибку транспорта и «ещё не читали», — `unknown`;
+     * ложное «выключено» не показываем никогда.
+     */
+    fun confirmedState(fact: PropFact?, op: Op?): String = when (fact?.value) {
+        Prop.TRUE -> "on"
+        Prop.FALSE -> if (op != null && !op.want && op.phase == Phase.DONE) "off" else "unknown"
+        null, Prop.UNKNOWN -> "unknown"
+    }
+
     fun verifyLabel(v: Verify): String = when (v) {
         Verify.OK -> "ok"
         Verify.NOT_APPLIED -> "not_applied"
@@ -190,8 +221,26 @@ object JitRef {
     }
 
     /**
+     * Чем закончился вызов транспорта для НАШЕГО скрипта — единственный доступный признак того,
+     * что поздней команды из этой операции уже не будет.
+     *
+     *  • [REPLIED] — `AdbClient.execute` вернул ответ на наш скрипт: скрипт дошёл до конца, значит
+     *    его последняя команда (`setprop ctl.restart zygote`) уже отправлена и ничего «позже» из
+     *    этой операции не выполнится;
+     *  • [LOST] — таймаут/обрыв (`rc=137`, `ERR_*`): транспорт не дал ответа, а поставленное в
+     *    очередь задание он НЕ отменяет (`AdbClient.kt:417-425`), поэтому поздняя команда возможна;
+     *  • [UNKNOWN] — на момент записи ответа ещё не было (процесс умер внутри вызова).
+     *
+     * ВАЖНО: выключенный Wi-Fi/AP — НЕ признак выполнения. `svc wifi disable` — первая команда
+     * скрипта, после неё ещё до 20 с слива правил, `setprop` и `ctl.restart zygote` (REVIEW 3-го
+     * захода, п.1).
+     */
+    enum class Shell { UNKNOWN, REPLIED, LOST }
+
+    /**
      * Одна операция. Поля `want`, `net`, `bootTag`, `ts` — из снимка; `pedidoChecked` — была ли
-     * сверка `getprop` определённой (иначе намерение не снимаем, см. `w0/r7` и §3 отчёта).
+     * сверка `getprop` определённой (иначе намерение не снимаем, см. `w0/r7` и §3 отчёта);
+     * `shell` — чем закончился наш вызов транспорта ([Shell]).
      */
     data class Op(
         val phase: Phase,
@@ -200,7 +249,8 @@ object JitRef {
         val bootTag: String,
         val ts: Long,
         val pedidoChecked: Boolean = false,
-        val note: String = ""
+        val note: String = "",
+        val shell: Shell = Shell.UNKNOWN
     ) {
         fun encode(): String = buildString {
             append("v=1")
@@ -211,12 +261,14 @@ object JitRef {
             append(";boot=").append(bootTag.replace(';', '_').replace('\n', '_'))
             append(";ts=").append(ts)
             append(";checked=").append(if (pedidoChecked) 1 else 0)
+            append(";shell=").append(shell.name)
             append(";note=").append(note.replace(';', '_').replace('\n', '_'))
         }
 
         fun log(): String =
             "phase=${phase.name.lowercase()} want=$want net=${net.wire()} boot=$bootTag ts=$ts " +
-                "checked=$pedidoChecked" + (if (note.isEmpty()) "" else " note=$note")
+                "checked=$pedidoChecked shell=${shell.name.lowercase()}" +
+                (if (note.isEmpty()) "" else " note=$note")
     }
 
     /** Строгий разбор: любое отклонение ⇒ `null` (снимок не трогаем, см. §0.1(6)). */
@@ -237,7 +289,13 @@ object JitRef {
         val ts = map["ts"]?.toLongOrNull() ?: return null
         if (ts <= 0L) return null
         val checked = when (map["checked"]) { "1" -> true; "0" -> false; null -> false; else -> return null }
-        return Op(phase, want, Net(wifi, ap), boot, ts, checked, map["note"] ?: "")
+        // `shell` появился в третьем заходе: снимок, записанный раньше, читается как UNKNOWN
+        // (то есть «выполнение не доказано»), а не как ошибка формата.
+        val shell = when (map["shell"]) {
+            null -> Shell.UNKNOWN
+            else -> Shell.values().firstOrNull { it.name == map["shell"] } ?: return null
+        }
+        return Op(phase, want, Net(wifi, ap), boot, ts, checked, map["note"] ?: "", shell)
     }
 
     // ─────────────────────────── опознание загрузки ───────────────────────────
@@ -268,34 +326,51 @@ object JitRef {
 
     /** Что делать при старте процесса с уже сохранённым снимком. */
     enum class StartDecision {
-        /** Снимка нет — обычный старт. */
+        /** Снимка нет — обычный старт (только чтение). */
         IDLE,
-        /** Снимок этой загрузки, есть признаки выполнения цепочки — возвращаем сеть. */
+        /** Скрипт доказанно закончился ([Shell.REPLIED]) ⇒ возвращаем сохранённую сеть. */
         RESTORE,
-        /** Снимок этой загрузки, но признаков выполнения нет: ждём, ничего не пишем. */
-        WAIT_NO_EVIDENCE,
+        /**
+         * Снимок этой загрузки, но выполнение скрипта НЕ доказано (нет ответа транспорта):
+         * возможна поздняя команда. Ничего не пишем и сеть не трогаем — ждём решения владельца.
+         */
+        HOLD_UNSAFE_PHASE,
+        /** Возвращать нечего (Wi-Fi и AP в снимке были выключены) и скрипт доказанно закончился. */
+        NOTHING_TO_RESTORE,
         /** Снимок доказанно другой загрузки: не применяем, не удаляем. */
         KEEP_PREVIOUS_BOOT,
         /** Загрузку доказать нельзя (epoch, пусто, разные форматы): не применяем, не удаляем. */
         KEEP_UNKNOWN_BOOT,
-        /** Операция уже завершена. */
+        /** Операция доказанно завершена. */
         DONE
     }
 
     /**
-     * Решение при старте. `evidence` — наблюдаемые признаки того, что цепочка уже прошла
-     * `svc wifi disable` (`wifi_off`, `ap_down`) или `setprop` (`prop == want`).
-     * Само по себе совпадение boot ID не является основанием (REVIEW §0.1(1)).
+     * Решение при старте.
+     *
+     * ЧТО СЧИТАЕТСЯ ДОКАЗАТЕЛЬСТВОМ (REVIEW 3-го захода, пп.1,2,6):
+     *  • только [Shell.REPLIED] — ответ транспорта на наш скрипт: скрипт дошёл до последней
+     *    команды, поздних команд этой операции не будет;
+     *  • НЕ считается: выключенный Wi-Fi/AP (их мог выключить кто угодно, а `svc wifi disable` —
+     *    первая команда скрипта), совпадение `getprop`, истёкшее время, `ARMED`, `SENT`, смерть
+     *    приложения, пустой журнал и ответ транспорта `rc=137`.
+     *
+     * Если доказательства нет — [StartDecision.HOLD_UNSAFE_PHASE]: ноль записей, ноль сетевых
+     * действий, снимок сохраняется, владельцу сообщается, что нужно решение.
      */
-    fun startDecision(op: Op?, currentTag: String, evidence: Boolean): StartDecision {
+    fun startDecision(op: Op?, currentTag: String): StartDecision {
         if (op == null) return StartDecision.IDLE
-        if (op.phase == Phase.DONE || op.phase == Phase.RESTORED) return StartDecision.DONE
-        // Возвращать нечего (Wi-Fi и AP были выключены): сеть не трогаем никогда.
-        if (!op.net.wifi && !op.net.ap) return StartDecision.DONE
+        if (op.phase == Phase.DONE) return StartDecision.DONE
         return when (bootMatch(op.bootTag, currentTag)) {
-            BootMatch.SAME -> if (evidence) StartDecision.RESTORE else StartDecision.WAIT_NO_EVIDENCE
             BootMatch.PREVIOUS -> StartDecision.KEEP_PREVIOUS_BOOT
             BootMatch.UNKNOWN -> StartDecision.KEEP_UNKNOWN_BOOT
+            BootMatch.SAME -> when {
+                // Ничего не возвращаем, но и «завершено» без доказательства не объявляем.
+                op.shell != Shell.REPLIED -> StartDecision.HOLD_UNSAFE_PHASE
+                !op.net.wifi && !op.net.ap -> StartDecision.NOTHING_TO_RESTORE
+                op.phase == Phase.RESTORED -> StartDecision.DONE
+                else -> StartDecision.RESTORE
+            }
         }
     }
 
@@ -305,10 +380,12 @@ object JitRef {
     /**
      * Можно ли начинать новую операцию.
      *
-     *  • `DONE` — можно (прежняя операция закончена);
-     *  • `ARMED/SENT` этой загрузки — нельзя: состояние одной операции не перезаписываем;
-     *  • `ARMED/SENT` доказанно прошлой загрузки — можно (референс тоже всегда перезаписывает
-     *    `jit_restaurar`), но старый снимок НЕ удаляем и сеть по нему на старте не трогаем;
+     *  • `DONE` — можно (операция доказанно завершена);
+     *  • снимок доказанно ПРОШЛОЙ загрузки — можно: после перезагрузки ГУ ни одно задание прежнего
+     *    процесса выполняться не может; старый снимок при этом НЕ применяем;
+     *  • `ARMED/SENT` этой загрузки (в том числе `wifi=0,ap=0`) — НЕЛЬЗЯ: скрипт мог остаться в
+     *    очереди транспорта, и второй клик разрешил бы позднюю команду поверх нового состояния
+     *    (REVIEW 3-го захода, п.2). Это честный блок, а не «уже всё хорошо»;
      *  • неразбираемый/неизвестный — нельзя: это может быть активная операция.
      */
     fun clickGate(op: Op?, unresolved: Boolean, currentTag: String): ClickGate = when {
@@ -359,10 +436,10 @@ interface JitStore {
 interface JitNetState {
     fun wifiOn(): Boolean?
     fun apUp(): Boolean?
-    /** `e2`: `setWifiEnabled(true)`; возвращает результат вызова, а не состояние сети. */
-    fun setWifi(on: Boolean): Pair<Boolean, String>
-    /** `U`/`d`: рефлексия `startSoftAp(null)`; возвращает результат вызова, а не состояние AP. */
-    fun startAp(): Pair<Boolean, String>
+    /** `e2`/`U`: запрос включения Wi-Fi. Возвращает ЗАПРОС, а не состояние сети. */
+    fun setWifi(on: Boolean): JitRef.Request
+    /** `U`/`d`: рефлексия `startSoftAp(null)`. Возвращает ЗАПРОС, а не состояние AP. */
+    fun startAp(): JitRef.Request
 }
 
 /** Ожидание и часы — подставляются в тестах, чтобы проверять паузы без реального сна. */
@@ -386,6 +463,8 @@ object JitOp {
 
     enum class ClickResult {
         STARTED,
+        /** На этом же `store` прямо сейчас идёт клик или старт процесса — второй не начинаем. */
+        BUSY,
         /** Снимок этой загрузки (или неизвестный) ещё не разобран. */
         REFUSED_PENDING,
         /** Снимок повреждён/частичен: не заменяем и не удаляем. */
@@ -404,11 +483,43 @@ object JitOp {
     )
 
     /**
-     * Замок на участок «прочитать снимок → проверить фазу → записать и подтвердить».
-     * Параллельные клики (второй палец, автоповтор, две панели) иначе перезаписали бы операцию.
-     * Под замком НЕ исполняется скрипт.
+     * ОДНА операция на всё приложение: клик и старт процесса не могут идти одновременно.
+     *
+     * ЗАЧЕМ (REVIEW 3-го захода, п.4): раньше клик запирал только `prepare`, а после ответа
+     * транспорта писал СТАРУЮ копию `op` (в `SENT`/`DONE`), тогда как `onProcessStart` в это время
+     * мог записать сверку или `RESTORED` — записи теряли друг друга, а `pending` в хранилище
+     * сбрасывался посреди операции. Теперь весь переход — «прочитал → решил → записал» — один
+     * неделимый шаг под этим замком, и параллельный вызов получает [ClickResult.BUSY] /
+     * [StartDecision.DONE]-независимый отказ (`JIT_BUSY`), не затирая снимок.
+     *
+     * Транспорт (`shell.exec`) исполняется ВНЕ замка: иначе 40-секундный скрипт блокировал бы UI
+     * и старт процесса. Ответ транспорта пишется отдельным коротким шагом (см. [click]).
      */
-    private val startLock = Any()
+    private val opLock = Any()
+
+    /** Флаг «идёт клик или старт процесса»: второй вызов получает BUSY и ничего не пишет. */
+    private val opGate = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /**
+     * Снимок на диске: «прочитал → проверил решатель → записал → подтвердил чтением».
+     *
+     * Возвращает `true`, только если запись подтверждена И снимок не изменился под нами (защита от
+     * записи по устаревшей копии: если кто-то успел записать другое значение, мы его не затираем).
+     */
+    private fun writeOp(store: JitStore, before: String?, op: JitRef.Op, log: (String) -> Unit): Boolean {
+        val now = store.getString(JitRef.KEY_OP)
+        if (now != before) {
+            log("JIT_STORE write_skipped reason=snapshot_changed_by_another_writer " +
+                "expected_len=${before?.length ?: 0} actual_len=${now?.length ?: 0} " +
+                "(снимок изменён параллельно: свою устаревшую копию не записываем)")
+            return false
+        }
+        val ok = store.putStringConfirmed(JitRef.KEY_OP, op.encode()) &&
+            store.getString(JitRef.KEY_OP) == op.encode()
+        log("JIT_STORE write phase=${op.phase.name.lowercase()} shell=${op.shell.name.lowercase()} " +
+            "confirmed=$ok")
+        return ok
+    }
 
     fun click(
         store: JitStore,
@@ -420,37 +531,90 @@ object JitOp {
         mountStep: Boolean = JitRef.MOUNT_STEP_ENABLED,
         log: (String) -> Unit = {}
     ): Click {
-        val prepared = synchronized(startLock) {
-            prepare(store, netState, want, bootTag, nowMs, mountStep, log)
+        if (!opGate.compareAndSet(false, true)) {
+            log("JIT_BUSY what=click reason=operation_in_progress action=none " +
+                "(клик и старт процесса не идут одновременно)")
+            return Click(ClickResult.BUSY, null, null, mountStep)
         }
-        if (prepared.result != ClickResult.STARTED) return prepared
-        val op = prepared.op
-        if (op == null) return prepared
-        val nothingToRestore = !op.net.wifi && !op.net.ap
-        if (nothingToRestore) {
-            log("JIT_SNAPSHOT nothing_to_restore net=${op.net.wire()} " +
-                "(Wi-Fi и AP были выключены: возвращать нечего, на старте сеть не трогаем)")
+        try {
+            val prepared = synchronized(opLock) {
+                prepare(store, netState, want, bootTag, nowMs, mountStep, log)
+            }
+            if (prepared.result != ClickResult.STARTED) return prepared
+            val op = prepared.op ?: return prepared
+            return runChain(store, shell, op, want, mountStep, log)
+        } finally {
+            opGate.set(false)
+        }
+    }
+
+    /**
+     * Отправка скрипта и запись итога — двумя короткими записями.
+     *
+     * 1. Перед отправкой: `ARMED → SENT/shell=UNKNOWN` — «скрипт отдан транспорту». Если процесс
+     *    умрёт внутри вызова, на диске останется `SENT`+`UNKNOWN`, и продолжение на старте
+     *    ОТКАЖЕТСЯ что-либо делать (возможна поздняя команда).
+     * 2. После ответа транспорта: перечитать снимок и записать `shell=REPLIED|LOST` ПОВЕРХ
+     *    актуального значения, а не поверх копии, прочитанной до `shell.exec` (иначе терялись бы
+     *    `checked`/`phase`, записанные параллельно сверкой).
+     */
+    private fun runChain(
+        store: JitStore,
+        shell: JitShell,
+        op: JitRef.Op,
+        want: Boolean,
+        mountStep: Boolean,
+        log: (String) -> Unit
+    ): Click {
+        val beforeSend = synchronized(opLock) {
+            val sent = op.copy(phase = JitRef.Phase.SENT, shell = JitRef.Shell.UNKNOWN)
+            val ok = writeOp(store, op.encode(), sent, log)
+            if (ok) op.encode() to sent else null
+        }
+        if (beforeSend == null) {
+            log("JIT_PHASE phase=sent confirmed=false action=abort " +
+                "(не удалось зафиксировать «скрипт отправляется» — команду не отправляем)")
+            return Click(ClickResult.SNAPSHOT_FAILED, op, null, mountStep)
         }
         val script = JitRef.chainScript(want, mountStep)
         log("JIT_CHAIN_SENT want=$want bytes=${script.toByteArray(Charsets.UTF_8).size} " +
-            "mount_step=${if (mountStep) "on" else "off"} text=\"${script.replace('\n', ' ').replace(Regex(" +"), " ").trim()}\"")
+            "mount_step=${if (mountStep) "on" else "off"} " +
+            "text=\"${script.replace('\n', ' ').replace(Regex(" +"), " ").trim()}\"")
         val (code, out) = shell.exec(script, JitRef.CHAIN_TIMEOUT_MS)
         val run = ChainRun(code, out)
         log("JIT_CHAIN_RETURN rc=$code outcome=${JitRef.chainOutcomeLabel(run.outcome)} restart=unknown " +
             "out=\"${out.replace('\n', ' ').trim().take(200)}\" " +
             "(ответ транспорта сам по себе не доказывает ни рестарт, ни его отсутствие)")
-        // Фаза SENT — только как отметка «скрипт отдан транспорту». Если процесс умрёт до записи,
-        // останется ARMED; на решение при старте это не влияет: там смотрят на признаки выполнения.
-        // Если возвращать нечего (Wi-Fi и AP были выключены) — операция сразу завершена: продолжать
-        // на старте нечего, и фаза DONE не даёт второму клику застрять в «ожидании».
-        val nextPhase = if (nothingToRestore) JitRef.Phase.DONE else JitRef.Phase.SENT
-        val nextNote = if (nothingToRestore) "nothing_to_restore" else op.note
-        val after = op.copy(phase = nextPhase, note = nextNote)
-        val ok = store.putStringConfirmed(JitRef.KEY_OP, after.encode())
-        log("JIT_PHASE phase=${nextPhase.name.lowercase()} confirmed=$ok " +
-            "(доказательством рестарта не является)")
-        return Click(ClickResult.STARTED, after, run, mountStep)
+        val shellResult = when (run.outcome) {
+            JitRef.ChainOutcome.REPLY_RECEIVED -> JitRef.Shell.REPLIED
+            JitRef.ChainOutcome.CHANNEL_LOST -> JitRef.Shell.LOST
+        }
+        val after = synchronized(opLock) {
+            val parsed = JitRef.decodeOp(store.getString(JitRef.KEY_OP))
+            val base = if (parsed != null && parsed.bootTag == op.bootTag && parsed.ts == op.ts) parsed else op
+            val next = base.copy(
+                phase = if (base.phase == JitRef.Phase.ARMED || base.phase == JitRef.Phase.SENT)
+                    JitRef.Phase.SENT else base.phase,
+                shell = shellResult,
+                note = if (!base.net.wifi && !base.net.ap) "nothing_to_restore" else base.note
+            )
+            val ok = writeOp(store, base.encode(), next, log)
+            next to ok
+        }
+        log("JIT_PHASE phase=${after.first.phase.name.lowercase()} shell=${shellResult.name.lowercase()} " +
+            "confirmed=${after.second} restart=not_claimed " +
+            "(ответ транспорта — единственный признак завершения НАШЕГО скрипта; " +
+            "выключенная сеть им не является)")
+        return Click(ClickResult.STARTED, after.first, run, mountStep)
     }
+
+    /**
+     * ТОЛЬКО ДЛЯ ТЕСТОВ: попытка записи «поздним писателем», у которого на руках устаревшая копия
+     * снимка. Должна быть отклонена [writeOp] — так проверяется отсутствие гонки старых записей
+     * (REVIEW 3-го захода, п.4).
+     */
+    internal fun publishForTest(store: JitStore, stale: JitRef.Op, log: (String) -> Unit): Boolean =
+        writeOp(store, stale.encode(), stale.copy(phase = JitRef.Phase.DONE), log)
 
     private fun prepare(
         store: JitStore,
@@ -491,6 +655,11 @@ object JitOp {
             return Click(ClickResult.REFUSED_STATE_UNKNOWN, null, null, mountStep)
         }
         val net = JitRef.Net(wifi = wifi, ap = ap)
+        if (!wifi && !ap) {
+            log("JIT_SNAPSHOT nothing_to_restore net=${net.wire()} " +
+                "(Wi-Fi и AP были выключены: возвращать нечего, но операция всё равно ждёт " +
+                "подтверждения завершения скрипта)")
+        }
         val fresh = JitRef.Op(
             phase = JitRef.Phase.ARMED, want = want, net = net, bootTag = bootTag, ts = nowMs
         )
@@ -528,11 +697,18 @@ object JitOp {
      * Ничего не удаляем автоматически: снимок переходит в фазу `RESTORED`/`DONE` или остаётся.
      */
     /**
-     * Один прогон проверки старта за раз: `onCreate` и `onStartCommand` могут позвать одновременно,
-     * и тогда два потока начали бы возврат сети параллельно.
+     * Старт процесса: разбор одной операции и продолжение ЕЁ ЖЕ (без второго клика).
+     *
+     * Общий single-flight с кликом ([opLock]/[opGate]): старт и клик не идут одновременно, поэтому
+     * запись `RESTORED` не может быть затёрта устаревшей копией из [click] и наоборот.
+     *
+     * Записи делает ТОЛЬКО этот путь и только при доказанном основании:
+     *  • [JitRef.StartDecision.RESTORE] / [NOTHING_TO_RESTORE] / [DONE] — своя загрузка;
+     *  • [JitRef.StartDecision.HOLD_UNSAFE_PHASE] — НОЛЬ записей и НОЛЬ сетевых действий: нет
+     *    доказательства, что скрипт уже не выполнится позже; решение за владельцем;
+     *  • [KEEP_PREVIOUS_BOOT]/[KEEP_UNKNOWN_BOOT] — снимок не применяем, не удаляем и НЕ
+     *    ПЕРЕПИСЫВАЕМ (сверка идёт в режиме `persist=false`: даже `jit_pedido` не трогаем).
      */
-    private val startGate = java.util.concurrent.atomic.AtomicBoolean(false)
-
     fun onProcessStart(
         store: JitStore,
         netState: JitNetState,
@@ -541,14 +717,15 @@ object JitOp {
         waiter: JitWaiter,
         log: (String) -> Unit = {}
     ): StartOutcome {
-        if (!startGate.compareAndSet(false, true)) {
-            log("JIT_START skipped reason=already_running boot=$bootTag (второй вызов на старте игнорируем)")
-            return StartOutcome(JitRef.StartDecision.WAIT_NO_EVIDENCE, null, null, null)
+        if (!opGate.compareAndSet(false, true)) {
+            log("JIT_BUSY what=start reason=operation_in_progress boot=$bootTag action=none " +
+                "(клик или другой старт уже работает: второй разбор не начинаем)")
+            return StartOutcome(JitRef.StartDecision.DONE, null, null, null)
         }
         try {
-            return onProcessStartLocked(store, netState, shell, bootTag, waiter, log)
+            return synchronized(opLock) { onProcessStartLocked(store, netState, shell, bootTag, waiter, log) }
         } finally {
-            startGate.set(false)
+            opGate.set(false)
         }
     }
 
@@ -563,7 +740,7 @@ object JitOp {
         val rawOp = store.getString(JitRef.KEY_OP)
         val op = JitRef.decodeOp(rawOp)
         if (rawOp != null && rawOp.isNotBlank() && op == null) {
-            log("JIT_START snapshot=unresolved raw=\"${rawOp?.take(120)}\" action=none " +
+            log("JIT_START snapshot=unresolved raw=\"${rawOp.take(120)}\" action=none " +
                 "need=owner_decision boot=$bootTag (не применяем и не удаляем)")
             return StartOutcome(JitRef.StartDecision.KEEP_UNKNOWN_BOOT, null, null, null)
         }
@@ -574,68 +751,70 @@ object JitOp {
             val verify = verifyApplied(store, shell, null, false, log)
             return StartOutcome(JitRef.StartDecision.IDLE, null, verify, null)
         }
-        val prop = readProp(shell)
+        val decision = JitRef.startDecision(op, bootTag)
         val wifi = netState.wifiOn()
         val ap = netState.apUp()
-        val evidence = evidenceOfChainRun(op, wifi, ap)
-        val decision = JitRef.startDecision(op, bootTag, evidence)
         log("JIT_START op=${op.log()} boot=$bootTag match=" +
             "${JitRef.bootMatch(op.bootTag, bootTag).name.lowercase()} " +
-            "wifi_now=$wifi ap_now=$ap ${prop.log} evidence=$evidence " +
-            "decision=${decision.name.lowercase()}")
-        // `persist` — только для снимка, который мы вправе применять (эта загрузка или ожидание).
+            "wifi_now=$wifi ap_now=$ap decision=${decision.name.lowercase()} " +
+            "(wifi_now/ap_now — только наблюдение, НЕ признак завершения скрипта)")
+        // `persist` — только для снимка, который мы вправе применять (эта загрузка).
         val persist = decision == JitRef.StartDecision.RESTORE ||
-            decision == JitRef.StartDecision.WAIT_NO_EVIDENCE ||
+            decision == JitRef.StartDecision.NOTHING_TO_RESTORE ||
             decision == JitRef.StartDecision.DONE
-        val verify = verifyApplied(store, shell, op.want, persist, log)
+        val verify = if (persist || decision == JitRef.StartDecision.HOLD_UNSAFE_PHASE)
+            verifyApplied(store, shell, op.want, persist, log) else null
         when (decision) {
             JitRef.StartDecision.RESTORE -> {
                 log("JIT_NET_CONT start reason=post_zygote_operation net=${op.net.wire()} " +
-                    "delay_ms=${JitRef.RESTORE_DELAY_MS} (продолжение этой же операции, второго клика нет)")
+                    "delay_ms=${JitRef.RESTORE_DELAY_MS} shell=replied " +
+                    "(продолжение этой же операции: скрипт ответил, второго клика нет)")
                 waiter.sleep(JitRef.RESTORE_DELAY_MS)
                 val rep = restoreNetwork(netState, op.net, waiter, log)
-                val phase = if (rep.confirmed) JitRef.Phase.RESTORED else op.phase
-                val next = op.copy(phase = phase, note = rep.summary)
-                val ok = store.putStringConfirmed(JitRef.KEY_OP, next.encode())
+                val base = JitRef.decodeOp(store.getString(JitRef.KEY_OP)) ?: op
+                val phase = if (rep.confirmed) JitRef.Phase.RESTORED else base.phase
+                val next = base.copy(phase = phase, note = rep.summary)
+                val ok = writeOp(store, base.encode(), next, log)
                 log("JIT_NET_CONT done confirmed=${rep.confirmed} phase=${phase.name.lowercase()} " +
-                    "saved=$ok dry=${rep.dry} (снимок остаётся историей операции и не удаляется)")
+                    "saved=$ok internet=not_checked " +
+                    "(снимок остаётся историей операции и не удаляется)")
                 return StartOutcome(decision, rep, verify, next)
             }
-            JitRef.StartDecision.WAIT_NO_EVIDENCE -> {
-                log("JIT_NET_CONT skipped reason=no_evidence_of_chain net=${op.net.wire()} " +
-                    "action=none (признаков выполнения нет: возможно, скрипт ещё в очереди — сеть не трогаем, снимок сохраняем)")
+            JitRef.StartDecision.NOTHING_TO_RESTORE -> {
+                // Оба радио были выключены ещё до клика: возвращать нечего. Завершение фиксируется
+                // ТОЛЬКО по ответу транспорта (иначе снимок остался бы активным и второй клик был бы
+                // запрещён навсегда — REVIEW 3-го захода, п.2).
+                // Перечитываем снимок: сверка выше могла уже пометить `checked`/`note`, и запись
+                // по устаревшей копии была бы отброшена защитой `writeOp`.
+                val base = JitRef.decodeOp(store.getString(JitRef.KEY_OP)) ?: op
+                val next = base.copy(phase = JitRef.Phase.DONE, note = "nothing_to_restore")
+                val ok = writeOp(store, base.encode(), next, log)
+                log("JIT_NET_CONT skipped reason=nothing_to_restore shell=replied saved=$ok " +
+                    "action=none (оба радио были выключены: сеть не трогаем)")
+                return StartOutcome(decision, null, verify, next)
+            }
+            JitRef.StartDecision.HOLD_UNSAFE_PHASE -> {
+                log("JIT_NET_CONT skipped reason=unsafe_phase shell=${op.shell.name.lowercase()} " +
+                    "net=${op.net.wire()} action=none write=none need=owner_decision " +
+                    "(нет ответа транспорта: возможна поздняя команда и рестарт zygote; " +
+                    "возврат сети сейчас мог бы отменить чужие изменения)")
                 return StartOutcome(decision, null, verify, op)
             }
             JitRef.StartDecision.KEEP_PREVIOUS_BOOT -> {
                 log("JIT_NET_CONT skipped reason=previous_boot op=${op.log()} boot=$bootTag " +
-                    "action=none need=owner_decision (снимок другой загрузки не применяем и не удаляем)")
+                    "action=none write=none need=owner_decision " +
+                    "(снимок другой загрузки не применяем, не удаляем и не переписываем)")
                 return StartOutcome(decision, null, verify, op)
             }
             JitRef.StartDecision.KEEP_UNKNOWN_BOOT -> {
                 log("JIT_NET_CONT skipped reason=boot_unknown saved_boot=${op.bootTag} boot=$bootTag " +
-                    "action=none need=owner_decision (загрузку доказать нельзя: epoch/пусто/разные форматы)")
+                    "action=none write=none need=owner_decision " +
+                    "(загрузку доказать нельзя: epoch/пусто/разные форматы)")
                 return StartOutcome(decision, null, verify, op)
             }
             JitRef.StartDecision.DONE, JitRef.StartDecision.IDLE ->
                 return StartOutcome(decision, null, verify, op)
         }
-    }
-
-    /**
-     * Признак того, что цепочка УЖЕ выполнила первую команду `svc wifi disable`.
-     *
-     * Только сеть, и только в сторону «стало выключено»: если Wi-Fi/AP, которые были включены до
-     * операции, сейчас выключены — цепочка как минимум начала выполняться. Если они такие же, как
-     * в снимке, то скрипт мог ещё не начаться (он в очереди транспорта) — и тогда возвращать сеть
-     * нельзя: снимок нужен для настоящего возврата позже.
-     *
-     * Это НЕ доказательство отсутствия поздней команды в очереди (REVIEW §0.1(1)) — поэтому
-     * снимок не удаляется, а новый клик не разрешается самим фактом восстановления.
-     */
-    fun evidenceOfChainRun(op: JitRef.Op, wifiNow: Boolean?, apNow: Boolean?): Boolean {
-        if (op.net.wifi && wifiNow == false) return true
-        if (op.net.ap && apNow == false) return true
-        return false
     }
 
     // ─────────────────────────── возврат сети: AP первым, затем Wi-Fi ───────────────────────────
@@ -678,23 +857,41 @@ object JitOp {
                 true -> { apConfirmed = true; apReason = "already_up"; log("JIT_NET_RESTORE ap=1 request=none state=up reason=already_up") }
                 null -> { apConfirmed = false; apReason = "state_unknown"; log("JIT_NET_RESTORE ap=1 request=none state=unknown reason=state_unknown") }
                 false -> {
-                    if (netState.wifiOn() == true) {
-                        // Как `U`: клиентский Wi-Fi включён — за радио не спорим.
-                        apConfirmed = false; apReason = "wifi_client_on_guard"
-                        log("JIT_NET_RESTORE ap=1 request=none state=down reason=wifi_client_on_guard " +
-                            "(как U: клиентский Wi-Fi включён — AP не открываю)")
-                    } else {
-                        val (issued, how) = netState.startAp()
-                        log("JIT_NET_RESTORE ap=1 request=startSoftAp issued=$issued api=$how state_before=down")
-                        val up = poll(netState::apUp, JitRef.AP_POLL_TOTAL_MS, JitRef.AP_POLL_STEP_MS, waiter)
-                        apConfirmed = up == true
-                        apReason = when (up) {
-                            true -> "up_after_request"
-                            false -> "not_up_after_${JitRef.AP_POLL_TOTAL_MS / 1000}s"
-                            null -> "state_unknown_after_request"
+                    // Guard `U`: если клиентский Wi-Fi включён — за радио не спорим. Но НЕИЗВЕСТНОЕ
+                    // состояние (`null`) выключенным не считаем (REVIEW 3-го захода, п.7): в этом
+                    // случае запрос AP не отправляем, а честно сообщаем `wifi_state_unknown`.
+                    when (netState.wifiOn()) {
+                        true -> {
+                            apConfirmed = false; apReason = "wifi_client_on_guard"
+                            log("JIT_NET_RESTORE ap=1 request=none state=down reason=wifi_client_on_guard " +
+                                "(как U: клиентский Wi-Fi включён — AP не открываю)")
                         }
-                        log("JIT_NET_RESTORE ap=1 state_after=${up?.toString() ?: "unknown"} " +
-                            "confirmed=$apConfirmed reason=$apReason issued=$issued")
+                        null -> {
+                            apConfirmed = false; apReason = "wifi_state_unknown"
+                            log("JIT_NET_RESTORE ap=1 request=none state=down reason=wifi_state_unknown " +
+                                "(состояние Wi-Fi прочитать нельзя: неизвестное не считаем выключенным, " +
+                                "запрос AP не отправляем)")
+                        }
+                        else -> {
+                            val res: JitRef.Request = netState.startAp()
+                            log("JIT_NET_RESTORE ap=1 request=startSoftAp invoked=${res.invoked} " +
+                                "accepted=${res.accepted} detail=${res.detail} state_before=down " +
+                                "(вызов ≠ принятый запрос ≠ подтверждённое состояние)")
+                            val up = poll(netState::apUp, JitRef.AP_POLL_TOTAL_MS, JitRef.AP_POLL_STEP_MS, waiter)
+                            apConfirmed = up == true
+                            apReason = when {
+                                up == true && !res.accepted -> "up_but_request_not_accepted"
+                                up == true -> "up_after_request"
+                                up == false && !res.invoked -> "api_unavailable"
+                                up == false && !res.accepted ->
+                                    "request_rejected_not_up_${JitRef.AP_POLL_TOTAL_MS / 1000}s"
+                                up == false -> "not_up_after_${JitRef.AP_POLL_TOTAL_MS / 1000}s"
+                                else -> "state_unknown_after_request"
+                            }
+                            log("JIT_NET_RESTORE ap=1 state_after=${up?.toString() ?: "unknown"} " +
+                                "confirmed=$apConfirmed reason=$apReason invoked=${res.invoked} " +
+                                "accepted=${res.accepted} (подтверждено только чтение состояния AP)")
+                        }
                     }
                 }
             }
@@ -710,17 +907,23 @@ object JitOp {
                 true -> { wifiConfirmed = true; wifiReason = "already_on"; log("JIT_NET_RESTORE wifi=1 request=none state=on") }
                 null -> { wifiConfirmed = false; wifiReason = "state_unknown"; log("JIT_NET_RESTORE wifi=1 request=none state=unknown") }
                 false -> {
-                    val (issued, how) = netState.setWifi(true)
-                    log("JIT_NET_RESTORE wifi=1 request=setWifiEnabled(true) issued=$issued api=$how state_before=off")
+                    val res: JitRef.Request = netState.setWifi(true)
+                    log("JIT_NET_RESTORE wifi=1 request=setWifiEnabled(true) invoked=${res.invoked} " +
+                        "accepted=${res.accepted} detail=${res.detail} state_before=off " +
+                        "(вызов ≠ принятый запрос ≠ подтверждённое состояние)")
                     val on = poll(netState::wifiOn, JitRef.WIFI_POLL_TOTAL_MS, JitRef.WIFI_POLL_STEP_MS, waiter)
                     wifiConfirmed = on == true
-                    wifiReason = when (on) {
-                        true -> "on_after_request"
-                        false -> "still_off_after_${JitRef.WIFI_POLL_TOTAL_MS / 1000}s"
-                        null -> "state_unknown_after_request"
+                    wifiReason = when {
+                        on == true && !res.accepted -> "on_but_request_not_accepted"
+                        on == true -> "on_after_request"
+                        on == false && !res.invoked -> "api_unavailable"
+                        on == false && !res.accepted -> "request_rejected_still_off_${JitRef.WIFI_POLL_TOTAL_MS / 1000}s"
+                        on == false -> "still_off_after_${JitRef.WIFI_POLL_TOTAL_MS / 1000}s"
+                        else -> "state_unknown_after_request"
                     }
                     log("JIT_NET_RESTORE wifi=1 state_after=${on?.toString() ?: "unknown"} " +
-                        "confirmed=$wifiConfirmed reason=$wifiReason issued=$issued")
+                        "confirmed=$wifiConfirmed reason=$wifiReason invoked=${res.invoked} " +
+                        "accepted=${res.accepted} (подтверждено только чтение состояния Wi-Fi)")
                 }
             }
         } else {
@@ -785,20 +988,37 @@ object JitOp {
                 "write=none (снимок не этой загрузки/неопознан: не применяем, не удаляем, не меняем)")
             return VerifyState(pedido, prop, cache, verdict)
         }
-        if (definitive) {
-            store.putBoolConfirmed(JitRef.KEY_PEDIDO, false)
-            if (op != null) {
-                val next = op.copy(
-                    phase = if (op.phase == JitRef.Phase.RESTORED) JitRef.Phase.DONE else op.phase,
-                    pedidoChecked = true,
-                    note = op.note.ifEmpty { "verify=${JitRef.verifyLabel(verdict)}" }
-                )
-                store.putStringConfirmed(JitRef.KEY_OP, next.encode())
-            }
-            log("JIT_PEDIDO cleared after verify result=${JitRef.verifyLabel(verdict)}")
+        // НАМЕРЕНИЕ СНИМАЕМ ТОЛЬКО ПО ОПЕРАЦИИ, А НЕ ПО СОВПАДЕНИЮ PROPERTY (REVIEW 3-го захода, п.8):
+        // `getprop` может показать старое значение от прошлой операции, а `shell` мог вообще не
+        // выполниться. Поэтому `jit_pedido`/`checked` снимаются только когда (а) транспорт ответил
+        // на наш скрипт и (б) намерение этой операции — «включить JIT» (`want=true`).
+        //   • `want=false`: «выключено» и «не включилось» выглядят одинаково ⇒ НИКОГДА не снимаем;
+        //   • `shell != REPLIED`: выполнение не доказано ⇒ не снимаем;
+        //   • `unknown`: не снимаем.
+        val settled = definitive && op?.want == true && op.shell == JitRef.Shell.REPLIED &&
+            op.phase != JitRef.Phase.ARMED
+        if (settled) {
+            val pedidoSaved = store.putBoolConfirmed(JitRef.KEY_PEDIDO, false)
+            val base = JitRef.decodeOp(store.getString(JitRef.KEY_OP)) ?: op!!
+            val next = base.copy(
+                phase = if (base.phase == JitRef.Phase.RESTORED) JitRef.Phase.DONE else base.phase,
+                pedidoChecked = true,
+                note = base.note.ifEmpty { "verify=${JitRef.verifyLabel(verdict)}" }
+            )
+            val opSaved = writeOp(store, base.encode(), next, log)
+            log("JIT_PEDIDO cleared after verify result=${JitRef.verifyLabel(verdict)} " +
+                "saved_pedido=$pedidoSaved saved_op=$opSaved shell=replied")
         } else {
-            log("JIT_PEDIDO kept result=unknown (проверка не дала определённого факта: " +
-                "намерение не снимаем, повторим на следующем старте)")
+            val why = when {
+                op == null -> "snapshot_absent"
+                op.want.not() -> "want_false_not_distinguishable"
+                op.shell != JitRef.Shell.REPLIED -> "shell_not_proven:${op.shell.name.lowercase()}"
+                !definitive -> "verify_unknown"
+                else -> "not_settled"
+            }
+            log("JIT_PEDIDO kept result=${JitRef.verifyLabel(verdict)} reason=$why write=none " +
+                "(доступность property, состояние runtime, выполнение операции и факт рестарта — " +
+                "разные вещи; намерение сохраняем)")
         }
         if (verdict == JitRef.Verify.NOT_APPLIED || verdict == JitRef.Verify.CACHE_MISSING) {
             log("JIT_NOT_APPLIED reason=${JitRef.verifyLabel(verdict)} pedido=$pedido " +

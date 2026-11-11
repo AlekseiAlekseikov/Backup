@@ -85,6 +85,7 @@ object JitFake {
         var ap: Boolean = false,
         var stateErrors: Boolean = false,
         var apiBroken: Boolean = false,
+        var apiRejects: Boolean = false,
         var wifiAppliesAfterReads: Int = 0,
         var apAppliesAfterReads: Int = 0
     ) : JitNetState {
@@ -103,8 +104,12 @@ object JitFake {
             return wifi
         }
 
+        /** `apMissing` — интерфейса ap0 нет (false), `stateErrors` — прочитать нельзя (null). */
+        var apMissing = false
+
         override fun apUp(): Boolean? {
             if (stateErrors) return null
+            if (apMissing) return false
             if (apPending) {
                 apReadsAfterRequest++
                 if (apReadsAfterRequest > apAppliesAfterReads) { ap = true; apPending = false }
@@ -112,18 +117,23 @@ object JitFake {
             return ap
         }
 
-        override fun setWifi(on: Boolean): Pair<Boolean, String> {
+        /** `callThrows` — метода нет/исключение (в отличие от `apiRejects`: вызов прошёл). */
+        var callThrows = false
+
+        override fun setWifi(on: Boolean): JitRef.Request {
             requests += "wifi=$on"
-            if (apiBroken) return Pair(false, "throw:SecurityException")
+            if (callThrows || apiBroken) return JitRef.Request.notInvoked("throw:SecurityException")
+            if (apiRejects) return JitRef.Request.rejected("setWifiEnabled($on)=false")
             if (on) wifiPending = true else { wifi = false; wifiPending = false }
-            return Pair(true, "ok")
+            return JitRef.Request.accepted("setWifiEnabled($on)=true")
         }
 
-        override fun startAp(): Pair<Boolean, String> {
+        override fun startAp(): JitRef.Request {
             requests += "ap=start"
-            if (apiBroken) return Pair(false, "throw:NoSuchMethodException")
+            if (callThrows || apiBroken) return JitRef.Request.notInvoked("throw:NoSuchMethodException")
+            if (apiRejects) return JitRef.Request.rejected("startSoftAp=false")
             apPending = true
-            return Pair(true, "reflection_invoked")
+            return JitRef.Request.accepted("startSoftAp=true")
         }
     }
 

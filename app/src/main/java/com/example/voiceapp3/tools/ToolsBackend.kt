@@ -185,16 +185,20 @@ enum class Choice(
         addProperty("perfVideo", AppPerformance.isVideo60FpsEnabled(appContext))
         /* iter33p-review2 §0.1(3): `perfJit` — это ЗАПРОШЕННОЕ состояние (preference тумблера),
            а не подтверждение применения. Факт читается отдельно и честно: on / off / unknown. */
+        /* iter33p (4-й заход) §0.0(5): `perfJit` — НАМЕРЕНИЕ драйвера (preference). Тумблер в UI
+           берёт состояние из `perfJitConfirmed`, который выводится из ФАКТА: runtime=true ⇒ вкл,
+           runtime=false И подтверждённая операция с `want=false` ⇒ выкл, иначе `unknown`.
+           Ложный `off` при недоступном property больше невозможен. */
         addProperty("perfJit", AppPerformance.isAutoOptimizeEnabled(appContext))
         val jitFact = AppPerformance.jitRuntimeFactCached()
         addProperty("perfJitRuntime", when (jitFact?.value) {
             JitRef.Prop.TRUE -> "true"
             JitRef.Prop.FALSE -> "false"
-            null -> "unknown"
-            JitRef.Prop.UNKNOWN -> "unknown"
+            null, JitRef.Prop.UNKNOWN -> "unknown"
         })
         addProperty("perfJitRuntimeRaw", jitFact?.raw ?: "")
         addProperty("perfJitRuntimeReason", jitFact?.reason ?: "not_read_yet")
+        addProperty("perfJitConfirmed", AppPerformance.jitConfirmedState(appContext))
         addProperty("unlockSound", LockSound.isUnlockSoundEnabled(appContext))
         addProperty("unlockSoundPath", LockSound.getUnlockSelectedPath(appContext))
         add("keepAliveApps", AppPerformance.getKeepAliveAppsJson(appContext))

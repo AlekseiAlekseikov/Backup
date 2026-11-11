@@ -54,11 +54,78 @@ object JitNet {
      * два `commit()` с проверкой и обратным чтением. Общая семантика `Prefs2` для остальных
      * функций НЕ меняется (REVIEW §0.1(5)).
      */
+    /**
+     * Разбор одной записи: что реально видели и что из этого следует.
+     *
+     * Вынесено в чистую функцию, чтобы поведение при `commit=false`, исключении, расходящихся
+     * значениях и «ключ есть только в одном хранилище» проверялось JVM-тестом, а не только чтением
+     * кода (REVIEW 3-го захода, п.3).
+     */
+    internal data class WriteOutcome(
+        val confirmed: Boolean,
+        val cpsCommitted: Boolean,
+        val dpsCommitted: Boolean,
+        val readFull: String?,
+        val readCps: String?,
+        val readDps: String?,
+        val reason: String
+    )
+
+    /**
+     * Правило подтверждения записи снимка.
+     *
+     * ЧТО ГАРАНТИРУЕТСЯ: значение прочитано обратно ИЗ ОБОИХ хранилищ и совпадает с записанным.
+     * Тогда любой будущий читатель (любой приоритет) получит новое значение, даже если один
+     * `commit()` вернул `false`.
+     *
+     * ЧТО НЕ ГАРАНТИРУЕТСЯ (и не выдаётся за гарантию): что `commit()==false` действительно не
+     * записал на диск — это поведение Android, а не наше; поэтому `false` при совпавшем чтении
+     * считается предупреждением (`reason=readback_ok_commit_false`), а не ошибкой.
+     *
+     * ОТЛИЧИЕ ОТ РЕФЕРЕНСА (обязательное): референс пишет три ключа одним `commit()` и его
+     * результат не проверяет. Здесь запись подтверждается чтением обоих хранилищ, иначе Wi-Fi не
+     * выключается — без этого «снимок есть» оставалось бы предположением.
+     */
+    internal fun judgeWrite(
+        value: String?,
+        cpsCommitted: Boolean,
+        dpsCommitted: Boolean,
+        cpsAvailable: Boolean,
+        dpsAvailable: Boolean,
+        readFull: String?,
+        readCps: String?,
+        readDps: String?
+    ): WriteOutcome {
+        if (!cpsAvailable && !dpsAvailable) {
+            return WriteOutcome(false, cpsCommitted, dpsCommitted, readFull, readCps, readDps, "no_store")
+        }
+        // Недоступное хранилище не участвует в проверке (его просто нет), но хотя бы одно должно
+        // быть доступно — иначе смотреть некуда (см. ветку `no_store` выше).
+        val cpsOk = !cpsAvailable || readCps == value
+        val dpsOk = !dpsAvailable || readDps == value
+        val reason = when {
+            !cpsOk || !dpsOk -> "readback_mismatch"
+            readFull != value -> "priority_read_mismatch"
+            !cpsCommitted || !dpsCommitted -> "readback_ok_commit_false"
+            else -> "ok"
+        }
+        return WriteOutcome(
+            confirmed = reason == "ok" || reason == "readback_ok_commit_false",
+            cpsCommitted = cpsCommitted,
+            dpsCommitted = dpsCommitted,
+            readFull = readFull,
+            readCps = readCps,
+            readDps = readDps,
+            reason = reason
+        )
+    }
+
     internal class AndroidStore(private val app: Context) : JitStore {
 
         private fun cps(): SharedPreferences? = runCatching { Prefs2.cps(app) }.getOrNull()
         private fun dps(): SharedPreferences? = runCatching { Prefs2.dps(app) }.getOrNull()
 
+        /** Приоритет чтения — как у `Prefs2.getString` (CPS, затем DPS): его и проверяем. */
         override fun getString(key: String): String? {
             val c = runCatching { cps()?.getString(key, null) }.getOrNull()
             val d = runCatching { dps()?.getString(key, null) }.getOrNull()
@@ -66,34 +133,38 @@ object JitNet {
         }
 
         /**
-         * Запись ОДНОГО ключа в оба хранилища + подтверждение чтением.
+         * Запись одного ключа в оба хранилища + подтверждение чтением ОБОИХ ([judgeWrite]).
          *
-         * Подтверждено = хотя бы одна запись вернула `commit()==true`, И чтение обратно (та же
-         * логика приоритета, что в `Prefs2.getString`) дало ровно записанное значение.
-         * Для `null` подтверждаем «ключа больше нет ни в одном хранилище».
+         * Общая семантика `Prefs2` для остальных функций не меняется: здесь свои два `commit()`,
+         * потому что `Prefs2` результат не возвращает.
          */
         override fun putStringConfirmed(key: String, value: String?): Boolean {
+            val c = runCatching { cps() }.getOrNull()
+            val d = runCatching { dps() }.getOrNull()
             var cpsOk = false
             var dpsOk = false
-            runCatching {
-                cps()?.let { p ->
-                    val ed = p.edit()
+            if (c != null) {
+                cpsOk = runCatching {
+                    val ed = c.edit()
                     if (value == null) ed.remove(key) else ed.putString(key, value)
-                    cpsOk = ed.commit()
-                }
+                    ed.commit()
+                }.getOrDefault(false)
             }
-            runCatching {
-                dps()?.let { p ->
-                    val ed = p.edit()
+            if (d != null) {
+                dpsOk = runCatching {
+                    val ed = d.edit()
                     if (value == null) ed.remove(key) else ed.putString(key, value)
-                    dpsOk = ed.commit()
-                }
+                    ed.commit()
+                }.getOrDefault(false)
             }
-            val back = getString(key)
-            val ok = (cpsOk || dpsOk) && back == value
-            AppLog.i(TAG, "JIT_STORE put key=$key confirmed=$ok cps=$cpsOk dps=$dpsOk " +
-                "back=${if (back == null) "null" else "len${back.length}"}")
-            return ok
+            val readCps = runCatching { c?.getString(key, null) }.getOrNull()
+            val readDps = runCatching { d?.getString(key, null) }.getOrNull()
+            val out = judgeWrite(value, cpsOk, dpsOk, c != null, d != null,
+                getString(key), readCps, readDps)
+            AppLog.i(TAG, "JIT_STORE put key=$key confirmed=${out.confirmed} reason=${out.reason} " +
+                "cps_commit=$cpsOk dps_commit=$dpsOk cps_back=${lenOf(readCps)} dps_back=${lenOf(readDps)} " +
+                "priority_back=${lenOf(out.readFull)}")
+            return out.confirmed
         }
 
         override fun getBool(key: String): Boolean? {
@@ -106,15 +177,23 @@ object JitNet {
         }
 
         override fun putBoolConfirmed(key: String, value: Boolean): Boolean {
+            val c = runCatching { cps() }.getOrNull()
+            val d = runCatching { dps() }.getOrNull()
             var cpsOk = false
             var dpsOk = false
-            runCatching { cps()?.let { cpsOk = it.edit().putBoolean(key, value).commit() } }
-            runCatching { dps()?.let { dpsOk = it.edit().putBoolean(key, value).commit() } }
-            val back = getBool(key)
-            val ok = (cpsOk || dpsOk) && back == value
-            AppLog.i(TAG, "JIT_STORE put key=$key(bool=$value) confirmed=$ok cps=$cpsOk dps=$dpsOk")
+            if (c != null) cpsOk = runCatching { c.edit().putBoolean(key, value).commit() }.getOrDefault(false)
+            if (d != null) dpsOk = runCatching { d.edit().putBoolean(key, value).commit() }.getOrDefault(false)
+            val readCps = runCatching { c?.contains(key) == true && c!!.getBoolean(key, false) }.getOrDefault(false)
+            val readDps = runCatching { d?.contains(key) == true && d!!.getBoolean(key, false) }.getOrDefault(false)
+            val ok = (c != null || d != null) &&
+                (c == null || readCps == value) && (d == null || readDps == value) &&
+                getBool(key) == value
+            AppLog.i(TAG, "JIT_STORE put key=$key(bool=$value) confirmed=$ok " +
+                "cps_commit=$cpsOk dps_commit=$dpsOk cps_back=$readCps dps_back=$readDps")
             return ok
         }
+
+        private fun lenOf(v: String?): String = if (v == null) "null" else "len${v.length}"
     }
 
     /** Реальное состояние сети. */
@@ -126,31 +205,63 @@ object JitNet {
 
         override fun wifiOn(): Boolean? = runCatching { wm()?.isWifiEnabled }.getOrNull()
 
-        override fun apUp(): Boolean? = runCatching {
-            val ni = java.net.NetworkInterface.getByName("ap0") ?: return@runCatching false
-            ni.isUp && ni.inetAddresses.hasMoreElements()
-        }.getOrNull()
-
         /**
-         * Запрос включения/выключения Wi-Fi. Как в референсе (`w0/e2`), результат запроса не
-         * считается состоянием: фактическое состояние потом читается отдельно.
+         * AP поднят? `null` — прочитать НЕ УДАЛОСЬ (исключение), `false` — интерфейса `ap0` нет.
+         *
+         * Раньше исключение и отсутствие интерфейса давали одинаковый результат: `false`
+         * («AP выключен»). Для решения «включать AP» это разные факты, поэтому они разделены —
+         * неизвестное состояние не выдаётся за выключенное (REVIEW 3-го захода, п.7).
          */
-        @Suppress("DEPRECATION")
-        override fun setWifi(on: Boolean): Pair<Boolean, String> {
-            val w = wm() ?: return Pair(false, "wifi_manager_absent")
-            return runCatching { Pair(w.setWifiEnabled(on), "request_sent") }
-                .getOrElse { t -> Pair(false, "throw:${t.javaClass.simpleName}") }
+        override fun apUp(): Boolean? = try {
+            val ni = java.net.NetworkInterface.getByName("ap0")
+            if (ni == null) false else ni.isUp && ni.inetAddresses.hasMoreElements()
+        } catch (t: Throwable) {
+            AppLog.w(TAG, "JIT_AP_STATE unreadable err=${t.javaClass.simpleName}:${t.message}")
+            null
         }
 
-        /** Как `U`/`d`: рефлексия `startSoftAp(WifiConfiguration)`, аргумент `null`. */
-        override fun startAp(): Pair<Boolean, String> {
-            val w = wm() ?: return Pair(false, "wifi_manager_absent")
-            return runCatching {
+        /**
+         * Запрос включения/выключения Wi-Fi. `setWifiEnabled` возвращает boolean «принято/нет» —
+         * это НЕ состояние сети: состояние читается отдельно ([wifiOn]).
+         */
+        @Suppress("DEPRECATION")
+        override fun setWifi(on: Boolean): JitRef.Request {
+            val w = wm() ?: return JitRef.Request.notInvoked("wifi_manager_absent")
+            return try {
+                val accepted = w.setWifiEnabled(on)
+                if (accepted) JitRef.Request.accepted("setWifiEnabled($on)=true")
+                else JitRef.Request.rejected("setWifiEnabled($on)=false")
+            } catch (t: Throwable) {
+                JitRef.Request.notInvoked("throw:" + t.javaClass.simpleName + ":" + (t.message ?: ""))
+            }
+        }
+
+        /**
+         * Как `U`/`d` референса: рефлексия `startSoftAp(WifiConfiguration)`, аргумент `null`.
+         *
+         * Возвращаем ТРИ разных факта (REVIEW 3-го захода, п.7):
+         *  • `invoked=false` — метода нет / вызвать нельзя (исключение рефлексии);
+         *  • `invoked=true, accepted=false` — метод вернул `Boolean.FALSE` (система отказала);
+         *  • `invoked=true, accepted=true` — метод вернул `true` или `null`/`void` без исключения.
+         * Отсутствие исключения больше НЕ считается «принято», если метод ответил `false`.
+         */
+        override fun startAp(): JitRef.Request {
+            val w = wm() ?: return JitRef.Request.notInvoked("wifi_manager_absent")
+            return try {
                 val m = w.javaClass.getDeclaredMethod("startSoftAp", WifiConfiguration::class.java)
                 m.isAccessible = true
-                m.invoke(w, null)
-                Pair(true, "reflection_invoked")
-            }.getOrElse { t -> Pair(false, "throw:${t.javaClass.simpleName}") }
+                when (val r = m.invoke(w, null)) {
+                    is Boolean -> if (r) JitRef.Request.accepted("startSoftAp=true")
+                                  else JitRef.Request.rejected("startSoftAp=false")
+                    null -> JitRef.Request.accepted("startSoftAp=void")
+                    else -> JitRef.Request.accepted("startSoftAp=" + r.javaClass.simpleName)
+                }
+            } catch (t: java.lang.reflect.InvocationTargetException) {
+                val c = t.targetException ?: t
+                JitRef.Request.notInvoked("target:" + c.javaClass.simpleName + ":" + (c.message ?: ""))
+            } catch (t: Throwable) {
+                JitRef.Request.notInvoked("throw:" + t.javaClass.simpleName + ":" + (t.message ?: ""))
+            }
         }
     }
 
