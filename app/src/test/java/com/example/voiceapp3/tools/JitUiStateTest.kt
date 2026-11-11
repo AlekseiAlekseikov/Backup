@@ -73,7 +73,10 @@ class JitUiStateTest {
     fun panelRunsVerificationOnOpenAndUpdatesBothWidgets() {
         val panel = code("src/main/java/com/example/voiceapp3/ui/ToolsPanel.kt")
         assertTrue("сверка при открытии панели", panel.contains("AppPerformance.verifyJitOnly(activity)"))
-        assertTrue("после ответа обновляется строка", panel.contains("view.text = jitRuntimeLineText(fresh)"))
+        assertTrue("после ответа обновляется строка",
+            panel.contains("view.text = jitRuntimeLineText(fresh, gen0)"))
+        assertTrue("устаревший ответ (поколение сменилось) не применяется",
+            panel.contains("JIT_UI stale_fact skipped generation_changed"))
         assertTrue("и тумблер", panel.contains("applyJitFact(fresh)"))
         assertFalse("новых кнопок JIT нет",
             panel.contains("addButton(\"JIT") || panel.contains("text = \"JIT"))

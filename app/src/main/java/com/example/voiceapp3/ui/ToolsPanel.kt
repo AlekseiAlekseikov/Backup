@@ -994,6 +994,9 @@ class ToolsPanel(
         addNote(info, key)
         row.addView(info, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         val userClick: (Boolean) -> Unit = { checked ->
+            // Само событие клика (до любых фоновых задач): устаревшие async-ответы, посчитанные
+            // раньше, уже не применятся к тумблеру, тексту и предупреждению.
+            if (key == "perfJit") runCatching { AppPerformance.markJitClick() }
             state.addProperty(key, checked)
             send("settings.change", JsonObject().apply {
                 addProperty("key", key)
@@ -1160,8 +1163,12 @@ class ToolsPanel(
      * остаётся `unknown`, ложного «выключено» нет.
      */
     private fun addJitRuntimeLine() {
+        // Поколение фиксируется на момент постройки строки. Любой ответ, посчитанный для другого
+        // поколения (в т.ч. после клика), не переписывает текст, не показывает предупреждение и не
+        // переставляет тумблер: поколение растёт синхронно с самим событием клика.
+        val gen0 = AppPerformance.jitGeneration()
         val fact = runCatching { AppPerformance.jitRuntimeFactCached() }.getOrNull()
-        val view = text(jitRuntimeLineText(fact), 11.5f, palette.muted, bold = false)
+        val view = text(jitRuntimeLineText(fact, gen0), 11.5f, palette.muted, bold = false)
         page.addView(view, matchWrap())
         // 1. Сверка `w0/bb`+`w0/r7` — то же, что делает открытие настроек в референсе (`S0`→`bb`).
         //    Она снимает `jit_pedido`, если намерение было; без намерения — ничего и не шлёт.
@@ -1172,7 +1179,9 @@ class ToolsPanel(
                 runCatching { AppPerformance.verifyJitOnly(activity) }
                 handler.post {
                     runCatching {
-                        view.text = jitRuntimeLineText(AppPerformance.jitRuntimeFactCached())
+                        if (AppPerformance.jitGeneration() == gen0) {
+                            view.text = jitRuntimeLineText(AppPerformance.jitRuntimeFactCached(), gen0)
+                        }
                     }
                     Unit
                 }
@@ -1181,18 +1190,20 @@ class ToolsPanel(
         // 2. Факт `getprop` (read-only) и обновление И строки, И тумблера на главном потоке.
         //    Поколение клика фиксируется ДО запроса: если пользователь успел кликнуть, устаревший
         //    ответ не переставит тумблер и не покажет «успех нового клика».
-        val gen0 = AppPerformance.jitGeneration()
         runCatching {
             AppPerformance.refreshJitRuntimeAsync(activity) { fresh ->
                 handler.post {
                     runCatching {
+                        // Устаревший относительно клика ответ не применяется вообще: ни текст, ни
+                        // предупреждение, ни положение тумблера.
                         if (AppPerformance.jitGeneration() != gen0) {
-                            // Ответ посчитан до клика — тумблер не трогаем, только текст факта.
-                            view.text = jitRuntimeLineText(fresh)
-                        } else {
-                            view.text = jitRuntimeLineText(fresh)
-                            applyJitFact(fresh)
+                            com.example.voiceapp3.tools.AppLog.i(
+                                "CENTRAL_Tools", "JIT_UI stale_fact skipped generation_changed"
+                            )
+                            return@runCatching
                         }
+                        view.text = jitRuntimeLineText(fresh, gen0)
+                        applyJitFact(fresh)
                     }
                     Unit
                 }
@@ -1218,14 +1229,15 @@ class ToolsPanel(
         if (listener != null) sw.setOnCheckedChangeListener { _, checked -> listener(checked) }
     }
 
-    private fun jitRuntimeLineText(fact: JitRef.PropFact?): String {
+    private fun jitRuntimeLineText(fact: JitRef.PropFact?, generation: Int): String {
         val shown = when {
             fact == null -> "ещё не прочитано — значение появится после фоновой проверки"
             fact.value == JitRef.Prop.TRUE -> "включён (getprop dalvik.vm.usejit = true)"
             fact.value == JitRef.Prop.FALSE -> "выключен (getprop dalvik.vm.usejit = false)"
             else -> "неизвестно (getprop не прочитан: ${fact.reason})"
         }
-        val hint = runCatching { AppPerformance.jitVerifyHintCached() }.getOrNull()
+        // Предупреждение показывается только для того поколения, для которого его посчитали.
+        val hint = runCatching { AppPerformance.jitVerifyHintCached(generation) }.getOrNull()
         return if (hint.isNullOrBlank()) "Сейчас на устройстве: $shown"
                else "Сейчас на устройстве: $shown · $hint"
     }

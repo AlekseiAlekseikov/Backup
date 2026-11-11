@@ -896,22 +896,43 @@ object AppPerformance {
     }
 
     /**
-     * Поколение клика: увеличивается на каждый клик тумблера. Асинхронный ответ, посчитанный ДО
-     * клика, не должен переставлять тумблер после него — UI сравнивает поколение и пропускает
-     * устаревший ответ.
+     * Поколение клика: увеличивается на САМО событие клика (в момент нажатия в UI — [markJitClick]),
+     * а не позже в фоне. Асинхронный ответ, посчитанный до клика, не должен переставлять тумблер,
+     * переписывать текст или показывать предупреждение после него — UI сравнивает поколение и
+     * устаревший ответ целиком пропускает.
      */
-    @Volatile private var jitGeneration: Int = 0
+    private val jitGeneration = java.util.concurrent.atomic.AtomicInteger(0)
 
-    fun jitGeneration(): Int = jitGeneration
+    fun jitGeneration(): Int = jitGeneration.get()
 
-    private fun bumpJitGeneration() {
-        jitGeneration++
+    /**
+     * Вызывается из UI-потока в обработчике клика ДО отправки работы в фон: поколение растёт
+     * синхронно с событием, поэтому окна «ответ пришёл после клика, но до повышения» больше нет.
+     * Клик-обработчик при этом не запускается — метод только помечает событие.
+     */
+    fun markJitClick() {
+        jitGeneration.incrementAndGet()
+        LAST_JIT_HINT.set(null)
     }
 
-    /** Подпись подтверждённого не-успеха сверки для существующей строки панели (`null` — нет). */
-    @Volatile private var LAST_JIT_HINT: String? = null
+    private fun bumpJitGeneration() {
+        jitGeneration.incrementAndGet()
+    }
 
-    fun jitVerifyHintCached(): String? = LAST_JIT_HINT
+    /**
+     * Подпись подтверждённого не-успеха сверки для существующей строки панели.
+     *
+     * Хранится вместе с поколением: если после сверки был новый клик, подпись не показывается —
+     * она относится к прошлой операции.
+     */
+    private data class Hint(val text: String?, val generation: Int)
+    private val LAST_JIT_HINT = java.util.concurrent.atomic.AtomicReference<Hint?>(null)
+
+    /** Подпись ТОЛЬКО для того поколения, для которого её посчитали (`null` — показывать нечего). */
+    fun jitVerifyHintCached(forGeneration: Int): String? {
+        val h = LAST_JIT_HINT.get() ?: return null
+        return if (h.generation == forGeneration) h.text else null
+    }
 
     // ═══════════ JIT_ZYGOTE_BEGIN ═══════════
     /*
@@ -943,6 +964,8 @@ object AppPerformance {
         BgWorker.assertNotMain("AppPerformance.jitApplyWithZygote")
         val app = context.applicationContext
         val t0 = System.currentTimeMillis()
+        // Поколение уже поднято событием клика в UI (markJitClick); вызов здесь — страховка для
+        // путей, которые приходят не из панели. Устаревшие ответы это только отсекает.
         bumpJitGeneration()
         AppLog.i(TAG, "JIT_APPLIED_REQUEST want=$enabled ${JitRef.mountStepNote()} " +
             "warning=\"фреймворк перезапустится: экран гаснет на 10–20 с, приложения закрываются\"")
@@ -952,26 +975,43 @@ object AppPerformance {
         val fact = runCatching { JitNet.usejitFact(app) }
             .getOrDefault(JitRef.PropFact(JitRef.Prop.UNKNOWN, "", 1, "exception"))
         val sent = click?.sent == true
-        AppLog.i(TAG, "JIT_APPLIED_RESULT sent=$sent blocked=${click?.blocked ?: "none"} " +
-            "saved=${click?.saved ?: false} confirmed=${click?.confirmed ?: 0} " +
+        val blocked = click?.blocked
+        AppLog.i(TAG, "JIT_APPLIED_RESULT sent=$sent blocked=${blocked ?: "none"} " +
+            "attempted=${click?.write?.attempted ?: 0} committed=${click?.write?.committed ?: 0} " +
+            "confirmed=${click?.confirmed ?: 0} first_readable=${click?.write?.firstReadable ?: false} " +
+            "read=${click?.read?.value ?: "none"} " +
+            "conflicts=${click?.read?.conflicts?.size ?: 0} previous_undefined=${click?.previousUndefined ?: false} " +
             "${fact.log} want=$enabled restart=not_claimed rc=${click?.exitCode ?: -1} " +
             "outcome=${click?.let { JitRef.chainOutcomeLabel(it.outcome) } ?: "none"}")
         val shellReply = click != null && click.sent &&
             click.outcome == JitRef.ChainOutcome.REPLY_RECEIVED
-        val blocked = click?.blocked
+        val restoreShown = click?.snap?.wire() ?: "none"
         val actual = when {
+            blocked == "busy" ->
+                "предыдущий клик ещё выполняется → вторая цепочка НЕ запущена, снимок Wi-Fi не " +
+                    "перезаписан; дождитесь завершения первой операции"
             blocked == "wifi_unknown" ->
                 "состояние клиентского Wi-Fi прочитать не удалось → скрипт НЕ отправлен, сеть не тронута"
             blocked == "snapshot_not_saved" ->
-                "снимок Wi-Fi не подтверждён (confirmed=${click?.confirmed ?: 0}) → скрипт НЕ отправлен, " +
-                    "сеть не тронута"
+                "снимок Wi-Fi не сохранён надёжно (committed=${click?.write?.committed ?: 0}, " +
+                    "confirmed=${click?.confirmed ?: 0}, первое по порядку чтения хранилище " +
+                    "подтвердило=${click?.write?.firstReadable ?: false}) → скрипт НЕ отправлен, " +
+                    "сеть и свойства не тронуты"
+            blocked == "snapshot_conflict" ->
+                "CPS и DPS расходятся, будущий снимок неоднозначен → скрипт НЕ отправлен"
+            blocked == "snapshot_not_readable" ->
+                "снимок не читается тем порядком, которым его прочтёт продолжение → скрипт НЕ отправлен"
             blocked != null -> "блокировано ($blocked) → скрипт НЕ отправлен"
             else ->
-                "restore=${click?.snap?.wire() ?: "none"} confirmed=${click?.confirmed ?: 0} " +
-                    "rc=${click?.exitCode ?: -1} " +
+                "restore=$restoreShown committed=${click?.write?.committed ?: 0} " +
+                    "confirmed=${click?.confirmed ?: 0} rc=${click?.exitCode ?: -1} " +
                     "outcome=${click?.let { JitRef.chainOutcomeLabel(it.outcome) } ?: "none"} " +
                     "getprop=${fact.raw.ifEmpty { "unknown" }} restart=not_claimed internet=not_checked"
         }
+        val note = if (click?.previousUndefined == true)
+            " · у предыдущей команды не было ответа: она могла остаться в очереди — исход прошлого " +
+                "действия не подтверждён"
+        else ""
         return listOf(
             ToolsStep(
                 step = "perf_zygote",
@@ -983,27 +1023,40 @@ object AppPerformance {
                 startedAtMs = t0, finishedAtMs = System.currentTimeMillis(),
                 exitCode = if (sent) (click!!.exitCode) else 1,
                 expected = "JIT pedido=… getprop=… result=ok на следующем старте (w0/bb + w0/r7)",
-                actual = actual,
+                actual = actual + note,
                 stdout = when {
+                    blocked == "busy" ->
+                        "скрипт не отправлен: предыдущий клик JIT ещё выполняется. Второй " +
+                            "конфликтующей цепочки нет — исходный снимок Wi-Fi не перезаписывается " +
+                            "состоянием, снятым уже после отключения Wi-Fi"
                     blocked == "wifi_unknown" ->
                         "скрипт не отправлен: Wi-Fi ГУ сейчас не прочитать, а без достоверного " +
                             "снимка после рестарта фреймворка сеть нечем вернуть. Выключение " +
                             "клиентского Wi-Fi в этом клике не выполнялось"
                     blocked == "snapshot_not_saved" ->
-                        "скрипт не отправлен: снимок Wi-Fi не подтверждён чтением " +
-                            "(confirmed=${click?.confirmed ?: 0}). Ни Wi-Fi, ни свойства не менялись"
+                        "скрипт не отправлен: снимок Wi-Fi не подтверждён (нужен успешный commit и " +
+                            "чтение ВСЕХ трёх ключей, причём в том хранилище, которое продолжение " +
+                            "прочитает первым — иначе после перезапуска вернулось бы прежнее " +
+                            "значение). Сеть и системные свойства не менялись"
+                    blocked == "snapshot_conflict" ->
+                        "скрипт не отправлен: в CPS и DPS разные значения снимка, продолжение " +
+                            "прочитало бы не то. Сеть и свойства не менялись"
+                    blocked == "snapshot_not_readable" ->
+                        "скрипт не отправлен: снимок не читается тем порядком, которым его читает " +
+                            "продолжение (CPS→DPS). Сеть и свойства не менялись"
                     blocked != null ->
                         "скрипт не отправлен: $blocked"
                     shellReply ->
                         "экран гаснет на 10–20 с · транспорт ответил целиком. Возврат клиентского " +
                             "Wi-Fi запрошен через 15 с после следующего запуска приложения " +
-                            "(restore=${click?.snap?.wire()}); интернет при этом НЕ проверяется. " +
+                            "(restore=$restoreShown); интернет при этом НЕ проверяется. " +
                             "Если приложение после рестарта фреймворка не запустится, Wi-Fi " +
                             "останется выключенным: это ограничение референса, см. отчёт"
                     sent ->
                         "команда отправлена, ответа транспорта нет (rc=${click?.exitCode ?: -1}): " +
                             "рестарт фреймворка мог не произойти, а команда могла остаться в очереди. " +
-                            "Итог покажет только сверка на следующем старте"
+                            "Намерение сохранено; итог покажет только сверка после определённого " +
+                            "исхода"
                     else -> "клик не отправлен"
                 },
                 status = if (sent) ToolsStep.Status.PARTIAL else ToolsStep.Status.BLOCKED
@@ -1042,10 +1095,13 @@ object AppPerformance {
             AppLog.i(TAG, "JIT_PROBE skipped reason=${out.skipped} write=none")
             return false
         }
-        LAST_JIT_HINT = JitRef.verifyHint(out.verdict, out.prop, out.cache)
+        val gen = jitGeneration.get()
+        val hint = JitRef.verifyHint(out.verdict, out.prop, out.cache)
+        LAST_JIT_HINT.set(Hint(hint, gen))
         AppLog.i(TAG, "JIT_PROBE result=${JitRef.verifyLabel(out.verdict)} pedido=${out.pedido} " +
             "write=remove_if_confirmed removed=${out.removed?.allOk ?: false} " +
-            "still_present=${out.stillPresent} ui_hint=${LAST_JIT_HINT ?: "none"} restart=not_claimed")
+            "still_present=${out.stillPresent} generation=$gen ui_hint=${hint ?: "none"} " +
+            "restart=not_claimed")
         return true
     }
 

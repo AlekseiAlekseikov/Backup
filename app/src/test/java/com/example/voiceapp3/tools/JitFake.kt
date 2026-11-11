@@ -1,41 +1,139 @@
 package com.example.voiceapp3.tools
 
+import android.content.SharedPreferences
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Подставные реализации интерфейсов [JitRef] — для локальных тестов на JVM.
+ * Подставные реализации для локальных JVM-тестов.
  *
- * Все фейки фиксируют ФАКТИЧЕСКИЕ действия: какие команды ушли, какие ключи записаны/удалены,
- * какие сетевые вызовы сделаны, в каком порядке, сколько раз.
+ * ВАЖНО: это НЕ Android-интеграционные тесты. На ГУ ничего не запускалось; `WifiManager` и
+ * `/proc/self/maps` ГУ этими тестами не проверяются.
  *
- * ВАЖНО: это НЕ Android-интеграционные тесты. На ГУ они не запускались, `WifiManager` и
- * `/proc/self/maps` ГУ ими не проверяются (для карты памяти есть отдельный тест на реальном файле
- * процесса JVM — см. `JitMapsTest`).
+ * Отдельно есть [Prefs] — реалистичная модель `SharedPreferences` (память отдельно от «диска»,
+ * «новый процесс» читает только «диск»), чтобы проверять настоящий `JitNet.AndroidStore`, а не
+ * только удобный фейк.
  */
 object JitFake {
 
-    private fun wire(snap: JitRef.WifiSnapshot) = "wifi=${if (snap.wifi) 1 else 0}:"
+    // ─────────────────────────── реалистичные SharedPreferences ───────────────────────────
 
-    // ─────────────────────────── префы ───────────────────────────
+    /**
+     * Модель Android `SharedPreferences`:
+     *  • `commit()` сразу меняет ПАМЯТЬ (как в Android), а на «диск» пишет только при успехе;
+     *  • `commitOk=false` — значение видно в памяти, но после «смерти процесса» пропадает;
+     *  • `throwOnEdit` — `edit()` бросает;
+     *  • `partialKeys` — ключи, которые не записываются (проверка согласованности трёх ключей);
+     *  • [newProcess] создаёт объект, читающий только «диск» — как после перезапуска.
+     */
+    class Prefs(
+        private val disk: MutableMap<String, Any?>,
+        var commitOk: Boolean = true,
+        var throwOnEdit: Boolean = false,
+        var partialKeys: Set<String> = emptySet(),
+        var throwOnRead: Boolean = false,
+    ) : SharedPreferences {
+
+        /** Текущая память процесса: стартует с того, что лежит на «диске». */
+        private val mem = LinkedHashMap<String, Any?>().apply { putAll(disk) }
+
+        val writes = AtomicInteger(0)
+        val commits = mutableListOf<Map<String, Any?>>()
+
+        /** «Новый процесс»: память = диск. */
+        fun newProcess() = Prefs(disk, commitOk, throwOnEdit, partialKeys, throwOnRead)
+
+        fun diskKeys(): Set<String> = disk.keys.toSet()
+        fun memKeys(): Set<String> = mem.keys.toSet()
+
+        override fun getAll(): MutableMap<String, *> = LinkedHashMap(mem)
+
+        override fun getString(key: String, defValue: String?): String? {
+            if (throwOnRead) throw IllegalStateException("read failed")
+            return mem[key] as? String ?: defValue
+        }
+
+        override fun getStringSet(key: String, defValues: MutableSet<String>?) =
+            @Suppress("UNCHECKED_CAST")
+            (mem[key] as? MutableSet<String>) ?: defValues
+
+        override fun getInt(key: String, defValue: Int): Int = mem[key] as? Int ?: defValue
+        override fun getLong(key: String, defValue: Long): Long = mem[key] as? Long ?: defValue
+        override fun getFloat(key: String, defValue: Float): Float = mem[key] as? Float ?: defValue
+        override fun getBoolean(key: String, defValue: Boolean): Boolean {
+            if (throwOnRead) throw IllegalStateException("read failed")
+            return mem[key] as? Boolean ?: defValue
+        }
+
+        override fun contains(key: String): Boolean = mem.containsKey(key)
+
+        override fun edit(): SharedPreferences.Editor {
+            if (throwOnEdit) throw IllegalStateException("edit failed")
+            return Editor()
+        }
+
+        override fun registerOnSharedPreferenceChangeListener(
+            listener: SharedPreferences.OnSharedPreferenceChangeListener?
+        ) = Unit
+
+        override fun unregisterOnSharedPreferenceChangeListener(
+            listener: SharedPreferences.OnSharedPreferenceChangeListener?
+        ) = Unit
+
+        inner class Editor : SharedPreferences.Editor {
+            private val puts = LinkedHashMap<String, Any?>()
+            private val removes = LinkedHashSet<String>()
+
+            override fun putString(key: String, value: String?) = apply { puts[key] = value }
+            override fun putStringSet(key: String, values: MutableSet<String>?) = apply { puts[key] = values }
+            override fun putInt(key: String, value: Int) = apply { puts[key] = value }
+            override fun putLong(key: String, value: Long) = apply { puts[key] = value }
+            override fun putFloat(key: String, value: Float) = apply { puts[key] = value }
+            override fun putBoolean(key: String, value: Boolean) = apply { puts[key] = value }
+            override fun remove(key: String) = apply { removes += key }
+            override fun clear() = apply { removes += mem.keys.toList() }
+
+            override fun commit(): Boolean {
+                writes.incrementAndGet()
+                // Память меняется всегда (как в Android): commit=false НЕ значит «значения нет».
+                // `partialKeys` моделирует ключ, который не записался вовсе (ни память, ни диск).
+                val effective = LinkedHashMap<String, Any?>()
+                puts.forEach { (k, v) -> if (k !in partialKeys) effective[k] = v }
+                effective.forEach { (k, v) -> if (v == null) mem.remove(k) else mem[k] = v }
+                removes.forEach { mem.remove(it) }
+                commits += effective
+                if (commitOk) {
+                    effective.forEach { (k, v) -> if (v == null) disk.remove(k) else disk[k] = v }
+                    removes.forEach { disk.remove(it) }
+                }
+                return commitOk
+            }
+
+            override fun apply() { commit() }
+        }
+    }
+
+    // ─────────────────────────── префы (фейк) ───────────────────────────
 
     /**
      * Два хранилища проекта (CPS/DPS): каждое можно «сломать» отдельно.
      *
-     * `commitFails` — индексы, у которых `commit()` возвращает false И значение НЕ записывается
-     * (обычный случай); `writeDespiteFalse` — записать, но вернуть false (поведение, при котором
-     * «commit=false» не доказывает отсутствие значения); `throwOn` — `edit()` бросает исключение.
+     * `commitFails` — индексы, у которых `commit()` возвращает false и значение НЕ пишется;
+     * `writeDespiteFalse` — записать, но вернуть false (значение видно в памяти);
+     * `throwOn` — `edit()` бросает; `skipKey` — ключ, который «не записался» (частичная запись).
      */
     class Store(storeCount: Int = 2) : JitRef.JitStore {
         val maps: List<MutableMap<String, Any?>> = List(storeCount) { mutableMapOf() }
         val commitFails = mutableSetOf<Int>()
         val throwOn = mutableSetOf<Int>()
         var writeDespiteFalse = false
+        var skipKey: String? = null
 
-        /** Журнал операций: `snapshot:i`, `remove:key:i`. */
+        /** Порядок чтения (по умолчанию — как CPS→DPS). */
+        var readOrder: List<Int> = maps.indices.toList()
+
         val ops = mutableListOf<String>()
-        val commits = mutableListOf<String>()
 
         fun writeCount(): Int = ops.size
 
@@ -43,68 +141,79 @@ object JitFake {
 
         fun presentIn(store: Int, key: String): Boolean = maps[store].containsKey(key)
 
+        fun name(i: Int) = "s$i"
+
         override fun getString(key: String): String? =
-            maps.firstNotNullOfOrNull { m -> if (m.containsKey(key)) m[key] as? String else null }
+            readOrder.firstNotNullOfOrNull { i -> maps[i][key] as? String }
 
         override fun getBool(key: String): Boolean? =
-            maps.firstNotNullOfOrNull { m -> if (m.containsKey(key)) m[key] as? Boolean else null }
+            readOrder.firstNotNullOfOrNull { i -> maps[i][key] as? Boolean }
 
         override fun contains(key: String): Boolean = maps.any { it.containsKey(key) }
 
-        override fun putSnapshot(want: Boolean, snap: JitRef.WifiSnapshot): JitRef.WriteResult {
-            if (maps.isNotEmpty() && throwOn.size == maps.size) throw IllegalStateException("all stores broken")
-            var ok = 0
-            val failed = mutableListOf<String>()
+        override fun putSnapshot(want: Boolean, snap: JitRef.WifiSnapshot): JitRef.SnapshotWrite {
+            val reports = mutableListOf<JitRef.StoreReport>()
             for ((i, m) in maps.withIndex()) {
-                if (i in throwOn) { failed += "s$i:exception"; continue }
-                if (i in commitFails && !writeDespiteFalse) { failed += "s$i:commit_false"; continue }
+                if (i in throwOn) {
+                    reports += JitRef.StoreReport(name(i), "exception:IllegalStateException", false)
+                    continue
+                }
+                if (i in commitFails && !writeDespiteFalse) {
+                    reports += JitRef.StoreReport(name(i), "false", false)
+                    continue
+                }
                 m[JitRef.KEY_PEDIDO] = want
                 m[JitRef.KEY_AUTO] = want
                 m[JitRef.KEY_RESTORE] = snap.wire()
+                skipKey?.let { m.remove(it) }
                 ops += "snapshot:$i"
-                commits += wire(snap)
-                if (i in commitFails) failed += "s$i:commit_false" else ok++
+                val readback = m[JitRef.KEY_PEDIDO] == want && m[JitRef.KEY_AUTO] == want &&
+                    m[JitRef.KEY_RESTORE] == snap.wire()
+                val commit = if (i in commitFails) "false" else "ok"
+                reports += JitRef.StoreReport(name(i), commit, readback)
             }
-            return JitRef.WriteResult(maps.size, ok, failed.joinToString(",").ifEmpty { "all_ok" })
+            return JitRef.SnapshotWrite(want, snap, reports)
         }
 
-        override fun confirmSnapshot(expected: String): Int =
-            maps.count { m -> m[JitRef.KEY_RESTORE] == expected }
+        override fun readRestore(): JitRef.SnapshotRead {
+            val conflicts = mutableListOf<String>()
+            for (key in JitRef.SNAPSHOT_KEYS) {
+                val per = maps.mapIndexedNotNull { i, m ->
+                    if (!m.containsKey(key)) null else name(i) to m[key].toString()
+                }
+                if (per.size > 1 && per.map { it.second }.distinct().size > 1) {
+                    conflicts += "$key(${per.joinToString("/") { "${it.first}=${it.second}" }})"
+                }
+            }
+            val value = readOrder.firstNotNullOfOrNull { i -> maps[i][JitRef.KEY_RESTORE] as? String }
+            return JitRef.SnapshotRead(value, conflicts)
+        }
 
-        override fun remove(key: String): JitRef.WriteResult {
+        override fun remove(key: String, onlyStores: Set<String>?): JitRef.WriteResult {
             var ok = 0
+            var attempted = 0
             val failed = mutableListOf<String>()
             for ((i, m) in maps.withIndex()) {
-                if (i in throwOn) { failed += "s$i:exception"; continue }
-                if (i in commitFails && !writeDespiteFalse) { failed += "s$i:commit_false"; continue }
+                if (onlyStores != null && name(i) !in onlyStores) continue
+                attempted++
+                if (i in throwOn) { failed += "${name(i)}:exception"; continue }
+                if (i in commitFails && !writeDespiteFalse) { failed += "${name(i)}:commit_false"; continue }
                 m.remove(key)
                 ok++
                 ops += "remove:$key:$i"
-                if (i in commitFails) failed += "s$i:commit_false"
             }
-            return JitRef.WriteResult(maps.size, ok, failed.joinToString(",").ifEmpty { "all_ok" })
+            return JitRef.WriteResult(attempted, ok, failed.joinToString(",").ifEmpty { "all_ok" })
         }
 
-        /** Прямая установка значения в указанное хранилище — для подготовки состояния. */
         fun setIn(store: Int, key: String, value: Any?) {
             if (value == null) maps[store].remove(key) else maps[store][key] = value
         }
 
-        /** Прямая установка значения в первое хранилище — для подготовки состояния в тесте. */
         fun set(key: String, value: Any?) = setIn(0, key, value)
     }
 
     // ─────────────────────────── клиентский Wi-Fi ───────────────────────────
 
-    /**
-     * Только клиентский Wi-Fi — точек доступа в интерфейсе больше нет (решение владельца).
-     *
-     * - `wifi` — наблюдаемое состояние; `wifiUnreadable` — чтение бросает исключение;
-     * - `setWifiResult` — что вернул `setWifiEnabled` (`null` = «не удалось/неизвестно»);
-     * - `setWifiThrows` — исключение из `setWifiEnabled`;
-     * - `setWifiApplies` — менять ли `wifi` при успешном `setWifiEnabled(true)`;
-     * - `address` — read-only признак адреса на `wlan0`.
-     */
     class Net(
         var wifi: Boolean = true,
         var wifiUnreadable: Boolean = false,
@@ -135,14 +244,15 @@ object JitFake {
 
     // ─────────────────────────── планировщик ───────────────────────────
 
-    /** Планировщик как `postDelayed`: ничего не выполняет сам, задачи складывает в очередь. */
     class Scheduler : JitRef.JitScheduler {
         val scheduled = mutableListOf<Pair<Long, () -> Unit>>()
-
-        /** `true` — выполнять сразу при планировании (для тестов «как будто 15 с прошли»). */
         var runInline = false
 
+        /** Бросать исключение при планировании (проверка честного `scheduler_failed`). */
+        var failWith: Throwable? = null
+
         override fun postDelayed(delayMs: Long, task: () -> Unit) {
+            failWith?.let { throw it }
             scheduled += delayMs to task
             if (runInline) task()
         }
@@ -158,12 +268,6 @@ object JitFake {
 
     // ─────────────────────────── shell ───────────────────────────
 
-    /**
-     * Транспорт: очередь команд с настраиваемым поведением.
-     *
-     * `runInline` — сколько команд «выполнятся и ответят»; остальные дают `137 / ERR_CHANNEL_LOST`
-     * (ответа нет). `maps` — содержимое `/proc/self/maps` (`null` = прочитать нельзя).
-     */
     class QueueShell(
         var stand: JitIsoStand? = null,
         var getprop: String = "true",
@@ -183,18 +287,12 @@ object JitFake {
                 pending.remove(command)
                 return rc to out
             }
-            return 137 to "ERR_CHANNEL_LOST"
+            return 137 to "ERR_ADB_TIMEOUT"
         }
 
         override fun mapsExcerpt(): String? = maps
-
-        fun getpropAnswers(): Pair<Int, String> = getpropRc to getprop
     }
 
-    /**
-     * Shell, который отвечает на `getprop` значениями из очереди, а на скрипт — «ок».
-     * Нужен для проверки сверки без выполнения цепочки.
-     */
     class AnswerShell(
         private val answers: MutableList<Pair<Int, String>> = mutableListOf(),
         var maps: String? = null,
@@ -212,24 +310,25 @@ object JitFake {
 
         fun queueGetprop(rc: Int, out: String) { answers += rc to out }
 
-        /** Команды, которые не являются чтением `getprop` (то есть изменения устройства). */
         fun scriptCommands(): List<String> = executed.filterNot { it.contains("getprop") }
     }
 
-    /**
-     * Shell, который блокируется внутри `exec`, пока тест не отпустит: нужен, чтобы проверить
-     * гонку «сверка во время клика».
-     */
+    /** Shell, который блокируется внутри `exec`, пока тест не отпустит: гонки и параллельность. */
     class BlockingShell(var maps: String? = null) : JitRef.JitShell {
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
         val calls = AtomicInteger(0)
+        var result: Pair<Int, String> = 0 to "ok"
+
+        /** Действие, выполняемое, пока «команда в транспорте» (для проверки гонок). */
+        var whileBlocked: (() -> Unit)? = null
 
         override fun exec(command: String, timeoutMs: Int): Pair<Int, String> {
             calls.incrementAndGet()
             entered.countDown()
+            whileBlocked?.invoke()
             release.await(5, TimeUnit.SECONDS)
-            return 0 to "ok"
+            return result
         }
 
         override fun mapsExcerpt(): String? = maps

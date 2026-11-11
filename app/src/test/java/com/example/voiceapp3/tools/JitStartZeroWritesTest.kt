@@ -3,6 +3,7 @@ package com.example.voiceapp3.tools
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 import java.io.File
 
@@ -15,6 +16,13 @@ import java.io.File
  * записи, ни одной команды и ни одного сетевого запроса.
  */
 class JitStartZeroWritesTest {
+
+    @Before
+    fun resetJitState() {
+        // Тесты одного JVM не должны наследовать состояние друг друга (слот клика, поколение,
+        // неопределённый исход): иначе порядок классов влияет на результат.
+        JitOp.resetStateForTest()
+    }
 
     @Test
     fun plainStartWritesNothingAndSendsNoCommands() {

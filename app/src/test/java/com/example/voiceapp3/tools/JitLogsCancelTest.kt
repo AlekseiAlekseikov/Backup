@@ -3,6 +3,7 @@ package com.example.voiceapp3.tools
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 import java.io.File
 
@@ -16,6 +17,13 @@ import java.io.File
  */
 class JitLogsCancelTest {
 
+    @Before
+    fun resetJitState() {
+        // Тесты одного JVM не должны наследовать состояние друг друга (слот клика, поколение,
+        // неопределённый исход): иначе порядок классов влияет на результат.
+        JitOp.resetStateForTest()
+    }
+
     private fun stand() = JitIsoStand(rules = 0)
 
     @Test
@@ -28,7 +36,7 @@ class JitLogsCancelTest {
 
         val click = log.first { it.startsWith("JIT_CLICK") }
         assertTrue("состояние — отдельным полем", click.contains("restore=wifi=1"))
-        assertTrue("результат записи виден", click.contains("written=2/2"))
+        assertTrue("результат записи виден", click.contains("attempted=2") && click.contains("committed=2"))
         assertTrue("снимок подтверждён чтением", click.contains("confirmed=2"))
 
         val sent = log.first { it.startsWith("JIT_CHAIN_SENT") }

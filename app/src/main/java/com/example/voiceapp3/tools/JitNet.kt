@@ -9,9 +9,8 @@ import android.net.wifi.WifiManager
  * `WifiManager.isWifiEnabled()` / `setWifiEnabled()`, чтение `/proc/self/maps` текущего процесса,
  * `getprop`, префы проекта.
  *
- * Точки доступа ГУ (`ap0`, `startSoftAp`, `WIFI_AP_STATE_CHANGED`, `wifi_state==14`) в JIT не
- * переносятся по решению владельца (iter36 §2.1) — ни здесь, ни в другом месте. `CarplayMonitor`,
- * `connadaptor_modo` и ConnAdaptor тоже не трогаются.
+ * Точки доступа ГУ (`ap0`, `startSoftAp`, `WIFI_AP_STATE_CHANGED`, `wifi_state==14`), `CarplayMonitor`,
+ * `connadaptor_modo` и ConnAdaptor в JIT не переносятся (решения владельца).
  *
  * Сетевые команды — только внутри цепочки клика и её продолжения после рестарта фреймворка;
  * `ip rule` только читается; `ctl.restart zygote` — единственная команда рестарта.
@@ -45,10 +44,7 @@ object JitNet {
 
         /**
          * `w0/bb`: `BufferedReader(FileInputStream("/proc/self/maps"))` → строки.
-         *
-         * Ошибка чтения ⇒ `null` (в референсе `catchall_67`), и тогда `maps` = `null`, а не
-         * `false`. Разбор (фильтр `jit-cache` + права `\br[-w]x[ps]\b`) — в
-         * [JitRef.cacheExecutableFromMaps], чтобы его можно было проверить тестами.
+         * Ошибка чтения ⇒ `null` (в референсе `catchall_67`).
          */
         override fun mapsExcerpt(): String? = runCatching {
             java.io.File("/proc/self/maps").readText()
@@ -60,20 +56,39 @@ object JitNet {
     /**
      * Префы операции поверх хранилищ проекта (`Prefs2.cps`/`Prefs2.dps`).
      *
-     * Ключи, значения и порядок — как у одного `Editor` референса. Отличие только в том, что
-     * хранилищ два: запись выполняется в КАЖДОЕ независимо, а сводный результат показывает,
-     * сколько попыток удалось (`attempted`/`ok`) — падение первого не отменяет второго. Если
-     * доступно только одно хранилище, результат честно пишется как `1/1`, а не `2/2`.
+     * Ключи и порядок — как у одного `Editor` референса. Отличия (только локально для JIT, общая
+     * семантика `Prefs2` не меняется):
+     *  • запись выполняется в КАЖДОЕ хранилище отдельно и отчитывается по каждому
+     *    (`commit` + readback ВСЕХ трёх ключей);
+     *  • `readRestore()` показывает, что именно увидит продолжение (порядок CPS→DPS, как у
+     *    `getString`) и есть ли конфликт между хранилищами;
+     *  • `remove(key, onlyStores)` не трогает хранилища, куда наша запись не прошла.
      */
-    internal class AndroidStore(private val app: Context) : JitRef.JitStore {
+    internal class AndroidStore(
+        private val cpsProvider: () -> SharedPreferences?,
+        private val dpsProvider: () -> SharedPreferences?
+    ) : JitRef.JitStore {
 
-        private fun cps(): SharedPreferences? = runCatching { Prefs2.cps(app) }.getOrNull()
-        private fun dps(): SharedPreferences? = runCatching { Prefs2.dps(app) }.getOrNull()
+        /**
+         * Боевой конструктор. Провайдеры вынесены в параметры, чтобы ТОТ ЖЕ код можно было
+         * проверить тестами на реалистичном `SharedPreferences` (отдельные память и диск,
+         * «новый процесс»), а не только на фейке хранилища.
+         */
+        constructor(app: Context) : this(
+            { try { Prefs2.cps(app) } catch (t: Throwable) { null } },
+            { try { Prefs2.dps(app) } catch (t: Throwable) { null } }
+        )
 
-        private fun stores(): List<SharedPreferences> = listOfNotNull(cps(), dps()).distinct()
+        private fun cps(): SharedPreferences? = runCatching { cpsProvider() }.getOrNull()
+        private fun dps(): SharedPreferences? = runCatching { dpsProvider() }.getOrNull()
 
-        private fun name(s: SharedPreferences): String =
-            runCatching { s.javaClass.simpleName }.getOrDefault("store")
+        /** Порядок тот же, что в [getString]: CPS первым. `distinct()` — если DPS недоступен. */
+        private fun stores(): List<Pair<String, SharedPreferences>> {
+            val out = ArrayList<Pair<String, SharedPreferences>>(2)
+            cps()?.let { out += "cps" to it }
+            dps()?.let { d -> if (out.none { it.second === d }) out += "dps" to d }
+            return out
+        }
 
         override fun getString(key: String): String? {
             val a = runCatching { cps()?.getString(key, null) }.getOrNull()
@@ -96,71 +111,104 @@ object JitNet {
         }
 
         override fun contains(key: String): Boolean =
-            runCatching { stores().any { it.contains(key) } }.getOrDefault(false)
+            runCatching { stores().any { it.second.contains(key) } }.getOrDefault(false)
 
-        override fun putSnapshot(want: Boolean, snap: JitRef.WifiSnapshot): JitRef.WriteResult {
+        override fun putSnapshot(want: Boolean, snap: JitRef.WifiSnapshot): JitRef.SnapshotWrite {
             val all = stores()
             if (all.isEmpty()) {
-                log("JIT_STORE snapshot saved=false reason=no_store")
-                return JitRef.WriteResult.none("no_store")
+                log("JIT_STORE snapshot attempted=0 reason=no_store")
+                return JitRef.SnapshotWrite(want, snap, emptyList())
             }
-            var ok = 0
-            val detail = StringBuilder()
-            for (s in all) {
-                val n = name(s)
-                val good = runCatching {
-                    s.edit()
-                        .putBoolean(KEY_PEDIDO, want)
-                        .putBoolean(KEY_AUTO, want)
-                        .putString(KEY_RESTORE, snap.wire())
-                        .commit()
-                }.getOrElse { t ->
-                    log("JIT_STORE snapshot store=$n exception=${t.javaClass.simpleName}")
-                    false
+            val reports = ArrayList<JitRef.StoreReport>(all.size)
+            for ((name, s) in all) {
+                var commit = "false"
+                var err: String? = null
+                try {
+                    commit = if (
+                        s.edit()
+                            .putBoolean(KEY_PEDIDO, want)
+                            .putBoolean(KEY_AUTO, want)
+                            .putString(KEY_RESTORE, snap.wire())
+                            .commit()
+                    ) "ok" else "false"
+                } catch (t: Throwable) {
+                    commit = "exception:${t.javaClass.simpleName}"
+                    err = t.message?.take(60)
                 }
-                if (good) ok++ else detail.append(if (detail.isEmpty()) "" else ",").append("$n:commit_false")
+                // readback ВСЕХ трёх ключей: чтение одного Wi-Fi-ключа не доказывает остальных.
+                val readback = runCatching {
+                    val pedidoOk = s.contains(KEY_PEDIDO) && s.getBoolean(KEY_PEDIDO, !want) == want
+                    val autoOk = s.contains(KEY_AUTO) && s.getBoolean(KEY_AUTO, !want) == want
+                    val restoreOk = s.getString(KEY_RESTORE, null) == snap.wire()
+                    pedidoOk && autoOk && restoreOk
+                }.getOrDefault(false)
+                reports += JitRef.StoreReport(name, commit, readback, err)
             }
-            val r = JitRef.WriteResult(all.size, ok, detail.ifEmpty { "all_ok" }.toString())
+            val w = JitRef.SnapshotWrite(want, snap, reports)
             log(
                 "JIT_STORE snapshot keys=$KEY_PEDIDO,$KEY_AUTO,$KEY_RESTORE value=${snap.wire()} " +
-                    "attempted=${r.attempted} ok=${r.ok} detail=${r.detail} " +
-                    "(как j9: один commit на хранилище)"
+                    "attempted=${w.attempted} committed=${w.committed} confirmed=${w.confirmed} " +
+                    "detail=${w.detail} (как j9: один commit на хранилище)"
             )
-            return r
+            return w
         }
 
         /**
-         * Подтверждение снимка ЧТЕНИЕМ: сколько хранилищ реально отдают `KEY_RESTORE == expected`.
+         * Что увидит продолжение: значение по порядку CPS→DPS + конфликты.
          *
-         * Нужно, потому что `commit()==false` не доказывает, что значения нет в файле, а
-         * `commit()==true` не доказывает, что оно доедет до диска при внезапной смерти процесса.
-         * Решение «можно ли выключать Wi-Fi скриптом» принимается по этому чтению, а не по
-         * возвращённому `true`.
+         * Если хранилища расходятся, будущий снимок неоднозначен: при падении CPS повторный старт
+         * прочитал бы DPS, а при живом CPS — CPS. Такой снимок не даёт права выключать Wi-Fi.
          */
-        override fun confirmSnapshot(expected: String): Int = runCatching {
-            stores().count { s -> s.getString(KEY_RESTORE, null) == expected }
-        }.getOrDefault(0)
-
-        override fun remove(key: String): JitRef.WriteResult {
+        override fun readRestore(): JitRef.SnapshotRead {
             val all = stores()
+            if (all.isEmpty()) return JitRef.SnapshotRead(null, emptyList())
+            val values = all.map { (name, s) ->
+                name to runCatching { s.getString(KEY_RESTORE, null) }.getOrNull()
+            }
+            val conflicts = ArrayList<String>()
+            for (key in JitRef.SNAPSHOT_KEYS) {
+                // Конфликт — это ДВА РАЗНЫХ значения. Отсутствие ключа во втором хранилище
+                // конфликтом не является: продолжение прочитает первое, а если первое недоступно —
+                // получит `null`, то есть «снимка нет» (операция просто не выполнится).
+                val perStore = all.mapNotNull { (name, s) ->
+                    runCatching {
+                        when (key) {
+                            KEY_RESTORE -> s.getString(key, null)?.let { name to it }
+                            else -> if (s.contains(key)) name to s.getBoolean(key, false).toString() else null
+                        }
+                    }.getOrNull()
+                }
+                if (perStore.size > 1 && perStore.map { it.second }.distinct().size > 1) {
+                    conflicts += "$key(${perStore.joinToString("/") { "${it.first}=${it.second}" }})"
+                }
+            }
+            val value = values.firstOrNull { it.second != null }?.second
+            val from = values.firstOrNull { it.second != null }?.first ?: "-"
+            if (conflicts.isNotEmpty()) {
+                log("JIT_STORE read_conflict value=$value from=$from conflicts=${conflicts.joinToString(",")}")
+            }
+            return JitRef.SnapshotRead(value, conflicts)
+        }
+
+        override fun remove(key: String, onlyStores: Set<String>?): JitRef.WriteResult {
+            val all = stores().filter { onlyStores == null || it.first in onlyStores }
             if (all.isEmpty()) return JitRef.WriteResult.none("no_store")
             var ok = 0
             val detail = StringBuilder()
-            for (s in all) {
-                val n = name(s)
+            for ((name, s) in all) {
                 val good = runCatching { s.edit().remove(key).commit() }.getOrElse { t ->
-                    log("JIT_STORE remove store=$n exception=${t.javaClass.simpleName}")
+                    log("JIT_STORE remove store=$name exception=${t.javaClass.simpleName}")
                     false
                 }
-                if (good) ok++ else detail.append(if (detail.isEmpty()) "" else ",").append("$n:commit_false")
+                if (good) ok++ else detail.append(if (detail.isEmpty()) "" else ",").append("$name:commit_false")
             }
             val r = JitRef.WriteResult(all.size, ok, detail.ifEmpty { "all_ok" }.toString())
-            log("JIT_STORE remove key=$key attempted=${r.attempted} ok=${r.ok} detail=${r.detail}")
+            log(
+                "JIT_STORE remove key=$key attempted=${r.attempted} ok=${r.ok} detail=${r.detail}" +
+                    (if (onlyStores != null) " only=${onlyStores.joinToString(",")}" else "")
+            )
             return r
         }
-
-        /** Есть ли снимок/намерение — локальная проверка без shell. */
-        fun has(key: String): Boolean = contains(key)
     }
 
     // ─────────────────────────── состояние клиентского Wi-Fi ───────────────────────────
@@ -168,9 +216,7 @@ object JitNet {
     /**
      * Только клиентский Wi-Fi: `isWifiEnabled`, `setWifiEnabled` и read-only признак адреса.
      *
-     * `wifiOn()` возвращает `null`, если прочитать нельзя: трактовка вынесена в [JitOp], чтобы
-     * правило было видно в одном месте (`j9` считал `false`; здесь неизвестное — повод НЕ выключать
-     * Wi-Fi скриптом).
+     * `wifiOn()` возвращает `null`, если прочитать нельзя: трактовка вынесена в [JitOp].
      */
     internal class AndroidNetState(private val app: Context) : JitRef.JitNetState {
 
@@ -183,8 +229,8 @@ object JitNet {
             runCatching { wm()?.setWifiEnabled(on) }.getOrNull()
 
         /**
-         * Read-only: у `wlan0` есть не-loopback адрес. Это признак подключения к точке доступа, но
-         * НЕ доказательство работающего интернета (маршруты/DNS/TTL не проверяются и не меняются).
+         * Read-only: у `wlan0` есть не-loopback адрес. Признак подключения к точке доступа, но НЕ
+         * доказательство работающего интернета (маршруты/DNS/TTL не проверяются и не меняются).
          * SSID/пароли не читаются и не сохраняются.
          */
         override fun wifiAddress(): Boolean? = runCatching {
@@ -238,4 +284,44 @@ object JitNet {
 
     /** Есть ли незавершённое намерение — дешёвая локальная проверка, без shell. */
     fun hasPendingPedido(app: Context): Boolean = AndroidStore(app).contains(KEY_PEDIDO)
+
+    // ─────────────────────────── одноразовая read-only диагностика монтирований ───────────────────────────
+
+    /** Процессный флаг: попытка сбора была (не чаще одной за процесс). */
+    private val mountDiagAttempted = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /**
+     * Одноразовый **read-only** сбор данных о монтированиях в датированный лог приложения.
+     *
+     * Требования, которые здесь соблюдены: запуск в фоне (не UI-поток), не чаще одной попытки за
+     * процесс, без ожидания готовности канала в рабочем потоке, без кнопок и без связи с кликом JIT,
+     * без записи в систему. Транспорт — тот же [AndroidShell], что и у JIT-цепочки, поэтому данные
+     * относятся к тому же каналу и правам.
+     */
+    fun requestMountDiagOnce(app: Context, source: String, delayMs: Long = 0L) {
+        if (!markMountDiagAttempted()) return
+        val task: () -> Unit = {
+            BgWorker.assertNotMain("JitNet.requestMountDiagOnce")
+            if (!runCatching { AdbClient.isChannelReady() }.getOrDefault(false)) {
+                AppLog.i(TAG, "JIT_MOUNT_DIAG source=$source status=root_unavailable action=none " +
+                    "(канал не готов на момент единственной попытки; повторов и ожидания в потоке нет)")
+            } else {
+                runCatching { JitMountDiag.collect(AndroidShell, log, source) }
+                    .onFailure { t ->
+                        AppLog.i(TAG, "JIT_MOUNT_DIAG source=$source status=unknown " +
+                            "reason=${t.javaClass.simpleName}")
+                    }
+            }
+        }
+        if (delayMs > 0) BgWorker.postDelayed("JitNet.mountDiag", delayMs, task)
+        else BgWorker.post("JitNet.mountDiag", task)
+    }
+
+    /** Занять единственную попытку сбора в этом процессе (одноразовый флаг, без повторов). */
+    internal fun markMountDiagAttempted(): Boolean = mountDiagAttempted.compareAndSet(false, true)
+
+    /** Только для тестов: сбросить процессный флаг одноразового сбора. */
+    internal fun resetMountDiagForTest() {
+        mountDiagAttempted.set(false)
+    }
 }

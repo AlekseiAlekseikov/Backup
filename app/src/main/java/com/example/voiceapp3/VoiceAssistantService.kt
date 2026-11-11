@@ -266,6 +266,12 @@ class VoiceAssistantService : Service() {
         // ставим сверку: иначе первый же `getprop` уходит в неподнятую авторизацию и даёт
         // ложный пустой ответ. Порядок по-прежнему ВЫШЕ проверки EXTRA_BOOT_RESTORE (:352).
         runCatching { com.example.voiceapp3.tools.AdbClient.attachContext(this) }
+        // iter37 §5: одноразовый read-only сбор данных о монтированиях в датированный лог —
+        // чтобы владельцу не вводить команды вручную. Не чаще одной попытки за процесс, в фоне,
+        // без ожидания канала в рабочем потоке, без кнопок и без связи с кликом JIT.
+        runCatching {
+            com.example.voiceapp3.tools.JitNet.requestMountDiagOnce(applicationContext, "service.onCreate", 20_000L)
+        }
         // iter33e A2: сверка «JIT после перезапуска zygote». Вызывается на КАЖДОМ старте.
         runCatching { AppPerformance.checkPendingZygoteVerify(this, "onCreate") }
         registerKeyReceiver()

@@ -2120,6 +2120,12 @@ object AdbClient {
         }
     }
 
+    /**
+     * Неблокирующая проверка готовности канала (для одноразовой read-only диагностики:
+     * ждать в рабочем потоке запрещено, а честный статус `root_unavailable` нужен).
+     */
+    fun isChannelReady(): Boolean = ready
+
     /** Дождаться готовности канала (вызывающий поток блокируется до ready). */
     fun awaitReady(timeoutMs: Long = 15000): Boolean {
         start()

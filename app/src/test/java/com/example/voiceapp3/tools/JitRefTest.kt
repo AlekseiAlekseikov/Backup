@@ -319,8 +319,10 @@ class JitRefTest {
     fun adapterIsIndependentStoresAndRealRemove() {
         val net = codeNoComments("src/main/java/com/example/voiceapp3/tools/JitNet.kt")
         assertTrue("удаление ключа настоящим remove", net.contains(".remove(key)"))
-        assertTrue("каждое хранилище пишется отдельно", net.contains("for (s in all)"))
-        assertTrue("снимок подтверждается чтением", net.contains("override fun confirmSnapshot"))
+        assertTrue("каждое хранилище пишется отдельно", net.contains("for ((name, s) in all)"))
+        assertTrue("снимок подтверждается readback всех трёх ключей",
+            net.contains("override fun putSnapshot") && net.contains("pedidoOk && autoOk && restoreOk"))
+        assertTrue("будущее чтение считается по факту", net.contains("override fun readRestore"))
         assertFalse("адаптер не выключает Wi-Fi", net.contains("setWifi(false"))
         assertFalse("адаптер не трогает маршруты", net.contains("ip rule del"))
         assertTrue("карта памяти читается, а не выдумывается", net.contains("/proc/self/maps"))
