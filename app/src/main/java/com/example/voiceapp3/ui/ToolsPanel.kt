@@ -29,6 +29,7 @@ import android.widget.Toast
 import com.example.voiceapp3.R
 import com.example.voiceapp3.nav.NavTheme
 import com.example.voiceapp3.tools.AppPerformance
+import com.example.voiceapp3.tools.BgWorker
 import com.example.voiceapp3.tools.JitRef
 import com.google.gson.JsonArray
 import com.google.gson.JsonObject
@@ -75,6 +76,18 @@ class ToolsPanel(
     /** Результат последнего действия (как TOOLS.last). */
     private var last: JsonObject? = null
     private val sliderPending = HashMap<String, Runnable>()
+
+    /**
+     * Тумблер JIT и его обработчик клика.
+     *
+     * Нужен, чтобы после фонового чтения `getprop` (как `toggle.setActive(getprop)` в `w0/r7`)
+     * программно переставить положение тумблера, НЕ запуская обработчик пользовательского клика:
+     * на время установки слушатель снимается, затем возвращается.
+     */
+    private var jitSwitch: Switch? = null
+    private var jitSwitchListener: ((Boolean) -> Unit)? = null
+    private var jitTitleView: TextView? = null
+    private var jitTitleText: String = ""
 
     init {
         view.visibility = View.GONE
@@ -962,7 +975,11 @@ class ToolsPanel(
         // iter33p §0.0(5): у JIT тумблер показывает ПОДТВЕРЖДЁННЫЙ факт (`on`/`off`), а при
         // недоступном property — `unknown` с явной пометкой, а не ложное «выключено».
         val jitConfirmed = if (key == "perfJit") strState("perfJitConfirmed") else null
-        val on = if (key == "perfJit" && jitConfirmed != "on") false else (boolState(key) ?: def)
+        // Положение тумблера JIT = ПОДТВЕРЖДЁННЫЙ факт getprop (`on`/`off`), как
+        // `toggle.setActive(getprop)` в `w0/r7`; preference участвует только когда факта нет
+        // (`unknown`) — и тогда это видно по подписи «состояние неизвестно».
+        val on = if (key != "perfJit") (boolState(key) ?: def)
+                 else JitRef.switchPosition(jitConfirmed ?: "unknown", boolState(key) ?: def)
         val row = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -971,21 +988,29 @@ class ToolsPanel(
         val info = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
         val titleText = if (key == "perfJit" && jitConfirmed == "unknown") "$title · состояние неизвестно"
                         else title
-        info.addView(text(titleText, 14.5f, palette.ink, bold = true))
+        val titleView = text(titleText, 14.5f, palette.ink, bold = true)
+        info.addView(titleView)
         descKey?.let { ToolsCatalog.TEXT[it] }?.let { info.addView(text(it, 12f, palette.muted, bold = false)) }
         addNote(info, key)
         row.addView(info, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        val userClick: (Boolean) -> Unit = { checked ->
+            state.addProperty(key, checked)
+            send("settings.change", JsonObject().apply {
+                addProperty("key", key)
+                addProperty("value", checked)
+            }.toString())
+            toast("$title · ${if (checked) "вкл" else "выкл"}")
+        }
         val sw = Switch(activity).apply {
             isChecked = on
             // Слушатель ставим после начального значения: программная установка не шлёт запись.
-            setOnCheckedChangeListener { _, checked ->
-                state.addProperty(key, checked)
-                send("settings.change", JsonObject().apply {
-                    addProperty("key", key)
-                    addProperty("value", checked)
-                }.toString())
-                toast("$title · ${if (checked) "вкл" else "выкл"}")
-            }
+            setOnCheckedChangeListener { _, checked -> userClick(checked) }
+        }
+        if (key == "perfJit") {
+            jitSwitch = sw
+            jitSwitchListener = userClick
+            jitTitleView = titleView
+            jitTitleText = title
         }
         row.addView(sw, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
         page.addView(row, matchWrap())
@@ -1138,14 +1163,39 @@ class ToolsPanel(
         val fact = runCatching { AppPerformance.jitRuntimeFactCached() }.getOrNull()
         val view = text(jitRuntimeLineText(fact), 11.5f, palette.muted, bold = false)
         page.addView(view, matchWrap())
+        // 1. Сверка `w0/bb`+`w0/r7` — то же, что делает открытие настроек в референсе (`S0`→`bb`).
+        //    Она снимает `jit_pedido`, если намерение было; без намерения — ничего и не шлёт.
+        runCatching { BgWorker.post("ToolsPanel.jitVerify") { runCatching { AppPerformance.verifyJitOnly(activity) } } }
+        // 2. Факт `getprop` (read-only) и обновление И строки, И тумблера на главном потоке.
         runCatching {
             AppPerformance.refreshJitRuntimeAsync(activity) { fresh ->
                 handler.post {
-                    runCatching { view.text = jitRuntimeLineText(fresh) }
+                    runCatching {
+                        view.text = jitRuntimeLineText(fresh)
+                        applyJitFact(fresh)
+                    }
                     Unit
                 }
             }
         }
+    }
+
+    /**
+     * Программно приводит тумблер JIT к подтверждённому факту — БЕЗ вызова обработчика клика.
+     *
+     * `unknown` не выдаётся за факт: положение остаётся прежним (preference), а подпись прямо
+     * говорит «состояние неизвестно». Новых кнопок/подтверждений здесь нет.
+     */
+    private fun applyJitFact(fact: JitRef.PropFact?) {
+        val sw = jitSwitch ?: return
+        val stateNow = JitRef.confirmedState(fact)
+        jitTitleView?.text = if (stateNow == "unknown") "$jitTitleText · состояние неизвестно"
+                            else jitTitleText
+        val want = JitRef.switchUpdate(sw.isChecked, stateNow) ?: return
+        val listener = jitSwitchListener
+        sw.setOnCheckedChangeListener(null)   // программное обновление не пишет настройку
+        sw.isChecked = want
+        if (listener != null) sw.setOnCheckedChangeListener { _, checked -> listener(checked) }
     }
 
     private fun jitRuntimeLineText(fact: JitRef.PropFact?): String {

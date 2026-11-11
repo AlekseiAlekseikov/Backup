@@ -24,7 +24,7 @@ class JitLogsCancelTest {
         val net = JitFake.Net(wifi = true, ap = false)
         val log = mutableListOf<String>()
         JitOp.click(store, net, JitFake.QueueShell(stand()).apply { runInline = 1 },
-            want = true, waiter = JitFake.Waiter(), log = { log += it })
+            want = true, log = { log += it })
 
         val click = log.first { it.startsWith("JIT_CLICK") }
         assertTrue("состояние — отдельным полем", click.contains("net=wifi=1,ap=0"))
@@ -44,7 +44,7 @@ class JitLogsCancelTest {
         val store = JitFake.Store()
         val net = JitFake.Net(wifi = true, ap = false)
         val log = mutableListOf<String>()
-        JitOp.click(store, net, JitFake.QueueShell(stand()), true, JitFake.Waiter(), log = { log += it })
+        JitOp.click(store, net, JitFake.QueueShell(stand()), true, log = { log += it })
         assertTrue(log.any { it.startsWith("JIT_CHAIN_RETURN") && it.contains("outcome=channel_lost") })
         assertTrue(log.any { it.startsWith("JIT_CHAIN_ERROR") })
         assertTrue("нет выдачи за успех", log.none { it.contains("result=ok") })
@@ -52,9 +52,8 @@ class JitLogsCancelTest {
 
     @Test
     fun unreadablePropertyIsLoggedAsUnknown() {
-        val store = JitFake.Store()
-        store.values[JitRef.KEY_PEDIDO] = true
-        val shell = JitFake.QueueShell(stand()).apply { getpropRc = 1 }
+        val store = JitFake.Store().apply { set(JitRef.KEY_PEDIDO, true) }
+        val shell = JitFake.AnswerShell().apply { default = 1 to "" }
         val log = mutableListOf<String>()
         JitOp.verifyApplied(store, shell, log = { log += it })
         assertTrue(log.any { it.startsWith("JIT pedido=") && it.contains("result=unknown") })
@@ -63,10 +62,9 @@ class JitLogsCancelTest {
 
     @Test
     fun restoreOnlyTurnsNetworkOn() {
-        val store = JitFake.Store()
-        store.values[JitRef.KEY_RESTORE] = "wifi=1,ap=1"
-        val net = JitFake.Net(wifi = false, ap = false)
-        JitOp.onProcessStart(store, net, JitFake.Waiter())
+        val store = JitFake.Store().apply { set(JitRef.KEY_RESTORE, "wifi=1,ap=1") }
+        val net = JitFake.Net(wifi = false, ap = false, apAppliesAfterReads = 1)
+        JitOp.onProcessStart(store, net, JitFake.Waiter(), JitFake.Scheduler().apply { runInline = true })
         assertEquals("ровно два запроса и оба включающие", listOf("ap=start", "wifi=true"), net.requests)
         assertTrue(net.requests.none { it.contains("false") })
     }

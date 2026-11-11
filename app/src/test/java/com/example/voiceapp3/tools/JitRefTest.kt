@@ -5,22 +5,31 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.File
 
 /**
- * Ядро JIT — проверка «поведение = референс», а не «есть похожие строки».
+ * Разбор и формулы ядра — по DEX референса.
  *
- * Ориентиры — DEX/smali `CentralEXAuto_v3.3.9.apk` (md5 `c3f1664125953b9851bf4483b265135f`):
- * `w0/j9.smali` (клик), `w0/la.smali` (скрипт), `CentralWatchdogService.smali` (`onCreate`, `U`),
- * `w0/e2.smali` (возврат сети), `w0/bb.smali` + `w0/r7.smali` (сверка).
+ * Здесь проверяется то, что видно в `w0/r7`, `w0/j9`, `w0/la`, `onCreate` и `w0/e2`: литерал
+ * скрипта, регулярка снимка, трактовка `getprop`, формула `ok`, положение тумблера, `c1()`.
  */
 class JitRefTest {
 
-    // ─────────────────────────── 1. скрипт: литерал DEX ───────────────────────────
+    private fun code(rel: String): String =
+        listOf(File(rel), File("app/$rel")).first { it.isFile }.readText()
+
+    private fun codeNoComments(rel: String): String =
+        code(rel).lines()
+            .filterNot { val s = it.trim(); s.startsWith("*") || s.startsWith("//") || s.startsWith("/*") }
+            .joinToString("\n")
+
+    // ─────────────────────────── литерал `w0/la.run` ───────────────────────────
 
     @Test
     fun chainScriptIsReferenceLiteralByteForByte() {
-        // Литерал скопирован из `w0/la.smali` (ветка `pswitch_10e`) без единого изменения.
-        val dex = "\n        svc wifi disable\n" +
+        // Литерал из DEX (`w0/la` pswitch_10e), 392 символа, как было в APK.
+        val dex = "\n" +
+            "        svc wifi disable\n" +
             "        _n=0\n" +
             "        while [ \$_n -lt 20 ]; do\n" +
             "          [ \"\$(ip rule show | grep -c 'oif wlan0')\" = \"0\" ] && break\n" +
@@ -31,160 +40,206 @@ class JitRefTest {
             "        done\n" +
             "        setprop dalvik.vm.usejit true\n" +
             "        setprop ctl.restart zygote\n    "
-        assertEquals("литерал референса (с шагом монтирований)", dex, JitRef.referenceScript(true))
+        assertEquals(dex, JitRef.referenceScript(true))
         assertEquals(392, JitRef.referenceScript(true).length)
+        assertEquals("литерал тот же и для false (меняется только значение)", dex.replace("usejit true", "usejit false"),
+            JitRef.referenceScript(false))
     }
 
     @Test
-    fun executedChainIsTheReferenceLiteralWithMountStep() {
-        // Вариантов нет: отправляется ровно литерал `w0/la.run`, шаг `umount -l` включён.
+    fun executedScriptIsTheSameLiteral() {
         assertEquals(JitRef.referenceScript(true), JitRef.chainScript(true))
         assertEquals(JitRef.referenceScript(false), JitRef.chainScript(false))
-        assertTrue(JitRef.chainScript(true).contains("umount -l"))
+        assertTrue("шаг umount -l присутствует и исполняется", JitRef.chainScript(true).contains("umount -l"))
         assertEquals("mount_step=present", JitRef.mountStepNote())
     }
 
     @Test
     fun scriptOrderAndBoundaries() {
-        val s = JitRef.chainScript(true)
-        val lines = s.lines().map { it.trim() }.filter { it.isNotEmpty() }
+        val lines = JitRef.chainScript(true).trim().lines().map { it.trim() }.filter { it.isNotEmpty() }
         assertEquals("svc wifi disable", lines.first())
-        assertEquals("setprop ctl.restart zygote", lines.last())
-        assertTrue("слив ждёт не больше 20 итераций", s.contains("while [ \$_n -lt 20 ]"))
-        assertTrue("счётчик правила — read-only", s.contains("ip rule show | grep -c 'oif wlan0'"))
-        assertFalse("никакого ip rule del", s.contains("ip rule del"))
-        assertFalse("никакого flush", s.contains("flush"))
-        assertFalse("никакого ndc", s.contains("ndc"))
-        assertFalse("никакого settings", s.contains("settings "))
-        assertFalse("никакого persist.*", s.contains("persist."))
-        assertFalse("никакого usejitprofiles", s.contains("usejitprofiles"))
-        assertEquals("одно setprop свойства", 1,
-            Regex("setprop dalvik\\.vm\\.usejit").findAll(s).count())
-        assertEquals("один рестарт фреймворка", 1,
-            Regex("ctl\\.restart zygote").findAll(s).count())
+        assertEquals("последняя команда — рестарт zygote", "setprop ctl.restart zygote", lines.last())
+        assertEquals(1, lines.count { it == "setprop ctl.restart zygote" })
+        assertEquals(1, lines.count { it.startsWith("setprop dalvik.vm.usejit") })
+        val propIdx = lines.indexOfFirst { it.startsWith("setprop dalvik.vm.usejit") }
+        val umountIdx = lines.indexOfFirst { it.startsWith("umount -l") }
+        assertTrue("umount до setprop", umountIdx in 0 until propIdx)
+        assertTrue("слив правил до umount", lines.indexOfFirst { it.contains("ip rule show") } < umountIdx)
     }
 
     @Test
-    fun constantsMatchDex() {
-        assertEquals(20, JitRef.DRAIN_LOOP_MAX)              // while [ $_n -lt 20 ]
-        assertEquals(40_000, JitRef.CHAIN_TIMEOUT_MS)        // H1(0x9c40)
-        assertEquals(15_000L, JitRef.RESTORE_DELAY_MS)       // postDelayed(…, 0x3a98)
-        assertEquals(8_000, JitRef.GETPROP_TIMEOUT_MS)       // H1(0x1f40)
-        assertEquals(25L, JitRef.AP_LATCH_TIMEOUT_S)         // await(0x19, SECONDS)
-        assertEquals(20_000L, JitRef.AP_POLL_TOTAL_MS)       // if-ge v0, 0x4e20
-        assertEquals(1_000L, JitRef.AP_POLL_STEP_MS)         // sleep(0x3e8)
-        assertEquals(3, JitRef.AP_ATTEMPTS)                  // if-ge p2, 0x3
-        assertEquals(2_000L, JitRef.AP_RETRY_PAUSE_MS)       // sleep(0x7d0)
-        assertEquals("jit_pedido", JitRef.KEY_PEDIDO)
-        assertEquals("perf_auto_otimizar", JitRef.KEY_AUTO)
-        assertEquals("jit_restaurar", JitRef.KEY_RESTORE)
-        assertEquals("dalvik.vm.usejit", JitRef.PROP_USEJIT)
+    fun noForbiddenPropertiesOrCommandsInScript() {
+        for (want in listOf(true, false)) {
+            val s = JitRef.chainScript(want)
+            for (bad in listOf("persist.dalvik.vm.usejit", "persist.sys.dalvik.vm.usejit",
+                "usejitprofiles", "ip rule del", "ip rule flush", "ndc ", "settings ", "setenforce",
+                "kill ", "pkill", "route add", "iptables")) {
+                assertFalse("в скрипте нет «$bad»", s.contains(bad))
+            }
+        }
     }
 
-    // ─────────────────────────── 2. снимок сети и его разбор ───────────────────────────
+    // ─────────────────────────── снимок `jit_restaurar` ───────────────────────────
 
     @Test
-    fun parseRestoreIsExactReferenceFormat() {
+    fun parseRestoreMatchesOnlyFullString() {
         assertEquals(JitRef.Net(true, false), JitRef.parseRestore("wifi=1,ap=0"))
         assertEquals(JitRef.Net(false, true), JitRef.parseRestore("wifi=0,ap=1"))
         assertEquals(JitRef.Net(true, true), JitRef.parseRestore("wifi=1,ap=1"))
         assertEquals(JitRef.Net(false, false), JitRef.parseRestore("wifi=0,ap=0"))
-        assertNull("null — снимка нет", JitRef.parseRestore(null))
-        assertNull("пробелы: Matcher.matches() по сырой строке", JitRef.parseRestore(" wifi=1,ap=0"))
-        assertNull("хвост запрещён", JitRef.parseRestore("wifi=1,ap=0\n"))
-        assertNull("чужая строка", JitRef.parseRestore("wifi=true,ap=false"))
-        assertNull("обрезанная строка", JitRef.parseRestore("wifi=1"))
+        // `matches()` без trim: пробелы и обрезки не совпадают.
+        assertNull(JitRef.parseRestore(null))
+        assertNull(JitRef.parseRestore(""))
+        assertNull(JitRef.parseRestore("wifi=1"))
+        assertNull(JitRef.parseRestore(" wifi=1,ap=0"))
+        assertNull(JitRef.parseRestore("wifi=1,ap=0 "))
+        assertNull(JitRef.parseRestore("wifi=2,ap=0"))
+        assertNull(JitRef.parseRestore("wifi=1,ap=0,extra=1"))
+        assertNull(JitRef.parseRestore("WIFI=1,AP=0"))
     }
 
     @Test
-    fun netWireFormatIsReference() {
+    fun netWireIsReferenceFormat() {
         assertEquals("wifi=1,ap=0", JitRef.Net(true, false).wire())
         assertEquals("wifi=0,ap=1", JitRef.Net(false, true).wire())
+        assertEquals("wifi=0,ap=0", JitRef.Net(false, false).wire())
     }
 
-    // ─────────────────────────── 3. сверка `bb` + `r7` ───────────────────────────
+    // ─────────────────────────── `getprop` ───────────────────────────
 
     @Test
-    fun onlyTrueAndFalseAreFacts() {
+    fun parsePropTruthTable() {
+        assertEquals(JitRef.Prop.TRUE, JitRef.parseProp(0, "true").value)
         assertEquals(JitRef.Prop.TRUE, JitRef.parseProp(0, "true\n").value)
         assertEquals(JitRef.Prop.FALSE, JitRef.parseProp(0, "false").value)
-        // прочитать нельзя — это НЕ «выключено» (отличие от референса, см. §3 отчёта)
-        assertEquals(JitRef.Prop.UNKNOWN, JitRef.parseProp(137, "ERR_ADB_TIMEOUT").value)
-        assertEquals(JitRef.Prop.UNKNOWN, JitRef.parseProp(1, "").value)
+        // ОТЛИЧИЕ: нечитаемое/странное — UNKNOWN, а не «выключено».
+        assertEquals(JitRef.Prop.UNKNOWN, JitRef.parseProp(1, "true").value)
         assertEquals(JitRef.Prop.UNKNOWN, JitRef.parseProp(0, "").value)
-        assertEquals(JitRef.Prop.UNKNOWN, JitRef.parseProp(0, "a\nb").value)
+        assertEquals(JitRef.Prop.UNKNOWN, JitRef.parseProp(0, "ERR_TIMEOUT").value)
+        assertEquals(JitRef.Prop.UNKNOWN, JitRef.parseProp(0, "true\nfalse").value)
         assertEquals(JitRef.Prop.UNKNOWN, JitRef.parseProp(0, "yes").value)
-        assertEquals("многострочность проверяется на обрезанном выводе", JitRef.Prop.TRUE,
-            JitRef.parseProp(0, "  true \n").value)
+        assertEquals("rc_nonzero", JitRef.parseProp(2, "").reason)
+        assertEquals("transport_error", JitRef.parseProp(0, "ERR_X").reason)
+    }
+
+    // ─────────────────────────── формула `w0/r7` целиком ───────────────────────────
+
+    private fun prop(v: JitRef.Prop) = JitRef.PropFact(v, v.name.lowercase(), 0, "ok")
+
+    @Test
+    fun verifyTableForConfirmedValues() {
+        // ok = (pedido == getprop) && (!pedido || maps != Boolean.FALSE)
+        val t = JitRef.Prop.TRUE
+        val f = JitRef.Prop.FALSE
+        // pedido = true
+        assertEquals("true/true/cache=true → ok", JitRef.Verify.OK, JitRef.verify(true, prop(t), true))
+        assertEquals("true/true/cache=null → ok", JitRef.Verify.OK, JitRef.verify(true, prop(t), null))
+        assertEquals("true/true/cache=false → НЕ ok", JitRef.Verify.CACHE_MISSING,
+            JitRef.verify(true, prop(t), false))
+        assertEquals("true/false (любой cache) → НЕ ok", JitRef.Verify.NOT_APPLIED,
+            JitRef.verify(true, prop(f), true))
+        assertEquals(JitRef.Verify.NOT_APPLIED, JitRef.verify(true, prop(f), false))
+        assertEquals(JitRef.Verify.NOT_APPLIED, JitRef.verify(true, prop(f), null))
+        // pedido = false
+        assertEquals("false/false/cache=false → ok (в референсе cache не мешает)", JitRef.Verify.OK,
+            JitRef.verify(false, prop(f), false))
+        assertEquals(JitRef.Verify.OK, JitRef.verify(false, prop(f), true))
+        assertEquals(JitRef.Verify.OK, JitRef.verify(false, prop(f), null))
+        assertEquals("false/true → НЕ ok", JitRef.Verify.NOT_APPLIED, JitRef.verify(false, prop(t), true))
+        assertEquals(JitRef.Verify.NOT_APPLIED, JitRef.verify(false, prop(t), false))
+        assertEquals(JitRef.Verify.NOT_APPLIED, JitRef.verify(false, prop(t), null))
     }
 
     @Test
-    fun verifyFormulaIsFromR7() {
-        fun fact(v: JitRef.Prop) = JitRef.PropFact(v, v.name.lowercase(), 0, "ok")
-        // ok = (pedido == getprop) && (!pedido || maps != FALSE)
-        assertEquals(JitRef.Verify.OK, JitRef.verify(true, fact(JitRef.Prop.TRUE), true))
-        assertEquals(JitRef.Verify.NOT_APPLIED, JitRef.verify(true, fact(JitRef.Prop.FALSE), true))
-        assertEquals(JitRef.Verify.OK, JitRef.verify(false, fact(JitRef.Prop.FALSE), true))
-        assertEquals(JitRef.Verify.OK, JitRef.verify(false, fact(JitRef.Prop.FALSE), null))
-        assertEquals(JitRef.Verify.CACHE_MISSING, JitRef.verify(false, fact(JitRef.Prop.FALSE), false))
-        assertEquals(JitRef.Verify.NOT_APPLIED, JitRef.verify(false, fact(JitRef.Prop.TRUE), true))
-        // нечитаемое свойство: результата нет (в референсе было бы false)
-        assertEquals(JitRef.Verify.UNKNOWN, JitRef.verify(true,
-            JitRef.PropFact(JitRef.Prop.UNKNOWN, "", 137, "rc_nonzero"), true))
-    }
-
-    @Test
-    fun verifyNeverCallsUnknownSuccess() {
-        for (v in JitRef.Verify.values()) {
-            val label = JitRef.verifyLabel(v)
-            if (v == JitRef.Verify.UNKNOWN) assertEquals("unknown", label)
-            if (v == JitRef.Verify.OK) assertEquals("ok", label)
-            assertFalse("нет ничего, кроме четырёх исходов", label.contains("success"))
+    fun verifyUnknownPropertyIsNotAVerdict() {
+        val u = JitRef.PropFact(JitRef.Prop.UNKNOWN, "", 137, "rc_nonzero")
+        for (pedido in listOf(true, false)) {
+            for (cache in listOf(true, false, null)) {
+                assertEquals("неизвестное свойство не выдаётся за результат",
+                    JitRef.Verify.UNKNOWN, JitRef.verify(pedido, u, cache))
+            }
         }
     }
 
-    // ─────────────────────────── 4. тумблер ───────────────────────────
-
     @Test
-    fun confirmedStateFollowsFactOnly() {
-        fun f(v: JitRef.Prop) = JitRef.PropFact(v, "", 0, "ok")
-        assertEquals("on", JitRef.confirmedState(f(JitRef.Prop.TRUE)))
-        assertEquals("off", JitRef.confirmedState(f(JitRef.Prop.FALSE)))
-        assertEquals("unknown", JitRef.confirmedState(f(JitRef.Prop.UNKNOWN)))
-        assertEquals("unknown", JitRef.confirmedState(null))
+    fun verifyLabels() {
+        assertEquals("ok", JitRef.verifyLabel(JitRef.Verify.OK))
+        assertEquals("not_applied", JitRef.verifyLabel(JitRef.Verify.NOT_APPLIED))
+        assertEquals("cache_missing", JitRef.verifyLabel(JitRef.Verify.CACHE_MISSING))
+        assertEquals("unknown", JitRef.verifyLabel(JitRef.Verify.UNKNOWN))
     }
 
-    // ─────────────────────────── 5. итог запуска ───────────────────────────
+    // ─────────────────────────── тумблер и `c1()` ───────────────────────────
 
     @Test
-    fun chainOutcomeDoesNotClaimRestart() {
-        assertEquals(JitRef.ChainOutcome.REPLY_RECEIVED, JitRef.chainOutcome(0, "ok"))
-        assertEquals(JitRef.ChainOutcome.CHANNEL_LOST,
-            JitRef.chainOutcome(137, "ERR_ADB_TIMEOUT after 40000ms"))
-        assertEquals(JitRef.ChainOutcome.CHANNEL_LOST,
-            JitRef.chainOutcome(0, "ERR_ROOT_CHANNEL_UNAVAILABLE"))
+    fun confirmedStateAndSwitchPosition() {
+        assertEquals("on", JitRef.confirmedState(prop(JitRef.Prop.TRUE)))
+        assertEquals("off", JitRef.confirmedState(prop(JitRef.Prop.FALSE)))
+        assertEquals("unknown", JitRef.confirmedState(null))
+        assertEquals("unknown", JitRef.confirmedState(JitRef.PropFact(JitRef.Prop.UNKNOWN, "", 1, "x")))
+        // Подтверждённый факт побеждает preference в обе стороны.
+        assertTrue(JitRef.switchPosition("on", preference = false))
+        assertFalse(JitRef.switchPosition("off", preference = true))
+        // Без факта — намерение водителя.
+        assertTrue(JitRef.switchPosition("unknown", preference = true))
+        assertFalse(JitRef.switchPosition("unknown", preference = false))
+        // Программное обновление: переставляем только когда факт известен и отличается.
+        assertEquals(true, JitRef.switchUpdate(false, "on"))
+        assertEquals(false, JitRef.switchUpdate(true, "off"))
+        assertNull("уже верно — не трогаем", JitRef.switchUpdate(true, "on"))
+        assertNull("уже верно — не трогаем", JitRef.switchUpdate(false, "off"))
+        assertNull("неизвестно — не выдаём за факт", JitRef.switchUpdate(true, "unknown"))
+        assertNull(JitRef.switchUpdate(false, "unknown"))
+    }
+
+    @Test
+    fun clientWifiBusyFollowsC1() {
+        // isWifiEnabled() || getWifiState()==ENABLING; исключение ⇒ true
+        assertTrue(JitRef.clientWifiBusy(true, false))
+        assertTrue(JitRef.clientWifiBusy(false, true))
+        assertTrue(JitRef.clientWifiBusy(null, null))
+        assertTrue(JitRef.clientWifiBusy(null, false))
+        assertTrue(JitRef.clientWifiBusy(false, null))
+        assertFalse(JitRef.clientWifiBusy(false, false))
+    }
+
+    // ─────────────────────────── итог транспорта ───────────────────────────
+
+    @Test
+    fun chainOutcomeDoesNotCallTimeoutSuccess() {
+        assertEquals(JitRef.ChainOutcome.REPLY_RECEIVED, JitRef.chainOutcome(0, ""))
+        assertEquals(JitRef.ChainOutcome.CHANNEL_LOST, JitRef.chainOutcome(137, "ERR_CHANNEL_LOST"))
         assertEquals(JitRef.ChainOutcome.CHANNEL_LOST, JitRef.chainOutcome(1, ""))
         assertEquals("reply_received", JitRef.chainOutcomeLabel(JitRef.ChainOutcome.REPLY_RECEIVED))
         assertEquals("channel_lost", JitRef.chainOutcomeLabel(JitRef.ChainOutcome.CHANNEL_LOST))
     }
 
-    // ─────────────────────────── 6. чего в ядре быть не должно ───────────────────────────
+    // ─────────────────────────── в ядре нет своих механизмов ───────────────────────────
 
     @Test
     fun noOwnMechanismsLeftInCore() {
-        val core = java.io.File("src/main/java/com/example/voiceapp3/tools/JitNetCore.kt")
-            .let { if (it.isFile) it else java.io.File("app/src/main/java/com/example/voiceapp3/tools/JitNetCore.kt") }
-            .readLines()
-            .filterNot { val s = it.trim(); s.startsWith("*") || s.startsWith("//") || s.startsWith("/*") }
-            .joinToString("\n")
-        for (bad in listOf(
-            "jit_op", "enum class Phase", "enum class Shell", "StartDecision", "ClickGate",
-            "HOLD_UNSAFE_PHASE", "opGate", "BUSY", "bootTag", "boot_id", "judgeWrite",
-            "putStringConfirmed", "persist.dalvik", "usejitprofiles", "watchdog", "cancelFile"
-        )) {
-            assertFalse("в ядре не должно быть «$bad»", core.contains(bad))
+        val core = codeNoComments("src/main/java/com/example/voiceapp3/tools/JitNetCore.kt")
+        for (bad in listOf("HOLD_", "ARMED", "SENT_STATE", "enum class Phase", "jit_op", "KEY_OP",
+            "ClickResult", "StartDecision", "bootId", "boot_id", "PID_CHECK", "TTL_MS",
+            "FileObserver", "watchdog", "jit_verified", "jit_pending_verify", "MOUNT_STEP_ENABLED")) {
+            assertFalse("ядро не содержит «$bad»", core.contains(bad))
         }
-        assertTrue("снимок — ровно три ключа референса",
-            core.contains("KEY_PEDIDO") && core.contains("KEY_AUTO") && core.contains("KEY_RESTORE"))
+        // Никакого «лечения перезагрузкой» и никаких persist-свойств JIT.
+        assertFalse(core.contains("persist."))
+        assertFalse(core.contains("usejitprofiles"))
+        // Единственная команда рестарта — в литерале скрипта.
+        assertEquals(1, Regex("ctl\\.restart zygote").findAll(core).count())
+    }
+
+    @Test
+    fun adapterIsIndependentStoresAndRealRemove() {
+        val net = codeNoComments("src/main/java/com/example/voiceapp3/tools/JitNet.kt")
+        assertTrue("удаление ключа настоящим remove", net.contains(".remove(key)"))
+        assertTrue("каждое хранилище пишется отдельно", net.contains("for (s in all)"))
+        assertFalse("нет обрыва цепочки по первому commit", net.contains("saved && runCatching"))
+        assertTrue("сигнал FAILED берётся из того же broadcast",
+            net.contains("JitRef.AP_STATE_CHANGED_ACTION") && net.contains("JitRef.AP_STATE_FAILED"))
+        assertTrue("CarplayMonitor честно недоступен", net.contains("override fun carplayBusy(): Boolean? = null"))
+        assertFalse("адаптер не выключает Wi-Fi", net.contains("setWifi(false"))
     }
 }

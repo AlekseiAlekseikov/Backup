@@ -62,10 +62,13 @@ class AvasIndependenceTest {
     @Test
     fun leftoverAvasSnapshotIsNotApplied() {
         val ap = code("src/main/java/com/example/voiceapp3/tools/AppPerformance.kt")
-        assertTrue("остаток фиксируется строкой", ap.contains("AVAS_LEGACY snapshot="))
+        assertTrue("остаток фиксируется строкой", ap.contains("AVAS_LEGACY checked="))
         assertTrue("проверка только читает файл", ap.contains("fun reportLegacyAvasSnapshot"))
         assertTrue("значения не меняются", ap.contains("action=none write=none"))
         assertTrue("и требует решения владельца", ap.contains("need=owner_decision"))
+        assertTrue("проверяются оба реальных имени (1.0.60 — avas_mode_saved)",
+            ap.contains("\"avas_mode_saved\""))
+        assertTrue("значение не читается", ap.contains("value=not_read"))
         assertFalse("файл прежней версии не удаляется", ap.contains("avas_snapshot\").delete()"))
         assertFalse("JIT-код не лезет в AVAS", ap.contains("AvasRestore") || ap.contains("AvasCore"))
     }

@@ -21,7 +21,7 @@ class JitStartZeroWritesTest {
         val store = JitFake.Store()
         val net = JitFake.Net(wifi = true, ap = true)
         val log = mutableListOf<String>()
-        val out = JitOp.onProcessStart(store, net, JitFake.Waiter(), log = { log += it })
+        val out = JitOp.onProcessStart(store, net, JitFake.Waiter(), JitFake.Scheduler(), log = { log += it })
         assertEquals(null, out.snapshot)
         assertEquals("ноль записей в префы", 0, store.writeCount())
         assertTrue("ноль сетевых запросов", net.requests.isEmpty())
@@ -34,9 +34,9 @@ class JitStartZeroWritesTest {
     fun stalePedidoWithoutSnapshotIsNotTouched() {
         // Остаток старых версий: `jit_pedido=true` в префах, строки снимка нет.
         val store = JitFake.Store()
-        store.values[JitRef.KEY_PEDIDO] = true
+        store.set(JitRef.KEY_PEDIDO, true)
         val net = JitFake.Net(wifi = true, ap = false)
-        JitOp.onProcessStart(store, net, JitFake.Waiter())
+        JitOp.onProcessStart(store, net, JitFake.Waiter(), JitFake.Scheduler())
         assertEquals("на старте мы не пишем даже «снять намерение»", 0, store.writeCount())
         assertEquals(true, store.getBool(JitRef.KEY_PEDIDO))
         assertTrue(net.requests.isEmpty())
@@ -47,11 +47,13 @@ class JitStartZeroWritesTest {
         // Старт процесса не должен звать transport вообще: снимка нет — нечего делать.
         val store = JitFake.Store()
         val net = JitFake.Net(wifi = true, ap = false)
-        val shell = JitFake.QueueShell(null)
-        JitOp.verifyApplied(store, shell) // отдельно: сверка без jit_pedido тоже read-only
-        assertEquals("сверка без намерения не пишет", 0, store.writeCount())
-        JitOp.onProcessStart(store, net, JitFake.Waiter())
-        assertTrue(shell.pending.isEmpty())
+        val shell = JitFake.AnswerShell()
+        JitOp.verifyApplied(store, shell) // сверка без jit_pedido: remove не выполняется
+        assertEquals("сверка без намерения не удаляет ключи", 0, store.writeCount())
+        val scheduler = JitFake.Scheduler()
+        JitOp.onProcessStart(store, net, JitFake.Waiter(), scheduler)
+        assertTrue("ни одной сетевой команды", shell.scriptCommands().isEmpty())
+        assertTrue("и ничего не запланировано", scheduler.scheduled.isEmpty())
     }
 
     @Test

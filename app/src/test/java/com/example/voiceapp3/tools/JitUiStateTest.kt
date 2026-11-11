@@ -2,68 +2,92 @@ package com.example.voiceapp3.tools
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
 
 /**
- * Что видит водитель.
+ * Настоящий тумблер JIT и его связывание с фактом `getprop`.
  *
- * Референс (`w0/bb` → `w0/r7`) ставит тумблер по `getprop`: `trim()=="true"` → включён, любая
- * другая строка → выключен. Мы делаем то же для подтверждённых значений, но **нечитаемое
- * значение показываем как «состояние неизвестно»**, а не как «выключено» (требование владельца,
- * отличие описано в отчёте §3). Новых кнопок и тумблеров нет — проверяется по исходнику.
+ * Референс (`w0/r7`): `toggle.setActive(getprop)` — положение берётся из ФАКТА, а не из preference;
+ * текст — `master_perf_jit_on/off`. ОТЛИЧИЕ (по требованию владельца): при нечитаемом `getprop`
+ * показывается «состояние неизвестно», а не ложное «выключено».
+ *
+ * Логика положения вынесена в [JitRef.switchPosition]/[JitRef.switchUpdate], поэтому проверяется
+ * целиком на JVM; в самой панели дополнительно проверяется, что программное обновление НЕ вызывает
+ * обработчик пользовательского клика.
  */
 class JitUiStateTest {
 
-    private fun fact(v: JitRef.Prop, raw: String = "") =
-        JitRef.PropFact(v, raw.ifEmpty { v.name.lowercase() }, 0, "ok")
+    private fun code(rel: String): String =
+        listOf(File(rel), File("app/$rel")).first { it.isFile }.readText()
 
     @Test
-    fun onOnlyWhenRuntimeIsTrue() {
-        assertEquals("on", JitRef.confirmedState(fact(JitRef.Prop.TRUE, "true")))
+    fun confirmedOnWinsOverPreferenceOff() {
+        // `getprop=true`, preference=false ⇒ тумблер включён (раньше был выключен — это и был баг).
+        assertTrue(JitRef.switchPosition("on", preference = false))
+        assertEquals("программное обновление переставляет тумблер",
+            true, JitRef.switchUpdate(false, "on"))
     }
 
     @Test
-    fun offOnlyWhenRuntimeIsFalse() {
-        assertEquals("off", JitRef.confirmedState(fact(JitRef.Prop.FALSE, "false")))
+    fun confirmedOffWinsOverPreferenceOn() {
+        assertFalse(JitRef.switchPosition("off", preference = true))
+        assertEquals(false, JitRef.switchUpdate(true, "off"))
     }
 
     @Test
-    fun unknownIsShownHonestly() {
-        assertEquals("ещё не читали", "unknown", JitRef.confirmedState(null))
-        assertEquals("транспорт не ответил", "unknown",
-            JitRef.confirmedState(JitRef.PropFact(JitRef.Prop.UNKNOWN, "", 137, "rc_nonzero")))
-        assertEquals("пустой вывод", "unknown",
-            JitRef.confirmedState(JitRef.PropFact(JitRef.Prop.UNKNOWN, "", 0, "empty")))
-    }
-
-    @Test
-    fun preferenceDoesNotDriveTheToggle() {
-        // Значение тумблера выводится ТОЛЬКО из факта: функция не принимает ни префы, ни операцию.
+    fun unknownKeepsPreferenceAndSaysUnknown() {
+        assertTrue(JitRef.switchPosition("unknown", preference = true))
+        assertFalse(JitRef.switchPosition("unknown", preference = false))
+        assertNull("неизвестное не переставляется программно", JitRef.switchUpdate(true, "unknown"))
+        assertNull(JitRef.switchUpdate(false, "unknown"))
         assertEquals("unknown", JitRef.confirmedState(null))
-        val store = JitFake.Store()
-        store.values[JitRef.KEY_AUTO] = true
-        assertEquals("preference сама по себе ничего не доказывает", "unknown",
-            JitRef.confirmedState(null))
+        assertEquals("unknown",
+            JitRef.confirmedState(JitRef.PropFact(JitRef.Prop.UNKNOWN, "", 137, "rc_nonzero")))
     }
 
     @Test
-    fun panelHasNoNewButtonsAndUpdatesWidget() {
-        fun code(rel: String): String =
-            listOf(File(rel), File("app/$rel")).first { it.isFile }.readText()
+    fun noRedrawWhenFactMatchesCurrentPosition() {
+        assertNull(JitRef.switchUpdate(true, "on"))
+        assertNull(JitRef.switchUpdate(false, "off"))
+    }
 
+    @Test
+    fun panelProgrammaticUpdateDoesNotFireClickListener() {
         val panel = code("src/main/java/com/example/voiceapp3/ui/ToolsPanel.kt")
-        assertTrue(panel.contains("private fun addJitRuntimeLine()"))
-        assertTrue("после ответа текст обновляется", panel.contains("view.text = jitRuntimeLineText(fresh)"))
-        assertTrue("unknown показывается словами", panel.contains("состояние неизвестно"))
-        assertTrue("состояние тумблера — из подтверждённого факта",
-            panel.contains("strState(\"perfJitConfirmed\")"))
-        assertFalse("никаких новых кнопок для JIT",
-            panel.contains("addButton(\"JIT") || panel.contains("Button(activity).apply { text = \"JIT"))
+        val fn = panel.substring(panel.indexOf("private fun applyJitFact"), panel.indexOf("private fun jitRuntimeLineText"))
+        assertTrue("слушатель снимается перед программной установкой",
+            fn.contains("setOnCheckedChangeListener(null)"))
+        assertTrue("и возвращается после", fn.contains("setOnCheckedChangeListener { _, checked -> listener(checked) }"))
+        assertFalse("программное обновление не пишет настройку", fn.contains("addProperty(key"))
+        assertFalse(fn.contains("send(\"settings.change\""))
+        // Положение при построении — из подтверждённого факта.
+        assertTrue(panel.contains("JitRef.switchPosition(jitConfirmed ?: \"unknown\", boolState(key) ?: def)"))
+        assertTrue("подпись про неизвестное состояние есть",
+            panel.contains("состояние неизвестно"))
+    }
 
-        val backend = code("src/main/java/com/example/voiceapp3/tools/ToolsBackend.kt")
-        assertTrue(backend.contains("addProperty(\"perfJitConfirmed\""))
-        assertTrue(backend.contains("addProperty(\"perfJitRuntime\""))
+    @Test
+    fun panelRunsVerificationOnOpenAndUpdatesBothWidgets() {
+        val panel = code("src/main/java/com/example/voiceapp3/ui/ToolsPanel.kt")
+        assertTrue("сверка при открытии панели", panel.contains("AppPerformance.verifyJitOnly(activity)"))
+        assertTrue("после ответа обновляется строка", panel.contains("view.text = jitRuntimeLineText(fresh)"))
+        assertTrue("и тумблер", panel.contains("applyJitFact(fresh)"))
+        assertFalse("новых кнопок JIT нет",
+            panel.contains("addButton(\"JIT") || panel.contains("text = \"JIT"))
+    }
+
+    @Test
+    fun verificationIsReachableAndNotPerTick() {
+        val app = code("src/main/java/com/example/voiceapp3/tools/AppPerformance.kt")
+        assertTrue("сверка проверяет наличие намерения до shell",
+            app.contains("JitNet.hasPendingPedido(app)"))
+        assertTrue("и честно пишет, что снимает ключ",
+            app.contains("write=remove_if_confirmed"))
+        val svc = code("src/main/java/com/example/voiceapp3/VoiceAssistantService.kt")
+        assertTrue("watchdog зовёт сверку только внутри ветки тяжёлых тиков",
+            svc.contains("AppPerformance.verifyJitOnly(app)"))
     }
 }

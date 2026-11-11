@@ -1,140 +1,191 @@
 package com.example.voiceapp3.tools
 
 /**
- * JIT — перенос цепочки референса CentralEXAuto 3.3.9 БЕЗ собственных механизмов (1.0.61).
+ * JIT по референсу CentralEXAuto 3.3.9 (1.0.61, iter35) — платформо-независимое ядро.
  *
- * Всё сверено по DEX/smali APK `CentralEXAuto_v3.3.9.apk` (md5 `c3f1664125953b9851bf4483b265135f`
- * из ZIP `8a65c6c29749c64d4e335c57490a347a`; baksmali 2.5.2, jadx 1.4.7):
+ * Сверено по DEX/smali APK `CentralEXAuto_v3.3.9.apk` (md5 `c3f1664125953b9851bf4483b265135f`
+ * из ZIP `8a65c6c29749c64d4e335c57490a347a`; baksmali 2.5.2 + jadx 1.4.7):
  *
- *  • **клик** `w0/j9.smali` (`onClick`, ветка `pswitch_2b`, вызов из `w0/b9.smali:1206`,
- *    индекс 0):
- *    `((WifiManager) getApplicationContext().getSystemService("wifi")).isWifiEnabled()`
- *    (весь блок в `catchall_48 → const/4 v3, 0` ⇒ исключение = `false`);
- *    `NetworkInterface.getByName("ap0")` → `isUp() && getInetAddresses().hasMoreElements()`
- *    (`catchall_64` ⇒ `false`); затем ОДИН `SharedPreferences.Editor.commit()`:
- *    `jit_pedido` = target, `perf_auto_otimizar` = target,
- *    `jit_restaurar` = `"wifi=" + wifi + ",ap=" + ap` (`Landroidx/activity/result/b;->f(II…)`);
- *    лог `"dalvik.vm.usejit -> <target>; reiniciando o framework"`; `pool.execute(new la(...))`.
- *    Результат `commit()` НЕ проверяется, второго клика/блокировки в референсе нет.
+ *  • **клик** `w0/j9.onClick` (`pswitch_2b`, вызов из `w0/b9` `S0`): `WifiManager.isWifiEnabled()`
+ *    (весь блок в `catchall_48 ⇒ false`), `NetworkInterface.getByName("ap0")` →
+ *    `isUp() && getInetAddresses().hasMoreElements()` (`catchall_64 ⇒ false`), затем ОДИН
+ *    `Editor.commit()`: `jit_pedido`, `perf_auto_otimizar`, `jit_restaurar="wifi=w,ap=a"`;
+ *    результат `commit()` не проверяется; `pool.execute(new la(...))`.
+ *  • **скрипт** `w0/la.run` (`pswitch_10e`), один литерал: `svc wifi disable` → ≤20×1 с до
+ *    `ip rule show | grep -c 'oif wlan0'` = 0 → `umount -l` точек `/data/app/` из `/proc/mounts`
+ *    → `setprop dalvik.vm.usejit true|false` → `setprop ctl.restart zygote` (последняя).
+ *  • **продолжение** `CentralWatchdogService.onCreate`: `getString("jit_restaurar", null)` →
+ *    `Pattern("^wifi=([01]),ap=([01])$").matcher(s).matches()` → `remove(...).apply()` ДО
+ *    выполнения → `postDelayed(new e2(...), 15000)`.
+ *  • **возврат сети** `w0/e2.run` (case 1): `if (ap) U("pós-JIT", false)` в try/catch (исключение
+ *    обрывает весь возврат: «JIT: restauro falhou»), затем `if (wifi && !isWifiEnabled())
+ *    setWifiEnabled(true)`.
+ *  • **`U(tag, boolean)`** — `garantirApAberto`, разобран по DEX целиком (см. [JitOp.openAp]).
+ *  • **сверка** `w0/bb` + `w0/r7`: `H1(8000,"getprop dalvik.vm.usejit")` → `trim()=="true"`;
+ *    `Boolean` по `/proc/self/maps`; `ok = (pedido == getprop) && (!pedido || maps != Boolean.FALSE)`
+ *    (jadx `w0/r7.java`: `z5 == z4 && (!z5 || !Intrinsics.areEqual(bool, Boolean.FALSE))`),
+ *    `toggle.setActive(getprop)`, `remove("jit_pedido").apply()`, предупреждение при `!ok && pedido`.
  *
- *  • **скрипт** `w0/la.smali` (ветка `pswitch_10e`) — один литерал, байт в байт:
- *    `svc wifi disable` → цикл до 20 итераций по `ip rule show | grep -c 'oif wlan0'` = 0 →
- *    `umount -l` для точек `/data/app/` из `/proc/mounts` → `setprop dalvik.vm.usejit <true|false>`
- *    → `setprop ctl.restart zygote` (последняя команда). Таймаут транспорта `H1(0x9c40=40000, …)`,
- *    после него `postDelayed(ua, 0xafc8=45000)` — это индикатор прогресса в UI, к сети не относится.
+ * Чего в референсе НЕТ и чего здесь поэтому нет: `persist.*` JIT, `usejitprofiles`, watcher,
+ * файл отмены, `sleep 8`, boot-backfill, собственные фазы/`HOLD`/`BUSY`, санация `ip rule`.
  *
- *  • **продолжение** `com/ex/auto/CentralWatchdogService.smali` (`onCreate`, 0x7b9…0x811):
- *    `getString("jit_restaurar", null)`; `Pattern.compile("^wifi=([01]),ap=([01])$").matcher(s)
- *    .matches()`; если совпало — `new oe(wifi, ap)`, `remove("jit_restaurar").apply()`
- *    (**до** выполнения), `postDelayed(new e2(oe, service, 0), 0x3a98 = 15000)`.
- *    `w0/e2.smali`: case 0 — поток (проверка `T2` = «сервис создан»), case 1 —
- *    `if (ap) service.U("pós-JIT", false);` затем `if (wifi && !wm.isWifiEnabled()) wm.setWifiEnabled(true);`
- *    лог `"JIT: restaurado após o restart (wifi=…, ap=…); wifi agora=…; ap agora=…"`,
- *    исключение → `"JIT: restauro falhou: …"`. Метки загрузки в референсе НЕТ, снимок не
- *    проверяется на «наша ли это операция».
- *
- *  • **`U(String,boolean)`** («garantirApAberto», `CentralWatchdogService.smali` 0x2880…):
- *    `v()` (AP в воздухе) ⇒ `true`; ожидание `O()` (CarplayMonitor) по 1 с; guard:
- *    клиентский Wi-Fi включён (`c1()`: `isWifiEnabled() || getWifiState()==2`, исключение ⇒ `true`)
- *    и не наш auto-enable ⇒ AP НЕ открываем, `false`; мьютекс `CountDownLatch` на `0x19 = 25` с;
- *    затем `d()` — рефлексия `getDeclaredMethod("startSoftAp", WifiConfiguration)` + `setAccessible`,
- *    аргумент `null`, результат `invoke` НЕ используется; ожидание `v()` до `0x4e20 = 20000` мс
- *    шагом 1000 мс; при сигнале FAILED (поле `u1`) — до 3 попыток с паузой `0x7d0 = 2000` мс.
- *
- *  • **сверка** `w0/bb.smali` (ветка по умолчанию, вызов из `MainActivity.S0()` = `bb(…, 1)`)
- *    → `w0/r7.smali`: `H1(0x1f40 = 8000, "getprop dalvik.vm.usejit")`, `trim() == "true"`;
- *    `Boolean` из `/proc/self/maps` (`"jit-cache"` или `"dalvik-jit-code-cache"`, ошибка ⇒ `null`);
- *    `toggle.setActive(getprop)`; если в префах есть `jit_pedido`:
- *    `ok = (pedido == getprop) && (!pedido || maps != FALSE)`, лог
- *    `"JIT pedido=… getprop=… code-cache-executavel=…"`, `remove("jit_pedido")`,
- *    при `!ok && pedido` — сообщение «не применилось».
- *
- * Чего в референсе НЕТ и чего здесь поэтому тоже нет: `persist.dalvik.vm.usejit`,
- * `persist.sys.dalvik.vm.usejit`, `dalvik.vm.usejitprofiles`, watcher, файл отмены, `sleep 8`,
- * санация/удаление `ip rule`, boot-backfill, собственный журнал шагов, фазы, `jit_op`, метка
- * загрузки, блокировки «одна операция» (`HOLD`/`BUSY`), подтверждение рестарта zygote.
- *
- * Единственное отличие в поведении — там, где референс выдаёт неизвестное за факт
- * (невозможность прочитать `getprop`): см. [JitRef.parseProp] и [JitRef.verify]. Оно описано в
- * отчёте §3 и не меняет ни одну команду цепочки.
+ * Заявленные отличия (не «копия») — только там, где данные недоступны или где неизвестное нельзя
+ * выдавать за факт; каждое перечислено в отчёте iter35 §5 и помечено в коде `ОТЛИЧИЕ`.
  */
 object JitRef {
 
-    // ─────────────────────────── ключи и константы референса ───────────────────────────
+    // ─────────────────────────── ключи и свойства референса ───────────────────────────
 
-    /** `jit_pedido`: намерение операции («включить/выключить»), снимается сверкой (`w0/r7`). */
+    /** `jit_pedido`: намерение операции; снимается **удалением** после сверки (`w0/r7`). */
     internal const val KEY_PEDIDO = "jit_pedido"
-    /** `perf_auto_otimizar`: тумблер в UI референса, пишется тем же `commit()`, что и снимок. */
+
+    /** `perf_auto_otimizar`: тот же target, пишется тем же `commit()`. */
     internal const val KEY_AUTO = "perf_auto_otimizar"
+
     /** `jit_restaurar`: `wifi=<0|1>,ap=<0|1>`, снимается в `onCreate` ДО выполнения `e2`. */
     internal const val KEY_RESTORE = "jit_restaurar"
 
-    /** Свойство, которое ставит скрипт и читает сверка (`w0/la`, `w0/bb`). */
     internal const val PROP_USEJIT = "dalvik.vm.usejit"
 
-    /** `while [ $_n -lt 20 ]` — предел ожидания исчезновения `oif wlan0` (`w0/la.smali`). */
+    // ─────────────────────────── константы референса ───────────────────────────
+
+    /** `while [ $_n -lt 20 ]` — окно слива правил `oif wlan0`. */
     internal const val DRAIN_LOOP_MAX = 20
-    /** `H1(0x9c40, …)` — таймаут транспорта на весь скрипт (`w0/la.smali`). */
+
+    /** `H1(0x9c40, …)` — таймаут транспорта вокруг скрипта. */
     internal const val CHAIN_TIMEOUT_MS = 40_000
-    /** `postDelayed(new e2(...), 0x3a98)` — пауза перед возвратом сети (`onCreate`). */
+
+    /** `postDelayed(new e2(...), 0x3a98)` — 15 000 мс между снятием снимка и возвратом сети. */
     internal const val RESTORE_DELAY_MS = 15_000L
-    /** `H1(0x1f40, "getprop dalvik.vm.usejit")` (`w0/bb.smali`). */
+
+    /** `H1(0x1f40, "getprop dalvik.vm.usejit")` — 8000 мс. */
     internal const val GETPROP_TIMEOUT_MS = 8_000
-    /** `CountDownLatch.await(0x19, SECONDS)` — мьютекс `U` на 25 с. */
-    internal const val AP_LATCH_TIMEOUT_S = 25L
-    /** `if-ge v0, 0x4e20` — ожидание AP в `U`, 20000 мс. */
+
+    /** `CountDownLatch.await(0x19, SECONDS)` — ожидание чужого открытия AP. */
+    internal const val AP_LATCH_WAIT_S = 25L
+
+    /** `const/16 v10, 0x4e20` — ожидание `v()` после `d()`: 20 000 мс. */
     internal const val AP_POLL_TOTAL_MS = 20_000L
-    /** шаг `Thread.sleep(0x3e8)` в ожидании AP. */
+
+    /** `Thread.sleep(0x3e8)` — шаг опроса `v()`. */
     internal const val AP_POLL_STEP_MS = 1_000L
+
     /** `if-ge p2, 0x3` — не более 3 попыток открыть AP. */
     internal const val AP_ATTEMPTS = 3
-    /** `Thread.sleep(0x7d0)` между попытками AP. */
+
+    /** `Thread.sleep(0x7d0)` между попытками после сигнала FAILED. */
     internal const val AP_RETRY_PAUSE_MS = 2_000L
+
+    /**
+     * `w0/u2`: broadcast `android.net.wifi.WIFI_AP_STATE_CHANGED` (в APK — строковый литерал) и
+     * `wifi_state == 14` (`WIFI_AP_STATE_FAILED`) ⇒ `u1 = elapsedRealtime()`.
+     */
+    internal const val AP_STATE_CHANGED_ACTION = "android.net.wifi.WIFI_AP_STATE_CHANGED"
+    internal const val EXTRA_WIFI_AP_STATE = "wifi_state"
+    internal const val AP_STATE_FAILED = 14
+
+    /** `Thread.sleep(0x3e8)` в ожидании CarplayMonitor (`O()`). */
+    internal const val CARPLAY_WAIT_STEP_MS = 1_000L
 
     /**
      * Шаг `umount -l` точек `/data/app/` из `w0/la.run` — **исполняется**, как в референсе.
      *
-     * Монтирования владельцем разрешены, отключать шаг «потому что это монтирование» нельзя, и
-     * скрытого флага «выключено» здесь нет. Обратимость на живом ГУ при этом **не проверена**:
-     * в этом окружении устройства нет, а массовый `umount` ради проверки запрещён. Поэтому шаг
-     * виден в каждой отправке цепочки (`mount_step=present`), а в отчёте он отдельным пунктом
-     * «точная копия литерала, поле не исполнялось».
+     * Монтирования владельцем разрешены; скрытого выключателя нет (в прежней итерации он был и
+     * убран). Обратимость на живом ГУ **не проверена**: устройства в этом окружении нет, а
+     * массовый `umount` ради проверки запрещён. Каждая отправка цепочки пишет
+     * `mount_step=present`, а в отчёте это отдельный блокер ⛔ с read-only запросом данных.
      */
+    internal const val MOUNT_STEP_NOTE = "mount_step=present"
 
     /** Регулярка референса — полное совпадение строки, без trim (`Matcher.matches()`). */
     private val RESTORE_RE = Regex("^wifi=([01]),ap=([01])$")
 
-    /** Модель интерфейсов, которыми пользуется цепочка (адаптеры — в `JitNet`). */
+    // ─────────────────────────── интерфейсы (адаптеры — в JitNet) ───────────────────────────
+
     interface JitShell {
         fun exec(command: String, timeoutMs: Int): Pair<Int, String>
+
+        /** `w0/bb`: `/proc/self/maps` текущего процесса; `null` — прочитать нельзя. */
         fun cacheVisible(): Boolean?
+    }
+
+    /**
+     * Результат записи в префы.
+     *
+     * Хранилищ в приложении два (CPS и DPS), поэтому «успех» — это `attempted == ok`, а не
+     * `ok первого && ok второго`: попытка выполняется в КАЖДОМ доступном хранилище независимо.
+     */
+    data class WriteResult(val attempted: Int, val ok: Int, val detail: String) {
+        val allOk: Boolean get() = attempted > 0 && ok == attempted
+        val anyOk: Boolean get() = ok > 0
+        val failed: Int get() = attempted - ok
+
+        companion object {
+            fun none(why: String) = WriteResult(0, 0, why)
+        }
     }
 
     interface JitStore {
         fun getString(key: String): String?
         fun getBool(key: String): Boolean?
         fun contains(key: String): Boolean
-        /** Три ключа референса ОДНИМ `commit()`. Возвращает результат `commit()`. */
-        fun putSnapshot(want: Boolean, net: Net): Boolean
-        fun putBool(key: String, value: Boolean): Boolean
-        /** `null` ⇒ `remove(key)`. */
-        fun putString(key: String, value: String?): Boolean
+
+        /** Три ключа референса ОДНИМ `commit()` на каждое хранилище. */
+        fun putSnapshot(want: Boolean, net: Net): WriteResult
+
+        /** `remove(key)` — как `r7`/`onCreate` референса (не запись `false`). */
+        fun remove(key: String): WriteResult
     }
 
     interface JitNetState {
-        /** `isWifiEnabled()`; `null` — прочитать нельзя (исключение). */
+        /** `isWifiEnabled()`; `null` — прочитать нельзя. */
         fun wifiOn(): Boolean?
-        /** `ap0` поднят и имеет адреса (`U.v()`); `null` — прочитать нельзя. */
+
+        /** `getWifiState() == WIFI_STATE_ENABLING` — вторая половина `c1()`. */
+        fun wifiEnabling(): Boolean?
+
+        /** `U.v()`: `ap0` поднят и имеет адреса. `null` — прочитать нельзя. */
         fun apUp(): Boolean?
-        /** `setWifiEnabled(on)`; `null` — вызов не удался (исключение). */
+
+        /** `e2`: `setWifiEnabled(true)`. `null` — вызов не удался. */
         fun setWifi(on: Boolean): Boolean?
-        /** `d()`: рефлексия `startSoftAp(null)`; `null` — вызов не удался (`startSoftAp FALHOU`). */
+
+        /** `U.d()`: рефлексия `startSoftAp((WifiConfiguration) null)`. `null` — вызов не удался. */
         fun startAp(): Boolean?
+
+        /**
+         * `U.u1`: `elapsedRealtime` события `WIFI_AP_STATE_FAILED` (broadcast
+         * `android.net.wifi.WIFI_AP_STATE_CHANGED`, `wifi_state == 14`); `0` — события не было.
+         *
+         * Пока AP не открывают, приёмник не нужен: [beginApWatch]/[endApWatch] включают и
+         * выключают его вокруг попытки, чтобы не держать регистрацию постоянно.
+         */
+        fun apFailedAtMs(): Long
+        fun beginApWatch() {}
+        fun endApWatch() {}
+
+        /**
+         * `U.O()` — «CarplayMonitor ещё не готов». Возвращает `true`, если идёт переходное
+         * состояние проекции, `false` — если нет, `null` — сигнала в нашем приложении **нет**
+         * (ОТЛИЧИЕ: в референсе это `n1/o1/p1` + установленный `com.njda.adapter` +
+         * `connadaptor_modo` из их префов; у нас таких источников нет).
+         */
+        fun carplayBusy(): Boolean? = null
     }
 
     interface JitWaiter {
         fun sleep(ms: Long)
         fun nowMs(): Long
+    }
+
+    /**
+     * Отложенный запуск — как `Handler.postDelayed` в референсе.
+     *
+     * В референсе `onCreate` НЕ спит: он снимает снимок и планирует `e2` через 15 000 мс на
+     * handler-е сервиса. Здесь так же: ожидание не занимает поток общего пула.
+     */
+    interface JitScheduler {
+        fun postDelayed(delayMs: Long, task: () -> Unit)
     }
 
     /** Состояние сети ДО операции (формат референса). */
@@ -143,7 +194,7 @@ object JitRef {
     }
 
     /**
-     * Разбор `jit_restaurar` ровно как `e2`: строка обязана совпасть ЦЕЛИКОМ и без trim —
+     * Разбор `jit_restaurar` ровно как `onCreate`: строка обязана совпасть ЦЕЛИКОМ и без trim —
      * `Matcher.matches()` на сыром значении из префов.
      */
     fun parseRestore(raw: String?): Net? {
@@ -177,7 +228,7 @@ object JitRef {
     fun chainScript(want: Boolean): String = scriptBody(want)
 
     /** Отметка о шаге монтирований для лога: он есть, как в референсе. */
-    fun mountStepNote(): String = "mount_step=present"
+    fun mountStepNote(): String = MOUNT_STEP_NOTE
 
     // ─────────────────────────── чтение `getprop`: факт, а не догадка ───────────────────────────
 
@@ -191,12 +242,12 @@ object JitRef {
 
     /**
      * `w0/bb`: `H1(8000,"getprop dalvik.vm.usejit")` → `trim() == "true"`; любое другое значение
-     * (включая пустой вывод при недоступном транспорте) трактуется как `false`, `rc` не смотрится.
+     * (включая пустой вывод при недоступном транспорте) референс трактует как `false`, `rc` не
+     * смотрит.
      *
-     * ОТЛИЧИЕ (единственное поведенческое): если прочитать НЕЛЬЗЯ (`rc≠0`, `ERR_…`, пусто,
-     * многострочный вывод), значение помечается [Prop.UNKNOWN] — «неизвестно», а не «выключено».
-     * Иначе при `want=false` недоступный канал давал бы ложный «успех». Команды цепочки от этого
-     * не меняются: `setprop` уходит ровно тот же.
+     * ОТЛИЧИЕ (разрешено мандатом): если прочитать НЕЛЬЗЯ (`rc≠0`, `ERR_…`, пусто, многострочный
+     * вывод), значение помечается [Prop.UNKNOWN] — «неизвестно», а не «выключено». Иначе при
+     * недоступном канале `want=false` давал бы ложный успех. Команды цепочки не меняются.
      */
     fun parseProp(rc: Int, out: String): PropFact {
         val raw = out.trim()
@@ -211,21 +262,29 @@ object JitRef {
         }
     }
 
-    /** Итог формулы `w0/r7`. `UNKNOWN` — нет данных (см. [parseProp]). */
+    /**
+     * Итог формулы `w0/r7`. [CACHE_MISSING] — «JIT запрошен и `getprop=true`, но исполняемой
+     * карты кэша нет»: в референсе это `ok=false` и предупреждение, поэтому это **не** успех.
+     */
     enum class Verify { OK, NOT_APPLIED, CACHE_MISSING, UNKNOWN }
 
     /**
-     * `ok = (pedido == getprop) && (!pedido || maps != Boolean.FALSE)` — дословно `w0/r7`.
-     * При нечитаемом `getprop` результат не выводится ([Verify.UNKNOWN]).
+     * `w0/r7` (jadx `w0/r7.java`): `ok = (pedido == getprop) && (!pedido || maps != FALSE)`.
+     *
+     * Разложение по ветвям:
+     *  • `pedido=false, getprop=false` → ok (независимо от `maps`, в том числе `maps=false`);
+     *  • `pedido=true,  getprop=true`  → ok только если `maps != false` (TRUE или `null`);
+     *  • несовпадение `pedido`/`getprop` → not ok;
+     *  • `getprop` не прочитан → [Verify.UNKNOWN] (ОТЛИЧИЕ: референс считает «не true» = false).
      */
     fun verify(pedido: Boolean, prop: PropFact, cache: Boolean?): Verify = when (prop.value) {
         Prop.UNKNOWN -> Verify.UNKNOWN
-        Prop.TRUE -> if (pedido) Verify.OK else Verify.NOT_APPLIED
-        Prop.FALSE -> when {
-            pedido -> Verify.NOT_APPLIED
+        Prop.TRUE -> when {
+            !pedido -> Verify.NOT_APPLIED
             cache == false -> Verify.CACHE_MISSING
             else -> Verify.OK
         }
+        Prop.FALSE -> if (pedido) Verify.NOT_APPLIED else Verify.OK
     }
 
     fun verifyLabel(v: Verify): String = when (v) {
@@ -240,6 +299,33 @@ object JitRef {
         Prop.TRUE -> "on"
         Prop.FALSE -> "off"
         null, Prop.UNKNOWN -> "unknown"
+    }
+
+    /**
+     * Положение тумблера JIT: `on`/`off` — по подтверждённому факту (как `toggle.setActive(getprop)`
+     * в `w0/r7`), и только при `unknown` — по preference (намерение водителя), с явной подписью.
+     */
+    fun switchPosition(confirmed: String, preference: Boolean): Boolean = when (confirmed) {
+        "on" -> true
+        "off" -> false
+        else -> preference
+    }
+
+    /**
+     * Что сделать с тумблером после фонового чтения: `true/false` — переставить, `null` — оставить
+     * как есть (неизвестное состояние не выдаётся за факт).
+     */
+    fun switchUpdate(current: Boolean, confirmed: String): Boolean? = when (confirmed) {
+        "on" -> if (current) null else true
+        "off" -> if (current) false else null
+        else -> null
+    }
+
+    /** CSV `c1()`: `isWifiEnabled() || getWifiState()==ENABLING`; исключение ⇒ `true`. */
+    fun clientWifiBusy(wifiOn: Boolean?, wifiEnabling: Boolean?): Boolean = when {
+        wifiOn == true -> true
+        wifiOn == false -> wifiEnabling ?: true
+        else -> true
     }
 
     /** Итог запуска скрипта — без выдачи таймаута за успех. */
@@ -258,148 +344,180 @@ object JitRef {
 /**
  * Шаги цепочки референса — по одному методу на метод референса.
  *
- * Никакого собственного состояния операции здесь нет: снимок — это три ключа референса, а не
- * отдельная модель; нет фаз, метки загрузки, `BUSY`, `HOLD`, сверки «наша ли это операция».
- * Продолжение после рестарта фреймворка делается так же, как в `CentralWatchdogService.onCreate`:
- * строка префа совпала с регуляркой → снять строку → подождать 15 с → AP, затем Wi-Fi.
+ * Своего состояния операции нет: снимок — это три ключа референса; нет фаз, метки загрузки,
+ * `BUSY`, `HOLD`, сверки «наша ли это операция». Есть только то, что есть в референсе:
+ * `jit_pedido` (намерение), `jit_restaurar` (что вернуть), общий `CountDownLatch` открытия AP и
+ * флаг «Wi-Fi включили мы сами» (`V` в `U`).
  */
 object JitOp {
 
-    private val RESTORE_LOCK = Any()
+    /**
+     * `U.V` — «клиентский Wi-Fi включён нашим auto-enable» (`y1`: `setWifiEnabled(true)` вернул
+     * true ⇒ `V=true`; `t1`: `!c1()` ⇒ `V=false`). В референсе это поле сервиса; у нас — то же
+     * самое по смыслу значение процесса.
+     */
+    private val AUTO_WIFI_ENABLED = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /**
+     * Сброс процесса-состояния `U` (флаг «Wi-Fi включили мы» и latch). Нужен только тестам:
+     * в референсе это поля сервиса, которые живут до пересоздания сервиса.
+     */
+    @Synchronized
+    internal fun resetStateForTest() {
+        AUTO_WIFI_ENABLED.set(false)
+        apLatch = null
+    }
+
+    /** `U.w1` — общий latch одного открытия AP; снимается тем, кто открывал. */
+    private val LATCH_LOCK = Any()
+    private var apLatch: java.util.concurrent.CountDownLatch? = null
 
     // ─────────────────────────── 1. клик: `w0/j9.onClick` ───────────────────────────
 
     data class Click(
         val want: Boolean,
-        val net: JitRef.Net?,
-        val saved: Boolean,
+        val net: JitRef.Net,
+        val snapshot: JitRef.WriteResult,
         val exitCode: Int,
         val output: String
     ) {
         val outcome: JitRef.ChainOutcome get() = JitRef.chainOutcome(exitCode, output)
+        /** Результат `commit()` — только для лога: цепочка от него не зависит (как в `j9`). */
+        val saved: Boolean get() = snapshot.allOk
     }
 
     /**
-     * Клик тумблера JIT — дословно ветка `pswitch_2b` из `w0/j9.smali`:
+     * Клик тумблера JIT — дословно ветка `pswitch_2b` из `w0/j9`:
      *
      * ```
      * wifi = isWifiEnabled()            // исключение → false
-     * ap   = ap0 in air                 // исключение → false
+     * ap   = ap0 в воздухе              // исключение → false
      * edit().putBoolean(jit_pedido, t).putBoolean(perf_auto_otimizar, t)
      *       .putString(jit_restaurar, "wifi=w,ap=a").commit()      // один commit
      * pool.execute(la)                  // скрипт
      * ```
-     *
-     * Сетевых команд до `commit()` нет; порядок «снимок → скрипт» сохранён. Наличие второго клика
-     * при незавершённой операции референс не проверяет — перезапись снимка новой операцией
-     * является его поведением (описано в отчёте, не «исправлено» своей блокировкой).
      */
     fun click(
         store: JitRef.JitStore,
         netState: JitRef.JitNetState,
         shell: JitRef.JitShell,
         want: Boolean,
-        waiter: JitRef.JitWaiter,
         log: (String) -> Unit = {}
     ): Click {
         // Исключение при чтении в референсе даёт `false` (catchall_48 / catchall_64).
-        val wifi = netState.wifiOn() ?: false
-        val ap = netState.apUp() ?: false
+        val wifi = runCatching { netState.wifiOn() }.getOrNull() ?: false
+        val ap = runCatching { netState.apUp() }.getOrNull() ?: false
         val net = JitRef.Net(wifi = wifi, ap = ap)
-        val saved = store.putSnapshot(want, net)
+        val snapshot = store.putSnapshot(want, net)
         log(
-            "JIT_CLICK want=$want net=${net.wire()} saved=$saved " +
-                "wifi_state=${netState.wifiOn()?.toString() ?: "unknown"} " +
-                "ap_state=${netState.apUp()?.toString() ?: "unknown"} " +
-                "(снимок ДО любых изменений; wifi/ap = то, что прочитано перед кликом)"
+            "JIT_CLICK want=$want net=${net.wire()} saved=${snapshot.allOk} " +
+                "stores=${snapshot.ok}/${snapshot.attempted} detail=«${snapshot.detail}» " +
+                "(снимок ДО любых изменений; результат commit не гейтит отправку — как j9)"
         )
         log("dalvik.vm.usejit -> $want; reiniciando o framework")
-        log("JIT_CHAIN_SENT ${JitRef.mountStepNote()} timeout_ms=${JitRef.CHAIN_TIMEOUT_MS} " +
-            "restart=not_claimed command=w0/la.run (литерал референса)")
+        log(
+            "JIT_CHAIN_SENT ${JitRef.mountStepNote()} timeout_ms=${JitRef.CHAIN_TIMEOUT_MS} " +
+                "restart=not_claimed command=w0/la.run (литерал референса)"
+        )
         val (rc, out) = shell.exec(JitRef.chainScript(want), JitRef.CHAIN_TIMEOUT_MS)
         val outcome = JitRef.chainOutcome(rc, out)
         log(
             "JIT_CHAIN_RETURN rc=$rc outcome=${JitRef.chainOutcomeLabel(outcome)} " +
                 "restart=not_claimed internet=not_checked out=${out.trim().take(200).ifEmpty { "empty" }} " +
-                "(ответ транспорта ≠ подтверждение рестарта zygote; состояние проверит сверка)"
+                "(ответ транспорта ≠ подтверждение рестарта zygote; состояние покажет сверка)"
         )
         if (outcome != JitRef.ChainOutcome.REPLY_RECEIVED) {
             log(
                 "JIT_CHAIN_ERROR rc=$rc reason=channel_lost action=none " +
-                    "(команда могла остаться в очереди транспорта: это НЕ «не выполнено» и НЕ «выполнено»)"
+                    "(команда могла остаться в очереди: это НЕ «не выполнено» и НЕ «выполнено»)"
             )
         }
-        return Click(want, net, saved, rc, out)
+        return Click(want, net, snapshot, rc, out)
     }
 
-    // ─────────────────────────── 2. продолжение: `CentralWatchdogService.onCreate` ───────────────────────────
-
-    data class RestoreReport(
-        val apNeeded: Boolean,
-        val apUp: Boolean,
-        val apReason: String,
-        val wifiNeeded: Boolean,
-        val wifiRequested: Boolean,
-        val wifiOn: Boolean?,
-        val failure: String?
-    )
+    // ─────────────────────────── 2. продолжение: `onCreate` → `e2` ───────────────────────────
 
     data class StartOutcome(
         val snapshot: JitRef.Net?,
         val rawSnapshot: String?,
-        val report: RestoreReport?
+        val removed: JitRef.WriteResult?,
+        /** `true`, если `e2` запланирован (а не выполнен: выполнение — в фоне через 15 с). */
+        val scheduled: Boolean
     )
 
     /**
-     * Продолжение операции на старте процесса — дословно `CentralWatchdogService.onCreate`:
-     * `getString("jit_restaurar")` → `matches()` → `remove()` → `postDelayed(e2, 15000)` → `e2`.
+     * Продолжение операции на старте процесса — `CentralWatchdogService.onCreate`:
+     * прочитать `jit_restaurar` → `matches()` → `remove()` **до** запуска → `postDelayed(e2, 15000)`.
      *
-     * Блокировка `synchronized` здесь не «машина состояний», а защита от двух одновременных
-     * вызовов из одного процесса (`onCreate` + `onStartCommand`): иначе `e2` запустился бы дважды
-     * и сеть дёргалась бы два раза. Состояние операции она не хранит.
+     * ОТЛИЧИЕ (структурное, поведение то же): в референсе планировщик — handler сервиса; у нас
+     * [JitRef.JitScheduler] поверх `BgWorker.postDelayed`. Поток общего пула ожиданием не занят,
+     * второго цикла/сторожа нет.
+     *
+     * Сохранён и честно назван риск референса: снимок снимается ДО 15-секундной паузы, поэтому
+     * смерть процесса в эти 15 с отменяет возврат сети навсегда; а запуск приложения после
+     * `ctl.restart zygote` ничем не гарантирован (это не `BOOT_COMPLETED`).
      */
     fun onProcessStart(
         store: JitRef.JitStore,
         netState: JitRef.JitNetState,
         waiter: JitRef.JitWaiter,
+        scheduler: JitRef.JitScheduler,
         log: (String) -> Unit = {}
-    ): StartOutcome = synchronized(RESTORE_LOCK) {
-        val raw = store.getString(JitRef.KEY_RESTORE)
-        val net = JitRef.parseRestore(raw)
-        if (net == null) {
+    ): StartOutcome {
+        val taken: Pair<JitRef.Net, JitRef.WriteResult>?
+        val raw: String?
+        synchronized(LATCH_LOCK) {
+            raw = store.getString(JitRef.KEY_RESTORE)
+            val parsed = JitRef.parseRestore(raw)
+            if (parsed == null) {
+                log(
+                    "JIT_START snapshot=${if (raw == null) "none" else "unparsed"} " +
+                        "raw=\"${raw?.take(60) ?: ""}\" action=none " +
+                        "(регулярка ^wifi=([01]),ap=([01])$ не совпала → e2 не запускается)"
+                )
+                return StartOutcome(null, raw, null, scheduled = false)
+            }
+            // `remove("jit_restaurar").apply()` — ДО выполнения, как в onCreate.
+            val removed = store.remove(JitRef.KEY_RESTORE)
+            val stillThere = store.contains(JitRef.KEY_RESTORE)
             log(
-                "JIT_START snapshot=${if (raw == null) "none" else "unparsed"} " +
-                    "raw=\"${raw?.take(60) ?: ""}\" action=none " +
-                    "(референс: регулярка ^wifi=([01]),ap=([01])$ не совпала → e2 не запускается)"
+                "JIT_START snapshot=${parsed.wire()} removed=${removed.allOk} " +
+                    "stores=${removed.ok}/${removed.attempted} still_present=$stillThere " +
+                    "delay_ms=${JitRef.RESTORE_DELAY_MS} action=restore_scheduled " +
+                    "(remove → postDelayed(e2, 15000); снимок снят до выполнения: смерть процесса " +
+                    "в эти 15 с отменяет возврат — риск референса)"
             )
-            return@synchronized StartOutcome(null, raw, null)
+            taken = parsed to removed
         }
-        // `remove("jit_restaurar").apply()` — ДО выполнения: так в референсе.
-        store.putString(JitRef.KEY_RESTORE, null)
-        log(
-            "JIT_START snapshot=${net.wire()} removed=true delay_ms=${JitRef.RESTORE_DELAY_MS} " +
-                "action=restore_scheduled (референс: remove → postDelayed(e2, 15000); " +
-                "снимок снимается до выполнения, поэтому смерть процесса в эти 15 с отменяет возврат)"
-        )
-        waiter.sleep(JitRef.RESTORE_DELAY_MS)
-        val report = restoreNetwork(netState, net, waiter, log)
-        log(
-            "JIT_NET_RESTORE done ap=${report.apUp}(${report.apReason}) " +
-                "wifi_requested=${report.wifiRequested} wifi_agora=${report.wifiOn?.toString() ?: "unknown"} " +
-                "failure=${report.failure ?: "none"} internet=not_checked " +
-                "(подтверждено только прочитанное состояние радио, не интернет)"
-        )
-        StartOutcome(net, raw, report)
+        val net = taken!!.first
+        scheduler.postDelayed(JitRef.RESTORE_DELAY_MS) {
+            runCatching { restoreNetwork(netState, net, waiter, log) }
+                .onFailure { log("JIT_NET_RESTORE exception=${it.javaClass.simpleName} (как e2: возврат прерван)") }
+        }
+        return StartOutcome(net, raw, taken.second, scheduled = true)
     }
 
-    // ─────────────────────────── 3. возврат сети: `e2` + `U` ───────────────────────────
+    // ─────────────────────────── 3. возврат сети: `e2` ───────────────────────────
+
+    data class RestoreReport(
+        val apRequested: Boolean,
+        val apUp: Boolean,
+        val apDetail: String,
+        val wifiRequested: Boolean,
+        val wifiOn: Boolean?,
+        val failure: String?
+    )
 
     /**
-     * `e2.run` (case 1): `if (ap) U("pós-JIT", false); if (wifi && !isWifiEnabled()) setWifiEnabled(true);`
+     * `e2.run` (case 1) дословно:
      *
-     * Порядок AP → Wi-Fi сохранён. Исключение внутри этого блока в референсе ловится целиком и
-     * пишется «JIT: restauro falhou» — тогда Wi-Fi уже не запрашивается; здесь так же
-     * ([RestoreReport.failure]).
+     * ```java
+     * if (ap) { try { U("pós-JIT", false); } catch (Throwable t) { log("JIT: restauro falhou: " + t); return; } }
+     * if (wifi && !wm.isWifiEnabled()) wm.setWifiEnabled(true);
+     * log("JIT: restaurado após o restart (wifi=…, ap=…); wifi agora=" + c1() + " ap agora=" + v());
+     * ```
+     *
+     * Общий catch вокруг AP-пути обрывает и Wi-Fi-путь — здесь так же ([RestoreReport.failure]).
      */
     fun restoreNetwork(
         netState: JitRef.JitNetState,
@@ -408,15 +526,16 @@ object JitOp {
         log: (String) -> Unit = {}
     ): RestoreReport {
         var failure: String? = null
-        var apUp = true
-        var apReason = "not_needed"
+        var apUp = !net.ap
+        var apDetail = "not_needed"
         if (net.ap) {
             try {
-                apUp = openAp(netState, waiter, "pós-JIT", log)
-                apReason = if (apUp) "up" else "not_up"
+                val r = openAp(netState, waiter, "pós-JIT", log = log)
+                apUp = r.up
+                apDetail = r.detail
             } catch (t: Throwable) {
                 apUp = false
-                apReason = "exception"
+                apDetail = "exception"
                 failure = "ap:${t.javaClass.simpleName}"
                 log("JIT: restauro falhou: $failure (как в e2: исключение обрывает весь возврат)")
             }
@@ -432,10 +551,12 @@ object JitOp {
                 } else {
                     wifiRequested = true
                     val accepted = netState.setWifi(true)
+                    // `y1`: V=true только если setWifiEnabled вернул true.
+                    if (accepted == true) AUTO_WIFI_ENABLED.set(true)
                     log(
                         "JIT_NET_RESTORE wifi=1 request=setWifiEnabled(true) " +
-                            "accepted=${accepted?.toString() ?: "unknown"} " +
-                            "(референс результат не смотрит: запрос ≠ состояние, состояние ниже)"
+                            "returned=${accepted?.toString() ?: "unknown"} auto_wifi=$AUTO_WIFI_ENABLED " +
+                            "(референс результат не смотрит; запрос ≠ состояние)"
                     )
                 }
                 wifiOn = netState.wifiOn()
@@ -446,128 +567,250 @@ object JitOp {
         } else if (failure == null) {
             log("JIT_NET_RESTORE wifi=0 request=none (Wi-Fi был выключен до операции)")
         }
-        return RestoreReport(net.ap, apUp, apReason, net.wifi, wifiRequested, wifiOn, failure)
+        return RestoreReport(net.ap, apUp, apDetail, wifiRequested, wifiOn, failure)
     }
 
+    // ─────────────────────────── 4. `U(tag, boolean)` целиком ───────────────────────────
+
+    data class ApResult(val up: Boolean, val detail: String)
+
     /**
-     * `U(tag, false)` — «garantirApAberto», перенесённая логика, а не только вызов
-     * `startSoftAp(null)`:
+     * `CentralWatchdogService.U(String, boolean)` — «garantirApAberto», по DEX:
      *
-     * 1. `v()` (AP уже в воздухе) ⇒ `true`;
-     * 2. guard: клиентский Wi-Fi включён ⇒ AP не открываем (`false`, «não disputo o rádio»);
-     * 3. `d()` — рефлексия `startSoftAp(null)`;
-     * 4. ожидание `v()` до 20 с шагом 1 с ⇒ `true`/`false`.
+     * 1. `v()` (AP уже в воздухе) ⇒ `true` — **до** любых ожиданий;
+     * 2. `O()` ⇒ ожидание CarplayMonitor шагом 1 с; после ожидания `v()` ⇒ `true`;
+     * 3. `c1()` — клиентский Wi-Fi (`isWifiEnabled() || ENABLING`), исключение ⇒ `true`;
+     * 4. `p2 == true` (только служебный путь `p1(…, true)`): `dono == PESSOA` ⇒ `false`;
+     *    наш путь (`U("pós-JIT", false)`) эту ветвь не проходит;
+     * 5. `c1() && !V` ⇒ `false` («não vou disputar o rádio»); `c1() && V` ⇒ открываем «por cima»;
+     * 6. общий `CountDownLatch`: второй запрос ждёт чужой результат `await(25 с)` и возвращает `v()`;
+     * 7. своя попытка: `d()` → опрос `v()` до 20 с шагом 1 с; при событии `WIFI_AP_STATE_FAILED`
+     *    (`u1 > старт попытки`) — до 3 попыток с паузой 2 с; иначе `false` («entregando ao
+     *    ConnAdaptor»);
+     * 8. latch снимается и `countDown()` — во всех исходах, включая исключение (там — проброс).
      *
-     * Не перенесено и помечено в отчёте: `O()` (ожидание CarplayMonitor — в нашем приложении такого
-     * состояния нет), мьютекс `CountDownLatch` на 25 с (в нашем приложении AP открывает только это
-     * продолжение, один вызов за раз — сериализует [RESTORE_LOCK]) и ветка «система ответила FAILED»
-     * с 3 попытками (сигнал `u1` приходит из broadcast-приёмника референса, которого у нас нет).
+     * ОТЛИЧИЯ (заявлены, см. отчёт):
+     *  • `O()`/CarplayMonitor — [JitRef.JitNetState.carplayBusy] = `null` ⇒ ожидание пропускается
+     *    (`carplay_wait=skipped reason=signal_unavailable`), а не изображается;
+     *  • `dono`/`sombra_projecao` — служебные состояния референса, в нашем пути не участвуют
+     *    (наш вызов всегда `p2=false`), поэтому ветвь owner реализована как явный параметр.
      */
     fun openAp(
         netState: JitRef.JitNetState,
         waiter: JitRef.JitWaiter,
         tag: String,
+        ownerCheck: Boolean = false,
+        ownerIsPerson: (() -> Boolean)? = null,
         log: (String) -> Unit = {}
-    ): Boolean {
-        log("JIT_AP garantirApAberto($tag)")
-        if (netState.apUp() == true) {
-            log("JIT_AP tag=$tag state=up action=none (AP уже в воздухе → true)")
-            return true
+    ): ApResult {
+        log("JIT_AP garantirApAberto($tag) owner_check=$ownerCheck")
+        // 1. AP уже в воздухе.
+        if (runCatching { netState.apUp() }.getOrNull() == true) {
+            log("JIT_AP tag=$tag state=up action=none result=true (ранний v())")
+            return ApResult(true, "already_up")
         }
-        // `c1()`: isWifiEnabled() || getWifiState()==ENABLING; в референсе исключение ⇒ true
-        // (считаем Wi-Fi включённым и не трогаем радио).
-        val wifiClientOn = netState.wifiOn() ?: true
-        if (wifiClientOn) {
-            log(
-                "JIT_AP tag=$tag state=down wifi_client=on action=none result=false " +
-                    "(как U: «AP fechado, mas o WiFi cliente está ligado — não vou disputar o rádio»)"
-            )
-            return false
+        // 2. Ожидание CarplayMonitor (O()): в референсе — пока проекция в переходе.
+        val carplay = runCatching { netState.carplayBusy() }.getOrNull()
+        if (carplay == null) {
+            log("JIT_AP tag=$tag carplay_wait=skipped reason=signal_unavailable " +
+                "(n1/o1/p1 + com.njda.adapter + connadaptor_modo в нашем приложении отсутствуют)")
+        } else if (carplay) {
+            log("JIT_AP tag=$tag carplay_wait=start step=${JitRef.CARPLAY_WAIT_STEP_MS}ms")
+            while (runCatching { netState.carplayBusy() }.getOrNull() == true) {
+                waiter.sleep(JitRef.CARPLAY_WAIT_STEP_MS)
+            }
+            if (runCatching { netState.apUp() }.getOrNull() == true) {
+                log("JIT_AP tag=$tag carplay_wait=done state=up result=true")
+                return ApResult(true, "up_after_carplay_wait")
+            }
+            log("JIT_AP tag=$tag carplay_wait=done state=down (как U: «fim da espera — sigo»)")
         }
-        val accepted = netState.startAp()
-        log(
-            "JIT_AP tag=$tag request=startSoftAp(null) invoked=${accepted != null} " +
-                "accepted=${accepted?.toString() ?: "unknown"} " +
-                "(референс результат invoke не использует; вызов ≠ открытый AP)"
+        // 3–4. Клиентский Wi-Fi и owner.
+        // `c1()`: исключение ⇒ `true` (Wi-Fi считается занятым, радио не трогаем).
+        val wifiOn = runCatching { netState.wifiOn() }.getOrNull()
+        if (wifiOn == false) AUTO_WIFI_ENABLED.set(false) // `t1`: !c1() ⇒ V=false
+        val clientBusy = JitRef.clientWifiBusy(
+            wifiOn,
+            runCatching { netState.wifiEnabling() }.getOrNull()
         )
-        val up = poll(netState::apUp, JitRef.AP_POLL_TOTAL_MS, JitRef.AP_POLL_STEP_MS, waiter)
-        log(
-            "JIT_AP tag=$tag state_after=${up?.toString() ?: "unknown"} " +
-                "poll=${JitRef.AP_POLL_TOTAL_MS / 1000}s step=${JitRef.AP_POLL_STEP_MS}ms " +
-                "(подтверждением считается только чтение ap0)"
-        )
-        return up == true
+        if (ownerCheck) {
+            val person = ownerIsPerson?.invoke() ?: true
+            if (person) {
+                log("JIT_AP tag=$tag owner=pessoa action=none result=false " +
+                    "(«o AP por antecipação não disputa o rádio»)")
+                return ApResult(false, "owner_person")
+            }
+        }
+        val auto = AUTO_WIFI_ENABLED.get()
+        if (clientBusy && !auto) {
+            log("JIT_AP tag=$tag state=down wifi_client=on auto=false action=none result=false " +
+                "(как U: «AP fechado, mas o WiFi cliente está ligado — não vou disputar o rádio»)")
+            return ApResult(false, "wifi_client_on")
+        }
+        if (clientBusy) {
+            log("JIT_AP tag=$tag wifi_client=on auto=true action=open " +
+                "(как U: «ligado pelo auto-enable, abro o AP por cima»)")
+        }
+        // 6. Общий latch: второй запрос ждёт чужой результат.
+        val mine = java.util.concurrent.CountDownLatch(1)
+        val other: java.util.concurrent.CountDownLatch?
+        synchronized(LATCH_LOCK) {
+            other = apLatch
+            if (other == null) apLatch = mine
+        }
+        if (other != null) {
+            log("JIT_AP tag=$tag action=await latch=foreign max=${JitRef.AP_LATCH_WAIT_S}s " +
+                "(как U: «AP já sendo aberto por outro pedido — espero o mesmo resultado»)")
+            try {
+                other.await(JitRef.AP_LATCH_WAIT_S, java.util.concurrent.TimeUnit.SECONDS)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+            val up = runCatching { netState.apUp() }.getOrNull() == true
+            log("JIT_AP tag=$tag latch=foreign result=$up (как U: «no ar (pelo outro pedido)»/«NÃO subiu»)")
+            return ApResult(up, if (up) "up_by_other" else "not_up_by_other")
+        }
+        var attempt = 1
+        try {
+            netState.beginApWatch()
+            while (attempt <= JitRef.AP_ATTEMPTS) {
+                val startedAt = waiter.nowMs()
+                log(
+                    "JIT_AP tag=$tag attempt=$attempt/${JitRef.AP_ATTEMPTS} state=down — " +
+                        "abrindo (как U: «AP fechado — abrindo»)"
+                )
+                val invoked = netState.startAp()
+                log(
+                    "JIT_AP tag=$tag request=startSoftAp(null) invoked=${invoked != null} " +
+                        "returned=${invoked?.toString() ?: "unknown"} " +
+                        "(референс результат invoke не использует: вызов ≠ открытый AP)"
+                )
+                var waited = 0L
+                var failedSignal = false
+                var up = false
+                while (waited < JitRef.AP_POLL_TOTAL_MS) {
+                    if (runCatching { netState.apUp() }.getOrNull() == true) {
+                        up = true
+                        break
+                    }
+                    waiter.sleep(JitRef.AP_POLL_STEP_MS)
+                    waited += JitRef.AP_POLL_STEP_MS
+                    // `u1 > t0`: событие WIFI_AP_STATE_FAILED пришло уже во время этой попытки.
+                    if (runCatching { netState.apFailedAtMs() }.getOrDefault(0L) > startedAt) {
+                        failedSignal = true
+                        break
+                    }
+                }
+                if (up) {
+                    log(
+                        "JIT_AP tag=$tag state_after=up após=${waited / 1000}s attempt=$attempt " +
+                            "(подтверждением считается только чтение ap0)"
+                    )
+                    return ApResult(true, "up_after_${waited / 1000}s")
+                }
+                if (failedSignal && attempt < JitRef.AP_ATTEMPTS) {
+                    log(
+                        "JIT_AP tag=$tag system=FAILED após=${waited / 1000}s action=retry " +
+                            "pause=${JitRef.AP_RETRY_PAUSE_MS}ms " +
+                            "(как U: «rádio ainda não pronto? espero 2s e tento de novo»)"
+                    )
+                    waiter.sleep(JitRef.AP_RETRY_PAUSE_MS)
+                    attempt++
+                    continue
+                }
+                log(
+                    "JIT_AP tag=$tag state_after=down result=false " +
+                        (if (failedSignal) "FAILED de novo" else "timeout ${waited / 1000}s") +
+                        " — entregando ao ConnAdaptor (в нашем приложении этого пути нет)"
+                )
+                return ApResult(false, if (failedSignal) "failed_again" else "timeout_${waited / 1000}s")
+            }
+            return ApResult(false, "attempts_exhausted")
+        } finally {
+            netState.endApWatch()
+            synchronized(LATCH_LOCK) { if (apLatch === mine) apLatch = null }
+            mine.countDown()
+        }
     }
 
-    /**
-     * `bb.run` + `r7.run`: `getprop dalvik.vm.usejit` (8000 мс) + `/proc/self/maps`, затем
-     * `ok = (pedido == getprop) && (!pedido || maps != FALSE)`, снятие `jit_pedido` и сообщение
-     * «не применилось».
-     *
-     * ОТЛИЧИЕ (см. [JitRef.parseProp]): при нечитаемом `getprop` результат `unknown` и
-     * `jit_pedido` НЕ снимается — иначе одна неудачная попытка чтения выбросила бы намерение и
-     * следующая сверка не смогла бы ничего сказать. В референсе `jit_pedido` снимается всегда.
-     */
+    // ─────────────────────────── 5. сверка: `bb` + `r7` ───────────────────────────
+
     data class VerifyState(
         val pedido: Boolean?,
         val prop: JitRef.PropFact,
         val cache: Boolean?,
         val verdict: JitRef.Verify,
-        val pedidoCleared: Boolean
+        val removed: JitRef.WriteResult?,
+        val stillPresent: Boolean
     )
 
+    /**
+     * `bb.run` + `r7.run`: `getprop dalvik.vm.usejit` (8000 мс) + `/proc/self/maps`, затем
+     * `ok = (pedido == getprop) && (!pedido || maps != FALSE)`, `toggle.setActive(getprop)`,
+     * `remove("jit_pedido").apply()` и предупреждение при `!ok && pedido`.
+     *
+     * ВАЖНО: это НЕ read-only — при подтверждённых `true/false` ключ реально удаляется (как в
+     * `r7`), поэтому и лог пишет `write=remove(...)`.
+     *
+     * ОТЛИЧИЕ (разрешено мандатом): при нечитаемом `getprop` результат [JitRef.Verify.UNKNOWN],
+     * `jit_pedido` НЕ удаляется — иначе одна неудачная попытка чтения выбросила бы намерение и
+     * следующая сверка не смогла бы ничего сказать.
+     */
     fun verifyApplied(
         store: JitRef.JitStore,
         shell: JitRef.JitShell,
         log: (String) -> Unit = {}
     ): VerifyState {
+        val present = store.contains(JitRef.KEY_PEDIDO)
+        if (!present) {
+            val (rc, out) = shell.exec("getprop ${JitRef.PROP_USEJIT}", JitRef.GETPROP_TIMEOUT_MS)
+            val prop = JitRef.parseProp(rc, out)
+            val cache = shell.cacheVisible()
+            log(
+                "JIT_APPLIED ${prop.log} code_cache_executavel=${cache?.toString() ?: "unknown"} " +
+                    "pedido=none result=no_request write=none " +
+                    "(в префах нет jit_pedido — сверять нечего, ничего не пишем)"
+            )
+            return VerifyState(null, prop, cache, JitRef.Verify.UNKNOWN, null, false)
+        }
+        val pedido = store.getBool(JitRef.KEY_PEDIDO) ?: false
         val (rc, out) = shell.exec("getprop ${JitRef.PROP_USEJIT}", JitRef.GETPROP_TIMEOUT_MS)
         val prop = JitRef.parseProp(rc, out)
         val cache = shell.cacheVisible()
-        val present = store.contains(JitRef.KEY_PEDIDO)
-        val pedido = if (present) (store.getBool(JitRef.KEY_PEDIDO) ?: false) else null
-        if (pedido == null) {
-            log("JIT_APPLIED ${prop.log} code_cache_executavel=${cache?.toString() ?: "unknown"} " +
-                "pedido=none result=no_request (в префах нет jit_pedido — сверять нечего)")
-            return VerifyState(null, prop, cache, JitRef.Verify.UNKNOWN, false)
-        }
         val verdict = JitRef.verify(pedido, prop, cache)
-        log("JIT pedido=$pedido getprop=${prop.raw.ifEmpty { "empty" }} " +
-            "code-cache-executavel=${cache?.toString() ?: "unknown"} " +
-            "result=${JitRef.verifyLabel(verdict)} restart=not_claimed")
+        log(
+            "JIT pedido=$pedido getprop=${prop.raw.ifEmpty { "empty" }} " +
+                "code-cache-executavel=${cache?.toString() ?: "unknown"} " +
+                "result=${JitRef.verifyLabel(verdict)} restart=not_claimed"
+        )
         if (verdict == JitRef.Verify.UNKNOWN) {
-            log("JIT_PEDIDO kept reason=property_unreadable ${prop.log} write=none " +
-                "(в референсе jit_pedido снимается всегда; здесь намерение сохраняется, чтобы " +
-                "следующая сверка не потеряла запрос — отличие описано в отчёте §3)")
-            return VerifyState(pedido, prop, cache, verdict, false)
+            log(
+                "JIT_PEDIDO kept reason=property_unreadable ${prop.log} write=none " +
+                    "(ОТЛИЧИЕ: референс удаляет jit_pedido всегда; здесь намерение сохраняется, " +
+                    "чтобы следующая сверка не потеряла запрос)"
+            )
+            return VerifyState(pedido, prop, cache, verdict, null, true)
         }
-        val cleared = store.putBool(JitRef.KEY_PEDIDO, false)
-        log("JIT_PEDIDO cleared=$cleared (как r7: remove(jit_pedido) после сверки)")
+        // `remove("jit_pedido").apply()` — настоящее удаление, не запись false.
+        val removed = store.remove(JitRef.KEY_PEDIDO)
+        val stillPresent = store.contains(JitRef.KEY_PEDIDO)
+        log(
+            "JIT_PEDIDO removed=${removed.allOk} stores=${removed.ok}/${removed.attempted} " +
+                "still_present=$stillPresent write=remove(${JitRef.KEY_PEDIDO}) " +
+                "(как r7: remove().apply() после сверки)"
+        )
         if (verdict != JitRef.Verify.OK && pedido) {
-            log("JIT_NOT_APPLIED result=${JitRef.verifyLabel(verdict)} pedido=$pedido " +
-                "getprop=${prop.raw.ifEmpty { "empty" }} cache=${cache?.toString() ?: "unknown"} " +
-                "(факт, а не предположение; ничего не дозаписываем)")
+            log(
+                "JIT_NOT_APPLIED result=${JitRef.verifyLabel(verdict)} pedido=$pedido " +
+                    "getprop=${prop.raw.ifEmpty { "empty" }} cache=${cache?.toString() ?: "unknown"} " +
+                    "(как r7: предупреждение при !ok && pedido; ничего не дозаписываем)"
+            )
         }
-        return VerifyState(pedido, prop, cache, verdict, cleared)
+        return VerifyState(pedido, prop, cache, verdict, removed, stillPresent)
     }
 
     fun readProp(shell: JitRef.JitShell): JitRef.PropFact {
         val (rc, out) = shell.exec("getprop ${JitRef.PROP_USEJIT}", JitRef.GETPROP_TIMEOUT_MS)
         return JitRef.parseProp(rc, out)
-    }
-
-    private fun poll(
-        read: () -> Boolean?,
-        totalMs: Long,
-        stepMs: Long,
-        waiter: JitRef.JitWaiter
-    ): Boolean? {
-        val t0 = waiter.nowMs()
-        var last = read()
-        while (last != true && waiter.nowMs() - t0 < totalMs) {
-            waiter.sleep(stepMs)
-            last = read()
-        }
-        return last
     }
 }

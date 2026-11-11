@@ -759,25 +759,28 @@ object AppPerformance {
     }
 
     /**
-     * Остаточный снимок AVAS прежних версий (до 1.0.61) — только фиксируется строкой.
+     * Остаточные файлы AVAS прежних версий — только проверка СУЩЕСТВОВАНИЯ, без чтения значения,
+     * удаления и применения.
      *
-     * §2 мандата: mute/выбор типа звука — самостоятельные функции референса (`w0/qa`, `w0/t2`,
-     * `w0/f2`, `CentralWatchdogService.z()/A()`), в JIT-цепочке (`w0/j9`, `w0/la`, `w0/e2`, `w0/bb`,
-     * `w0/r7`) они не участвуют. Механизм `AvasCore`/`AvasRestore` удалён вместе с файлом-снимком
-     * `avas_snapshot`. Файл прежней версии на ГУ может остаться: его существование только
-     * СООБЩАЕТСЯ, значения на устройстве не меняются и файл не удаляется (удаление — решение
-     * владельца, §9 отчёта). Независимые функции звука (замки) этот код не трогает.
+     * Что было в 1.0.60 (`a155e79`): `AvasRestore.kt` сохранял режим AVAS в файл
+     * `avas_mode_saved` (sound type не сохранялся) и при восстановлении мог вызвать
+     * `setAVASMode(сохранённое)`, в том числе `0`. Исполнилось ли это на конкретной ГУ — по
+     * имеющимся логам НЕ установлено.
+     *
+     * Поэтому проверяются ОБА известных имени (`avas_mode_saved` — реальный файл 1.0.60 и
+     * `avas_snapshot` — имя механизма, удалённого в 1.0.61). Лог не пишет `snapshot=none` как
+     * «снимков нет вообще»: он перечисляет ровно те имена, которые искал.
      */
     private fun reportLegacyAvasSnapshot(app: Context) {
-        val candidates = listOfNotNull(
-            runCatching { File(app.filesDir, "avas_snapshot") }.getOrNull(),
-            runCatching { File(app.filesDir, "avas_snapshot.tmp") }.getOrNull()
-        )
-        val present = candidates.filter { runCatching { it.isFile }.getOrDefault(false) }
-        AppLog.i(TAG, "AVAS_LEGACY snapshot=${if (present.isEmpty()) "none" else "present"} " +
-            "files=${present.joinToString(",") { it.name }.ifEmpty { "none" }} action=none write=none " +
-            "need=owner_decision boot=${currentBootTag()} " +
-            "(JIT не читает и не применяет остаточный снимок AVAS; звук не трогаем)")
+        val names = listOf("avas_mode_saved", "avas_snapshot", "avas_snapshot.tmp")
+        val found = names.filter { n ->
+            runCatching { File(app.filesDir, n).isFile }.getOrDefault(false)
+        }
+        AppLog.i(TAG, "AVAS_LEGACY checked=${names.joinToString(",")} " +
+            "present=${found.ifEmpty { listOf("none") }.joinToString(",")} files_found=${found.size} " +
+            "action=none write=none value=not_read apply=none need=owner_decision " +
+            "boot=${currentBootTag()} " +
+            "(только существование; режим AVAS не читаем и не выставляем, файлы не удаляем)")
     }
 
     // Строки состояния JIT для UI собирает [ToolsBackend.perfJitRuntime] по ФАКТУ из кэша
@@ -823,12 +826,15 @@ object AppPerformance {
             .onFailure { AppLog.i(TAG, "JIT_START_RESULT exception=${it.javaClass.simpleName} (сеть не тронута)") }
             .getOrNull()
         if (out == null) return false
-        val restored = out.report != null
+        // Ни `restarted=`, ни `net_restore_done`: наличие снимка НЕ доказывает ни рестарт zygote,
+        // ни успешный возврат сети. Пишем только то, что известно: что снято, что запланировано.
         AppLog.i(TAG, "JIT_START_RESULT snapshot=${out.snapshot?.wire() ?: "none"} " +
-            "restarted=$restored ap=${out.report?.apUp?.toString() ?: "none"} " +
-            "wifi=${out.report?.wifiOn?.toString() ?: "none"} " +
-            "internet=not_checked action=${if (restored) "net_restore_done" else "none"}")
-        return restored
+            "restore_removed=${out.removed?.allOk ?: false} " +
+            "restore_stores=${out.removed?.let { "${it.ok}/${it.attempted}" } ?: "0/0"} " +
+            "e2_scheduled=${out.scheduled} delay_ms=${JitRef.RESTORE_DELAY_MS} " +
+            "zygote_restart=not_claimed internet=not_checked " +
+            "(возврат сети выполнится в фоне через 15 с; его итог — строки JIT_NET_RESTORE)")
+        return out.scheduled
     }
 
     /**
@@ -891,9 +897,9 @@ object AppPerformance {
      *   zygote` последней командой) → `CentralWatchdogService.onCreate` → `w0/e2.run`
      *   (возврат AP, затем Wi-Fi) → `w0/bb`/`w0/r7` (getprop + `dalvik-jit-code-cache`).
      *
-     * Отличий в последовательности нет. Не включён только шаг `umount -l` точек `/data/app/`
-     * (обратимость не доказана на живой ГУ) — он не «спрятан флагом»: каждая отправка цепочки
-     * пишет `mount_step=absent reason=reversibility_unproven need=owner_decision`.
+     * Отличий в последовательности нет. Шаг `umount -l` точек `/data/app/` **включён** и
+     * отправляется как в референсе (каждая отправка пишет `mount_step=present`); обратимость на
+     * живой ГУ при этом НЕ проверена — это отдельный блокер отчёта iter35 §3, а не выключенный шаг.
      */
 
     /**
@@ -953,15 +959,30 @@ object AppPerformance {
     // ═══════════ JIT_ZYGOTE_END ═══════════
 
     /**
-     * read-only проба состояния JIT (без файлов-маркеров и без записей).
+     * Сверка `w0/bb` + `w0/r7` (getprop + `/proc/self/maps` + `jit_pedido`).
      *
-     * В референсе проверка — `w0/bb`+`w0/r7` (`getprop` + `dalvik-jit-code-cache`), она выполняется
-     * после операции. Здесь только факт для лога/UI: ничего не пишем, рестартов не просим.
+     * Это **НЕ read-only**, когда намерение есть: как и `r7`, сверка УДАЛЯЕТ `jit_pedido`
+     * (`remove(...).apply()`) при подтверждённом `true/false`. Честный лог пишет
+     * `write=remove(...)`/`write=none` по факту, а не «write=none» всегда.
+     *
+     * Вызывается: (а) при открытии панели инструментов — как настройки в референсе (`S0` → `bb`);
+     * (б) в watchdog раз в 5 тиков, и только если в префах есть `jit_pedido`
+     * ([JitNet.hasPendingPedido], локальная проверка без shell) — иначе ни команд, ни записей.
+     *
+     * @return `true`, если сверка действительно выполнялась (было что сверять).
      */
-    fun verifyJitOnly(context: Context) {
+    fun verifyJitOnly(context: Context): Boolean {
         val app = context.applicationContext
-        val out = runCatching { JitNet.verifyApplied(app) }.getOrNull() ?: return
-        AppLog.i(TAG, "JIT_PROBE write=none (сверка w0/bb + w0/r7; рестарт не заявляется)")
+        if (!runCatching { JitNet.hasPendingPedido(app) }.getOrDefault(false)) {
+            AppLog.i(TAG, "JIT_PROBE skipped reason=no_pedido write=none commands=0 " +
+                "(сверять нечего: намерения нет; getprop-запрос не отправлялся)")
+            return false
+        }
+        val out = runCatching { JitNet.verifyApplied(app) }.getOrNull() ?: return false
+        AppLog.i(TAG, "JIT_PROBE result=${JitRef.verifyLabel(out.verdict)} pedido=${out.pedido} " +
+            "write=remove_if_confirmed removed=${out.removed?.allOk ?: false} " +
+            "still_present=${out.stillPresent} restart=not_claimed")
+        return true
     }
 
     private fun runSuCommand(command: String): ExecResult {
