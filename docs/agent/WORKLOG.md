@@ -1037,3 +1037,45 @@ bind-mount только в `/vendor/etc/carlock/`; `setAVASMode`/запись `/
 датированный лог в момент симптома (без клика JIT и без перезагрузки).
 
 **SOURCE_SHA** = `10cd137`.
+
+---
+
+## iter36 (1.0.61) — JIT без точки доступа, честный клиентский Wi-Fi, реальная проверка JIT-кэша
+
+**Коммит кода:** `b3705f3`. **CI:** run `43022611861`, job `130529271884` — `success`,
+`PASSED` 221 / `FAILED` 0, artifact `app-debug` id `13856077487` (177 170 063 Б).
+Локально: `OK (106 tests)`. База — HEAD `f2ccceb` / код `10cd137`, ничего чужого не откатывалось.
+
+**Убрано из JIT целиком** (решение владельца): `U`/`openAp`, `ap0`, `startSoftAp`,
+`WIFI_AP_STATE_CHANGED`/`wifi_state==14`, попытки/пауза 2 с/`FAILED`, `CountDownLatch`,
+`AUTO_WIFI_ENABLED`, owner/`dono`, `CarplayMonitor`/`connadaptor_modo`, логи `JIT_AP`.
+`JitRef.JitNetState` = ровно `wifiOn()`, `setWifi()`, `wifiAddress()` — мёртвого кода нет.
+
+**Снимок:** новый минимальный `jit_restaurar="wifi=0|1"`; старый `wifi=…,ap=…` принимается,
+`ap` игнорируется без вызовов AP; битая запись не выполняется и не чистится.
+
+**Клик:** неизвестное состояние Wi-Fi (`null`, не `false`) или снимок, не подтверждённый чтением
+(`confirmSnapshot`), блокируют отправку `svc wifi disable`; причина уходит в существующую панель
+(`ToolsStep.Status.BLOCKED`) и лог `JIT_CLICK blocked=…`. Текст шага больше не обещает «AP, затем
+Wi-Fi»: показано `restore=`, `confirmed=`, `internet=not_checked`.
+
+**Найденная и исправленная ошибка:** `JitNet.kt` считал успехом ЛЮБУЮ строку `/proc/self/maps`
+со словом `jit-cache`, включая `rw-p` без `x`, а отсутствие строк давало `false`. Теперь как
+`w0/bb`→`w0/sa`→`w0/j5.d`: фильтр имён + права `\br[-w]x[ps]\b`, три значения `true/false/null`.
+Проверено на синтетических строках и на реальных файлах (`JitMapsTest`).
+
+**Гонки:** сверка не выполняется во время нашего клика (`click_in_flight`) и не снимает
+`jit_pedido`, если значение изменилось (`race=pedido_changed`); async-ответ не переставляет
+тумблер после нового клика (`jitGeneration`); пустой кэш больше не съедает callback
+(`refreshJitRuntimeAsync`). Подтверждённый не-успех сверки показывается в той же read-only строке
+панели (`JitRef.verifyHint`) — без новых кнопок и красного текста.
+
+**⛔ `umount -l`:** шаг включён (`mount_step=present`), обратимость на ГУ не проверена; в отчёте
+iter36 §3 — четыре read-only команды (`/proc/self/mountinfo` своего namespace и PID 1,
+`ls -l ns/mnt`, `findmnt` по точкам), пустой вывод/нет `findmnt` = `unknown`.
+
+**⛔ Продолжение:** что приложение запустится после `ctl.restart zygote`, недоказуемо без ГУ
+(`BOOT_COMPLETED` при рестарте zygote не приходит, `START_STICKY` — не гарантия). Возврат сети не
+заявляется.
+
+**SOURCE_SHA** = `b3705f3`.
