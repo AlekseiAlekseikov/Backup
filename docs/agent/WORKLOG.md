@@ -864,3 +864,44 @@ run `42881198633`, job `130057601380` — BUILD SUCCESSFUL, **200 PASSED / 0 FAI
 
 **Открыто:** полевого прогона JIT нет (по условию — после нового REVIEW); случай «снимок есть,
 журнала нет, сеть уже не та» намеренно останавливается на `HOLD_UNKNOWN` и ждёт решения владельца.
+
+## iter33p (1.0.61) — ТРЕТИЙ ЗАХОД: 11 замечаний REVIEW к `78a3248`, код `aed18fb`
+
+**База:** `e8f5e23`. **Код:** `aed18fb` (`fix/v2`, fast-forward, без `--force`). **CI:** run
+`42954771103`, job `130307151164` — `BUILD SUCCESSFUL in 4m 27s`, **186 PASSED / 0 FAILED**
+(из полного лога: `grep -c ' PASSED$'` = 186, `grep -c ' FAILED$'` = 0), artifact `app-debug`
+id `13826483630`, 177 171 113 Б.
+
+**Что исправлено (по замечаниям):** признак выполнения цепочки — только сеть (совпадение
+`getprop` больше не доказательство); снят запрет «одна попытка на процесс» + `startGate` против
+двойного возврата; `perf_auto_otimizar` пишет ядро после ПОДТВЕРЖДЁННОГО снимка; `unknown` в
+сверке не снимает намерение и не переписывает чужой снимок (`persist=false`); `parseProp` не
+считает `unknown` обычный `\n` в конце вывода; `JitOp.click` возвращает реальный `ChainRun`
+(раньше `run` всегда был `null`); `AndroidNetState.setWifi` — рабочий `setWifiEnabled(on)`
+(прежняя запись была присваиванием-выражением и не компилировалась); восстановлен
+`reportLegacyAvasSnapshot` (был вызов без определения); удалён допуск ±60 с в `JitBootMark`
+(`sameLoad`/`format`/`stripEpochPrefix`) — недоказанный признак «той же загрузки»; убраны мёртвые
+`JIT_STATE_ON_LINE/OFF_LINE`; скрипт приведён к литералу DEX символ в символ
+(`_n=$((_n + 1))`, 392 символа — проверено независимым сравнением с `w0/la.smali:326,342`).
+
+**Ядро:** `JitRef` (ключи и текст скрипта референса, `PropFact`/`Verify`, `Phase`, `BootMatch`,
+`StartDecision`, `ClickGate`, `ChainOutcome`) + `JitOp` (клик под `startLock`, продолжение под
+`startGate`, возврат AP→Wi-Fi с ожиданием факта, сверка с `rc`). Адаптеры `JitNet` —
+`AndroidShell`/`AndroidStore` (два `commit()` + обратное чтение)/`AndroidNetState`. UI:
+`perfJit` = запрос, `perfJitRuntime` = факт из кэша (`true|false|unknown`), строка
+«Сейчас на устройстве: …» под тумблером, shell из главного потока не вызывается.
+
+**Тесты:** 10 классов, **71 PASS / 0 FAIL** локально (`/home/user/runtests.sh`, kotlinc 1.9.24 +
+`android.jar` + junit 4.13.2, настоящий `/bin/sh` с подставными командами) и те же 71 в CI.
+Добавлены `JitOrchestratorTest` (20), `JitStartZeroWritesTest` (5), `JitLogsCancelTest` (5);
+удалены `JitChainEndToEndTest` (14), `JitBootTest` (5), `JitBootMarkTest` (4), `JitTogglePathTest` (4)
+— эквивалентное покрытие в отчёте §4.1.
+
+**Шаг монтирований §1.1:** реализован символ в символ, выключен (`MOUNT_STEP_ENABLED=false`).
+Анализ read-only (в отчёте §3.2): `umount -l` точек `/data/app/` бьёт по APK чужих приложений,
+штатного возврата без перезагрузки нет ⇒ обратимость не доказана, нужно решение владельца.
+
+**SOURCE_SHA** в handoff-коммите: `78a3248` → `aed18fb` (`app/buildinfo.properties`).
+
+**Открыто:** полевого прогона JIT нет (владелец не запускает до нового REVIEW); вопросы владельцу —
+монтирования, чистка остатков `persist.*` JIT, остаточный `avas_snapshot`, `ACTION_BOOT_HU`.
