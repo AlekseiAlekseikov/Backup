@@ -15,7 +15,7 @@ APK, не `assets/pip-overlay.apk`).
 | что | значение |
 |---|---|
 | ветка / HEAD | `fix/v2` / **`9de9dce`** (код итерации) |
-| docs-коммит | см. `WORKLOG.md` (отчёт + `SOURCE_SHA`), CI по нему — отдельный run |
+| docs-коммит | **`b93eea8`** (отчёт + `WORKLOG.md` + `SOURCE_SHA`); run **`42996265714`**, job `130441021795` — `success`, `PASSED` 194 / `FAILED` 0, artifact `13844292942` (177 161 997 Б) |
 | run / job | **`42994299986`** / **`130434558159`** |
 | результат job | **`success`** (09:20:27 → 09:31:04 UTC) |
 | `PASSED` / `FAILED` из полного лога | **194 / 0** (`grep -a 'PASSED'` = 194 строки; строк `FAILED` — 0; `BUILD SUCCESSFUL`) |

@@ -987,7 +987,9 @@ sleep 15 000 → restore), `restoreNetwork` (= `w0/e2.run`), `openAp` (= `U(Stri
 
 **CI опубликованного кода** (`9de9dce`): run `42994299986`, job `130434558159` — `success`,
 `PASSED` 194 / `FAILED` 0 (полный лог: 194 строки `PASSED`, 0 строк `FAILED`, `BUILD SUCCESSFUL`),
-artifact `app-debug` id `13843339117` (177 161 925 Б).
+artifact `app-debug` id `13843339117` (177 161 925 Б). Docs-коммит `b93eea8` (этот отчёт + WORKLOG +
+`SOURCE_SHA`): run `42996265714`, job `130441021795` — `success`, `PASSED` 194 / `FAILED` 0,
+artifact `13844292942` (177 161 997 Б).
 
 **Отличия от референса (все заявлены):** нечитаемый `getprop` = «неизвестно» и `jit_pedido` не
 снимается; тумблер показывает «состояние неизвестно»; два хранилища prefs проекта вместо одного;
