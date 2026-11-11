@@ -1,15 +1,22 @@
-# REPORT iter33p (1.0.61) — ТРЕТИЙ ЗАХОД: 11 замечаний REVIEW к `78a3248` исправлены
+# REPORT iter33p (1.0.61) — ТРЕТИЙ ЗАХОД, ПРАВКА 2: 10 проблем §0.0 мандата
 
 **Ветка:** `fix/v2` (без `--force`, `main` не тронут). **Версия:** `versionCode=61`,
-`versionName="1.0.61"` (не устанавливалась — APK собирает и подписывает владелец).
+`versionName="1.0.61"` (APK собирает и подписывает владелец).
 
-> **Почему заходов несколько.** Первый (`c8e4c9c`) был построен на СВОЕЙ механике (журнал шагов,
-> TTL, окно 60 с, `CONTINUE/COMPENSATE/HOLD`, watcher, boot-backfill) вместо копии `j9`→`la`→`e2`.
-> Второй (`577d338` → `78a3248`) её убрал, но REVIEW нашёл 11 дефектов в самом исполнении:
-> ложный признак «цепочка выполнена», потеря `ChainRun`, ложный `unknown` из-за перевода строки,
-> признак «та же загрузка» по допуску ±60 с, вызов несуществующей функции и т. д. Этот документ
-> описывает третий заход по мандату `PROMPT_iter33p_restart-2_…ИСПРАВЛЕНИЕ_1.0.61.md` (§0.1 — 11
-> пунктов) и заменяет прежний отчёт целиком.
+> **Почему правка 2.** Правка 1 (`aed18fb`) скопировала последовательность `j9`→`la`→`e2`→`bb/r7`,
+> но признаком завершения нашего скрипта в ней оставалось **выключенное радио**. Мандат
+> `PROMPT_iter33p_3й_заход_ИСПРАВЛЕНИЕ_1.0.61.md` §0.0 показал 10 мест, где это даёт ложный
+> результат: сеть мог выключить другой shell, а `svc wifi disable` — вообще ПЕРВАЯ команда
+> скрипта, поэтому «сеть выключена» ничего не говорит о том, дошёл ли скрипт до `setprop` и
+> `ctl.restart zygote`.
+>
+> Правка 2 меняет признак завершения на единственный доказуемый — **ответ транспорта на НАШ
+> вызов** (`shell=REPLIED`). Всё, что не доказано, останавливается в `HOLD_UNSAFE_PHASE`: ноль
+> записей в хранилища, ноль сетевых действий, решение за владельцем. Механика референса
+> (`j9`→`la`→`e2`→`bb/r7`) не менялась; скрипт по-прежнему совпадает с DEX символ в символ.
+>
+> Документ заменяет прежний отчёт целиком; §0.4 сохранён как история правки 1 (`aed18fb`) с
+> пометкой, что номера строк там относятся к тому коммиту.
 
 ---
 
@@ -23,43 +30,51 @@
 | тесты в CI | **186 PASSED / 0 FAILED** (`grep -c ' PASSED$'` = 186, `grep -c ' FAILED$'` = 0 по полному логу) |
 | artifact | `app-debug`, id `13826483630`, 177 171 113 Б |
 | handoff | **`297f1ef`** — только `docs/agent/**` + `app/buildinfo.properties` (`SOURCE_SHA=aed18fb`) |
-| CI по handoff | run **`42956152521`**, job **`130311632733`** — **SUCCESS**, `BUILD SUCCESSFUL in 2m 57s`, **186 PASSED / 0 FAILED**, artifact `13827676157` (177 170 921 Б) |
+| CI по handoff правки 1 | run **`42956152521`**, job **`130311632733`** — **SUCCESS**, `BUILD SUCCESSFUL in 2m 57s`, **186 PASSED / 0 FAILED**, artifact `13827676157` |
+| база правки 2 | **`6436be8`** (было в CI: run `42957218012`, job `130315052654`, **186 / 0**) |
+| **код правки 2** | **`61bfddd`** (`61bfddd0c55352156c34a55706c2811ae07e9634`) — только JIT-файлы, UI-строка и тесты |
+| **CI по коду правки 2** | заполняется в handoff-коммите ниже (прогон идёт по последнему push) |
+| локальный прогон @ `61bfddd` | **`OK (95 tests)`** — JIT/лог-подмножество на стабах и настоящем `/bin/sh` (§7) |
 
 `SKIPPED` в логе — только Gradle-задачи (`checkKotlinGradlePluginConfigurationErrors`,
 `kspDebugUnitTestKotlin`), ни одного пропущенного теста.
 
 ### 0.1 Разбивка JIT-тестов в CI (из полного лога той же джобы)
 
-| класс | в CI | локально |
-|---|---|---|
-| `JitOrchestratorTest` | 20 | 20 |
-| `JitRefTest` | 13 | 13 |
-| `JitChainScriptTest` | 8 | 8 |
-| `JitStartZeroWritesTest` | 5 | 5 |
-| `JitLogsCancelTest` | 5 | 5 |
-| `AvasIndependenceTest` | 5 | 5 |
-| `JitBootBoundaryTest` | 4 | 4 |
-| `JitNoPersistTest` | 3 | 3 |
-| `JitRulesReadOnlyTest` | 2 | 2 |
-| `LogFilesTest` (§9, лог по датам) | 6 | 6 |
-| **итого** | **71** | **71** |
+| класс | локально (правка 2) | было (правка 1) | что нового |
+|---|---|---|---|
+| `JitOrchestratorTest` | **23** | 20 | `lostChainNeverRestoresEvenWhenNetworkIsDown`, `bothRadiosOffWaitsForProvenCompletion`, `bothRadiosOffWithRepliedChainIsDoneAndNextClickAllowed` |
+| `JitRefTest` | **14** | 13 | `startDecisionRequiresProvenShellCompletion`, `shellFieldRoundTripsAndOldSnapshotIsUnknown` |
+| `JitLifecycleTest` | **7** | — | барьеры на каждом шаге цепочки (см. §4) |
+| `JitStoreConsistencyTest` | **8** | — | CPS/DPS: `commit=false`, расхождение, приоритет, одно/оба хранилища, удаление ключа |
+| `JitUiStateTest` | **5** | — | тумблер = подтверждённый факт, новых кнопок нет |
+| `JitChainScriptTest` | 8 | 8 | без изменений |
+| `JitStartZeroWritesTest` | 5 | 5 | без изменений |
+| `JitLogsCancelTest` | 5 | 5 | `restoreOnlyTurnsNetworkOn` переписан на `runInline=1`; `HOLD` убран из чёрного списка |
+| `AvasIndependenceTest` | 5 | 5 | без изменений |
+| `JitBootBoundaryTest` | 4 | 4 | без изменений |
+| `JitNoPersistTest` | 3 | 3 | без изменений |
+| `JitRulesReadOnlyTest` | 2 | 2 | без изменений |
+| `LogFilesTest` (§9, лог по датам) | 6 | 6 | без изменений |
+| **итого** | **95** | **71** | +24 |
+
+Полный набор проекта (Android-модуль) исполняется только в CI — локально нет Android SDK.
+Поэтому здесь и далее «95» — это JIT/лог-подмножество, а не весь набор: цифры CI по коду
+`61bfddd` указаны в §0 после прогона и **не** подменяются локальными.
 
 Остальные 115 PASSED — тесты других подсистем (TTL, климат, статус-иконки, плагин, reconnect и
 т. д.), они не менялись.
 
-### 0.2 Что именно в коммите `aed18fb`
+### 0.2 Что именно в коммите `61bfddd`
 
 | файл | изменение |
 |---|---|
-| `tools/JitNetCore.kt` | ядро `JitRef`+`JitOp`: `startLock`/`startGate`, честный `parseProp`, `persist`-флаг сверки, `nothing_to_restore ⇒ DONE`, возврат `ChainRun`, скрипт приведён к DEX символ в символ |
-| `tools/JitNet.kt` | адаптеры: `AndroidShell`/`AndroidStore` (два `commit()` + обратное чтение), `AndroidNetState` (рабочий `setWifiEnabled`), `click`/`onProcessStart`/`verifyApplied` |
-| `tools/AppPerformance.kt` | `setAutoOptimize` (pref пишет ядро), `jitApplyWithZygote`→`JitNet.click`, `jitPendingVerify`→`JitNet.onProcessStart`, `verifyJitOnly` read-only, `jitRuntimeFact*`, восстановлен `reportLegacyAvasSnapshot` |
-| `tools/ToolsBackend.kt` | `perfJit` = запрос, `perfJitRuntime`/`Raw`/`Reason` = факт из кэша |
-| `ui/ToolsPanel.kt` | строка «Сейчас на устройстве: …» под тумблером (только кэш, без shell из UI) |
-| `tools/JitBootMark.kt` | удалён недоказанный допуск ±60 с (`sameLoad`/`format`/`stripEpochPrefix`) |
-| тесты | 5 классов переписано, 4 удалено, 5 добавлено (см. §4) |
-
-`git show --stat aed18fb`: 21 файл, **+1190 / −1182**.
+| `tools/JitNetCore.kt` | `JitRef.Shell {UNKNOWN, REPLIED, LOST}` — единственный доказанный признак завершения; `startDecision` (`HOLD_UNSAFE_PHASE` вместо решения по сети); `clickGate` (блок и при `wifi=0,ap=0` этой загрузки); `JitRef.Request` (invoked/accepted/detail); `confirmedState(fact, op)`; `verifyApplied` → `settled = definitive && want==true && shell==REPLIED && phase!=ARMED`; `restoreNetwork` возвращает `Request`, guard `wifiOn()==null ⇒ wifi_state_unknown`; `writeOp(before)` — запись только по актуальному снимку; `opGate`/`opLock` — одна операция; `publishForTest` для теста позднего писателя |
+| `tools/JitNet.kt` | `judgeWrite`/`WriteOutcome`: `ok` / `readback_ok_commit_false` / `readback_mismatch` / `priority_read_mismatch` / `no_store`; публикация ключа только при совпадении обратного чтения; `AndroidStore.putStringConfirmed`/`putBoolConfirmed` через этот вердикт; `AndroidNetState.setWifi/startAp` → `JitRef.Request` (в т.ч. отказ `false`, `void`/`null` и исключение рефлексии) |
+| `tools/AppPerformance.kt` | `jitConfirmedState` = `JitRef.confirmedState(LAST_JIT_FACT, readJitOp())`; `refreshJitRuntimeAsync(..., onDone)` — обновление виджета после фонового чтения; `JIT_START_RESULT` с честными `stdout`/`status`; `BUSY` в `why` |
+| `tools/ToolsBackend.kt` | `perfJitConfirmed` — факт из кэша, а не preference |
+| `ui/ToolsPanel.kt` | строка «Сейчас на устройстве: …» (+ фаза/скрипт/сеть операции), обновляется по `onDone`; новых кнопок нет |
+| тесты | +`JitLifecycleTest` (7), +`JitStoreConsistencyTest` (8), +`JitUiStateTest` (5), +`JitLifecycleShell`; переписаны `JitOrchestratorTest` (23), `JitRefTest` (14), `JitLogsCancelTest`, `JitFake` |
 
 ### 0.3 `SOURCE_SHA`
 
@@ -67,6 +82,11 @@
 в сборке не используется — сборка читает файл-маркер (владелец собирает в Android Studio).
 
 ### 0.4 Замечания REVIEW → что сделано (по одному)
+### 0.4 История: замечания REVIEW к `78a3248` (правка 1, `aed18fb`)
+
+> Номера строк в таблице ниже относятся к `aed18fb`. В `61bfddd` часть кода переписана —
+> актуальные ссылки в §0.5 и §3. Таблица сохранена как история, чтобы было видно, что именно
+> проверялось в прошлый раз.
 
 | № | замечание REVIEW к `78a3248` | что сделано | код | тест |
 |---|---|---|---|---|
@@ -81,6 +101,31 @@
 | 9 | `JitBootMark.sameLoad` (±60 с) — недоказанный признак «той же загрузки» | удалён; JIT сравнивает только `boot_id`-теги (`BootMatch`), `epoch…` ⇒ `UNKNOWN` ⇒ ничего не делаем | `JitNetCore.kt:261`, `JitBootMark.kt` | `unknownBootTagBlocksRestore`, `JitBootMark` покрыт CI-сборкой |
 | 10 | мёртвые константы `JIT_STATE_ON_LINE`/`OFF_LINE` (обещали `false` заранее) | удалены; UI показывает факт из кэша (`true|false|unknown`) | `ToolsBackend.kt:190`, `ToolsPanel.kt:1126` | `JitBootBoundaryTest.*` |
 | 11 | скрипт расходился с DEX на один символ (`$(($_n + 1))` вместо `$((_n + 1))`) | приведён символ в символ; тест фиксирует литерал из smali и длину 392 | `JitNetCore.kt:105` | `JitRefTest.verbatimReferenceLiteralFromSmali` |
+
+---
+
+### 0.5 Десять проблем §0.0 мандата правки 2 → что именно изменено
+
+Формулировки — из мандата (`PROMPT_iter33p_3й_заход_ИСПРАВЛЕНИЕ_1.0.61.md`, §0.0). Для каждой
+строки: чем закрыто, где в коде и каким тестом доказано. «Ноль записей» везде означает, что тест
+считает ВСЕ записи хранилища (`JitFake.Store.writes`) и все сетевые запросы
+(`JitFake.Net.calls`), а не только ожидаемый ключ.
+
+| № | проблема §0.0 | закрытие | код | тест |
+|---|---|---|---|---|
+| 1 | выключенный Wi-Fi/AP не признак завершения: сеть мог выключить другой shell, `svc wifi disable` — первая команда скрипта, задержка возврата может истечь | признак завершения один — `Shell.REPLIED` (транспорт ответил на наш `exec`). `wifi_now`/`ap_now` пишутся в лог с пометкой «только наблюдение, НЕ признак завершения». Нет ответа ⇒ `HOLD_UNSAFE_PHASE` | `JitNetCore.kt:238` (`Shell`), `:361-376` (`startDecision`), `:755-761` (лог) | `JitLifecycleTest.foreignWifiOffIsNotEvidence`, `JitOrchestratorTest.lostChainNeverRestoresEvenWhenNetworkIsDown`, `JitOrchestratorTest.timeoutWithQueuedShellDoesNotTriggerEarlyRestore` |
+| 2 | оба радио off — не доказательство: `DONE` при timeout/потере канала; второй клик; `DONE` до проверки загрузки; запись на чужой/неизвестной загрузке | `NOTHING_TO_RESTORE` только при `REPLIED`; `clickGate` не пускает второй клик при `ARMED/SENT` этой загрузки даже при `wifi=0,ap=0`; на чужой/неизвестной загрузке — ноль записей | `JitNetCore.kt:366-371`, `:389-397`, `:776-796` | `JitLifecycleTest.bothRadiosWereOffDoesNotBecomeDoneByItself`, `JitOrchestratorTest.bothRadiosOffWaitsForProvenCompletion`, `bothRadiosOffWithRepliedChainIsDoneAndNextClickAllowed`, `JitStartZeroWritesTest.previousBootStartWritesNothingAndKeepsSnapshot` |
+| 3 | CPS/DPS атомарность не доказана | `judgeWrite` пишет оба хранилища и **читает оба обратно**; `ok` только при совпадении; `commit=false` при совпавшем чтении — предупреждение; расхождение/`no_store` ⇒ снимок не принят, скрипт не отправляется. Семантика `Prefs2` не тронута | `JitNet.kt:64-122` (`WriteOutcome`,`judgeWrite`), `:141-175` (`putStringConfirmed`/`putBoolConfirmed`) | `JitStoreConsistencyTest` (8 тестов: ok, `commit=false`, расхождение, приоритет, одно хранилище, оба, удаление ключа, сквозная запись снимка), `JitOrchestratorTest.snapshotIsNotAcceptedWithoutReadback`, `partialStoreWritesAreDetected` |
+| 4 | гонки старт↔клик↔возврат: старая копия `op` в `SENT`/`DONE`; `startGate` пишет сверку параллельно; восстановление теряет `pedidoChecked` | `opGate` — одна операция на приложение (`BUSY`/`JIT_BUSY`); все записи идут через `writeOp(before)`: если снимок изменил другой писатель, запись отбрасывается и это видно в логе; `RESTORED` пишется по ПЕРЕЧИТАННОМУ снимку | `JitNetCore.kt:498-523` (`opLock`,`opGate`,`writeOp`), `:767-781`, `:986-1000` | `JitLifecycleTest.staleWriterCannotOverwriteNewSnapshot`, `clickAndStartNeverOverlap`, `JitOrchestratorTest.concurrentClicksStartExactlyOneOperation`, `concurrentProcessStartsDoNotRestoreTwice` |
+| 5 | тумблер отдавал preference, а не подтверждённый факт | `JitRef.confirmedState`: `on` только при `getprop=true`; `off` только при `false` + `Phase.DONE` + `want=false`; иначе «состояние неизвестно». Виджет обновляется после фонового чтения (`onDone`); новых кнопок нет | `JitNetCore.kt:197-202`, `ToolsBackend.kt:201`, `ToolsPanel.kt:1139-1168` | `JitUiStateTest` (5: `onOnlyWhenRuntimeIsTrue`, `offOnlyWithProvenOperation`, `unknownIsShownHonestly`, `panelHasNoNewButtonsAndUpdatesWidget`, `refreshCallbackIsCalledOnce`) |
+| 6 | `RESTORED` ≠ безопасное завершение и мог навсегда заблокировать клики | `RESTORED` ставится только при подтверждённом чтении состояния радио; `DONE` из `RESTORED` — только через сверку (`definitive && want==true && REPLIED`). Не доказано ⇒ `HOLD_UNSAFE_PHASE`, ноль записей; перезагрузка ГУ лечением не считается | `JitNetCore.kt:774-781`, `:994-1030` | `JitOrchestratorTest.apiRefusalIsNotReportedAsRestored`, `restoreNotRepeatedAfterSuccess`, `secondStartInSameProcessRetriesRestore` |
+| 7 | AP: результат `startSoftAp` игнорировался (`issued=true` без исключения), guard не срабатывал при `wifiOn()==null` | `JitRef.Request(invoked, accepted, detail)`; рефлексия: `false` ⇒ `rejected`, `void`/`null` ⇒ «вызван, не подтверждён», исключение ⇒ `notInvoked`; `wifiOn()==null` ⇒ `wifi_state_unknown`, запрос AP НЕ отправляется. В логе раздельно `request=` / `state_after=` / `confirmed=` / `reason=` | `JitNetCore.kt:99-105`, `:855-905`, `JitNet.kt:224-262` | `JitOrchestratorTest.apAndWifiAppliedLateAreStillConfirmed`, `apiRefusalIsNotReportedAsRestored`, `JitLogsCancelTest.logSeparatesStateRequestAndErrors` |
+| 8 | сверка до выполнения считалась результатом; намерение стиралось по случайному `getprop` | `settled` требует `want==true` + `shell==REPLIED` + фаза не `ARMED`; `unknown`/`rc≠0`/`ERR_`/пусто/cache `null` ⇒ `unknown` и намерение СОХРАНЯЕТСЯ; результат обеих записей проверяется и логируется (`saved_pedido=`, `saved_op=`) | `JitNetCore.kt:181-196` (`verify`), `:994-1030` | `JitOrchestratorTest.verifyOutcomes`, `wantFalseWithBrokenChannelIsNotSuccess`, `JitRefTest.verifyNeverCallsUnknownSuccess` |
+| 9 | запуск после zygote не доказан | не заявляется ни `BOOT_COMPLETED`, ни рестарт: в логе `restart=not_claimed`; продолжение привязано к старту ПРОЦЕССА (`.BootReceiver`, `VoiceAssistantService.onCreate`, `App.jitBootProbe`), скрытых сервисов и boot-фильтров не добавлено | `AppPerformance.kt:805-853`, `JitNet.kt:314-329` | `JitBootBoundaryTest.restartOnlyFromClickPath`, `noBootBackfillAnywhere`, `JitRefTest.chainOutcomeDoesNotClaimRestart` |
+| 10 | `MOUNT_STEP_ENABLED=false` ⇒ не точная копия; нельзя утверждать, что lazy umount даёт `ENOENT` и лечится только reboot | шаг реализован символ в символ и выключен; в отчёте он помечен ⛔ и разобран как недоказанный; владельцу даны короткие read-only команды (mountinfo/namespace root-транспорта), массовый unmount не запускался | `JitNetCore.kt:86`, `:123-155` | `JitChainScriptTest.mountStepTouchesOnlyDataAppWhenEnabled`, `JitRefTest.mountStepOnEqualsReferenceVerbatim` |
+
+Итог по §0.0: **8 закрыто (✅), 1 остаётся вопросом владельца (🟡 — монтирования, ⛔ по исполнению),
+1 недоказуемо в принципе (запуск после zygote — заявлять нельзя, поэтому не заявляется).**
 
 ---
 
@@ -99,14 +144,14 @@ prefs.edit().putBoolean("jit_pedido", target).putBoolean("perf_auto_otimizar", t
 pool.execute(new la(activity, target, progress));
 ```
 
-Наша копия: `JitOp.prepare` (`JitNetCore.kt:455`) — чтение состояния (`wifiOn`/`apUp`, `null` ⇒
+Наша копия: `JitOp.prepare` (`JitNetCore.kt:619`) — чтение состояния (`wifiOn`/`apUp`, `null` ⇒
 `REFUSED_STATE_UNKNOWN`, ноль команд), одна запись снимка с подтверждением обратным чтением,
 затем ключи референса `jit_pedido`/`perf_auto_otimizar`/`jit_restaurar` (`JitRef.KEY_*`), затем
 скрипт. Отличие — «снимок одним значением» `jit_op` (§3).
 
 ### 1.2 Скрипт: `w0/la.run` — символ в символ
 
-`JitRef.chainScript` (`JitNetCore.kt:105`) генерирует ровно литерал DEX (`w0/la.smali:326`+`:342`,
+`JitRef.chainScript` (`JitNetCore.kt:143`) генерирует ровно литерал DEX (`w0/la.smali:326`+`:342`,
 подстановка `la.smali:153`); при `mountStep = true` длина 392 символа и **байтовое равенство**
 проверено независимо (см. §4):
 
@@ -137,17 +182,19 @@ if (s != null && Pattern.compile("^wifi=([01]),ap=([01])$").matcher(s).matches()
 //     if (wifi && !wm.isWifiEnabled()) wm.setWifiEnabled(true);   // затем Wi-Fi
 ```
 
-Наша копия — `JitOp.onProcessStart` + `JitOp.restoreNetwork` (`JitNetCore.kt:536`, `:666`): та же
+Наша копия — `JitOp.onProcessStart` + `JitOp.restoreNetwork` (`JitNetCore.kt:712`, `:845`): та же
 регулярка (`JitRef.parseRestore`), пауза `RESTORE_DELAY_MS = 15_000` (`:65`), **AP первым**, затем
 Wi-Fi; AP ждётся до 20 с шагом 1 с (`AP_POLL_*`, как `U`), Wi-Fi — до 10 с шагом 0.5 с (наше
 отличие, §3).
 
-**Как служба запускается и получает данные ИМЕННО этой операции.** `ctl.restart zygote` даёт
+**Как служба запускается и получает данные ИМЕННО этой операции — гипотеза, а не факт (§0.0 п.9):** `ctl.restart zygote` даёт
 новую загрузку фреймворка ⇒ система поднимает приложение ⇒ `.BootReceiver` (BOOT_COMPLETED /
 LOCKED_BOOT_COMPLETED / QUICKBOOT_POWERON) и `VoiceAssistantService.onCreate`/`onStartCommand` →
 `AppPerformance.checkPendingZygoteVerify` → `jitPendingVerify` → `JitNet.onProcessStart`; плюс
 `AppPerformance.jitBootProbe` из `App.kt`. Данные операции — префы (`jit_op` + три ключа
-референса) и тег загрузки: они лежат на диске, поэтому переживают смерть процесса.
+референса) и тег загрузки: они лежат на диске, поэтому переживают смерть процесса. А вот ЧТО
+именно система вызовет после `ctl.restart zygote` и когда — не доказано ни референсом, ни нами:
+гарантированный `BOOT_COMPLETED`, сроки подъёма и порядок `onCreate` не заявляются (§3, строка 13).
 
 **Что здесь НЕ доказано и не заявляется:** что наш `onCreate` будет вызван ровно через 15 000 мс.
 15000 мс — это литерал `0x3a98` в `CentralWatchdogService.onCreate` (smali); мы выдерживаем паузу
@@ -174,7 +221,7 @@ ok = (pedido == getprop) && (!pedido || maps != Boolean.FALSE);
 prefs.edit().remove("jit_pedido").apply();
 ```
 
-Наша копия — `JitRef.verify` (`JitNetCore.kt:163`) + `JitOp.verifyApplied` (`:761`): та же формула,
+Наша копия — `JitRef.verify` (`JitNetCore.kt:181`) + `JitOp.verifyApplied` (`:964`): та же формула,
 но `rc≠0`/`ERR_`/пусто/неожиданное значение → `UNKNOWN` (а не «не применено»), и `UNKNOWN` не
 снимает намерение. Отличие — §3.
 
@@ -215,21 +262,28 @@ need=owner_decision`. Поведение при старом снимке: ни�
 
 ---
 
-## 3. Отличия: референс против реализации (п.11 §0.1)
+## 3. Таблица соответствия: референс → фактический код → совпадение → тест
 
-| № | поведение | референс | у нас | зачем / что при отказе | код |
+Формат — по §4 мандата: для каждого элемента видно, ЧТО делает референс, ЧТО делает наш код,
+совпадает ли это, где смотреть и чем доказано. «Неизвестно» — не отговорка, а состояние, которое
+нельзя проверить без исполнения на ГУ; такие строки помечены и вынесены в §9.
+
+| № | элемент референса | фактический код | совпадение / отличие / неизвестно | файл:строка | тест или недоказанное |
 |---|---|---|---|---|---|
-| 1 | снимок состояния | три ключа одним `commit()`, результат `commit()` не проверяется | дополнительно `jit_op` одним значением + **обратное чтение** обоих хранилищ | иначе сеть уже выключена, а вернуть нечем; отказ ⇒ `SNAPSHOT_FAILED`, скрипт не отправляется, Wi-Fi не тронут | `JitNetCore.kt:455`, `JitNet.kt:75` |
-| 2 | второй клик | всегда перезаписывает `jit_restaurar` | `REFUSE_PENDING`, пока снимок этой загрузки не разобран; чужой/повреждённый снимок не перезаписывается (`REFUSE_UNRESOLVED`) | незавершённая операция не должна терять снимок; при отказе — ноль команд устройству | `JitNetCore.kt:314`, `:411` |
-| 3 | продолжение на старте | `onCreate` → `postDelayed(15000)` → возврат, без проверки «а цепочка выполнялась?» | решение по фактам: `boot_id` + признак «сеть уже изменилась»; иначе `WAIT_NO_EVIDENCE` | исключить возврат по одному факту старта; при отказе — сеть не трогаем, снимок сохраняем | `JitNetCore.kt:290`, `:635` |
-| 4 | `jit_restaurar` | `remove(...)` сразу при чтении `onCreate` | снимок остаётся историей операции до `RESTORED`/`DONE` | при неудачном возврате снимок нужен для следующего старта; перезапись — только новым кликом | `JitNetCore.kt:536-620` |
-| 5 | ожидание AP | `U()`: latch 25 с, `v()` до 20 000 мс шагом 1 с, до 3 попыток | то же окно и шаг, без «3 попыток» (третья попытка в референсе только при ответе `FAILED`) | лишний повтор — новая попытка открыть AP при уже включённом клиентском Wi-Fi; при отказе — `not_up_after_20s`, снимок не завершён | `JitNetCore.kt:666` |
-| 6 | ожидание Wi-Fi | нет (только лог `c1()` сразу после запроса) | опрос до 10 с шагом 0.5 с | «запрошено» ≠ «включено»: иначе UI и лог показывали бы успех при отказе | `JitNetCore.kt:78` |
-| 7 | сверка | `trim()=="true"`, rc не смотрится; `jit_pedido` снимается всегда | `rc≠0`/`ERR_`/многострочно ⇒ `UNKNOWN`; намерение сохраняется | при недоступном канале `false` считался бы фактом и при `want=false` дал бы ложный «успех» | `JitNetCore.kt:144`, `:761` |
-| 8 | опознание загрузки | загрузка не опознаётся вообще (см. §3.1 ниже) | строгий `boot_id`-тег; `epoch…` ⇒ `UNKNOWN` ⇒ не применяем | снимок прошлой загрузки не должен отменять чужое решение | `JitNetCore.kt:261` |
-| 9 | шаг `umount -l` §1.1 | выполняется всегда | реализован символ в символ, **выключен** (`MOUNT_STEP_ENABLED=false`) | обратимость не доказана (§3.2) ⇒ по мандату не выполнять | `JitNetCore.kt:86` |
-| 10 | рестарт zygote | команда отправлена = процесс умрёт | `restart=not_claimed` в логе; итог — только по сверке на следующем старте | ни транспорт, ни `H1` не доказывают рестарт | `AppPerformance.kt:891`, `JitNet.kt:184` |
-| 11 | индикация | `H1(45000)` + прогресс | `ToolsStep.Status.PARTIAL` («отправлено, итог на следующем старте») | процесс умирает, прочитать факт нечем | `AppPerformance.kt:891` |
+| 1 | **клик** `w0/j9.onClick`: читает `wifi`/`ap`, пишет 3 префа одним `commit()` (результат не проверяется), затем `pool.execute(la)` | `JitOp.prepare` + `JitOp.click`: чтение состояния (`null` ⇒ `REFUSED_STATE_UNKNOWN`, ноль команд), запись снимка с подтверждением обратным чтением, ключи `jit_pedido`/`perf_auto_otimizar`/`jit_restaurar`, затем скрипт | **совпадает** по порядку и значениям; **отличие** — `jit_op` одним значением и проверка результата записи (§3.1) | `JitNetCore.kt:619-686`, `:524-560` | `JitOrchestratorTest.clickSavesSnapshotThenRunsReferenceChain`, `unknownNetworkStateMeansNoChain` |
+| 2 | **снимок** `jit_pedido`/`jit_restaurar` = `wifi=<0/1>,ap=<0/1>` | те же ключи + `jit_op` (`Net`/`Phase`/`Shell`/`bootTag`/`want`/`checked`), формат `wifi=…,ap=…` — та же регулярка `^wifi=([01]),ap=([01])$` | **совпадает** по ключам и формату строки; **отличие** — ссылка на загрузку и фаза (иначе снимок прошлой загрузки применялся бы к чужому решению) | `JitNetCore.kt:88`, `:245-274`, `:275-313` | `JitRefTest.parseRestoreAcceptsOnlyReferenceFormat`, `opPayloadRoundTripAndStrictness` |
+| 3 | **скрипт** `w0/la.run`: `svc wifi disable` → слив ≤20 с → `umount -l /data/app/` → `setprop usejit` → `setprop ctl.restart zygote` | `JitRef.chainScript` (392 символа при `mountStep=true`) | **совпадает символ в символ** (проверено сравнением с литералом из `w0/la.smali:326,342`); таймаут 40 000 мс как `H1(40000,…)` | `JitNetCore.kt:123-155`, `:68` | `JitRefTest.verbatimReferenceLiteralFromSmali`, `scriptShape`; `JitChainScriptTest.orderIsReferenceOrder` (реальный `/bin/sh`) |
+| 4 | **монтирования** (шаг §1.1 внутри того же скрипта) | реализован, `MOUNT_STEP_ENABLED=false` | **отличие**: не выполняется ⇒ **нельзя называть копию полной**; обратимость и последствия для чужих APK не доказаны (⛔, §3.2) | `JitNetCore.kt:86`, `:143` | `JitChainScriptTest.mountStepTouchesOnlyDataAppWhenEnabled`; на ГУ не проверялось |
+| 5 | **продолжение** `CentralWatchdogService.onCreate` → `postDelayed(e2, 15000)` при совпадении регулярки, без метки загрузки | `JitOp.onProcessStart`: `startDecision` по `bootMatch` + `Shell`; пауза `RESTORE_DELAY_MS=15_000`; снимок НЕ удаляется, а становится историей (`DONE`/`RESTORED`) | **совпадает** по 15 000 мс (литерал `0x3a98`) и «AP первым»; **отличие** — решение принимается только при доказанном завершении скрипта, иначе `HOLD_UNSAFE_PHASE`; **неизвестно** — что наш `onCreate` будет вызван ровно через 15 с (не заявляется) | `JitNetCore.kt:361-376`, `:712-820`; `AppPerformance.kt:805-853` | `JitLifecycleTest.disableThenClientDeathThenLateZygoteRestoresNothing`, `JitOrchestratorTest.repliedChainThenRestoreOnNextStart`, `previousBootSnapshotIsNeitherAppliedNorDeleted` |
+| 6 | **AP** `e2`: `service.U("pós-JIT", false)` → рефлексия `startSoftAp(null)`, результат не смотрится, latch 25 с, опрос `v()` ≤20 000 мс шагом 1 с | `restoreNetwork`: guard `wifiOn()==true` (как `U`), `startAp()` возвращает `Request(invoked, accepted, detail)`, опрос `apUp()` 20 с × 1 с | **совпадает** по порядку, вызову и окну ожидания; **отличие** — результат вызова различается (`invoked`/`accepted`), состояние подтверждается только чтением `isUp()`+адреса; `wifiOn()==null` ⇒ `wifi_state_unknown` без запроса (в референсе `!isWifiEnabled()` при ошибке дал бы `true`) | `JitNetCore.kt:845-910`, `JitNet.kt:240-262` | `JitOrchestratorTest.apAndWifiAppliedLateAreStillConfirmed`, `apiRefusalIsNotReportedAsRestored` |
+| 7 | **Wi-Fi** `e2`: `if (wifi && !wm.isWifiEnabled()) setWifiEnabled(true)`, ожидания нет | `setWifi(true)` + опрос `wifiOn()` 10 000 мс шагом 500 мс | **отличие (осознанное)**: «запрошено» ≠ «включено», иначе UI/лог показывали бы успех при отказе; при отказе — `request_rejected_still_off_10s`, снимок не завершён | `JitNetCore.kt:911-935`, `:78-79` | `restoreOnlyTurnsNetworkOn`, `JitOrchestratorTest.apiRefusalIsNotReportedAsRestored` |
+| 8 | **порядок возврата**: AP первым, затем Wi-Fi | `restoreNetwork` — AP-блок, затем Wi-Fi-блок | **совпадает** | `JitNetCore.kt:845-937` | `JitChainScriptTest` не участвует; `JitOrchestratorTest.repliedChainThenRestoreOnNextStart` |
+| 9 | **readback/сверка** `w0/bb`+`w0/r7`: `getprop` `trim()=="true"`, `maps` содержит `dalvik-jit-code-cache`, `ok=(pedido==getprop)&&(!pedido||maps!=false)`, `jit_pedido` снимается ВСЕГДА | `JitRef.verify` (та же формула) + `verifyApplied`: `rc≠0`/`ERR_`/многострочно/пусто ⇒ `UNKNOWN`; намерение снимается только при `definitive && want==true && REPLIED && phase!=ARMED`; запись через `judgeWrite` с обратным чтением обоих хранилищ | **совпадает** по формуле; **отличие** — `unknown` не считается успехом и не снимает намерение; **отличие** — публикация ключа только после подтверждённого чтения | `JitNetCore.kt:181-196`, `:964-1030`; `JitNet.kt:64-122` | `JitOrchestratorTest.verifyOutcomes`, `wantFalseWithBrokenChannelIsNotSuccess`, `JitStoreConsistencyTest` (8) |
+| 10 | **UI** референса: прогресс `H1(45000)` в шторке | строка «Сейчас на устройстве: …» под существующим тумблером: `on`/`off`/«неизвестно» + фаза/скрипт/сеть операции; обновляется по завершении фонового чтения | **отличие**: прогресса нет (процесс умирает на `ctl.restart`), вместо него — подтверждённый факт или честное «неизвестно»; **новых кнопок и тумблеров нет** | `ToolsPanel.kt:1139-1168`, `ToolsBackend.kt:201`, `JitNetCore.kt:197-202` | `JitUiStateTest` (5), `JitBootBoundaryTest.startPathIsReadOnly` |
+| 11 | **ошибки/транспорт**: `H1` даёт `rc`/вывод; референс исход не различает | `chainOutcome`: `REPLY_RECEIVED` при `rc==0` и выводе без `ERR_`, иначе `CHANNEL_LOST`; `rc=137`/`ERR_ADB_TIMEOUT` — потеря канала, а НЕ «выполнено»; задание в очереди транспорта не отменяется | **отличие**: разделены «ответ получен» / «канал потерян» / «состояние неизвестно»; в логе отдельные поля, в т.ч. `restart=not_claimed` | `JitNetCore.kt:400-410`, `AppPerformance.kt:840-860` | `JitRefTest.chainOutcomeDoesNotClaimRestart`, `JitLogsCancelTest.lostChannelIsLoggedAsErrorNotSuccess`, `unknownFactIsLoggedAsUnknown` |
+| 12 | **AVAS**: в `j9`/`la`/`e2`/`bb`/`r7` НЕ участвует | `AvasCore.kt`/`AvasRestore.kt` удалены; JIT-код не содержит `Avas*`, `audioserver`, `avas_*`; остаток `filesDir/avas_snapshot` только фиксируется строкой лога | **совпадает** (в референсе связи нет ⇒ у нас тоже) | `AppPerformance.kt:774-790` | `AvasIndependenceTest` (5) |
+| 13 | **запуск после zygote**: `ctl.restart zygote` — последняя команда; как именно поднимется наше приложение, референс не доказывает | продолжение — на старте ПРОЦЕССА (`.BootReceiver`, `VoiceAssistantService.onCreate`, `App.jitBootProbe`), данные — на диске | **неизвестно**: гарантированный `BOOT_COMPLETED`/рестарт не заявляется; скрытых сервисов, boot-фильтров и своих команд не добавлено | `AppPerformance.kt:805-853`, `JitNet.kt:314-329` | `JitBootBoundaryTest.restartOnlyFromClickPath`, `noBootBackfillAnywhere` |
+| 14 | **логи**: у референса только `Log` в logcat | `AppLog` → дневной файл; строки `JIT_*`; состояние/запрос/ошибка/`unknown` — разными полями, `internet=not_checked` | **отличие** (требование владельца, §9 мандата) | §6 | `LogFilesTest` (6), `JitLogsCancelTest.logSeparatesStateRequestAndErrors` |
 
 ### 3.1 Как референс узнаёт «ту же загрузку» — и почему так нельзя
 
@@ -254,8 +308,9 @@ need=owner_decision`. Поведение при старом снимке: ни�
    поверх), (в) loop/`dm-verity`-образы. Строка `/data/app/` в `/proc/mounts` — признак (б)/(в).
 2. **Что делает `umount -l`.** Ленивое снятие: точка исчезает из дерева сразу, ресурсы
    освобождаются, когда закроется последний пользователь. Для уже запущенных процессов обычно
-   ничего не рвётся (их файловые дескрипторы живы), но новый `open()`/`mmap()` по этому пути даёт
-   `ENOENT`.
+   ничего не рвётся (их файловые дескрипторы живы), но новый `open()`/`mmap()` по снятому пути,
+   по механике Linux, попадает в уже отсоединённое дерево и обычно даёт `ENOENT`. Это вывод из
+   механики VFS, а НЕ измерение на ГУ: полем `ENOENT` не подтверждён и за факт не выдаётся.
 3. **Последствия для ЧУЖИХ приложений.** Если точка — APK другого приложения (в том числе
    системного), то после снятия его код нельзя заново отобразить в память: первый же холодный
    старт/перезапуск процесса = падение или «приложение не установлено». Это ровно тот класс
@@ -265,8 +320,8 @@ need=owner_decision`. Поведение при старом снимке: ни�
    в `/data/dalvik-cache`, который шаг не трогает.
 5. **Обратимость.** Штатного «вернуть как было» в рамках нашей программы нет: обратное
    `mount` требует знать исходные параметры (source, fstype, opts) и права, которых у нас нет;
-   после `umount -l` восстановление возможно только перезагрузкой ГУ (а перезагрузка как лечение
-   запрещена). Значит, требование «после выключения функций/удаления приложения система должна
+   после `umount -l` вернуть точку штатными средствами приложения нельзя, а перезагрузка ГУ как
+   «лечение» запрещена и лечением не считается. Значит, требование «после выключения функций/удаления приложения система должна
    возвращаться в сток» этим шагом нарушается.
 6. **На ГУ проверять запрещено** (мандат: исследование — только чтение, массовый unmount не
    запускать), поэтому состав `/data/app/` в `/proc/mounts` полем не подтверждён.
@@ -277,29 +332,57 @@ need=owner_decision`. Поведение при старом снимке: ни�
 `JitChainScriptTest.mountStepTouchesOnlyDataAppWhenEnabled` доказывает, что при включении снимаются
 только точки `/data/app/`, шаг стоит до `setprop`, и появляется ровно 3 строки.
 
-**Что нужно от владельца:** (а) подтвердить по `adb shell cat /proc/mounts | grep ' /data/app/'`,
-что на его ГУ вообще есть такие точки (если их нет — вопрос снимается), (б) решение «выполнять /
-не выполнять»; без него шаг остаётся выключенным.
+**Как проверить это, ничего не меняя (§0.0 п.10).** `/proc/mounts` описывает namespace ТОГО
+процесса, который его читает, поэтому `cat /proc/mounts` через транспорт и `grep` внутри нашего
+скрипта могут видеть РАЗНЫЕ деревья. Читать надо mountinfo root-транспорта и сравнивать namespace
+с namespace PID 1 — всё только на чтение, без единого `umount`:
+
+```
+adb shell 'echo pid=$$; readlink /proc/self/ns/mnt; readlink /proc/1/ns/mnt'
+adb shell 'grep -c " /data/app" /proc/self/mountinfo'
+adb shell 'grep " /data/app" /proc/self/mountinfo | head -n 5'
+adb shell 'ls -l /proc/self/ns/mnt /proc/1/ns/mnt'
+```
+
+Если `readlink` для `self` и `1` совпадают, mountinfo транспорта применим к системе; если нет —
+вывод скрипта ничего не говорит о том, что видят zygote и приложения, и шаг тем более нельзя
+включать. Команды read-only, массовых `umount` в них нет.
+
+**Что нужно от владельца:** (а) вывод указанных выше четырёх команд (есть ли вообще точки
+`/data/app/` и тот ли это namespace), (б) решение «выполнять / не выполнять»; без него шаг
+остаётся выключенным (`MOUNT_STEP_ENABLED=false`).
 
 ---
 
 ## 4. Тесты (§4 мандата)
 
-Локально: **71 / 71 PASS** на настоящем `/bin/sh` с подставными
-`svc`/`ip`/`setprop`/`getprop`/`sleep`/`umount` (§7). В CI те же 71 (§0.1).
+Локально: **95 / 95 PASS** на настоящем `/bin/sh` с подставными
+`svc`/`ip`/`setprop`/`getprop`/`sleep`/`umount` (§7). Это JIT/лог-подмножество; полный набор
+проекта исполняется только в CI (§0).
+
+Барьеры этой правки (§4 мандата: «disable → задержка → гибель/старт процесса → ранний возврат →
+поздний zygote; сеть выключена другим действием, команда в очереди; оба радио off; timeout без
+отмены; поздняя команда после нового клика») реализованы на управляемом устройстве
+`JitLifecycleShell.kt`: `answering` (ответит ли транспорт), `queued` (задание осталось в очереди),
+`accepted` (что вернул API), `deviceSteps` (журнал реальных шагов устройства), `stepWifiDisable()`,
+`foreignAction()`, `getprop`/`getpropRc`/`cache`.
 
 | класс | тестов | что покрывает |
 |---|---|---|
-| `JitRefTest` | 13 | формат `jit_restaurar`; **литерал из DEX символ в символ** (длина 392); первая/последняя команда, окно 20 с; `parseProp` (rc≠0, `ERR_`, многострочно, пусто); формула `bb/r7`; `bootMatch`; `startDecision`/`clickGate` |
-| `JitChainScriptTest` | 8 | реальный `sh`: порядок команд, ранний выход при 0 правилах, исчерпание 20 с (20×`sleep 1`), `false`-ветка, только `/data/app/` при включённом шаге, отказ `setprop` не обрывает цепочку, ноль запрещённых литералов |
-| `JitOrchestratorTest` | 20 | вся цепочка: клик → снимок → транспорт (с очередью!) → старт процесса → возврат AP→Wi-Fi → сверка. Потеря канала и поздний `drain`, смерть процесса до zygote, повторный клик при незавершённой операции, чужая загрузка, `epoch`-тег, повреждённый снимок, «нечего возвращать», отложенное появление AP/Wi-Fi, отказ API, повтор после неудачи, отсутствие повторного возврата, `verify` ok/cache_missing/unknown/not_applied, одновременные клики через барьер, одновременные старты |
-| `JitStartZeroWritesTest` | 5 | обычный старт и «через 30 с»: **ноль записей** (счётчик записей хранилища), ноль команд, ноль сетевых запросов; остаток `jit_pedido=true` не переписывается; чужая загрузка — ноль записей и снимок цел; в стартовом коде нет рестарта/`persist`/собственных механизмов |
-| `JitLogsCancelTest` | 5 | в логе раздельно состояние (`JIT_SNAPSHOT`), запрос (`JIT_CHAIN_SENT`), ошибки (`channel_lost`) и `unknown`; восстановление только включает (ни одного `false`-запроса); механизма отмены/компенсации нет (код + поведение) |
-| `AvasIndependenceTest` | 5 | AVAS-механизм удалён; JIT-код не ссылается на AVAS; в цепочке нет ни одной AVAS/audio-команды (проверяется по журналу вызовов); остаток `avas_snapshot` только фиксируется; независимые функции звука на месте |
+| `JitOrchestratorTest` | 23 | цепочка целиком: клик → снимок → транспорт (с очередью) → старт процесса → возврат AP→Wi-Fi → сверка. Потеря канала при выключенной сети (`lostChainNeverRestoresEvenWhenNetworkIsDown`), оба радио off без доказательства (`bothRadiosOffWaitsForProvenCompletion`) и с доказательством (`bothRadiosOffWithRepliedChainIsDoneAndNextClickAllowed`), чужая загрузка, `epoch`-тег, повреждённый снимок, отложенное появление AP/Wi-Fi, отказ API, повтор после неудачи, отсутствие повторного возврата, `verify` ok/cache_missing/unknown/not_applied, одновременные клики и одновременные старты |
+| `JitLifecycleTest` | 7 | барьеры по шагам: `disableThenClientDeathThenLateZygoteRestoresNothing` (смерть клиента после `svc wifi disable`, поздний zygote — ноль сети и записей), `foreignWifiOffIsNotEvidence` (Wi-Fi выключил кто-то другой — не признак), `bothRadiosWereOffDoesNotBecomeDoneByItself`, `timeoutDoesNotCancelAndBlocksEverything` (timeout транспорта не отменяет задание ⇒ ноль действий), `staleWriterCannotOverwriteNewSnapshot` (поздний писатель), `clickAndStartNeverOverlap`, `repeatedStartIsAllowedButWritesNothingWithoutProof` |
+| `JitStoreConsistencyTest` | 8 | CPS/DPS: обе записи + обратное чтение; `commit=false` при совпавшем чтении; расхождение; расхождение приоритетного чтения; недоступно ОДНО хранилище (подтверждается другим); недоступны ОБА (`no_store`); `null` ⇒ ключа нет в обоих; сквозная запись снимка через то же правило |
+| `JitUiStateTest` | 5 | `on` только при `getprop=true`; `off` только при `false` + `DONE` + `want=false`; иначе «неизвестно»; в панели нет новых кнопок, а виджет обновляется по `onDone`; колбэк вызывается один раз |
+| `JitRefTest` | 14 | формат `jit_restaurar`; литерал из DEX символ в символ (392); первая/последняя команда, окно 20 с; `parseProp`; формула `bb/r7`; `bootMatch`; `startDecision` требует `shell=REPLIED`; `Shell` переживает сериализацию, старая запись без поля ⇒ `UNKNOWN`; `clickGate`; `chainOutcome` не заявляет рестарт |
+| `JitChainScriptTest` | 8 | реальный `sh`: порядок команд, ранний выход при 0 правилах, исчерпание 20 с, `false`-ветка, только `/data/app/` при включённом шаге, отказ `setprop` не обрывает цепочку, ноль запрещённых литералов |
+| `JitStartZeroWritesTest` | 5 | обычный старт и «через 30 с»: ноль записей, ноль команд, ноль сетевых запросов; остаток `jit_pedido=true` не переписывается; чужая загрузка — ноль записей и снимок цел; в стартовом коде нет рестарта/`persist`/своих механизмов |
+| `JitLogsCancelTest` | 5 | в логе раздельно состояние, запрос, ошибка и `unknown`; восстановление только включает (ни одного `false`-запроса); механизма отмены/компенсации нет |
+| `AvasIndependenceTest` | 5 | AVAS-механизм удалён; JIT-код не ссылается на AVAS; в цепочке нет AVAS/audio-команд; остаток `avas_snapshot` только фиксируется; звук не тронут |
 | `JitBootBoundaryTest` | 4 | нет `bootRestoreJit`/`jitPersistBackfill`/повтора 30 с/записи `persist.*`; `ctl.restart` ровно один раз и только в тексте скрипта; старт — только чтение; остатки persist только читаются |
 | `JitNoPersistTest` | 3 | нет записи `persist.*`/`usejitprofiles`; в скрипте одно `setprop`; старые значения только читаются |
 | `JitRulesReadOnlyTest` | 2 | `ip rule` только считается (код + исполнение): ни `del`, ни `flush`, ни `ndc`, ни `settings` |
 | `LogFilesTest` | 6 | имя `voiceapp3-DD.MM.YYYY.log`, локальная дата, append, retention 14 сут. только своих файлов, чужие имена не трогаются, ошибка записи не ломает приложение |
+| **итого** | **95** | |
 
 Отдельно проверено независимо от кода (Python-сравнение с литералом из `w0/la.smali:326,342`):
 `chainScript(true, mountStep = true) == литерал DEX` (392 символа), false-вариант отличается только
@@ -352,19 +435,19 @@ wake/CarService-путь — **5000 мс**. В `w0/j9`, `w0/la`, `w0/e2`, `w0/bb
 
 ```
 === compile ===  (без ошибок)
-=== run ===      OK (71 tests)
-ИТОГ: PASS=71 FAIL=0
+=== run ===      OK (95 tests)
 ```
 
-Как повторить: `/home/user/runtests.sh` (kotlinc 1.9.24 + `android.jar` + junit 4.13.2; в сборку
-не входит, каталог вне `app/src/**`). Классы — те же 10 из §0.1.
+Как повторить: `bash /home/user/runtests.sh` (kotlinc 1.9.24 + `android.jar` + junit 4.13.2;
+скрипт сам переходит в рабочую копию `W=/tmp/w9`, иначе source-сканирующие тесты не находят
+`app/src/main/java`, в сборку не входит, каталог вне `app/src/**`).
 
 Это **не** прогон на ГУ: `WifiManager`, `startSoftAp`, `ctl.restart zygote` подменены; Android-модуль
-локально не собирается (нет Android SDK) — его проверяет CI (`:app:compileDebugKotlin`). Поэтому
-дополнительно локально проверено: `JitNet.kt`+`JitNetCore.kt` типизируются против настоящего
-`android.jar` (без ошибок), а весь `app/src/main/java` даёт ноль ошибок в JIT-файлах.
-
----
+локально не собирается (нет Android SDK) — его проверяет CI (`:app:compileDebugKotlin`). Дополнительно
+локально проверено: `JitNetCore.kt`+`JitNet.kt` типизируются против настоящего `android.jar`
+(стабы `AppLog`/`AdbClient`/`Prefs2`/`BgWorker` — `/home/user/scripts/localjvm/Stubs.kt`), а
+`ToolsPanel.kt`/`AppPerformance.kt`/`ToolsBackend.kt` компилируются без ошибок в собственном коде
+(остаются только ошибки разрешения `R`/классов проекта при одиночной компиляции — их закрывает CI).
 
 ## 8. Чек-лист
 
@@ -372,9 +455,9 @@ wake/CarService-путь — **5000 мс**. В `w0/j9`, `w0/la`, `w0/e2`, `w0/bb
 
 | № | требование | статус | доказательство |
 |---|---|---|---|
-| 1 | гипотеза не выдаётся за гарантию; продолжение — по фактам | ✅ | `JitNetCore.kt:290`, `:635`; `JitOrchestratorTest.timeoutWithQueuedShellDoesNotTriggerEarlyRestore` |
+| 1 | гипотеза не выдаётся за гарантию; продолжение — по фактам | ✅ | `JitNetCore.kt:361`, `:732`; `JitOrchestratorTest.timeoutWithQueuedShellDoesNotTriggerEarlyRestore`, `JitLifecycleTest.foreignWifiOffIsNotEvidence` |
 | 2 | копия и ограничения различимы; всё, что не из референса, помечено | ✅ | §3 (таблица 11 отличий), §0.4 |
-| 3 | сеть не возвращается и снимок не снимается по одному boot ID | ✅ | `JitNetCore.kt:290` (`WAIT_NO_EVIDENCE`), `JitStartZeroWritesTest` |
+| 3 | сеть не возвращается и снимок не снимается по одному boot ID | ✅ | `JitNetCore.kt:361` (`startDecision`: только `bootMatch` + `Shell.REPLIED`, иначе `HOLD_UNSAFE_PHASE`), `JitStartZeroWritesTest` |
 | 4 | на ГУ ничего не выполнялось | ✅ | все прогоны локальные/CI; полевое подтверждение не заявляется |
 | 5 | при невыполнимости безопасно — остановиться и запросить решение | ✅ | §3.2 (монтирования), §9 |
 | 6 | монтирования не запрещены, но необратимые правки запрещены | ✅ | шаг реализован и выключен (§3.2) |
@@ -388,21 +471,21 @@ wake/CarService-путь — **5000 мс**. В `w0/j9`, `w0/la`, `w0/e2`, `w0/bb
 
 | № | требование | статус | доказательство |
 |---|---|---|---|
-| 1.1 | снимок Wi-Fi/AP до изменений + ключи референса | ✅ | `JitNetCore.kt:455`, `JitOrchestratorTest.clickSavesSnapshotThenRunsReferenceChain` |
-| 1.2 | один скрипт: `svc wifi disable` → слив ≤20 с → `usejit` → zygote последней | ✅ | `JitNetCore.kt:105`, `JitRefTest.verbatimReferenceLiteralFromSmali` (392 симв.), `JitChainScriptTest.orderIsReferenceOrder` |
+| 1.1 | снимок Wi-Fi/AP до изменений + ключи референса | ✅ | `JitNetCore.kt:619`, `JitOrchestratorTest.clickSavesSnapshotThenRunsReferenceChain` |
+| 1.2 | один скрипт: `svc wifi disable` → слив ≤20 с → `usejit` → zygote последней | ✅ | `JitNetCore.kt:143`, `JitRefTest.verbatimReferenceLiteralFromSmali` (392 симв.), `JitChainScriptTest.orderIsReferenceOrder` |
 | 1.3 | шаг монтирований §1.1 | ⛔ | реализован символ в символ, выключен: обратимость не доказана (§3.2) |
-| 2 | возврат — продолжение той же операции, AP→Wi-Fi, 15 с | ✅ | `JitNetCore.kt:536`, `:666`; `JitOrchestratorTest.lateShellThenRestoreOnNextStart` |
+| 2 | возврат — продолжение той же операции, AP→Wi-Fi, 15 с | ✅ | `JitNetCore.kt:712`, `:845`; `JitOrchestratorTest.repliedChainThenRestoreOnNextStart` |
 | 2.1 | объяснить запуск службы и получение данных операции | ✅ | §1.3 |
 | 2.2 | тайминг — по инструкциям, недоказанное не за факт | ✅ | §1.3 (15000 = `0x3a98`; «`onCreate` вовремя» не утверждается) |
-| 3 | сверка `getprop` + `dalvik-jit-code-cache`, нет данных ⇒ `unknown` | ✅ | `JitNetCore.kt:163`, `:761`; `JitRefTest.onlyTrueAndFalseAreFacts` |
+| 3 | сверка `getprop` + `dalvik-jit-code-cache`, нет данных ⇒ `unknown` | ✅ | `JitNetCore.kt:181`, `:964`; `JitRefTest.onlyTrueAndFalseAreFacts` |
 | 4 | обычный старт/ребут не применяют JIT и не рестартуют zygote | ✅ | `JitStartZeroWritesTest` (5) |
 | 5 | §1.1 исследование обратимости | 🟡 | §3.2 |
 | 6 | §1.2 убрать своё (persist, watcher, отмена, `sleep 8`, санация, boot-backfill, `bootRestoreJit`, `jitPersistBackfill`) | ✅ | §2, `JitNoPersistTest`, `JitStartZeroWritesTest.noOwnMechanismsInStartPath` |
 | 6.1 | старые persist-значения не менять, дать read-only способ | ✅ | §2.1 |
 | 6.2 | не копировать `ip rule del` | ✅ | `JitRulesReadOnlyTest` |
-| 7 | жизненный цикл: одна операция, второй клик не перезаписывает, чужая загрузка ⇒ ноль записей | ✅ | `JitNetCore.kt:314`, `JitOrchestratorTest.concurrentClicksStartExactlyOneOperation`, `JitStartZeroWritesTest.previousBootStartWritesNothingAndKeepsSnapshot` |
-| 7.1 | `ARMED`/«отправлено»/отсутствие журнала/60 с/таймаут — не доказательства | ✅ | `JitRef.chainOutcome`, `restart=not_claimed`, `JitLogsCancelTest.lostChannelIsLoggedAsErrorNotSuccess` |
-| 7.2 | `setWifiEnabled(true)`/`startSoftAp` ≠ интернет; в логах раздельно | ✅ | `JitNetCore.kt:666` (`request`/`state_before`/`state_after`/`internet=not_checked`), §6 |
+| 7 | жизненный цикл: одна операция, второй клик не перезаписывает, чужая загрузка ⇒ ноль записей | ✅ | `JitNetCore.kt:391`, `JitLifecycleTest.clickAndStartNeverOverlap`, `JitOrchestratorTest.concurrentClicksStartExactlyOneOperation` |
+| 7.1 | `ARMED`/«отправлено»/отсутствие журнала/60 с/таймаут — не доказательства | ✅ | `JitRef.chainOutcome` (`JitNetCore.kt:400`), `restart=not_claimed`, `JitLogsCancelTest.lostChannelIsLoggedAsErrorNotSuccess` |
+| 7.2 | `setWifiEnabled(true)`/`startSoftAp` ≠ интернет; в логах раздельно | ✅ | `JitNetCore.kt:845` (`request=`/`state_before=`/`state_after=`/`confirmed=`/`internet=not_checked`), §6 |
 | 8 | AVAS — отдельные функции, убрать привязку к JIT | ✅ | §5 |
 | 8.1 | поведение при старом снимке AVAS | ✅ | §2.2 |
 | 9 | логи (путь, fallback, retention 14 сут.) | ✅ | §6, `LogFilesTest` (6) |
@@ -414,10 +497,29 @@ wake/CarService-путь — **5000 мс**. В `w0/j9`, `w0/la`, `w0/e2`, `w0/bb
 
 ---
 
+### 8.3 Десять проблем §0.0 третьего захода (мандат правки 2)
+
+| № | требование §0.0 | статус | доказательство |
+|---|---|---|---|
+| 1 | выключенный Wi-Fi/AP — не признак завершения | ✅ | `JitNetCore.kt:361` (`Shell.REPLIED` — единственный признак), `JitLifecycleTest.foreignWifiOffIsNotEvidence` |
+| 2 | оба радио off — не доказательство; ноль ВСЕХ записей и сетевых действий | ✅ | `JitNetCore.kt:366-397`, `:776-796`; `bothRadiosOffWaitsForProvenCompletion`, `bothRadiosWasOffDoesNotBecomeDoneByItself` |
+| 3 | CPS/DPS атомарность доказана на обеих сторонах, `commit=false`, исключение, недоступность, расхождение, смерть между записями | ✅ | `JitNet.kt:64-122`; `JitStoreConsistencyTest` (8) |
+| 4 | гонки старт↔клик↔возврат, включая поздний shell; проверка содержимого снимка | ✅ | `JitNetCore.kt:498-523`, `:986-1000`; `JitLifecycleTest.staleWriterCannotOverwriteNewSnapshot`, `clickAndStartNeverOverlap` |
+| 5 | тумблер = подтверждённый факт; нет подтверждения ⇒ `unknown`, без новых кнопок | ✅ | `JitNetCore.kt:197`, `ToolsPanel.kt:1139`; `JitUiStateTest` (5) |
+| 6 | `RESTORED` ≠ безопасное завершение; честный блок вместо фиктивного успеха | ✅ | `JitNetCore.kt:774-781`, `:994-1030`; `apiRefusalIsNotReportedAsRestored` |
+| 7 | AP: разделять `invoked/accepted/confirmed/unknown`; guard при `wifiOn()==null` | ✅ | `JitRef.Request`, `JitNetCore.kt:855-905`; `apAndWifiAppliedLateAreStillConfirmed` |
+| 8 | сверка до выполнения — не результат; `unknown` не снимает намерение | ✅ | `JitNetCore.kt:994-1030`; `verifyOutcomes`, `wantFalseWithBrokenChannelIsNotSuccess` |
+| 9 | запуск после zygote не доказан — не заявлять `BOOT_COMPLETED`, не добавлять сервисы/фильтры | ✅ | `restart=not_claimed`; `JitBootBoundaryTest.noBootBackfillAnywhere` |
+| 10 | `MOUNT_STEP_ENABLED=false` ⇒ не точная копия; read-only команды; без массовых unmount | ⛔ / 🟡 | §3.2: шаг выключен и честно назван недоказанным; команды read-only даны; исполнение — по решению владельца |
+| — | таблица `референс → код → совпадение/отличие/неизвестно → файл:строка → тест` | ✅ | §3 (14 строк), §0.5 |
+| — | честная остановка при конфликте с точной копией | ✅ | §3.2 (⛔ шаг монтирований), §9 |
+
 ## 9. Что осталось за владельцем
 
 1. **§1.1 монтирования** — решение по `umount -l` (шаг готов, выключен, §3.2). Полезная проверка
-   только чтением: `adb shell cat /proc/mounts | grep ' /data/app/'`.
+   только чтением — `mountinfo` root-транспорта и сравнение namespace с PID 1 (четыре команды в
+   §3.2); `cat /proc/mounts` сам по себе ничего не доказывает, потому что показывает namespace
+   читающего процесса.
 2. **Остатки persist-свойств JIT** прежних версий — чистить или оставить (сейчас только читаем, §2.1).
 3. **Остаточный снимок AVAS** (`filesDir/avas_snapshot`) — удалять или оставить (сейчас не трогаем, §2.2).
 4. **`ACTION_BOOT_HU`** — нужен ли отдельный фильтр, как в референсе (сейчас нет; продолжение
