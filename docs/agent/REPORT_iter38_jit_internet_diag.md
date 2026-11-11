@@ -3,6 +3,7 @@
 **Ветка:** `fix/v2` (без force). **Кодовый коммит:** `64ad8510392ecddef402a718265fb308f75d2da3` (`64ad851`).
 **Версия:** `versionCode=61`, `versionName=1.0.61` — не менялись (1.0.61 владелец ещё не устанавливал).
 **CI на кодовом коммите:** run `43076766217`, job `130718505139` (`build`) — **SUCCESS**, **297 PASSED / 0 FAILED**, `BUILD SUCCESSFUL in 3m 48s`.
+**CI на итоговом HEAD ветки (код + этот отчёт + WORKLOG + `SOURCE_SHA`):** run `43078810520`, job `130725646945` (`build`) — **SUCCESS**, **297 PASSED / 0 FAILED**, `BUILD SUCCESSFUL in 4m 40s`.
 **Локальный JVM-прогон** (`/home/user/runtests.sh`: ядро + адаптеры + стабы): `OK (182 tests)`.
 
 > APK не собирался и не подписывался здесь — это делает владелец. На ГУ ничего не запускалось: **ни один тест не выполнялся на устройстве**, полевых данных нет, «точно работает» не заявляю.
@@ -173,4 +174,4 @@
 - Код: `tools/JitNetCore.kt` (отметка операции, блокеры, согласование задачи, восстановление прежних значений), `tools/JitNet.kt` (хранилище v3 + `requestDiagOnce`), `tools/JitMountDiag.kt` (переписан), `tools/InternetDiag.kt` (**новый**), `tools/NetInfoAndroid.kt` (**новый**), `tools/AppPerformance.kt` (тексты новых блокировок, лог старта), `tools/AdbClient.kt:2133/2144`, `VoiceAssistantService.kt:274`.
 - Тесты: `JitOrchestratorTest.kt`, `JitPersistenceTest.kt`, `JitMountDiagTest.kt`, `InternetDiagTest.kt` (**новый**), `JitFake.kt`, `JitLogsCancelTest.kt`, `JitRefTest.kt`, `JitUiStateTest.kt`, `JitStartZeroWritesTest.kt`.
 - Отчёт: `/home/user/REPORT_iter38_jit_internet_diag.md` + копия `docs/agent/`; `WORKLOG.md`; `app/buildinfo.properties` → `SOURCE_SHA=64ad851`.
-- Кодовый SHA: `64ad8510392ecddef402a718265fb308f75d2da3`; CI run `43076766217` / job `130718505139` — 297 PASSED / 0 FAILED.
+- Кодовый SHA: `64ad8510392ecddef402a718265fb308f75d2da3`; CI run `43076766217` / job `130718505139` — 297 PASSED / 0 FAILED. Итоговый HEAD ветки (этот отчёт, `WORKLOG`, `SOURCE_SHA=64ad851`): run `43078810520` / job `130725646945` — 297 PASSED / 0 FAILED.
