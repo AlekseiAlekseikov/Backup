@@ -164,6 +164,11 @@ object AdbClient {
         val timeoutMs: Int,
         val expectRoot: Boolean,
         val op: String? = LogKit.currentOp(),
+        /**
+         * iter39 §3.1: пассивный (read-only, диагностический) путь. Такой job НЕ запускает
+         * bootstrap, переподключение, replay и `ctl.restart adbd` ни на одной ветке обработки.
+         */
+        val passive: Boolean = false,
         val onResult: (Pair<Int, String>) -> Unit
     )
 
@@ -428,6 +433,79 @@ object AdbClient {
     }
 
     /**
+     * iter39 §3.1 — пассивный read-only путь для диагностики: без восстановления канала.
+     *
+     * Отличия от [execute] (и это единственные отличия):
+     *  • bootstrap НЕ запускается: если транспорт ещё не поднимался, честный
+     *    `ERR_ADB_PASSIVE_UNAVAILABLE reason=not_started` (а не неявный старт с побочными
+     *    эффектами: проба порта, ADB-свойства, ключ, replay);
+     *  • при таймауте/обрыве/ошибке не вызываются `scheduleReconnectOnce`/`reconnectRoot`,
+     *    не меняется состояние канала и не отправляются отложенные команды;
+     *  • правило `ctl.restart adbd` недостижимо: оно живёт только в [reconnectRoot], которого
+     *    пассивный путь не вызывает.
+     *
+     * Обычные вызовы ([execute], [executeAsync], [submit]) сохраняют прежнее поведение.
+     */
+    @JvmStatic
+    fun executePassive(command: String, timeoutMs: Int = 8000): Pair<Int, String> {
+        if (!started) {
+            AppLog.i(TAG, "ADB_PASSIVE status=unavailable reason=not_started " +
+                "(диагностика не поднимает транспорт: это сделало бы побочные действия)")
+            return Pair(AdbPassive.RC_UNAVAILABLE, "ERR_ADB_PASSIVE_UNAVAILABLE reason=not_started")
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            AppLog.e(TAG, "ADB_PASSIVE отказ: вызван с main-потока — команда не отправлена")
+            return Pair(AdbPassive.RC_UNAVAILABLE, "ERR_ADB_PASSIVE_UNAVAILABLE reason=main_thread")
+        }
+        val latch = CountDownLatch(1)
+        var res: Pair<Int, String> = Pair(AdbPassive.RC_UNAVAILABLE, "pending")
+        queue.offer(Job(command, timeoutMs, expectRoot = false, passive = true) { r ->
+            res = r
+            latch.countDown()
+        })
+        val ok = latch.await((timeoutMs + 5000).toLong(), TimeUnit.MILLISECONDS)
+        if (!ok) {
+            // Ни reconnect, ни channelLost: решение «лечить» принимает только обычный путь.
+            AppLog.i(TAG, "ADB_PASSIVE status=timeout dt=${timeoutMs}ms action=none " +
+                "(восстановление канала не запускается: это диагностика)")
+            return Pair(AdbPassive.RC_TIMEOUT, "ERR_ADB_TIMEOUT after ${timeoutMs}ms")
+        }
+        return res
+    }
+
+    /** Пассивный I/O для [AdbPassive.run]: только чтение, без восстановления канала. */
+    private val passiveIo: AdbPassive.Io = object : AdbPassive.Io {
+        override fun channel(): AdbPassive.Channel = when (state.get()) {
+            ChannelState.IDLE -> AdbPassive.Channel.NOT_STARTED
+            ChannelState.BOOTING -> AdbPassive.Channel.BOOTING
+            ChannelState.ROOT_5555 -> AdbPassive.Channel.ROOT_TCP
+            ChannelState.ROOT_UNIX -> AdbPassive.Channel.ROOT_UNIX
+            ChannelState.NO_ROOT_SH -> AdbPassive.Channel.NO_ROOT_SH
+            ChannelState.PERM_FAIL -> AdbPassive.Channel.PERM_FAIL
+        }
+
+        override fun execRoot(cmd: String, timeoutMs: Int): Pair<Int, String> =
+            execAdbSocket(cmd, workingPort.get(), timeoutMs)
+
+        override fun execUnix(cmd: String, timeoutMs: Int): Pair<Int, String> =
+            execAdbLocalSocket(cmd, timeoutMs)
+
+        override fun execShell(cmd: String, timeoutMs: Int): Pair<Int, String> =
+            runShellFallbackWithRc(cmd, timeoutMs)
+    }
+
+    /**
+     * Тело пассивного job: единственная точка выполнения. Ни одна ветка не запускает
+     * восстановление, не меняет [state] и не ставит ничего в очередь.
+     */
+    private fun runPassive(cmd: String, timeoutMs: Int): Pair<Int, String> {
+        val r = AdbPassive.run(cmd, timeoutMs, passiveIo)
+        AppLog.i(TAG, "ADB_PASSIVE path=${r.path} rc=${r.rc} len=${r.out.length} " +
+            "recovery=none cmd=${cmd.replace('\n', ' ').take(120)}")
+        return Pair(r.rc, r.out)
+    }
+
+    /**
      * Асинхронный вариант (fire-and-forget) — результат игнорируется.
      */
     fun executeAsync(command: String, timeoutMs: Int = 20000, expectRoot: Boolean = true) {
@@ -521,12 +599,19 @@ object AdbClient {
             AppLog.e(TAG, "ADB bootstrap fatal: ${t.message}", t)
         }
 
-        ready = true
-        readyLatch.countDown()
-        // Однократные обработчики готовности: каждый выполняется ровно раз и снимается.
-        runCatching {
-            val hooks = readyHooks.toList()
+        // iter39 §3.4: `ready` и список обработчиков переключаются ОДНИМ действием под [readyLock].
+        // Раньше проверка `ready` в onChannelReadyOnce и добавление в список расходились с этим
+        // местом: обработчик мог остаться в списке навсегда (потеря события) либо выполниться
+        // дважды. Теперь событие ровно однократное для каждого зарегистрированного обработчика.
+        val hooks: List<() -> Unit> = synchronized(readyLock) {
+            ready = true
+            val copy = readyHooks.toList()
             readyHooks.clear()
+            copy
+        }
+        readyLatch.countDown()
+        // Каждый обработчик выполняется ровно раз и снимается из списка выше.
+        runCatching {
             hooks.forEach { h -> runCatching { BgWorker.post("AdbClient.readyHook") { h() } } }
         }
 
@@ -540,7 +625,7 @@ object AdbClient {
             // iter33h H1.2: счётчик checksum_skipped живёт в границах команды.
             resetChecksumSkip()
             val out = try {
-                runCommand(job.cmd, job.timeoutMs, job.expectRoot)
+                runCommand(job.cmd, job.timeoutMs, job.expectRoot, passive = job.passive)
             } catch (t: Throwable) {
                 Log.e(TAG, "runCommand error", t)
                 Pair(1, "ERR_EXEC: ${t.javaClass.simpleName}: ${t.message}")
@@ -1787,7 +1872,14 @@ object AdbClient {
      *  - Каждый вызов логирует VERIFY EXEC с портом/rc/expectRoot/первыми
      *    буквами команды и вердиктом SUCCESS/FAILED(reason).
      */
-    private fun runCommand(cmd: String, timeoutMs: Int, expectRoot: Boolean): Pair<Int, String> {
+    private fun runCommand(
+        cmd: String,
+        timeoutMs: Int,
+        expectRoot: Boolean,
+        passive: Boolean = false
+    ): Pair<Int, String> {
+        // iter39 §3.1: пассивный путь решается ДО любых веток восстановления канала.
+        if (passive) return runPassive(cmd, timeoutMs)
         val shortCmd = cmd.replace("\\s+".toRegex(), " ").take(160)
         noteCmd(cmd)
         val st = state.get()
@@ -2129,11 +2221,21 @@ object AdbClient {
     /**
      * Неблокирующая проверка готовности канала (для одноразовой read-only диагностики:
      * ждать в рабочем потоке запрещено, а честный статус `root_unavailable` нужен).
+     *
+     * Семантика §3.4: `true` — bootstrap ЗАВЕРШИЛСЯ (в том числе с исключением) и воркер
+     * принимает задания. Это НЕ значит «root доступен»: root проверяется отдельно
+     * ([hasRoot]/состояние канала), а пассивный путь отвечает `root_unavailable` честно.
      */
     fun isChannelReady(): Boolean = ready
 
+    /**
+     * Лок «готовность канала + очередь обработчиков»: один и тот же для [workerLoop] и
+     * [onChannelReadyOnce], поэтому событие готовности не может потеряться или сработать дважды.
+     */
+    private val readyLock = Any()
+
     /** Ожидающие однократного события готовности канала (для одноразовой диагностики). */
-    private val readyHooks = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
+    private val readyHooks = ArrayList<() -> Unit>()
 
     /**
      * Выполнить [hook] ОДИН раз, когда существующий канал станет готовым (или сразу, если готов).
@@ -2142,11 +2244,10 @@ object AdbClient {
      * чтобы одноразовая read-only диагностика не занимала рабочий поток ожиданием `awaitReady`.
      */
     fun onChannelReadyOnce(hook: () -> Unit) {
-        if (ready) {
-            runCatching { hook() }
-            return
+        val runNow = synchronized(readyLock) {
+            if (ready) true else { readyHooks += hook; false }
         }
-        readyHooks += hook
+        if (runNow) runCatching { hook() }
     }
 
     /** Дождаться готовности канала (вызывающий поток блокируется до ready). */

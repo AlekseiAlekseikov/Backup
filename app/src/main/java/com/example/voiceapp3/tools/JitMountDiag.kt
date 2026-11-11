@@ -124,6 +124,16 @@ object JitMountDiag {
         o.contains("Permission denied") || o.contains("Operation not permitted") || o.contains("not permitted")
 
     /**
+     * Байты строки в UTF-8 — то, что считает `wc -c`.
+     *
+     * `String.length` — это символы (UTF-16 units), и для не-ASCII пути приложения они
+     * расходятся с байтами: наивное сравнение давало ложное `ok`/`truncated`. Полнота при этом
+     * всё равно НЕ доказывается: `wc` и `cat` — два отдельных чтения, а `/proc` меняется между
+     * ними; при расхождении пишется `truncated`, при невозможности доказать — `unknown`.
+     */
+    internal fun utf8Bytes(text: String): Int = text.toByteArray(Charsets.UTF_8).size
+
+    /**
      * `wc -lc` → (строки, байты). Второе число может отсутствовать (другая реализация `wc`).
      */
     internal fun wcCounts(out: String): Pair<Int?, Int?> {
@@ -167,9 +177,12 @@ object JitMountDiag {
         matched: Int
     ): String {
         if (transportRc == 137 || out.contains("ERR_ADB_TIMEOUT") || out.contains("ERR_TIMEOUT")) return STATUS_TIMEOUT
+        if (out.contains("ERR_ADB_PASSIVE_UNAVAILABLE")) return STATUS_UNKNOWN
         if (!complete(out)) return STATUS_UNKNOWN
         if (denied(out)) return STATUS_PERMISSION_DENIED
         if (catRc == null || wcRc == null) return STATUS_UNKNOWN
+        // §3.4: ненулевой код транспорта при целых маркерах — полнота ответа не подтверждена.
+        if (transportRc != 0) return STATUS_UNKNOWN
         if (wcRc != 0 || catRc != 0) {
             return if (out.contains("No such file")) STATUS_ROOT_UNKNOWN else STATUS_UNKNOWN
         }
@@ -257,11 +270,15 @@ object JitMountDiag {
             val parts = chunks(text)
             log(
                 "$SECTION name=identity status=$status rc=${raw.rc} id_rc=$idRc uid=$uid " +
-                    "root=${uid == 0} ns_self=${nsSelf ?: "unknown"} ns_init=${nsInit ?: "unknown"} " +
+                    "root=${if (uid == null) "unknown" else if (uid == 0) "true" else "false"} " +
+                    "uid_known=${uid != null} context=transport_shell ts=${System.currentTimeMillis()} " +
+                    "ns_self=${nsSelf ?: "unknown"} ns_init=${nsInit ?: "unknown"} " +
                     "same_ns_as_init=${if (nsSelf != null && nsInit != null) nsSelf == nsInit else "unknown"} " +
                     "lines=${text.lines().count { it.isNotBlank() }} parts=${parts.size} " +
-                    "note=\"namespace вызываемых утилит = namespace транспорта; совпадение с JIT " +
-                    "подтверждается только одинаковым транспортным контекстом, а не этим логом\""
+                    "note=\"uid/namespace относятся к тем вызовам одного транспортного контекста, " +
+                    "что видны в этом же логе; после переподключения канала они могли измениться, " +
+                    "поэтому один `id` не доказывает контекст других запросов; совпадение с JIT " +
+                    "этим логом не подтверждается\""
             )
             parts.forEachIndexed { i, part -> log("$DATA name=identity part=${i + 1}/${parts.size} $part") }
             if (status == STATUS_OK && uid != 0) {
@@ -283,7 +300,8 @@ object JitMountDiag {
             val content = catRegion(raw.out)
             val (wcLines, wcBytes) = wcCounts(raw.out)
             val seenLines = content.lines().count { it.isNotBlank() }
-            val seenBytes = content.length
+            // §3.4: байты — в UTF-8 (что и считает `wc -c`), а не `String.length`.
+            val seenBytes = utf8Bytes(content)
             val matched = filterDataApp(content)
             val status = fileStatus(
                 raw.rc, raw.out, wcRc, catRc, wcLines, wcBytes, seenLines, seenBytes, matched.size

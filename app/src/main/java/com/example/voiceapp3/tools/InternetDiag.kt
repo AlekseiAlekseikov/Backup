@@ -93,6 +93,44 @@ object InternetDiag {
     internal fun body(out: String): String =
         out.lines().filterNot { it.startsWith("__JMD_") }.joinToString("\n").trim()
 
+    // ─────────────────────────── личные данные (§3.2) ───────────────────────────
+
+    /**
+     * MAC-адрес в любом из типичных форматов: `aa:bb:cc:dd:ee:ff`, `AA-BB-CC-DD-EE-FF`,
+     * `aabb.ccdd.eeff` (Cisco-стиль), а также звёздочки `*` в позициях октетов (Android 10+
+     * скрывает MAC в `ip addr`: `link/ether 02:00:00:00:00:00`/`**:**:**:**:**:**`).
+     */
+    private val MAC_RE = Regex(
+        "(?i)(?<![0-9a-z])(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}(?![0-9a-z])" + "|" +
+            "(?i)(?<![0-9a-z])(?:[0-9a-f]{4}\\.){2}[0-9a-f]{4}(?![0-9a-z])" + "|" +
+            "(?i)(?<![0-9a-z])(?:[0-9a-f*]{2}:){5}[0-9a-f*]{2}(?![0-9a-z])"
+    )
+
+    /** SSID/BSSID/имя сети в выводе `ip`/`wpa_cli`/`dumpsys`: значение удаляем, поле оставляем. */
+    private val SSID_RE = Regex(
+        "(?i)\\b(ssid|bssid|wifi_ssid|wlan_ssid|current_ssid|ap_ssid)\\b(\\s*[:=]\\s*)(\\S+)"
+    )
+
+    /** Признак строки, которую нельзя писать в лог как есть. */
+    internal fun needsRedaction(text: String): Boolean =
+        MAC_RE.containsMatchIn(text) || SSID_RE.containsMatchIn(text)
+
+    /**
+     * Удаление аппаратных идентификаторов перед записью в лог: MAC (все форматы), SSID/BSSID.
+     *
+     * Что НЕ трогается: IPv4/IPv6-адреса, маршруты, номера таблиц, DNS, имена интерфейсов,
+     * счётчики — они нужны для анализа. Замена явная (`<удалён:MAC>`), чтобы читающий лог видел
+     * факт редактирования, а не «пустое место».
+     *
+     * Ограничение: это фильтр известных форматов. Он не доказывает, что полный общий лог
+     * приложения не содержит иных сведений — об этом сказано в предупреждении владельцу.
+     */
+    fun redact(text: String): String {
+        var t = MAC_RE.replace(text, "<удалён:MAC>")
+        t = SSID_RE.replace(t) { m -> m.groupValues[1] + m.groupValues[2] + "<удалён:SSID/BSSID>" }
+        return t
+    }
+
     /** Строки, несущие признаки отказа в правах или отсутствия утилиты. */
     private fun denied(o: String): Boolean =
         o.contains("Permission denied") || o.contains("Operation not permitted") ||
@@ -110,10 +148,19 @@ object InternetDiag {
         if (transportRc == 137 || out.contains("ERR_ADB_TIMEOUT") || out.contains("ERR_TIMEOUT")) {
             return STATUS_TIMEOUT
         }
+        // §3.1/§3.4: пассивный путь честно сказал «недоступно» — это НЕ пусто и не «нет root».
+        if (out.contains("ERR_ADB_PASSIVE_UNAVAILABLE")) {
+            return if (out.contains("channel_not_ready") || out.contains("not_started") ||
+                out.contains("state=BOOTING") || out.contains("state=IDLE")
+            ) STATUS_CHANNEL_NOT_READY else STATUS_UNAVAILABLE
+        }
+        if (out.contains("ERR_ROOT_CHANNEL_UNAVAILABLE")) return STATUS_UNAVAILABLE
         if (!complete(out)) return STATUS_UNKNOWN          // хвост потерян: полноты не подтвердить
         if (rc == null) return STATUS_UNKNOWN              // нет маркера кода возврата
         if (denied(out)) return STATUS_PERMISSION_DENIED
         if (missingTool(out)) return STATUS_UNAVAILABLE
+        // §3.4: транспорт вернул свой код — даже при целых маркерах полноту не подтверждаем.
+        if (transportRc != 0) return STATUS_UNKNOWN
         if (rc != 0) return STATUS_UNKNOWN
         if (!hasBody) return STATUS_EMPTY
         return STATUS_OK
@@ -209,7 +256,9 @@ object InternetDiag {
             "$BEGIN ts=$t0 source=$source mode=read_only transport=jit_shell " +
                 "channel_ready=$channelReady app_version=$appVersion " +
                 "note=\"в логе будут IP-адреса, маршруты и адреса DNS ГУ — это чувствительные " +
-                "данные; SSID/MAC/идентификаторы не собираются; сеть НЕ изменяется\""
+                "данные владельца; SSID/BSSID/MAC удаляются редактором известных форматов " +
+                "(redacted=yes/no в разделе), но ПОЛНЫЙ общий лог приложения может содержать " +
+                "другие сведения; сеть НЕ изменяется, лог никуда не отправляется\""
         )
         val sections = ArrayList<Section>(7)
 
@@ -225,8 +274,11 @@ object InternetDiag {
                 continue
             }
             val cmd = wrap(c.name, c.body)
-            val (trc, out) = runCatching { shell.exec(cmd, c.timeoutMs) }
+            val (trcRaw, outRaw) = runCatching { shell.exec(cmd, c.timeoutMs) }
                 .getOrElse { t -> Pair(1, "ERR_EXCEPTION:${t.javaClass.simpleName}") }
+            // §3.2: любой путь (включая ошибки транспорта) идёт в лог только через redact.
+            val out = redact(outRaw)
+            val trc = trcRaw
             val rc = rcOf(out, c.name)
             val content = body(out)
             val status = statusOf(trc, out, rc, content.isNotBlank())
@@ -235,14 +287,15 @@ object InternetDiag {
             log(
                 "$SECTION name=${c.name} status=$status transport_rc=$trc rc=${rc ?: -1} " +
                     "lines=${content.lines().count { it.isNotBlank() }} parts=${parts.size} " +
-                    "command=\"${c.body}\"" +
+                    "redacted=${if (needsRedaction(out)) "yes" else "no"} " +
+                    "command=\"${redact(c.body)}\"" +
                     (if (verdict != null) " verdict=$verdict" else "") +
                     (if (c.ping) " note=\"это проверка ICMP до ${
                         if (c.name == "ping_ip") "1.1.1.1" else "google.com (разрешение имени)"
                     }: отсутствие ответа НЕ доказывает отсутствия интернета\"" else "")
             )
             parts.forEachIndexed { i, part ->
-                log("$DATA name=${c.name} part=${i + 1}/${parts.size} $part")
+                log("$DATA name=${c.name} part=${i + 1}/${parts.size} ${redact(part)}")
             }
             sections += Section(c.name, status, trc, content.lines().count { it.isNotBlank() }, parts.size, verdict)
         }

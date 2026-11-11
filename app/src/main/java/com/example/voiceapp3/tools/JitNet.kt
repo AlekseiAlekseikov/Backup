@@ -56,6 +56,27 @@ object JitNet {
         }.getOrNull()
     }
 
+    /**
+     * iter39 §3.1 — shell ТОЛЬКО для диагностики: пассивный путь транспорта.
+     *
+     * Отдельный объект, а не [AndroidShell]: клик JIT и сверка должны сохранить прежнее поведение
+     * транспорта (включая восстановление канала), а диагностика — не иметь к нему доступа вовсе.
+     * Пассивный путь не запускает bootstrap, переподключение, replay и `ctl.restart adbd`; при
+     * недоступности возвращает `ERR_ADB_PASSIVE_UNAVAILABLE`, который сборщики показывают как
+     * `unavailable`/`channel_not_ready`, а не как «нет root» или «пусто».
+     */
+    internal object DiagShell : JitRef.JitShell {
+        override fun exec(command: String, timeoutMs: Int): Pair<Int, String> = runCatching {
+            AdbClient.executePassive(command, timeoutMs)
+        }.getOrElse { t ->
+            Pair(AdbPassive.RC_UNAVAILABLE,
+                "ERR_ADB_PASSIVE_UNAVAILABLE reason=exception:${t.javaClass.simpleName}")
+        }
+
+        /** `/proc/self/maps` читающего процесса — к диагностике сети/монтирований не относится. */
+        override fun mapsExcerpt(): String? = null
+    }
+
     // ─────────────────────────── префы ───────────────────────────
 
     /**
@@ -125,13 +146,24 @@ object JitNet {
         override fun readSnapshotState(): List<JitRef.StorePrev> = stores().map { (name, s) ->
             JitRef.StorePrev(
                 name,
-                JitRef.SNAPSHOT_KEYS.plus(KEY_MARK).map { key ->
-                    val present = runCatching { s.contains(key) }.getOrDefault(false)
-                    val str = runCatching { s.getString(key, null) }.getOrNull()
-                    val bool = runCatching {
-                        if (present && (key == KEY_PEDIDO || key == KEY_AUTO)) s.getBoolean(key, false) else null
-                    }.getOrNull()
-                    JitRef.KeyPrev(key, present, bool, str)
+                (JitRef.SNAPSHOT_KEYS + KEY_MARK).map { key ->
+                    // §2.5: «ключа нет» и «прочитать нельзя» — РАЗНОЕ. Исключение чтения даёт
+                    // present=null (неизвестно), и тогда менять данные нельзя вовсе.
+                    val present: Boolean? = try {
+                        s.contains(key)
+                    } catch (t: Throwable) {
+                        log("JIT_STORE prev_unknown store=$name key=$key reason=${t.javaClass.simpleName}")
+                        null
+                    }
+                    if (present == null) {
+                        JitRef.KeyPrev(key, null, null, null)
+                    } else {
+                        val str = try { s.getString(key, null) } catch (t: Throwable) { null }
+                        val bool = try {
+                            if (present && (key == KEY_PEDIDO || key == KEY_AUTO)) s.getBoolean(key, false) else null
+                        } catch (t: Throwable) { null }
+                        JitRef.KeyPrev(key, present, bool, str)
+                    }
                 }
             )
         }
@@ -148,6 +180,10 @@ object JitNet {
             var ok = 0
             val detail = StringBuilder()
             for (p in prev) {
+                if (!p.complete) {
+                    detail.append(if (detail.isEmpty()) "" else ",").append("${p.name}:prev_unknown")
+                    continue
+                }
                 val s = stores().firstOrNull { it.first == p.name }?.second
                 if (s == null) {
                     detail.append(if (detail.isEmpty()) "" else ",").append("${p.name}:store_absent")
@@ -157,7 +193,7 @@ object JitNet {
                     val e = s.edit()
                     for (k in p.keys) {
                         when {
-                            !k.present -> e.remove(k.key)
+                            k.present == false -> e.remove(k.key)
                             k.str != null -> e.putString(k.key, k.str)
                             k.bool != null -> e.putBoolean(k.key, k.bool)
                             else -> e.remove(k.key)
@@ -173,6 +209,71 @@ object JitNet {
             }
             val r = JitRef.WriteResult(prev.size, ok, detail.ifEmpty { "all_ok" }.toString())
             log("JIT_STORE restore_previous attempted=${r.attempted} ok=${r.ok} detail=${r.detail}")
+            return r
+        }
+
+        /**
+         * §2.2: согласованное условное удаление данных СВОЕЙ операции.
+         *
+         * В каждом хранилище: если отметка принадлежит [opId] — снимок и отметка удаляются ОДНИМ
+         * `editor/commit` и проверяются чтением. Чужая отметка ⇒ хранилище не трогается.
+         * Атомарности между CPS и DPS нет: это отдельные `commit()`; частичный успех честно
+         * виден в отчёте и НЕ выдаётся за гарантированное продолжение.
+         */
+        override fun removeOwned(opId: String): JitRef.OwnedRemoval {
+            val all = stores()
+            if (all.isEmpty()) {
+                log("JIT_STORE remove_owned op=$opId attempted=0 reason=no_store")
+                return JitRef.OwnedRemoval(0, 0, 0, true, true, "no_store")
+            }
+            var clean = 0
+            var other = 0
+            // `commit() == false` означает «удаление НЕ подтверждено», а не «удалено»: память
+            // процесса пуста, но на диске значение могло остаться, и после перезапуска оно
+            // вернётся. Поэтому такой остаток считается возможным (честно, без гарантий).
+            var unconfirmed = false
+            val detail = StringBuilder()
+            for ((name, s) in all) {
+                val cur = try {
+                    JitRef.OpMark.parse(s.getString(KEY_MARK, null))
+                } catch (t: Throwable) {
+                    null
+                }
+                if (cur == null || cur.op != opId) {
+                    other++
+                    detail.append(if (detail.isEmpty()) "" else ",")
+                        .append("$name:skip(${cur?.op ?: "no_mark"})")
+                    continue
+                }
+                val ok = try {
+                    s.edit().remove(KEY_RESTORE).remove(KEY_MARK).commit()
+                } catch (t: Throwable) {
+                    log("JIT_STORE remove_owned store=$name exception=${t.javaClass.simpleName}")
+                    false
+                }
+                val restoreGone = try { !s.contains(KEY_RESTORE) } catch (t: Throwable) { false }
+                val markGone = try { !s.contains(KEY_MARK) } catch (t: Throwable) { false }
+                if (ok && restoreGone && markGone) {
+                    clean++
+                } else {
+                    unconfirmed = true
+                    detail.append(if (detail.isEmpty()) "" else ",")
+                        .append("$name:commit=${if (ok) "ok" else "false"}" +
+                            ",restore_left=${!restoreGone},mark_left=${!markGone}")
+                }
+            }
+            // Остаток смотрим по порядку чтения (CPS→DPS) — так его увидит следующий процесс.
+            // Плюс: если хоть одно хранилище не подтвердило удаление, остаток возможен на диске
+            // даже при пустой памяти — согласованность не заявляем.
+            val restoreLeft = unconfirmed ||
+                runCatching { getString(KEY_RESTORE) != null }.getOrDefault(true)
+            val markLeft = unconfirmed ||
+                runCatching { getString(KEY_MARK) != null }.getOrDefault(true)
+            val r = JitRef.OwnedRemoval(
+                all.size, clean, other, restoreLeft, markLeft,
+                detail.ifEmpty { "all_clean" }.toString()
+            )
+            log("JIT_STORE remove_owned op=$opId ${r.brief()}")
             return r
         }
 
@@ -195,12 +296,19 @@ object JitNet {
         override fun putSnapshot(
             want: Boolean,
             snap: JitRef.WifiSnapshot,
-            mark: JitRef.OpMark
+            mark: JitRef.OpMark,
+            target: List<String>?
         ): JitRef.SnapshotWrite {
-            val all = stores()
+            // §2.5: набор хранилищ фиксируется моментом чтения прежних значений; если хранилище
+            // исчезло или появилось между этапами — отчёт покажет это, а не «тихо» переедет.
+            val all = stores().filter { target == null || it.first in target }
             if (all.isEmpty()) {
                 log("JIT_STORE snapshot attempted=0 reason=no_store")
                 return JitRef.SnapshotWrite(want, snap, emptyList())
+            }
+            val absent = target?.filter { t -> all.none { it.first == t } } ?: emptyList()
+            if (absent.isNotEmpty()) {
+                log("JIT_STORE snapshot note=store_absent names=${absent.joinToString(",")}")
             }
             val reports = ArrayList<JitRef.StoreReport>(all.size)
             for ((name, s) in all) {
@@ -379,6 +487,9 @@ object JitNet {
     /** Процессный флаг: сбор УЖЕ выполнен (успешный или честно-неуспешный — второй не начинаем). */
     private val diagRan = java.util.concurrent.atomic.AtomicBoolean(false)
 
+    /** Лок на однократную отложенную запись «канал пока не готов» (§3.4). */
+    private val diagFallbackLock = Any()
+
     /**
      * Одноразовая **read-only** диагностика: монтирования ([JitMountDiag]) и сеть ([InternetDiag]).
      *
@@ -405,21 +516,28 @@ object JitNet {
 
         val runBoth: (String) -> Unit = { via ->
             if (diagRan.compareAndSet(false, true)) {
-                runCatching { JitMountDiag.collect(AndroidShell, true, log, "$source/$via") }
+                runCatching { JitMountDiag.collect(DiagShell, true, log, "$source/$via") }
                     .onFailure { t ->
                         AppLog.i(TAG, "JIT_MOUNT_DIAG source=$source/$via status=unknown " +
                             "reason=${t.javaClass.simpleName} (сбой сборщика, не результат чтения)")
                     }
-                runCatching { InternetDiag.collect(AndroidShell, true, netInfo, log, "$source/$via", appVersion) }
+                runCatching { InternetDiag.collect(DiagShell, true, netInfo, log, "$source/$via", appVersion) }
                     .onFailure { t ->
                         AppLog.i(TAG, "INTERNET_DIAG source=$source/$via status=unknown " +
                             "reason=${t.javaClass.simpleName} (сбой сборщика, сеть не менялась)")
                     }
             }
         }
+        // §3.4: отложенная честная запись «канал пока не готов» НЕ занимает единственный сбор.
+        // Если канал станет готов позже, сбор ещё выполнится (обработчик события остаётся живым),
+        // но не более одного раза — это по-прежнему `diagRan`, а не этот флаг.
+        var fallbackWrote = false
         val treatNotReady: (String) -> Unit = { why ->
-            if (diagRan.compareAndSet(false, true)) {
-                runCatching { JitMountDiag.collect(AndroidShell, false, log, source) }
+            val once = synchronized(diagFallbackLock) {
+                if (fallbackWrote) false else { fallbackWrote = true; true }
+            }
+            if (once) {
+                runCatching { JitMountDiag.collect(DiagShell, false, log, source) }
                     .onFailure { t -> AppLog.i(TAG, "JIT_MOUNT_DIAG status=unknown reason=${t.javaClass.simpleName}") }
                 runCatching { InternetDiag.collectChannelNotReady(log, source, why) }
                     .onFailure { t -> AppLog.i(TAG, "INTERNET_DIAG status=unknown reason=${t.javaClass.simpleName}") }

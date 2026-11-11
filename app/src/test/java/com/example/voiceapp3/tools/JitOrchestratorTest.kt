@@ -486,7 +486,8 @@ class JitOrchestratorTest {
 
         assertEquals("снимок новой операции не удалён", "wifi=0", store.rawRestore())
         assertEquals("отметка новой операции не удалена", newMark, store.getString(JitRef.KEY_MARK))
-        assertTrue(lines().contains("cleanup=skipped reason=snapshot_belongs_to_other_op"))
+        assertTrue(lines().contains("skipped reason=snapshot_belongs_to_other_op"))
+        assertTrue("ничего не удалено у чужой операции", store.presentIn(0, JitRef.KEY_RESTORE))
     }
 
     @Test
@@ -532,7 +533,8 @@ class JitOrchestratorTest {
         store.commitFails += listOf(0, 1)   // удаление не подтвердится
         sched.drain()
         assertTrue("снимок остался (удаление не подтверждено)", store.contains(JitRef.KEY_RESTORE))
-        assertTrue(lines().contains("still_present=true"))
+        assertTrue("честно: очистка не подтверждена", lines().contains("data=kept_or_partial"))
+        assertTrue(lines().contains("restore_left=true"))
         // Следующий старт увидит тот же опознанный снимок и повторит возврат (setWifiEnabled идемпотентен).
         store.commitFails.clear()
         val sched2 = JitFake.Scheduler()

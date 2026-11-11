@@ -114,31 +114,59 @@ object LogFiles {
     fun currentPath(): String = pathRef
 
     /**
-     * Дописать строку в файл текущих суток. Вызывается из [AppLog] на каждую запись —
-     * поэтому ошибки глушим молча (лог не имеет права ломать приложение).
+     * Бюджет диагностики в `AppLog` может считать строку «записанной», поэтому физическая
+     * запись обязана быть видимой: счётчик ошибок и последняя причина доступны без файла.
      */
-    fun append(context: Context, line: String) {
+    private val ioErrorCount = java.util.concurrent.atomic.AtomicLong(0)
+
+    @Volatile private var lastIoError: String = ""
+
+    /** Сколько раз запись в датированный лог не удалась (включая fallback). */
+    fun ioErrors(): Long = ioErrorCount.get()
+
+    /** Последняя ошибка записи (для независимого канала: logcat/UI/строка в основном логе). */
+    fun lastIoError(): String = lastIoError
+
+    /**
+     * Дописать строку в файл текущих суток. Возвращает `true` ТОЛЬКО если запись подтверждена
+     * (файл дописан, в том числе через fallback `filesDir/logs`).
+     *
+     * Ошибки не глушим до конца: они уходят в независимый канал (logcat, `LogFiles.ERR`) и в
+     * счётчик [ioErrors], иначе «сохранено» было бы утверждением без подтверждения.
+     */
+    fun append(context: Context, line: String): Boolean {
         val app = context.applicationContext
         var d = dirRef ?: dirFor(app).also { dirRef = it }
         val now = System.currentTimeMillis()
-        var failed = false
+        var failed: Throwable? = null
         runCatching { write(File(d, fileNameFor(now)), line) }.onFailure {
-            failed = true
+            failed = it
             Log.w(TAG, "append failed: ${it.javaClass.simpleName}: ${it.message}")
         }
-        if (failed) {
-            // Один раз переключаемся на внутренний каталог и пробуем снова (тихий фоллбэк).
+        if (failed != null) {
+            // Один раз переключаемся на внутренний каталог и пробуем снова.
             val internal = ensureDir(File(app.filesDir, "logs"))
             if (d.absolutePath != internal.absolutePath) {
                 dirRef = internal
                 d = internal
+                failed = null
                 runCatching { write(File(d, fileNameFor(now)), line) }.onFailure {
+                    failed = it
                     Log.w(TAG, "append failed (internal too): ${it.javaClass.simpleName}")
                 }
             }
         }
+        val fail = failed
+        if (fail != null) {
+            ioErrorCount.incrementAndGet()
+            lastIoError = "${fail.javaClass.simpleName}: ${fail.message} " +
+                "dir=${d.absolutePath} file=${fileNameFor(now)}"
+            Log.e(TAG, "LOGFILES_WRITE_ERROR $lastIoError (сообщение не сохранено)")
+            return false
+        }
         val target = File(d, fileNameFor(now))
         if (pathRef != target.absolutePath) pathRef = target.absolutePath
+        return true
     }
 
     private fun write(target: File, line: String) {

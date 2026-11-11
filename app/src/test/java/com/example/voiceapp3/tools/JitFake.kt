@@ -154,23 +154,58 @@ object JitFake {
 
         override fun contains(key: String): Boolean = maps.any { it.containsKey(key) }
 
+        /** Хранилища, у которых чтение прежних значений «не удаётся» (проверка §2.5). */
+        val readStateFails = mutableSetOf<Int>()
+
+        /** Хранилища, которые «пропадают» после чтения прежних значений (проверка §2.5). */
+        val vanishAfterRead = mutableSetOf<Int>()
+
         override fun readSnapshotState(): List<JitRef.StorePrev> =
             maps.mapIndexed { i, m ->
                 JitRef.StorePrev(
                     name(i),
                     listOf(JitRef.KEY_PEDIDO, JitRef.KEY_AUTO, JitRef.KEY_RESTORE, JitRef.KEY_MARK).map { k ->
-                        JitRef.KeyPrev(k, m.containsKey(k), m[k] as? Boolean, m[k] as? String)
+                        if (i in readStateFails) JitRef.KeyPrev(k, null, null, null)
+                        else JitRef.KeyPrev(k, m.containsKey(k), m[k] as? Boolean, m[k] as? String)
                     }
                 )
             }
 
+        override fun removeOwned(opId: String): JitRef.OwnedRemoval {
+            var clean = 0
+            var other = 0
+            val detail = StringBuilder()
+            for ((i, m) in maps.withIndex()) {
+                val cur = JitRef.OpMark.parse(m[JitRef.KEY_MARK] as? String)
+                if (cur == null || cur.op != opId) {
+                    other++
+                    detail.append(if (detail.isEmpty()) "" else ",").append("${name(i)}:skip")
+                    continue
+                }
+                if (i in throwOn || (i in commitFails && !writeDespiteFalse)) {
+                    detail.append(if (detail.isEmpty()) "" else ",").append("${name(i)}:commit=false")
+                    continue
+                }
+                m.remove(JitRef.KEY_RESTORE)
+                m.remove(JitRef.KEY_MARK)
+                ops += "remove_owned:$i"
+                clean++
+            }
+            val restoreLeft = maps.any { it.containsKey(JitRef.KEY_RESTORE) }
+            val markLeft = maps.any { it.containsKey(JitRef.KEY_MARK) }
+            return JitRef.OwnedRemoval(maps.size, clean, other, restoreLeft, markLeft,
+                detail.ifEmpty { "all_clean" }.toString())
+        }
+
         override fun putSnapshot(
             want: Boolean,
             snap: JitRef.WifiSnapshot,
-            mark: JitRef.OpMark
+            mark: JitRef.OpMark,
+            target: List<String>?
         ): JitRef.SnapshotWrite {
             val reports = mutableListOf<JitRef.StoreReport>()
             for ((i, m) in maps.withIndex()) {
+                if (target != null && name(i) !in target) continue
                 if (i in throwOn) {
                     reports += JitRef.StoreReport(name(i), "exception:IllegalStateException", false)
                     continue
@@ -217,7 +252,7 @@ object JitFake {
                     continue
                 }
                 for (k in p.keys) {
-                    if (!k.present) maps[i].remove(k.key)
+                    if (k.present == false) maps[i].remove(k.key)
                     else when {
                         k.str != null -> maps[i][k.key] = k.str
                         k.bool != null -> maps[i][k.key] = k.bool

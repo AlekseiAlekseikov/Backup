@@ -291,6 +291,18 @@ object AppLog {
         "LOG_BUDGET", "CHANNEL_LOST", "ADB_RECOVERY", "SCRIPT_UPLOAD",
     )
 
+    /** §3.3: диагностический блок в датированном логе (свой ограниченный бюджет). */
+    internal fun isDiagLine(msg: String): Boolean = LogBudget.isDiagLine(msg)
+
+    /** Единственный экземпляр бюджета диагностики (живёт на процесс). */
+    private val diagBudget = LogBudget.DiagState()
+
+    /** Для тестов/диагностики: сколько строк диагностики усечено в текущем окне. */
+    internal fun diagDropped(): Long = diagBudget.droppedLines()
+
+    /** Для тестов/диагностики: был ли факт усечения объявлен. */
+    internal fun diagTruncated(): Boolean = diagBudget.truncated()
+
     /** Строка действия (exempt-список §4.5). */
     internal fun isActionLine(msg: String): Boolean {
         val m = msg.trimStart()
@@ -341,12 +353,27 @@ object AppLog {
         // подменяет собой очередную запись (порядок важен: сначала budgetAllow).
         // iter33n §4.5: строки ДЕЙСТВИЙ не режутся бюджетом никогда — иначе из лога пропадают
         // клики тумблеров и пробы (в прогоне 08.11 из файла исчезли TTL_*/TOGGLE*).
-        val exempt = isActionLine(msg)
-        val allowed = if (exempt) true else budgetAllow(line.toByteArray(Charsets.UTF_8).size)
-        val notice = budgetNotice
-        budgetNotice = null
-        if (notice != null) line = formatLine("INFO", "CENTRAL_LogBudget", notice, null)
-        else if (!allowed) return
+        val lineBytes = line.toByteArray(Charsets.UTF_8).size
+        // §3.3: диагностические блоки (INTERNET_DIAG_*/JIT_MOUNT_DIAG_*) идут по СВОЕМУ бюджету:
+        // общий trim их не выбрасывает и не подменяет своей сводкой. Ограничение объёма и числа
+        // строк остаётся, а факт усечения объявляется одной явной строкой `*_TRUNCATED`.
+        if (isDiagLine(msg)) {
+            val v = diagBudget.decide(msg, lineBytes, android.os.SystemClock.elapsedRealtime())
+            if (!v.write) {
+                // Строку не пишем, но факт усечения объявляем ОДНОЙ явной строкой.
+                if (v.notice != null && linesDiagNoticeWritten(v.notice)) {
+                    writeRawLine(c, formatLine("INFO", "CENTRAL_LogDiag", v.notice, null), null)
+                }
+                return
+            }
+        } else {
+            val exempt = isActionLine(msg)
+            val allowed = if (exempt) true else budgetAllow(lineBytes)
+            val notice = budgetNotice
+            budgetNotice = null
+            if (notice != null) line = formatLine("INFO", "CENTRAL_LogBudget", notice, null)
+            else if (!allowed) return
+        }
         // iter16: собираем "шапку" (BUILD/App INIT) — пишем её в начало каждого
         // нового/повёрнутого файла, чтобы после ротации версия не терялась.
         if (isHeaderLine(tag, msg)) {
@@ -386,6 +413,43 @@ object AppLog {
         // iter33p §4.3: та же строка уходит в дневной файл `voiceapp3-DD.MM.YYYY.log`
         // (ошибки записи глушим — дневной лог не имеет права ломать приложение).
         runCatching { LogFiles.append(c, line) }
+    }
+
+    /** Однократность уведомления об усечении: одна строка на факт, а не на каждую запись. */
+    private val diagNoticeSeen = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+
+    private fun linesDiagNoticeWritten(notice: String): Boolean =
+        diagNoticeSeen.putIfAbsent(notice, true) == null
+
+    /** Физическая запись готовой строки (файл + fallback). Используется уведомлениями бюджета. */
+    private fun writeRawLine(c: Context?, line: String, th: Throwable?) {
+        val cx = c ?: return
+        synchronized(lock) {
+            var out: java.io.PrintWriter? = null
+            try {
+                val target = pickFile(cx)
+                rotateIfNeeded(target)
+                out = java.io.PrintWriter(java.io.FileWriter(target, true))
+                out.println(line)
+                th?.printStackTrace(out)
+                out.flush()
+            } catch (x: Throwable) {
+                try {
+                    val f2 = java.io.File(cx.filesDir, "logs")
+                        .apply { runCatching { if (!exists()) mkdirs() } }
+                        .let { java.io.File(it, LOG_NAME) }
+                    rotateIfNeeded(f2)
+                    java.io.PrintWriter(java.io.FileWriter(f2, true)).use {
+                        it.println(line); th?.printStackTrace(it); it.flush()
+                    }
+                } catch (xx: Throwable) {
+                    Log.e(TAG_BASE, "write(RawLine) failed both: ${x.message} / ${xx.message}")
+                }
+            } finally {
+                try { out?.close() } catch (_: Throwable) {}
+            }
+        }
+        runCatching { LogFiles.append(cx, line) }
     }
 
     private fun formatLine(lvl: String, tag: String, msg: String, _th: Throwable?): String {
