@@ -26,7 +26,11 @@ object JitNet {
     internal const val RESTORE_DELAY_MS = JitRef.RESTORE_DELAY_MS
     internal const val CHAIN_TIMEOUT_MS = JitRef.CHAIN_TIMEOUT_MS
 
-    private val log: (String) -> Unit = { AppLog.i(TAG, it) }
+    /**
+     * Лог не должен влиять на решение: если запись в лог невозможна (например, в JVM-тесте
+     * `android.util.Log` — заглушка), операция продолжается по тем же правилам.
+     */
+    private val log: (String) -> Unit = { line -> runCatching { AppLog.i(TAG, line) } }
 
     /** Планировщик отложенного возврата сети: тот же смысл, что `postDelayed` у handler-а сервиса. */
     internal object AndroidScheduler : JitRef.JitScheduler {
