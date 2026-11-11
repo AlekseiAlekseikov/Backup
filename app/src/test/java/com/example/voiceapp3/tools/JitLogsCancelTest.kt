@@ -21,14 +21,15 @@ class JitLogsCancelTest {
     @Test
     fun logSeparatesStateRequestAndTransport() {
         val store = JitFake.Store()
-        val net = JitFake.Net(wifi = true, ap = false)
+        val net = JitFake.Net(wifi = true)
         val log = mutableListOf<String>()
         JitOp.click(store, net, JitFake.QueueShell(stand()).apply { runInline = 1 },
             want = true, log = { log += it })
 
         val click = log.first { it.startsWith("JIT_CLICK") }
-        assertTrue("состояние — отдельным полем", click.contains("net=wifi=1,ap=0"))
-        assertTrue("результат записи виден", click.contains("saved=true"))
+        assertTrue("состояние — отдельным полем", click.contains("restore=wifi=1"))
+        assertTrue("результат записи виден", click.contains("written=2/2"))
+        assertTrue("снимок подтверждён чтением", click.contains("confirmed=2"))
 
         val sent = log.first { it.startsWith("JIT_CHAIN_SENT") }
         assertTrue("шаг монтирований есть, как в референсе", sent.contains("mount_step=present"))
@@ -42,7 +43,7 @@ class JitLogsCancelTest {
     @Test
     fun lostChannelIsLoggedAsErrorNotSuccess() {
         val store = JitFake.Store()
-        val net = JitFake.Net(wifi = true, ap = false)
+        val net = JitFake.Net(wifi = true)
         val log = mutableListOf<String>()
         JitOp.click(store, net, JitFake.QueueShell(stand()), true, log = { log += it })
         assertTrue(log.any { it.startsWith("JIT_CHAIN_RETURN") && it.contains("outcome=channel_lost") })
@@ -61,11 +62,13 @@ class JitLogsCancelTest {
     }
 
     @Test
-    fun restoreOnlyTurnsNetworkOn() {
+    fun restoreOnlyTurnsWifiOn() {
+        // Старый снимок с ap=1 читается, но ни одного вызова AP не делает (решение владельца).
         val store = JitFake.Store().apply { set(JitRef.KEY_RESTORE, "wifi=1,ap=1") }
-        val net = JitFake.Net(wifi = false, ap = false, apAppliesAfterReads = 1)
-        JitOp.onProcessStart(store, net, JitFake.Waiter(), JitFake.Scheduler().apply { runInline = true })
-        assertEquals("ровно два запроса и оба включающие", listOf("ap=start", "wifi=true"), net.requests)
+        val net = JitFake.Net(wifi = false)
+        JitOp.onProcessStart(store, net, JitFake.Scheduler().apply { runInline = true })
+        assertEquals("единственный запрос — включение клиентского Wi-Fi",
+            listOf("wifi=true"), net.requests)
         assertTrue(net.requests.none { it.contains("false") })
     }
 

@@ -54,7 +54,8 @@ class JitBootBoundaryTest {
         assertFalse("ядро не зовёт shell", jit.contains("shell.exec(\"setprop") || jit.contains("shell.exec(\"svc"))
         assertFalse("ядро не пишет свойства напрямую", jit.contains("Runtime.getRuntime"))
         assertTrue("сеть меняется только через адаптер",
-            jit.contains("netState.setWifi") && jit.contains("netState.startAp"))
+            jit.contains("netState.setWifi") && jit.contains("netState.wifiOn"))
+        assertFalse("точек доступа в JIT нет", jit.contains("startAp"))
     }
 
     @Test

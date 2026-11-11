@@ -1165,14 +1165,34 @@ class ToolsPanel(
         page.addView(view, matchWrap())
         // 1. Сверка `w0/bb`+`w0/r7` — то же, что делает открытие настроек в референсе (`S0`→`bb`).
         //    Она снимает `jit_pedido`, если намерение было; без намерения — ничего и не шлёт.
-        runCatching { BgWorker.post("ToolsPanel.jitVerify") { runCatching { AppPerformance.verifyJitOnly(activity) } } }
+        //    Подтверждённый не-успех доходит до ЭТОЙ ЖЕ строки (без новой кнопки, без красного
+        //    текста): `JIT_NOT_APPLIED` больше не остаётся только в логе.
+        runCatching {
+            BgWorker.post("ToolsPanel.jitVerify") {
+                runCatching { AppPerformance.verifyJitOnly(activity) }
+                handler.post {
+                    runCatching {
+                        view.text = jitRuntimeLineText(AppPerformance.jitRuntimeFactCached())
+                    }
+                    Unit
+                }
+            }
+        }
         // 2. Факт `getprop` (read-only) и обновление И строки, И тумблера на главном потоке.
+        //    Поколение клика фиксируется ДО запроса: если пользователь успел кликнуть, устаревший
+        //    ответ не переставит тумблер и не покажет «успех нового клика».
+        val gen0 = AppPerformance.jitGeneration()
         runCatching {
             AppPerformance.refreshJitRuntimeAsync(activity) { fresh ->
                 handler.post {
                     runCatching {
-                        view.text = jitRuntimeLineText(fresh)
-                        applyJitFact(fresh)
+                        if (AppPerformance.jitGeneration() != gen0) {
+                            // Ответ посчитан до клика — тумблер не трогаем, только текст факта.
+                            view.text = jitRuntimeLineText(fresh)
+                        } else {
+                            view.text = jitRuntimeLineText(fresh)
+                            applyJitFact(fresh)
+                        }
                     }
                     Unit
                 }
@@ -1205,7 +1225,9 @@ class ToolsPanel(
             fact.value == JitRef.Prop.FALSE -> "выключен (getprop dalvik.vm.usejit = false)"
             else -> "неизвестно (getprop не прочитан: ${fact.reason})"
         }
-        return "Сейчас на устройстве: $shown"
+        val hint = runCatching { AppPerformance.jitVerifyHintCached() }.getOrNull()
+        return if (hint.isNullOrBlank()) "Сейчас на устройстве: $shown"
+               else "Сейчас на устройстве: $shown · $hint"
     }
 
     private fun addText(title: String, body: String) {

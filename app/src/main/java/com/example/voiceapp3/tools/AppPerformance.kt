@@ -802,38 +802,40 @@ object AppPerformance {
      * (снимок + загрузка + признаки выполнения), поэтому повторный старт сервиса в том же
      * процессе снова проверит состояние, а не «запомнит, что уже пробовали» (REVIEW §0.1(2)).
      */
-    fun checkPendingZygoteVerify(context: Context) {
+    fun checkPendingZygoteVerify(context: Context, source: String = "process") {
         val app = context.applicationContext
         BgWorker.post("AppPerformance.jitPendingVerify") {
-            runCatching { jitPendingVerify(app) }
+            runCatching { jitPendingVerify(app, source) }
         }
         saidNoClaim.compareAndSet(false, true)
     }
 
     /**
-     * Продолжение операции на старте процесса — дословно `CentralWatchdogService.onCreate`:
-     * строка `jit_restaurar` совпала с `^wifi=([01]),ap=([01])$` → снять строку → через 15 с
-     * `w0/e2` (AP, затем Wi-Fi).
+     * Продолжение операции на старте процесса — `CentralWatchdogService.onCreate`:
+     * снимок `jit_restaurar` разобран → снят → через 15 с `w0/e2` **только клиентский Wi-Fi**
+     * (AP не поднимается: решение владельца, iter36 §2.1).
      *
      * Своих условий здесь нет: ни метки загрузки, ни проверки «а выполнялся ли скрипт», ни
      * блокировок. Так делает референс — и это описано в отчёте как его поведение, включая риск:
      * снимок применяется на ЛЮБОМ старте процесса, пока строка не снята, а снимается она до
      * выполнения, поэтому смерть процесса в эти 15 с отменяет возврат сети навсегда.
      */
-    fun jitPendingVerify(context: Context): Boolean {
+    fun jitPendingVerify(context: Context, source: String = "process"): Boolean {
         val app = context.applicationContext
-        val out = runCatching { JitNet.onProcessStart(app) }
+        val out = runCatching { JitNet.onProcessStart(app, source) }
             .onFailure { AppLog.i(TAG, "JIT_START_RESULT exception=${it.javaClass.simpleName} (сеть не тронута)") }
             .getOrNull()
         if (out == null) return false
         // Ни `restarted=`, ни `net_restore_done`: наличие снимка НЕ доказывает ни рестарт zygote,
         // ни успешный возврат сети. Пишем только то, что известно: что снято, что запланировано.
-        AppLog.i(TAG, "JIT_START_RESULT snapshot=${out.snapshot?.wire() ?: "none"} " +
+        AppLog.i(TAG, "JIT_START_RESULT source=$source snapshot=${out.snapshot?.wire() ?: "none"} " +
+            "format=${out.format ?: "none"} reason=${out.reason} " +
             "restore_removed=${out.removed?.allOk ?: false} " +
             "restore_stores=${out.removed?.let { "${it.ok}/${it.attempted}" } ?: "0/0"} " +
-            "e2_scheduled=${out.scheduled} delay_ms=${JitRef.RESTORE_DELAY_MS} " +
-            "zygote_restart=not_claimed internet=not_checked " +
-            "(возврат сети выполнится в фоне через 15 с; его итог — строки JIT_NET_RESTORE)")
+            "restore_scheduled=${out.scheduled} delay_ms=${JitRef.RESTORE_DELAY_MS} " +
+            "restart=not_claimed internet=not_checked " +
+            "(возврат клиентского Wi-Fi выполнится в фоне через 15 с; его итог — строки " +
+            "JIT_NET_RESTORE; AP не поднимается — решение владельца)")
         return out.scheduled
     }
 
@@ -877,42 +879,71 @@ object AppPerformance {
     fun refreshJitRuntimeAsync(context: Context, minIntervalMs: Long = 5_000L, onDone: (JitRef.PropFact) -> Unit = {}) {
         val app = context.applicationContext
         val now = System.currentTimeMillis()
-        if (now - lastJitFactAt < minIntervalMs) {
-            LAST_JIT_FACT?.let(onDone)
+        // Кэш отдаётся только если он ЕСТЬ. Раньше при пустом кэше в пределах 5 с вызывающий не
+        // получал callback вообще и панель оставалась с прежним текстом — это и исправлено.
+        val cached = LAST_JIT_FACT
+        if (cached != null && now - lastJitFactAt < minIntervalMs) {
+            runCatching { onDone(cached) }
             return
         }
         lastJitFactAt = now
         BgWorker.post("AppPerformance.jitFact") {
             val fact = runCatching { jitRuntimeFact(app) }
                 .getOrDefault(JitRef.PropFact(JitRef.Prop.UNKNOWN, "", 1, "exception"))
+            lastJitFactAt = System.currentTimeMillis()
             runCatching { onDone(fact) }
         }
     }
 
+    /**
+     * Поколение клика: увеличивается на каждый клик тумблера. Асинхронный ответ, посчитанный ДО
+     * клика, не должен переставлять тумблер после него — UI сравнивает поколение и пропускает
+     * устаревший ответ.
+     */
+    @Volatile private var jitGeneration: Int = 0
+
+    fun jitGeneration(): Int = jitGeneration
+
+    private fun bumpJitGeneration() {
+        jitGeneration++
+    }
+
+    /** Подпись подтверждённого не-успеха сверки для существующей строки панели (`null` — нет). */
+    @Volatile private var LAST_JIT_HINT: String? = null
+
+    fun jitVerifyHintCached(): String? = LAST_JIT_HINT
+
     // ═══════════ JIT_ZYGOTE_BEGIN ═══════════
     /*
      * ЕДИНСТВЕННОЕ место в коде, где разрешён перезапуск фреймворка (владелец, 08.11):
-     * только тумблер JIT по явному клику. Механика — точно по референсу:
-     *   `w0/j9.onClick` (снимок Wi-Fi/AP в один commit) → `w0/la.run` (один скрипт, `ctl.restart
-     *   zygote` последней командой) → `CentralWatchdogService.onCreate` → `w0/e2.run`
-     *   (возврат AP, затем Wi-Fi) → `w0/bb`/`w0/r7` (getprop + `dalvik-jit-code-cache`).
+     * только тумблер JIT по явному клику. Механика — по референсу:
+     *   `w0/j9.onClick` (снимок клиентского Wi-Fi одним commit) → `w0/la.run` (один скрипт,
+     *   `ctl.restart zygote` последней командой) → `CentralWatchdogService.onCreate` →
+     *   `w0/e2.run` (возврат клиентского Wi-Fi) → `w0/bb`/`w0/r7` (getprop + права JIT-кэша).
      *
-     * Отличий в последовательности нет. Шаг `umount -l` точек `/data/app/` **включён** и
-     * отправляется как в референсе (каждая отправка пишет `mount_step=present`); обратимость на
-     * живой ГУ при этом НЕ проверена — это отдельный блокер отчёта iter35 §3, а не выключенный шаг.
+     * Отличия (iter36, §5 отчёта): AP из снимка и `U`/`openAp` не переносятся вовсе; неизвестное
+     * состояние Wi-Fi или неподтверждённый снимок блокируют отправку `svc wifi disable`; итог
+     * возврата сети не выдаётся за «интернет есть».
+     *
+     * Шаг `umount -l` точек `/data/app/` **включён** и отправляется как в референсе (каждая
+     * отправка пишет `mount_step=present`); обратимость на живой ГУ НЕ проверена — это отдельный
+     * блокер отчёта iter36 §3, а не выключенный шаг.
      */
 
     /**
      * Применение JIT по клику тумблера — один вызов ядра [JitOp.click] (референс `w0/j9.onClick`
-     * → `w0/la.run`). Своей логики здесь нет: только строка статуса шага.
+     * → `w0/la.run`). Своей логики здесь нет: только строка статуса.
      *
      * Статус честный: `PARTIAL` — «скрипт отправлен, итог дочитается на следующем старте»: и
      * `getprop`, и `maps` из процесса, который умрёт от рестарта zygote, прочитать нельзя.
+     * `BLOCKED` — скрипт НЕ отправлялся, и в тексте написано, почему (Wi-Fi неизвестен/снимок не
+     * подтверждён).
      */
     fun jitApplyWithZygote(context: Context, enabled: Boolean): List<ToolsStep> {
         BgWorker.assertNotMain("AppPerformance.jitApplyWithZygote")
         val app = context.applicationContext
         val t0 = System.currentTimeMillis()
+        bumpJitGeneration()
         AppLog.i(TAG, "JIT_APPLIED_REQUEST want=$enabled ${JitRef.mountStepNote()} " +
             "warning=\"фреймворк перезапустится: экран гаснет на 10–20 с, приложения закрываются\"")
         val click = runCatching { JitNet.click(app, enabled) }
@@ -920,11 +951,27 @@ object AppPerformance {
             .getOrNull()
         val fact = runCatching { JitNet.usejitFact(app) }
             .getOrDefault(JitRef.PropFact(JitRef.Prop.UNKNOWN, "", 1, "exception"))
-        val sent = click != null
-        AppLog.i(TAG, "JIT_APPLIED_RESULT started=$sent saved=${click?.saved ?: false} " +
+        val sent = click?.sent == true
+        AppLog.i(TAG, "JIT_APPLIED_RESULT sent=$sent blocked=${click?.blocked ?: "none"} " +
+            "saved=${click?.saved ?: false} confirmed=${click?.confirmed ?: 0} " +
             "${fact.log} want=$enabled restart=not_claimed rc=${click?.exitCode ?: -1} " +
             "outcome=${click?.let { JitRef.chainOutcomeLabel(it.outcome) } ?: "none"}")
-        val shellReply = click != null && click.outcome == JitRef.ChainOutcome.REPLY_RECEIVED
+        val shellReply = click != null && click.sent &&
+            click.outcome == JitRef.ChainOutcome.REPLY_RECEIVED
+        val blocked = click?.blocked
+        val actual = when {
+            blocked == "wifi_unknown" ->
+                "состояние клиентского Wi-Fi прочитать не удалось → скрипт НЕ отправлен, сеть не тронута"
+            blocked == "snapshot_not_saved" ->
+                "снимок Wi-Fi не подтверждён (confirmed=${click?.confirmed ?: 0}) → скрипт НЕ отправлен, " +
+                    "сеть не тронута"
+            blocked != null -> "блокировано ($blocked) → скрипт НЕ отправлен"
+            else ->
+                "restore=${click?.snap?.wire() ?: "none"} confirmed=${click?.confirmed ?: 0} " +
+                    "rc=${click?.exitCode ?: -1} " +
+                    "outcome=${click?.let { JitRef.chainOutcomeLabel(it.outcome) } ?: "none"} " +
+                    "getprop=${fact.raw.ifEmpty { "unknown" }} restart=not_claimed internet=not_checked"
+        }
         return listOf(
             ToolsStep(
                 step = "perf_zygote",
@@ -936,15 +983,23 @@ object AppPerformance {
                 startedAtMs = t0, finishedAtMs = System.currentTimeMillis(),
                 exitCode = if (sent) (click!!.exitCode) else 1,
                 expected = "JIT pedido=… getprop=… result=ok на следующем старте (w0/bb + w0/r7)",
-                actual = "saved=${click?.saved ?: false} rc=${click?.exitCode ?: -1} " +
-                    "outcome=${click?.let { JitRef.chainOutcomeLabel(it.outcome) } ?: "none"} " +
-                    "getprop=${fact.raw.ifEmpty { "unknown" }} restart=not_claimed",
+                actual = actual,
                 stdout = when {
+                    blocked == "wifi_unknown" ->
+                        "скрипт не отправлен: Wi-Fi ГУ сейчас не прочитать, а без достоверного " +
+                            "снимка после рестарта фреймворка сеть нечем вернуть. Выключение " +
+                            "клиентского Wi-Fi в этом клике не выполнялось"
+                    blocked == "snapshot_not_saved" ->
+                        "скрипт не отправлен: снимок Wi-Fi не подтверждён чтением " +
+                            "(confirmed=${click?.confirmed ?: 0}). Ни Wi-Fi, ни свойства не менялись"
+                    blocked != null ->
+                        "скрипт не отправлен: $blocked"
                     shellReply ->
-                        "экран гаснет на 10–20 с · транспорт ответил целиком; сеть вернётся при " +
-                            "следующем запуске приложения — AP, затем Wi-Fi (как e2). Если приложение " +
-                            "после рестарта фреймворка не запустится, сеть останется выключенной: " +
-                            "это ограничение референса, см. отчёт"
+                        "экран гаснет на 10–20 с · транспорт ответил целиком. Возврат клиентского " +
+                            "Wi-Fi запрошен через 15 с после следующего запуска приложения " +
+                            "(restore=${click?.snap?.wire()}); интернет при этом НЕ проверяется. " +
+                            "Если приложение после рестарта фреймворка не запустится, Wi-Fi " +
+                            "останется выключенным: это ограничение референса, см. отчёт"
                     sent ->
                         "команда отправлена, ответа транспорта нет (rc=${click?.exitCode ?: -1}): " +
                             "рестарт фреймворка мог не произойти, а команда могла остаться в очереди. " +
@@ -959,15 +1014,19 @@ object AppPerformance {
     // ═══════════ JIT_ZYGOTE_END ═══════════
 
     /**
-     * Сверка `w0/bb` + `w0/r7` (getprop + `/proc/self/maps` + `jit_pedido`).
+     * Сверка `w0/bb` + `w0/r7` (getprop + права JIT-кэша в `/proc/self/maps` + `jit_pedido`).
      *
      * Это **НЕ read-only**, когда намерение есть: как и `r7`, сверка УДАЛЯЕТ `jit_pedido`
      * (`remove(...).apply()`) при подтверждённом `true/false`. Честный лог пишет
-     * `write=remove(...)`/`write=none` по факту, а не «write=none» всегда.
+     * `write=remove(...)`/`write=none` по факту.
+     *
+     * Результат-предупреждение теперь доходит до существующей строки панели: [jitVerifyHintCached]
+     * (без новой кнопки и без красного текста). Неизвестность предупреждением НЕ считается.
      *
      * Вызывается: (а) при открытии панели инструментов — как настройки в референсе (`S0` → `bb`);
      * (б) в watchdog раз в 5 тиков, и только если в префах есть `jit_pedido`
-     * ([JitNet.hasPendingPedido], локальная проверка без shell) — иначе ни команд, ни записей.
+     * ([JitNet.hasPendingPedido], локальная проверка без shell). Пока наш клик в полёте, сверка
+     * ядром пропускается (`click_in_flight`) — иначе она удалила бы только что записанное намерение.
      *
      * @return `true`, если сверка действительно выполнялась (было что сверять).
      */
@@ -979,9 +1038,14 @@ object AppPerformance {
             return false
         }
         val out = runCatching { JitNet.verifyApplied(app) }.getOrNull() ?: return false
+        if (out.skipped != null) {
+            AppLog.i(TAG, "JIT_PROBE skipped reason=${out.skipped} write=none")
+            return false
+        }
+        LAST_JIT_HINT = JitRef.verifyHint(out.verdict, out.prop, out.cache)
         AppLog.i(TAG, "JIT_PROBE result=${JitRef.verifyLabel(out.verdict)} pedido=${out.pedido} " +
             "write=remove_if_confirmed removed=${out.removed?.allOk ?: false} " +
-            "still_present=${out.stillPresent} restart=not_claimed")
+            "still_present=${out.stillPresent} ui_hint=${LAST_JIT_HINT ?: "none"} restart=not_claimed")
         return true
     }
 

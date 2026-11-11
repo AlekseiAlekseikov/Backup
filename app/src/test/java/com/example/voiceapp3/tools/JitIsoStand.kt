@@ -88,12 +88,12 @@ class JitIsoStand(rules: Int = 0) {
     }
 
     /** [JitShell] поверх стенда: то, что на устройстве делает `AdbClient`. */
-    inner class Shell(private val getprop: String = "true", private val cache: Boolean? = true) : JitRef.JitShell {
+    inner class Shell(private val getprop: String = "true", private var maps: String? = null) : JitRef.JitShell {
         val executed = mutableListOf<String>()
         override fun exec(command: String, timeoutMs: Int): Pair<Int, String> {
             executed += command
             return this@JitIsoStand.exec(command, getprop)
         }
-        override fun cacheVisible(): Boolean? = cache
+        override fun mapsExcerpt(): String? = maps
     }
 }

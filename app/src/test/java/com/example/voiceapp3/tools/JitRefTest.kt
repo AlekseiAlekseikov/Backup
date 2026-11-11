@@ -8,10 +8,11 @@ import org.junit.Test
 import java.io.File
 
 /**
- * Разбор и формулы ядра — по DEX референса.
+ * Разбор и формулы ядра — по DEX референса (iter36: только клиентский Wi-Fi, без AP).
  *
- * Здесь проверяется то, что видно в `w0/r7`, `w0/j9`, `w0/la`, `onCreate` и `w0/e2`: литерал
- * скрипта, регулярка снимка, трактовка `getprop`, формула `ok`, положение тумблера, `c1()`.
+ * Здесь проверяется то, что видно в `w0/r7`, `w0/j9`, `w0/la`, `onCreate`, `w0/e2`, `w0/bb`+`w0/j5`:
+ * литерал скрипта, форматы снимка (новый и старый), трактовка `getprop`, формула `ok`,
+ * разбор `/proc/self/maps` по правам, положение тумблера.
  */
 class JitRefTest {
 
@@ -73,7 +74,7 @@ class JitRefTest {
             val s = JitRef.chainScript(want)
             for (bad in listOf("persist.dalvik.vm.usejit", "persist.sys.dalvik.vm.usejit",
                 "usejitprofiles", "ip rule del", "ip rule flush", "ndc ", "settings ", "setenforce",
-                "kill ", "pkill", "route add", "iptables")) {
+                "kill ", "pkill", "route add", "iptables", "startSoftAp", "ap0")) {
                 assertFalse("в скрипте нет «$bad»", s.contains(bad))
             }
         }
@@ -82,27 +83,50 @@ class JitRefTest {
     // ─────────────────────────── снимок `jit_restaurar` ───────────────────────────
 
     @Test
-    fun parseRestoreMatchesOnlyFullString() {
-        assertEquals(JitRef.Net(true, false), JitRef.parseRestore("wifi=1,ap=0"))
-        assertEquals(JitRef.Net(false, true), JitRef.parseRestore("wifi=0,ap=1"))
-        assertEquals(JitRef.Net(true, true), JitRef.parseRestore("wifi=1,ap=1"))
-        assertEquals(JitRef.Net(false, false), JitRef.parseRestore("wifi=0,ap=0"))
-        // `matches()` без trim: пробелы и обрезки не совпадают.
-        assertNull(JitRef.parseRestore(null))
-        assertNull(JitRef.parseRestore(""))
-        assertNull(JitRef.parseRestore("wifi=1"))
-        assertNull(JitRef.parseRestore(" wifi=1,ap=0"))
-        assertNull(JitRef.parseRestore("wifi=1,ap=0 "))
-        assertNull(JitRef.parseRestore("wifi=2,ap=0"))
-        assertNull(JitRef.parseRestore("wifi=1,ap=0,extra=1"))
-        assertNull(JitRef.parseRestore("WIFI=1,AP=0"))
+    fun newSnapshotIsMinimalWifiOnly() {
+        assertEquals(JitRef.WifiSnapshot(true), JitRef.parseSnapshot("wifi=1")!!.snap)
+        assertEquals(JitRef.WifiSnapshot(false), JitRef.parseSnapshot("wifi=0")!!.snap)
+        assertEquals("wifi_only", JitRef.parseSnapshot("wifi=1")!!.format)
+        assertEquals("wifi=1", JitRef.WifiSnapshot(true).wire())
+        assertEquals("wifi=0", JitRef.WifiSnapshot(false).wire())
+        assertFalse("в новом формате нет поля ap", JitRef.WifiSnapshot(true).wire().contains("ap="))
     }
 
     @Test
-    fun netWireIsReferenceFormat() {
-        assertEquals("wifi=1,ap=0", JitRef.Net(true, false).wire())
-        assertEquals("wifi=0,ap=1", JitRef.Net(false, true).wire())
-        assertEquals("wifi=0,ap=0", JitRef.Net(false, false).wire())
+    fun legacySnapshotIsAcceptedAndApIgnored() {
+        // Старый формат референса читается, но поле ap не используется: никаких вызовов AP нет.
+        assertEquals(JitRef.WifiSnapshot(true), JitRef.parseSnapshot("wifi=1,ap=0")!!.snap)
+        assertEquals(JitRef.WifiSnapshot(true), JitRef.parseSnapshot("wifi=1,ap=1")!!.snap)
+        assertEquals(JitRef.WifiSnapshot(false), JitRef.parseSnapshot("wifi=0,ap=1")!!.snap)
+        assertEquals("legacy_ap_ignored", JitRef.parseSnapshot("wifi=1,ap=1")!!.format)
+    }
+
+    @Test
+    fun brokenSnapshotIsNotExecuted() {
+        // `matches()` без trim: ничего не обрезаем и не «исправляем».
+        assertNull(JitRef.parseSnapshot(null))
+        assertNull(JitRef.parseSnapshot(""))
+        assertNull(JitRef.parseSnapshot(" wifi=1"))
+        assertNull(JitRef.parseSnapshot("wifi=1 "))
+        assertNull(JitRef.parseSnapshot("wifi=2"))
+        assertNull(JitRef.parseSnapshot("wifi=1,ap=0,extra=1"))
+        assertNull(JitRef.parseSnapshot("WIFI=1,AP=0"))
+        assertNull(JitRef.parseSnapshot("ap=1"))
+    }
+
+    @Test
+    fun noApAnywhereInJitCode() {
+        // Решение владельца: AP/CarplayMonitor/connadaptor в JIT не переносятся.
+        val core = codeNoComments("src/main/java/com/example/voiceapp3/tools/JitNetCore.kt")
+        val net = codeNoComments("src/main/java/com/example/voiceapp3/tools/JitNet.kt")
+        for (bad in listOf("startSoftAp", "apUp", "apFailedAtMs", "carplayBusy", "AUTO_WIFI_ENABLED",
+            "AP_STATE_CHANGED", "AP_ATTEMPTS", "AP_LATCH", "openAp", "connadaptor", "CarplayMonitor",
+            "WIFI_AP_STATE")) {
+            assertFalse("ядро не содержит «$bad»", core.contains(bad))
+            assertFalse("адаптер не содержит «$bad»", net.contains(bad))
+        }
+        assertFalse("адаптер не поднимает AP", net.contains("startAp"))
+        assertFalse("адаптер не трогает ap0", net.contains("\"ap0\""))
     }
 
     // ─────────────────────────── `getprop` ───────────────────────────
@@ -131,16 +155,16 @@ class JitRefTest {
         // ok = (pedido == getprop) && (!pedido || maps != Boolean.FALSE)
         val t = JitRef.Prop.TRUE
         val f = JitRef.Prop.FALSE
-        // pedido = true
+        // pedido = true — все 3 состояния maps
         assertEquals("true/true/cache=true → ok", JitRef.Verify.OK, JitRef.verify(true, prop(t), true))
         assertEquals("true/true/cache=null → ok", JitRef.Verify.OK, JitRef.verify(true, prop(t), null))
         assertEquals("true/true/cache=false → НЕ ok", JitRef.Verify.CACHE_MISSING,
             JitRef.verify(true, prop(t), false))
-        assertEquals("true/false (любой cache) → НЕ ok", JitRef.Verify.NOT_APPLIED,
+        assertEquals("true/false (cache=true) → НЕ ok", JitRef.Verify.NOT_APPLIED,
             JitRef.verify(true, prop(f), true))
         assertEquals(JitRef.Verify.NOT_APPLIED, JitRef.verify(true, prop(f), false))
         assertEquals(JitRef.Verify.NOT_APPLIED, JitRef.verify(true, prop(f), null))
-        // pedido = false
+        // pedido = false — все 3 состояния maps
         assertEquals("false/false/cache=false → ok (в референсе cache не мешает)", JitRef.Verify.OK,
             JitRef.verify(false, prop(f), false))
         assertEquals(JitRef.Verify.OK, JitRef.verify(false, prop(f), true))
@@ -162,14 +186,85 @@ class JitRefTest {
     }
 
     @Test
-    fun verifyLabels() {
+    fun verifyLabelsAndHints() {
         assertEquals("ok", JitRef.verifyLabel(JitRef.Verify.OK))
         assertEquals("not_applied", JitRef.verifyLabel(JitRef.Verify.NOT_APPLIED))
         assertEquals("cache_missing", JitRef.verifyLabel(JitRef.Verify.CACHE_MISSING))
         assertEquals("unknown", JitRef.verifyLabel(JitRef.Verify.UNKNOWN))
+        // Подпись для существующей строки панели: успех и неизвестность не пугают зря.
+        assertNull(JitRef.verifyHint(JitRef.Verify.OK, prop(JitRef.Prop.TRUE), true))
+        assertNull(JitRef.verifyHint(JitRef.Verify.UNKNOWN,
+            JitRef.PropFact(JitRef.Prop.UNKNOWN, "", 1, "empty"), null))
+        assertTrue(JitRef.verifyHint(JitRef.Verify.NOT_APPLIED, prop(JitRef.Prop.FALSE), true)!!
+            .startsWith("JIT не применился"))
+        assertTrue(JitRef.verifyHint(JitRef.Verify.CACHE_MISSING, prop(JitRef.Prop.TRUE), false)!!
+            .contains("JIT-кэша"))
+        assertTrue("отсутствие данных о карте названо", JitRef.verifyHint(
+            JitRef.Verify.CACHE_MISSING, prop(JitRef.Prop.TRUE), null)!!.contains("карта не прочитана"))
     }
 
-    // ─────────────────────────── тумблер и `c1()` ───────────────────────────
+    // ─────────────────────────── `/proc/self/maps` (w0/bb → w0/sa → w0/j5.d) ───────────────────────────
+
+    private val jitLine = "7c4b000000-7c4b040000 r-xp 00000000 fd:04 1234 /data/dalvik-cache/arm64/jit-cache"
+    private val jitLineNoX = "7c4b040000-7c4b080000 rw-p 00000000 fd:04 1234 /data/dalvik-cache/arm64/jit-cache"
+    private val otherLine = "7c4b100000-7c4b100400 r--p 00000000 fd:04 1234 /system/framework/foo.oat"
+
+    @Test
+    fun cacheExecutableUsesPermissionsNotFileName() {
+        // r-xp — исполняемая карта
+        assertEquals(true, JitRef.cacheExecutable(jitLine))
+        // rwxp / rwx — тоже (символьный класс референса допускает w и s)
+        assertEquals(true, JitRef.cacheExecutable(jitLine.replace("r-xp", "rwxp")))
+        assertEquals(true, JitRef.cacheExecutable(jitLine.replace("r-xp", "r-xs")))
+        assertEquals(true, JitRef.cacheExecutable(jitLine.replace("r-xp", "rwxs")))
+        // rw-p — файл тот же, но права БЕЗ x: это НЕ успех (прежний код считал это успехом)
+        assertEquals(false, JitRef.cacheExecutable(jitLineNoX))
+        // смешанные строки: достаточно одной исполняемой
+        assertEquals(true, JitRef.cacheExecutable("$jitLine\n$jitLineNoX"))
+        assertEquals(true, JitRef.cacheExecutable("$jitLineNoX\n$jitLine\n$otherLine"))
+        // слово rx внутри другого слова не считается (границы слова в регулярке)
+        assertEquals(false, JitRef.cacheExecutable("7c-7d rwxpX 0000 /data/dalvik-cache/jit-cache"))
+    }
+
+    @Test
+    fun cacheExecutableNullIsNotFalse() {
+        // Пустой список строк в j5.d ⇒ null, а не false.
+        assertEquals(null, JitRef.cacheExecutable(""))
+        assertEquals(null, JitRef.cacheExecutable("\n\n  \n"))
+        // Чтение не удалось (catchall_67) ⇒ null.
+        assertEquals(null, JitRef.cacheExecutable(null))
+        // Фильтр w0/sa не нашёл строк JIT-кэша ⇒ excerpt пуст ⇒ null (JIT-кэш ещё не отображён).
+        assertEquals(null, JitRef.cacheExecutableFromMaps("$otherLine\n7c4b200000-7c4b204000 rw-p 0 fd:04 1 [stack]"))
+        assertEquals(null, JitRef.cacheExecutableFromMaps(null))
+        assertEquals(null, JitRef.cacheExecutableFromMaps(""))
+    }
+
+    @Test
+    fun mapsFilterAndJoinIsLikeReference() {
+        // dalvik-jit-code-cache — второе имя, которое ищет `w0/sa`.
+        val dalvik = "7c4b000000-7c4b040000 r-xp 00000000 fd:04 9 /data/dalvik-cache/arm64/dalvik-jit-code-cache"
+        assertEquals(true, JitRef.cacheExecutableFromMaps("$otherLine\n$dalvik"))
+        assertEquals(true, JitRef.cacheExecutableFromMaps("$jitLineNoX\n$jitLine"))
+        assertEquals(false, JitRef.cacheExecutableFromMaps("$jitLineNoX"))
+        assertTrue("фильтр w0/sa", JitRef.isCacheLine(jitLine))
+        assertTrue(JitRef.isCacheLine(dalvik))
+        assertFalse(JitRef.isCacheLine(otherLine))
+    }
+
+    @Test
+    fun realProcSelfMapsOfThisProcessIsRead() {
+        // Не фейк: читается настоящий /proc/self/maps процесса JVM, где идёт тест.
+        val text = File("/proc/self/maps").readText()
+        assertTrue("карта процесса читается и не пуста", text.contains(" r-xp ") || text.contains(" r--p "))
+        val v = JitRef.cacheExecutableFromMaps(text)
+        // В JVM-процессе строк jit-cache нет ⇒ null (не false): это и есть семантика j5.d.
+        assertNull("нет строк jit-cache ⇒ null", v)
+        // Без фильтра `w0/sa` любая исполняемая строка дала бы `true` — ровно поэтому фильтр
+        // по имени кэша обязателен, а имя без проверки прав ничего не значит.
+        assertEquals(true, JitRef.cacheExecutable(text))
+    }
+
+    // ─────────────────────────── тумблер ───────────────────────────
 
     @Test
     fun confirmedStateAndSwitchPosition() {
@@ -190,17 +285,6 @@ class JitRefTest {
         assertNull("уже верно — не трогаем", JitRef.switchUpdate(false, "off"))
         assertNull("неизвестно — не выдаём за факт", JitRef.switchUpdate(true, "unknown"))
         assertNull(JitRef.switchUpdate(false, "unknown"))
-    }
-
-    @Test
-    fun clientWifiBusyFollowsC1() {
-        // isWifiEnabled() || getWifiState()==ENABLING; исключение ⇒ true
-        assertTrue(JitRef.clientWifiBusy(true, false))
-        assertTrue(JitRef.clientWifiBusy(false, true))
-        assertTrue(JitRef.clientWifiBusy(null, null))
-        assertTrue(JitRef.clientWifiBusy(null, false))
-        assertTrue(JitRef.clientWifiBusy(false, null))
-        assertFalse(JitRef.clientWifiBusy(false, false))
     }
 
     // ─────────────────────────── итог транспорта ───────────────────────────
@@ -236,10 +320,9 @@ class JitRefTest {
         val net = codeNoComments("src/main/java/com/example/voiceapp3/tools/JitNet.kt")
         assertTrue("удаление ключа настоящим remove", net.contains(".remove(key)"))
         assertTrue("каждое хранилище пишется отдельно", net.contains("for (s in all)"))
-        assertFalse("нет обрыва цепочки по первому commit", net.contains("saved && runCatching"))
-        assertTrue("сигнал FAILED берётся из того же broadcast",
-            net.contains("JitRef.AP_STATE_CHANGED_ACTION") && net.contains("JitRef.AP_STATE_FAILED"))
-        assertTrue("CarplayMonitor честно недоступен", net.contains("override fun carplayBusy(): Boolean? = null"))
+        assertTrue("снимок подтверждается чтением", net.contains("override fun confirmSnapshot"))
         assertFalse("адаптер не выключает Wi-Fi", net.contains("setWifi(false"))
+        assertFalse("адаптер не трогает маршруты", net.contains("ip rule del"))
+        assertTrue("карта памяти читается, а не выдумывается", net.contains("/proc/self/maps"))
     }
 }

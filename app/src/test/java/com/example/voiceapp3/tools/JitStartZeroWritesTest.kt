@@ -19,9 +19,9 @@ class JitStartZeroWritesTest {
     @Test
     fun plainStartWritesNothingAndSendsNoCommands() {
         val store = JitFake.Store()
-        val net = JitFake.Net(wifi = true, ap = true)
+        val net = JitFake.Net(wifi = true)
         val log = mutableListOf<String>()
-        val out = JitOp.onProcessStart(store, net, JitFake.Waiter(), JitFake.Scheduler(), log = { log += it })
+        val out = JitOp.onProcessStart(store, net, JitFake.Scheduler(), log = { log += it })
         assertEquals(null, out.snapshot)
         assertEquals("ноль записей в префы", 0, store.writeCount())
         assertTrue("ноль сетевых запросов", net.requests.isEmpty())
@@ -35,8 +35,8 @@ class JitStartZeroWritesTest {
         // Остаток старых версий: `jit_pedido=true` в префах, строки снимка нет.
         val store = JitFake.Store()
         store.set(JitRef.KEY_PEDIDO, true)
-        val net = JitFake.Net(wifi = true, ap = false)
-        JitOp.onProcessStart(store, net, JitFake.Waiter(), JitFake.Scheduler())
+        val net = JitFake.Net(wifi = true)
+        JitOp.onProcessStart(store, net, JitFake.Scheduler())
         assertEquals("на старте мы не пишем даже «снять намерение»", 0, store.writeCount())
         assertEquals(true, store.getBool(JitRef.KEY_PEDIDO))
         assertTrue(net.requests.isEmpty())
@@ -46,12 +46,12 @@ class JitStartZeroWritesTest {
     fun startSendsNoCommandsToDevice() {
         // Старт процесса не должен звать transport вообще: снимка нет — нечего делать.
         val store = JitFake.Store()
-        val net = JitFake.Net(wifi = true, ap = false)
+        val net = JitFake.Net(wifi = true)
         val shell = JitFake.AnswerShell()
         JitOp.verifyApplied(store, shell) // сверка без jit_pedido: remove не выполняется
         assertEquals("сверка без намерения не удаляет ключи", 0, store.writeCount())
         val scheduler = JitFake.Scheduler()
-        JitOp.onProcessStart(store, net, JitFake.Waiter(), scheduler)
+        JitOp.onProcessStart(store, net, scheduler)
         assertTrue("ни одной сетевой команды", shell.scriptCommands().isEmpty())
         assertTrue("и ничего не запланировано", scheduler.scheduled.isEmpty())
     }

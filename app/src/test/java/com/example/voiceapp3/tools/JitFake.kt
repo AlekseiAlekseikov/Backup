@@ -2,42 +2,46 @@ package com.example.voiceapp3.tools
 
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Подставные реализации интерфейсов [JitRef] — для локальных тестов на JVM (не на ГУ).
+ * Подставные реализации интерфейсов [JitRef] — для локальных тестов на JVM.
  *
  * Все фейки фиксируют ФАКТИЧЕСКИЕ действия: какие команды ушли, какие ключи записаны/удалены,
  * какие сетевые вызовы сделаны, в каком порядке, сколько раз.
+ *
+ * ВАЖНО: это НЕ Android-интеграционные тесты. На ГУ они не запускались, `WifiManager` и
+ * `/proc/self/maps` ГУ ими не проверяются (для карты памяти есть отдельный тест на реальном файле
+ * процесса JVM — см. `JitMapsTest`).
  */
 object JitFake {
 
-    private fun wire(want: Boolean, net: JitRef.Net) = "wifi=${if (net.wifi) 1 else 0},ap=${if (net.ap) 1 else 0}:$want"
+    private fun wire(snap: JitRef.WifiSnapshot) = "wifi=${if (snap.wifi) 1 else 0}:"
 
     // ─────────────────────────── префы ───────────────────────────
 
     /**
      * Два хранилища проекта (CPS/DPS): каждое можно «сломать» отдельно.
      *
-     * `commitFails` — индексы хранилищ, у которых `commit()` возвращает false;
-     * `throwOn` — индексы, где `edit()` бросает исключение. Сводный результат обязан честно
-     * показывать `attempted/ok`, а не обрываться на первом.
+     * `commitFails` — индексы, у которых `commit()` возвращает false И значение НЕ записывается
+     * (обычный случай); `writeDespiteFalse` — записать, но вернуть false (поведение, при котором
+     * «commit=false» не доказывает отсутствие значения); `throwOn` — `edit()` бросает исключение.
      */
     class Store(storeCount: Int = 2) : JitRef.JitStore {
         val maps: List<MutableMap<String, Any?>> = List(storeCount) { mutableMapOf() }
         val commitFails = mutableSetOf<Int>()
         val throwOn = mutableSetOf<Int>()
+        var writeDespiteFalse = false
 
-        /** Журнал операций: `snapshot:…`, `remove:key`, `commit:i`. */
+        /** Журнал операций: `snapshot:i`, `remove:key:i`. */
         val ops = mutableListOf<String>()
         val commits = mutableListOf<String>()
 
         fun writeCount(): Int = ops.size
 
-        fun rawRestore(): String? = getString(key = JitRef.KEY_RESTORE)
+        fun rawRestore(): String? = getString(JitRef.KEY_RESTORE)
 
         fun presentIn(store: Int, key: String): Boolean = maps[store].containsKey(key)
-
-        // JitStore
 
         override fun getString(key: String): String? =
             maps.firstNotNullOfOrNull { m -> if (m.containsKey(key)) m[key] as? String else null }
@@ -47,31 +51,36 @@ object JitFake {
 
         override fun contains(key: String): Boolean = maps.any { it.containsKey(key) }
 
-        override fun putSnapshot(want: Boolean, net: JitRef.Net): JitRef.WriteResult {
+        override fun putSnapshot(want: Boolean, snap: JitRef.WifiSnapshot): JitRef.WriteResult {
+            if (maps.isNotEmpty() && throwOn.size == maps.size) throw IllegalStateException("all stores broken")
             var ok = 0
             val failed = mutableListOf<String>()
             for ((i, m) in maps.withIndex()) {
                 if (i in throwOn) { failed += "s$i:exception"; continue }
-                if (i in commitFails) { failed += "s$i:commit_false"; continue }
+                if (i in commitFails && !writeDespiteFalse) { failed += "s$i:commit_false"; continue }
                 m[JitRef.KEY_PEDIDO] = want
                 m[JitRef.KEY_AUTO] = want
-                m[JitRef.KEY_RESTORE] = net.wire()
-                ok++
+                m[JitRef.KEY_RESTORE] = snap.wire()
                 ops += "snapshot:$i"
-                commits += wire(want, net)
+                commits += wire(snap)
+                if (i in commitFails) failed += "s$i:commit_false" else ok++
             }
             return JitRef.WriteResult(maps.size, ok, failed.joinToString(",").ifEmpty { "all_ok" })
         }
+
+        override fun confirmSnapshot(expected: String): Int =
+            maps.count { m -> m[JitRef.KEY_RESTORE] == expected }
 
         override fun remove(key: String): JitRef.WriteResult {
             var ok = 0
             val failed = mutableListOf<String>()
             for ((i, m) in maps.withIndex()) {
                 if (i in throwOn) { failed += "s$i:exception"; continue }
-                if (i in commitFails) { failed += "s$i:commit_false"; continue }
+                if (i in commitFails && !writeDespiteFalse) { failed += "s$i:commit_false"; continue }
                 m.remove(key)
                 ok++
                 ops += "remove:$key:$i"
+                if (i in commitFails) failed += "s$i:commit_false"
             }
             return JitRef.WriteResult(maps.size, ok, failed.joinToString(",").ifEmpty { "all_ok" })
         }
@@ -82,108 +91,55 @@ object JitFake {
         }
 
         /** Прямая установка значения в первое хранилище — для подготовки состояния в тесте. */
-        fun set(key: String, value: Any?) {
-            if (value == null) maps[0].remove(key) else maps[0][key] = value
-        }
+        fun set(key: String, value: Any?) = setIn(0, key, value)
     }
 
-    // ─────────────────────────── радио ───────────────────────────
+    // ─────────────────────────── клиентский Wi-Fi ───────────────────────────
 
     /**
-     * `WifiManager`/`ap0`/`startSoftAp` + сигнал FAILED (`u1`) и CarplayMonitor (`O()`).
+     * Только клиентский Wi-Fi — точек доступа в интерфейсе больше нет (решение владельца).
      *
-     * - `wifi`, `ap` — наблюдаемое состояние; `wifiEnabling` — `getWifiState()==ENABLING`;
-     * - `wifiReadError`/`apReadError` — чтение бросает (в референсе `false`, в `c1()` — `true`);
-     * - `apAppliesAfterReads` — сколько чтений `apUp()` вернут `false` до появления AP;
-     * - `setWifiResult` — что вернул `setWifiEnabled` (`null` = исключение);
-     * - `startApResult` — что вернул `startSoftAp` (`null` = исключение);
-     * - `apFailsAtRead` — на каком чтении `apUp()` «прилетает» FAILED (событие broadcast);
-     * - `carplay` — значение `carplayBusy()` (`null` = сигнала нет).
+     * - `wifi` — наблюдаемое состояние; `wifiUnreadable` — чтение бросает исключение;
+     * - `setWifiResult` — что вернул `setWifiEnabled` (`null` = «не удалось/неизвестно»);
+     * - `setWifiThrows` — исключение из `setWifiEnabled`;
+     * - `setWifiApplies` — менять ли `wifi` при успешном `setWifiEnabled(true)`;
+     * - `address` — read-only признак адреса на `wlan0`.
      */
     class Net(
-        var wifi: Boolean = false,
-        var ap: Boolean = false,
-        var wifiEnabling: Boolean = false,
-        var wifiReadError: Boolean = false,
-        var apReadError: Boolean = false,
-        var apAppliesAfterReads: Int = 0,
+        var wifi: Boolean = true,
+        var wifiUnreadable: Boolean = false,
         var setWifiResult: Boolean? = true,
-        var startApResult: Boolean? = true,
         var setWifiThrows: Boolean = false,
-        var apFailedAtRead: Int? = null,
-        var carplay: Boolean? = null,
+        var setWifiApplies: Boolean = true,
+        var address: Boolean? = true,
     ) : JitRef.JitNetState {
 
         val requests = mutableListOf<String>()
-        var apReads = 0
-        var apFailedAt: Long = 0L
-        var watchOn = false
-        var watchRegistrations = 0
+        var wifiReads = 0
 
         override fun wifiOn(): Boolean? {
-            if (wifiReadError) throw IllegalStateException("wifi read failed")
+            wifiReads++
+            if (wifiUnreadable) throw IllegalStateException("wifi read failed")
             return wifi
-        }
-
-        override fun wifiEnabling(): Boolean? {
-            if (wifiReadError) throw IllegalStateException("wifi read failed")
-            return wifiEnabling
-        }
-
-        override fun apUp(): Boolean? {
-            if (apReadError) throw IllegalStateException("ap read failed")
-            apReads++
-            apFailedAtRead?.let { if (apReads == it) apFailedAt = 1_000L + apReads }
-            if (apAppliesAfterReads > 0) {
-                apAppliesAfterReads--
-                return false
-            }
-            return ap
         }
 
         override fun setWifi(on: Boolean): Boolean? {
             if (setWifiThrows) throw IllegalStateException("setWifiEnabled failed")
             requests += "wifi=$on"
-            if (setWifiResult == true && on) wifi = true
+            if (setWifiResult == true && on && setWifiApplies) wifi = true
             return setWifiResult
         }
 
-        override fun startAp(): Boolean? {
-            requests += "ap=start"
-            if (startApResult == null) return null
-            if (startApResult == true) ap = true
-            return startApResult
-        }
-
-        override fun apFailedAtMs(): Long = apFailedAt
-
-        override fun beginApWatch() { watchOn = true; watchRegistrations++ }
-
-        override fun endApWatch() { watchOn = false }
-
-        override fun carplayBusy(): Boolean? = carplay
+        override fun wifiAddress(): Boolean? = address
     }
 
-    // ─────────────────────────── время и планировщик ───────────────────────────
-
-    class Waiter : JitRef.JitWaiter {
-        val sleeps = mutableListOf<Long>()
-        private var t = 1_000L
-
-        override fun sleep(ms: Long) {
-            sleeps += ms
-            t += ms
-        }
-
-        override fun nowMs(): Long = t
-    }
+    // ─────────────────────────── планировщик ───────────────────────────
 
     /** Планировщик как `postDelayed`: ничего не выполняет сам, задачи складывает в очередь. */
-    class Scheduler(clock: Waiter? = null) : JitRef.JitScheduler {
+    class Scheduler : JitRef.JitScheduler {
         val scheduled = mutableListOf<Pair<Long, () -> Unit>>()
-        private val waiter = clock
 
-        /** `true`, если выполнять сразу при планировании (для тестов «как будто 15 с прошли»). */
+        /** `true` — выполнять сразу при планировании (для тестов «как будто 15 с прошли»). */
         var runInline = false
 
         override fun postDelayed(delayMs: Long, task: () -> Unit) {
@@ -191,7 +147,6 @@ object JitFake {
             if (runInline) task()
         }
 
-        /** Выполнить всё запланированное (в порядке постановки). */
         fun drain() {
             val copy = scheduled.toList()
             scheduled.clear()
@@ -206,22 +161,24 @@ object JitFake {
     /**
      * Транспорт: очередь команд с настраиваемым поведением.
      *
-     * `runInline = 1` — команда «выполнилась и ответила»; `0` — ответа нет (таймаут вызывающего,
-     * как потеря канала). `getprop`/`cache` задают ответ сверки.
+     * `runInline` — сколько команд «выполнятся и ответят»; остальные дают `137 / ERR_CHANNEL_LOST`
+     * (ответа нет). `maps` — содержимое `/proc/self/maps` (`null` = прочитать нельзя).
      */
-    class QueueShell(var stand: JitIsoStand?) : JitRef.JitShell {
+    class QueueShell(
+        var stand: JitIsoStand? = null,
+        var getprop: String = "true",
+        var getpropRc: Int = 0,
+        var maps: String? = null,
+    ) : JitRef.JitShell {
         val pending = mutableListOf<String>()
         val executed = mutableListOf<Triple<String, Int, String>>()
         var runInline = 0
-        var getprop: String = "true"
-        var getpropRc: Int = 0
-        var cache: Boolean? = true
 
         override fun exec(command: String, timeoutMs: Int): Pair<Int, String> {
             pending += command
             if (runInline > 0 && command.contains("zygote")) {
                 runInline--
-                val (rc, out) = stand?.exec(command) ?: Pair(0, "")
+                val (rc, out) = stand?.exec(command, getprop) ?: Pair(0, "")
                 executed += Triple(command, rc, out)
                 pending.remove(command)
                 return rc to out
@@ -229,7 +186,7 @@ object JitFake {
             return 137 to "ERR_CHANNEL_LOST"
         }
 
-        override fun cacheVisible(): Boolean? = cache
+        override fun mapsExcerpt(): String? = maps
 
         fun getpropAnswers(): Pair<Int, String> = getpropRc to getprop
     }
@@ -240,7 +197,7 @@ object JitFake {
      */
     class AnswerShell(
         private val answers: MutableList<Pair<Int, String>> = mutableListOf(),
-        var cache: Boolean? = true,
+        var maps: String? = null,
     ) : JitRef.JitShell {
         val executed = mutableListOf<String>()
         var default: Pair<Int, String> = 0 to "true"
@@ -251,11 +208,30 @@ object JitFake {
             return if (answers.isEmpty()) default else answers.removeAt(0)
         }
 
-        override fun cacheVisible(): Boolean? = cache
+        override fun mapsExcerpt(): String? = maps
 
         fun queueGetprop(rc: Int, out: String) { answers += rc to out }
 
         /** Команды, которые не являются чтением `getprop` (то есть изменения устройства). */
         fun scriptCommands(): List<String> = executed.filterNot { it.contains("getprop") }
+    }
+
+    /**
+     * Shell, который блокируется внутри `exec`, пока тест не отпустит: нужен, чтобы проверить
+     * гонку «сверка во время клика».
+     */
+    class BlockingShell(var maps: String? = null) : JitRef.JitShell {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val calls = AtomicInteger(0)
+
+        override fun exec(command: String, timeoutMs: Int): Pair<Int, String> {
+            calls.incrementAndGet()
+            entered.countDown()
+            release.await(5, TimeUnit.SECONDS)
+            return 0 to "ok"
+        }
+
+        override fun mapsExcerpt(): String? = maps
     }
 }

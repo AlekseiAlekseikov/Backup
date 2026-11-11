@@ -267,7 +267,7 @@ class VoiceAssistantService : Service() {
         // ложный пустой ответ. Порядок по-прежнему ВЫШЕ проверки EXTRA_BOOT_RESTORE (:352).
         runCatching { com.example.voiceapp3.tools.AdbClient.attachContext(this) }
         // iter33e A2: сверка «JIT после перезапуска zygote». Вызывается на КАЖДОМ старте.
-        runCatching { AppPerformance.checkPendingZygoteVerify(this) }
+        runCatching { AppPerformance.checkPendingZygoteVerify(this, "onCreate") }
         registerKeyReceiver()
         registerWakeWordSwitchReceiver()
         registerHubReceiver()
@@ -346,7 +346,7 @@ class VoiceAssistantService : Service() {
         startForegroundService()
         // iter33e A2: та же сверка и здесь — на случай, если процесс жив, а сервис перезапущен
         // (onCreate тогда не вызывался). Стоит ВЫШЕ проверки extra (см. ниже).
-        runCatching { AppPerformance.checkPendingZygoteVerify(this) }
+        runCatching { AppPerformance.checkPendingZygoteVerify(this, "onStartCommand") }
         /* Boot-ветка: BootReceiver помечает запуск — возвращаем сохранённую
            яркость (порт w() с boot-события; при обычном старте из приложения
            шаг не выполняется, чтобы не перебивать яркость штатной панели). */
