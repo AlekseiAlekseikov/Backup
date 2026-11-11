@@ -920,9 +920,7 @@ class ToolsPanel(
             setPadding(0, dp(10f), 0, dp(10f))
         }
         val info = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
-        val titleText = if (key == "perfJit" && jitConfirmed == "unknown") "$title · состояние неизвестно"
-                        else title
-        info.addView(text(titleText, 14.5f, palette.ink, bold = true))
+        info.addView(text(title, 14.5f, palette.ink, bold = true))
         info.addView(text(desc, 12f, palette.muted, bold = false))
         oneShotNote(info, actionPrefix)
         row.addView(info, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
