@@ -175,17 +175,32 @@ class JitLifecycleTest {
             override fun cacheVisible(): Boolean? = true
         }
         val results = java.util.Collections.synchronizedList(mutableListOf<String>())
-        val t1 = Thread { gate.await(); results += click(store, net, shell).result.name }
-        val t2 = Thread { gate.await(); results += start(store, net, shell).decision.name }
+        val t1 = Thread { gate.await(); results += "click:" + click(store, net, shell).result.name }
+        val t2 = Thread { gate.await(); results += "start:" + start(store, net, shell).decision.name }
         t1.start(); t2.start(); t1.join(5_000); t2.join(5_000)
         assertEquals(2, results.size)
-        assertEquals("операцию начала ровно одна сторона", 1, results.count { it == "STARTED" })
-        assertTrue(
-            "вторая сторона получила отказ, а не начала параллельную работу",
-            results.any { it == "BUSY" || it == "IDLE" || it == "DONE" }
-        )
-        assertTrue("снимок в согласованном состоянии",
-            store.op() == null || store.op()!!.shell == JitRef.Shell.REPLIED)
+
+        // Кто первым занимает единственную операцию — решает планировщик, и оба порядка законны.
+        // Проверяем не порядок, а ГАРАНТИИ, которые обязаны держаться при любом из них.
+        val clickOutcome = results.single { it.startsWith("click:") }.substringAfter(':')
+        val startOutcome = results.single { it.startsWith("start:") }.substringAfter(':')
+        assertTrue("клик либо начал операцию, либо получил честный отказ: $clickOutcome",
+            clickOutcome == "STARTED" || clickOutcome == "BUSY")
+        assertTrue("старт принял решение из допустимых: $startOutcome",
+            startOutcome in setOf("IDLE", "HOLD_UNSAFE_PHASE", "RESTORE",
+                "NOTHING_TO_RESTORE", "DONE"))
+        // оба радио в модель-устройстве включены, значит запросов быть не должно ни от кого:
+        // возвращать нечего, а «доступно» ≠ «нужно включить»
+        assertTrue("ни одного сетевого запроса: $startOutcome", net.requests.isEmpty())
+        // намерение клика не должно быть переписано чужой стороной
+        val op = store.op()
+        if (clickOutcome == "STARTED") {
+            assertTrue("снимок начатой операции не потерян", op != null)
+            assertTrue("снимок остался снимком ВКЛЮЧЕНИЯ", op!!.want)
+        } else {
+            assertEquals("отказ по занятой операции: ноль записей", 0, store.writeCount())
+            assertNull("снимка нет: старт только читал", op)
+        }
     }
 
     // ─────────── 7. Повторный старт в том же процессе — не «одна попытка», но и без записи ───────────
