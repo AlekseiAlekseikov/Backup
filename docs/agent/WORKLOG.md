@@ -1002,3 +1002,38 @@ artifact `13844292942` (177 161 997 Б).
 **Открыто:** `umount -l` на живом ГУ не исполнялся (нужны read-only `mountinfo` root-транспорта +
 сравнение namespace с PID 1 либо явное «идём как есть»); остатки `persist.*` JIT и `avas_snapshot`
 только фиксируются; полевой прогон не запускался, полевого успеха нет.
+
+---
+
+## iter35 (1.0.61) — JIT доведён до рабочего состояния; AVAS отдельно, причина не установлена
+
+**Коммит кода:** `10cd137` (ветка `fix/v2`). **CI:** run `43014460281`, job `130501940144` —
+`success`, `PASSED` 218 / `FAILED` 0 (полный лог: 218 строк `PASSED`, 0 `FAILED`,
+`BUILD SUCCESSFUL`), artifact `app-debug` id `13851849907` (177 169 982 Б).
+Локально на фейках/стенде: `OK (103 tests)`.
+
+**Что сделано по §1:** `openAp` = полный `U` (ранний `v()`, ожидание `O()`, `c1()` с ENABLING и
+исключением⇒true, owner-ветвь `p2`, флаг `V`, общий `CountDownLatch` 25 с, `d()` + опрос 20 с ×1 с,
+**настоящий сигнал FAILED** `WIFI_AP_STATE_CHANGED/wifi_state==14` → ≤3 попытки с паузой 2 с,
+снятие latch в `finally`); `onProcessStart` больше не спит в пуле (`remove` → `postDelayed(e2,15000)`,
+риск смерти процесса назван); сверка `r7` `ok=(pedido==getprop)&&(!pedido||maps!=FALSE)` покрыта
+таблицей всех сочетаний; `jit_pedido` **удаляется** (`contains=false`), ложный `write=none` убран;
+тумблер `ToolsPanel` показывает подтверждённый `getprop`, обновляется программно без вызова
+обработчика клика, `unknown` → «состояние неизвестно»; хранилища пишутся независимо
+(`WriteResult(attempted, ok)`), `removed` только по подтверждению, `restarted=`/`net_restore_done`
+из логов убраны.
+
+**Что НЕ сделано и почему:** ⛔ `umount -l` — шаг перенесён и включён (`mount_step=present`), но
+данных о его безопасности на этой ГУ нет; запускать JIT на устройстве до ответа владельца не нужно,
+запрошены read-only `mountinfo` (наш namespace + PID 1), `ls -l ns/mnt`, `findmnt` по точкам
+`/data/app/`. Ни `umount`, ни mount, ни reboot ради проверки не выполнялись.
+
+**AVAS:** только диагностика. Подтверждено кодом: единственный путь звука открытия —
+VHAL `PROP_DOOR_UNLOCK_STATE` (`WindowDoors.kt:232-240`) → дебаунс 5 с → `LockSound.playUnlockSound`
+→ `playExternalSound` (usage 29/73/13); звук замка при boot пишет `Settings.System` и делает
+bind-mount только в `/vendor/etc/carlock/`; `setAVASMode`/запись `/system/etc/avas/**`/трогание
+`audioserver` в 1.0.61 отсутствуют. `MediaPlayer.start()` маршрут не доказывает. Причина не
+установлена, лога 1.0.60 нет; владельцу заданы 4 вопроса, предложен read-only `dumpsys audio` +
+датированный лог в момент симптома (без клика JIT и без перезагрузки).
+
+**SOURCE_SHA** = `10cd137`.
