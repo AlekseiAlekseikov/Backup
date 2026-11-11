@@ -9,7 +9,7 @@ import org.junit.Test
  * Реальный текст цепочки исполняется настоящим `/bin/sh` на стенде [JitIsoStand].
  *
  * Проверяется ФАКТИЧЕСКИЙ порядок команд, поведение цикла слива правил, отсутствие запрещённых
- * действий и полное совпадение с литералом референса при включённом шаге монтирований.
+ * действий и полное совпадение с литералом референса (шаг монтирований исполняется).
  */
 class JitChainScriptTest {
 
@@ -29,7 +29,11 @@ class JitChainScriptTest {
         )
         assertEquals("слив правил до нуля", 3, calls.count { it == "ip rule show" })
         assertEquals("пауза 1 с между попытками", 2, calls.count { it == "sleep 1" })
-        assertFalse("по умолчанию umount НЕ вызывается", calls.any { it.startsWith("umount") })
+        assertTrue("шаг монтирований исполняется, как в референсе",
+            calls.any { it.startsWith("umount -l ") })
+        assertTrue("и он до setprop",
+            calls.indexOfFirst { it.startsWith("umount") } <
+                calls.indexOf("setprop dalvik.vm.usejit true"))
     }
 
     @Test
@@ -61,9 +65,9 @@ class JitChainScriptTest {
     }
 
     @Test
-    fun mountStepTouchesOnlyDataAppWhenEnabled() {
+    fun mountStepTouchesOnlyDataApp() {
         val stand = JitIsoStand(rules = 0)
-        val (rc, _) = stand.exec(JitRef.chainScript(want = true, mountStep = true))
+        val (rc, _) = stand.exec(JitRef.chainScript(want = true))
         assertEquals(0, rc)
         val calls = stand.calls()
         val umounts = calls.filter { it.startsWith("umount") }
@@ -78,19 +82,18 @@ class JitChainScriptTest {
     }
 
     @Test
-    fun enabledConfigurationEqualsReferenceText() {
-        // Включённая конфигурация (шаг монтирований) обязана совпасть с литералом референса целиком.
+    fun sentScriptEqualsReferenceText() {
+        // Отправляемое совпадает с литералом референса целиком — вариантов нет.
         val stand = JitIsoStand(rules = 0)
-        stand.exec(JitRef.chainScript(true, mountStep = true))
-        assertEquals(JitRef.referenceScript(true).replace(Regex("\\s+"), " ").trim(),
-            JitRef.chainScript(true, mountStep = true).replace(Regex("\\s+"), " ").trim())
+        stand.exec(JitRef.chainScript(true))
+        assertEquals(JitRef.referenceScript(true), JitRef.chainScript(true))
         assertTrue(stand.callsText().contains("umount -l"))
     }
 
     @Test
     fun noForbiddenCommands() {
         val stand = JitIsoStand(rules = 1)
-        stand.exec(JitRef.chainScript(want = true, mountStep = true))
+        stand.exec(JitRef.chainScript(want = true))
         val text = stand.callsText()
         for (bad in listOf("persist.", "usejitprofiles", "rule del", "flush", "ndc", "settings", "kill", "pkill")) {
             assertFalse("в выполненных командах нет «$bad»", text.contains(bad))
@@ -114,6 +117,6 @@ class JitChainScriptTest {
         assertEquals("первая команда всё равно выполнена", "svc wifi disable", calls.first())
         assertTrue("свойство выставлено до рестарта", calls.contains("setprop dalvik.vm.usejit true"))
         assertEquals("рестарт остался последней командой", "setprop ctl.restart zygote", calls.last())
-        assertFalse("ни одной лишней команды", calls.any { it.startsWith("umount") })
+        assertTrue("шаг монтирований всё равно выполнен", calls.any { it.startsWith("umount -l ") })
     }
 }

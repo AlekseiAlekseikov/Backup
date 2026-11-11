@@ -36,27 +36,12 @@ class JitRefTest {
     }
 
     @Test
-    fun executedChainDiffersOnlyByMountStepAndValue() {
-        val full = JitRef.referenceScript(true)
-        val executed = JitRef.chainScript(true)
-        // Шаг монтирований в исполняемой цепочке отсутствует — это заявлено, а не спрятано.
-        assertFalse(executed.contains("umount"))
-        assertFalse(JitRef.MOUNT_STEP)
-        assertTrue(JitRef.mountStepNote().contains("reason=" + JitRef.MOUNT_STEP_REASON))
-        assertTrue(JitRef.mountStepNote().contains("need=owner_decision"))
-        // Всё остальное совпадает символ в символ.
-        val withoutMount = full.replace(
-            "        for _m in \$(grep ' /data/app/' /proc/mounts | awk '{print \$2}'); do\n" +
-                "          umount -l \"\$_m\" 2>/dev/null\n" +
-                "        done\n",
-            ""
-        )
-        assertEquals("отличие только в шаге монтирований", withoutMount, executed)
-        assertEquals(
-            "ветка выключения отличается только значением свойства",
-            executed.replace("usejit true", "usejit false"),
-            JitRef.chainScript(false)
-        )
+    fun executedChainIsTheReferenceLiteralWithMountStep() {
+        // Вариантов нет: отправляется ровно литерал `w0/la.run`, шаг `umount -l` включён.
+        assertEquals(JitRef.referenceScript(true), JitRef.chainScript(true))
+        assertEquals(JitRef.referenceScript(false), JitRef.chainScript(false))
+        assertTrue(JitRef.chainScript(true).contains("umount -l"))
+        assertEquals("mount_step=present", JitRef.mountStepNote())
     }
 
     @Test

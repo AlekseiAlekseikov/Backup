@@ -92,17 +92,14 @@ object JitRef {
     internal const val AP_RETRY_PAUSE_MS = 2_000L
 
     /**
-     * Шаг `umount -l` точек `/data/app/` из `w0/la.run`.
+     * Шаг `umount -l` точек `/data/app/` из `w0/la.run` — **исполняется**, как в референсе.
      *
-     * ⛔ **Не включён в исполняемую цепочку.** Владелец разрешил монтирования, но требует
-     * доказанной стоковой обратимости; в этом окружении живой ГУ нет, а массовый `umount` для
-     * проверки запрещён. Поэтому шаг не «спрятан флагом»: он явно отсутствует, каждая отправка
-     * цепочки пишет `mount_step=absent reason=reversibility_unproven need=owner_decision`, а в
-     * отчёте это отдельный ⛔-пункт с read-only командами. Пока шаг не включён, цепочка НЕ является
-     * полной копией референса, и это сказано прямо.
+     * Монтирования владельцем разрешены, отключать шаг «потому что это монтирование» нельзя, и
+     * скрытого флага «выключено» здесь нет. Обратимость на живом ГУ при этом **не проверена**:
+     * в этом окружении устройства нет, а массовый `umount` ради проверки запрещён. Поэтому шаг
+     * виден в каждой отправке цепочки (`mount_step=present`), а в отчёте он отдельным пунктом
+     * «точная копия литерала, поле не исполнялось».
      */
-    internal const val MOUNT_STEP = false
-    internal const val MOUNT_STEP_REASON = "reversibility_unproven"
 
     /** Регулярка референса — полное совпадение строки, без trim (`Matcher.matches()`). */
     private val RESTORE_RE = Regex("^wifi=([01]),ap=([01])$")
@@ -157,7 +154,7 @@ object JitRef {
 
     // ─────────────────────────── скрипт: `w0/la.run` байт в байт ───────────────────────────
 
-    private fun scriptBody(want: Boolean, mountStep: Boolean): String {
+    private fun scriptBody(want: Boolean): String {
         val D = "$"
         val drain = "        svc wifi disable\n" +
             "        _n=0\n" +
@@ -170,20 +167,17 @@ object JitRef {
             "        done\n"
         val props = "        setprop $PROP_USEJIT ${if (want) "true" else "false"}\n" +
             "        setprop ctl.restart zygote\n    "
-        return "\n" + drain + (if (mountStep) mount else "") + props
+        return "\n" + drain + mount + props
     }
 
-    /** Полный литерал референса вместе с шагом монтирований — эталон для сравнения. */
-    fun referenceScript(want: Boolean): String = scriptBody(want, mountStep = true)
+    /** Литерал `w0/la.run` целиком, включая шаг монтирований — эталон для сверки. */
+    fun referenceScript(want: Boolean): String = scriptBody(want)
 
-    /** Скрипт, который реально отправляется (в текущей конфигурации — без шага монтирований). */
-    fun chainScript(want: Boolean, mountStep: Boolean = MOUNT_STEP): String =
-        scriptBody(want, mountStep)
+    /** Скрипт, который отправляется: тот же литерал, вариантов нет. */
+    fun chainScript(want: Boolean): String = scriptBody(want)
 
-    /** Отметка о шаге монтирований для лога — чтобы отправленная цепочка не выглядела копией. */
-    fun mountStepNote(): String =
-        if (MOUNT_STEP) "mount_step=present"
-        else "mount_step=absent reason=$MOUNT_STEP_REASON need=owner_decision"
+    /** Отметка о шаге монтирований для лога: он есть, как в референсе. */
+    fun mountStepNote(): String = "mount_step=present"
 
     // ─────────────────────────── чтение `getprop`: факт, а не догадка ───────────────────────────
 

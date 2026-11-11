@@ -31,8 +31,7 @@ class JitLogsCancelTest {
         assertTrue("результат записи виден", click.contains("saved=true"))
 
         val sent = log.first { it.startsWith("JIT_CHAIN_SENT") }
-        assertTrue("шаг монтирований заявлен, а не спрятан", sent.contains("mount_step=absent"))
-        assertTrue(sent.contains("reason=" + JitRef.MOUNT_STEP_REASON))
+        assertTrue("шаг монтирований есть, как в референсе", sent.contains("mount_step=present"))
 
         val back = log.first { it.startsWith("JIT_CHAIN_RETURN") }
         assertTrue("ответ транспорта", back.contains("rc=0"))
