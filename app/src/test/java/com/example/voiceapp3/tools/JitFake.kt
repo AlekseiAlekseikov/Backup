@@ -3,167 +3,169 @@ package com.example.voiceapp3.tools
 import java.util.ArrayDeque
 
 /**
- * Подставное устройство для тестов оркестратора: префы, состояние сети и shell.
+ * Подставное устройство для тестов JIT-цепочки.
  *
- * Специально моделирует то, что REVIEW §0.1(1),(2),(5) требует проверять:
- *  • очередь транспорта с ОТЛОЖЕННЫМ исполнением (`AdbClient.kt:417-425` — Job остаётся в
- *    `LinkedBlockingQueue`, таймаут вызывающего его не отменяет);
- *  • запись префов, которая может «дойти» только в одно хранилище и не подтвердиться чтением;
- *  • отложенное (асинхронное) появление AP/Wi-Fi после запроса и полный отказ API.
+ * Моделирует ровно то, что есть в референсе и в наших адаптерах: префы с одним `commit()` на
+ * снимок, доступность `WifiManager`/`ap0` (включая «прочитать нельзя»), рефлексию `startSoftAp`
+ * (успех/отказ/исключение), отложенное появление AP и Wi-Fi и транспорт с очередью.
  */
 object JitFake {
 
-    /** Префы с двумя «хранилищами» и управляемыми отказами записи. */
-    class Store : JitStore {
-        val cps = LinkedHashMap<String, String?>()
-        val dps = LinkedHashMap<String, String?>()
-        val booleanCps = LinkedHashMap<String, Boolean>()
-        val booleanDps = LinkedHashMap<String, Boolean>()
+    /**
+     * Префы. Помимо значений считает ЗАПИСИ (`commits`): тесты проверяют, что клик пишет снимок
+     * одним `commit()` и что обычный старт не пишет вообще ничего.
+     */
+    class Store : JitRef.JitStore {
 
-        /** Запретить запись в CPS (как будто оно недоступно). */
-        var cpsFails = false
-        /** Запретить запись в DPS. */
-        var dpsFails = false
-        /** Записать, но не подтвердить (эмуляция «commit=false»). */
-        var commitReportsFalse = false
-        /** Сколько записей выполнить успешно, затем начать «падать» (смерть на шаге). */
-        var writesUntilFailure = Int.MAX_VALUE
-        /** Исключение на записи (адаптер обязан это пережить). */
-        var throwOnWrite = false
+        val values = LinkedHashMap<String, Any?>()
+        val commits = mutableListOf<String>()
 
-        /** Сколько записей реально пытались сделать (для проверки «на старте — ноль записей»). */
+        /** Что вернёт `commit()` (в референсе результат не используется — мы тоже его не гоняем). */
+        var commitResult: Boolean = true
+        var throwOnWrite: Boolean = false
+
         @Synchronized
-        fun writeCount(): Int = writes
+        fun writeCount(): Int = commits.size
 
-        private var writes = 0
+        fun rawRestore(): String? = values[JitRef.KEY_RESTORE] as? String
 
-        private fun mayWrite(): Boolean {
+        @Synchronized
+        override fun getString(key: String): String? = values[key] as? String
+
+        @Synchronized
+        override fun getBool(key: String): Boolean? = values[key] as? Boolean
+
+        @Synchronized
+        override fun contains(key: String): Boolean = values.containsKey(key)
+
+        @Synchronized
+        override fun putSnapshot(want: Boolean, net: JitRef.Net): Boolean {
             if (throwOnWrite) throw IllegalStateException("store write failure")
-            writes++
-            return writes <= writesUntilFailure
+            commits += "snapshot:${net.wire()}:$want"
+            values[JitRef.KEY_PEDIDO] = want
+            values[JitRef.KEY_AUTO] = want
+            values[JitRef.KEY_RESTORE] = net.wire()
+            return commitResult
         }
 
         @Synchronized
-        override fun getString(key: String): String? = cps[key] ?: dps[key]
-
-        @Synchronized
-        override fun putStringConfirmed(key: String, value: String?): Boolean {
-            val allowed = mayWrite()
-            if (allowed && !cpsFails) cps[key] = value
-            if (allowed && !dpsFails) dps[key] = value
-            val back = getString(key)
-            return allowed && !commitReportsFalse && back == value
+        override fun putBool(key: String, value: Boolean): Boolean {
+            if (throwOnWrite) throw IllegalStateException("store write failure")
+            commits += "bool:$key=$value"
+            values[key] = value
+            return commitResult
         }
 
         @Synchronized
-        override fun getBool(key: String): Boolean? {
-            val c = booleanCps[key]
-            val d = booleanDps[key]
-            if (c == null && d == null) return null
-            return (c == true) || (d == true)
+        override fun putString(key: String, value: String?): Boolean {
+            if (throwOnWrite) throw IllegalStateException("store write failure")
+            commits += if (value == null) "remove:$key" else "string:$key=$value"
+            if (value == null) values.remove(key) else values[key] = value
+            return commitResult
         }
-
-        @Synchronized
-        override fun putBoolConfirmed(key: String, value: Boolean): Boolean {
-            val allowed = mayWrite()
-            if (allowed && !cpsFails) booleanCps[key] = value
-            if (allowed && !dpsFails) booleanDps[key] = value
-            val back = getBool(key)
-            return allowed && !commitReportsFalse && back == value
-        }
-
-        fun op(): JitRef.Op? = JitRef.decodeOp(getString(JitRef.KEY_OP))
-        fun rawOp(): String? = getString(JitRef.KEY_OP)
     }
 
     /**
-     * Сеть. `applyDelayCalls` — сколько обращений к состоянию должно пройти до того, как запрос
-     * «сработает» (0 = сразу). `apiBroken` — `setWifi`/`startAp` возвращают отказ.
+     * `WifiManager` + `ap0` + рефлексия `startSoftAp`.
+     *
+     * `wifiReadError`/`apReadError` — «прочитать нельзя» (`null`), как исключение в референсе.
+     * `*AppliesAfterReads` — AP/Wi-Fi поднимаются не сразу после запроса (как на устройстве).
      */
     class Net(
         var wifi: Boolean = true,
         var ap: Boolean = false,
-        var stateErrors: Boolean = false,
-        var apiBroken: Boolean = false,
-        var apiRejects: Boolean = false,
+        var wifiReadError: Boolean = false,
+        var apReadError: Boolean = false,
         var wifiAppliesAfterReads: Int = 0,
         var apAppliesAfterReads: Int = 0
-    ) : JitNetState {
+    ) : JitRef.JitNetState {
+
         val requests = mutableListOf<String>()
+
+        /** `null` — вызов `setWifiEnabled` бросил исключение. */
+        var setWifiResult: Boolean? = true
+        /** `null` — рефлексия `startSoftAp` бросила исключение; `false` — вернула `false`. */
+        var startApResult: Boolean? = true
+
         private var wifiPending = false
         private var apPending = false
-        private var wifiReadsAfterRequest = 0
-        private var apReadsAfterRequest = 0
+        private var wifiReads = 0
+        private var apReads = 0
 
         override fun wifiOn(): Boolean? {
-            if (stateErrors) return null
+            if (wifiReadError) return null
             if (wifiPending) {
-                wifiReadsAfterRequest++
-                if (wifiReadsAfterRequest > wifiAppliesAfterReads) { wifi = true; wifiPending = false }
+                wifiReads++
+                if (wifiReads > wifiAppliesAfterReads) {
+                    wifi = true
+                    wifiPending = false
+                }
             }
             return wifi
         }
 
-        /** `apMissing` — интерфейса ap0 нет (false), `stateErrors` — прочитать нельзя (null). */
-        var apMissing = false
-
         override fun apUp(): Boolean? {
-            if (stateErrors) return null
-            if (apMissing) return false
+            if (apReadError) return null
             if (apPending) {
-                apReadsAfterRequest++
-                if (apReadsAfterRequest > apAppliesAfterReads) { ap = true; apPending = false }
+                apReads++
+                if (apReads > apAppliesAfterReads) {
+                    ap = true
+                    apPending = false
+                }
             }
             return ap
         }
 
-        /** `callThrows` — метода нет/исключение (в отличие от `apiRejects`: вызов прошёл). */
-        var callThrows = false
-
-        override fun setWifi(on: Boolean): JitRef.Request {
+        override fun setWifi(on: Boolean): Boolean? {
             requests += "wifi=$on"
-            if (callThrows || apiBroken) return JitRef.Request.notInvoked("throw:SecurityException")
-            if (apiRejects) return JitRef.Request.rejected("setWifiEnabled($on)=false")
-            if (on) wifiPending = true else { wifi = false; wifiPending = false }
-            return JitRef.Request.accepted("setWifiEnabled($on)=true")
+            val r = setWifiResult
+            if (r == null) return null
+            if (on) wifiPending = true else {
+                wifi = false
+                wifiPending = false
+            }
+            return r
         }
 
-        override fun startAp(): JitRef.Request {
+        override fun startAp(): Boolean? {
             requests += "ap=start"
-            if (callThrows || apiBroken) return JitRef.Request.notInvoked("throw:NoSuchMethodException")
-            if (apiRejects) return JitRef.Request.rejected("startSoftAp=false")
-            apPending = true
-            return JitRef.Request.accepted("startSoftAp=true")
+            val r = startApResult
+            if (r == null) return null
+            if (r) apPending = true
+            return r
         }
     }
 
     /** Ожидание без реального сна: запоминает паузы, часы двигает сам. */
-    class Waiter(start: Long = 1_000L) : JitWaiter {
+    class Waiter(start: Long = 1_000L) : JitRef.JitWaiter {
         val sleeps = mutableListOf<Long>()
         private var clock = start
-        override fun sleep(ms: Long) { sleeps += ms; clock += ms }
+        override fun sleep(ms: Long) {
+            sleeps += ms
+            clock += ms
+        }
+
         override fun nowMs(): Long = clock
     }
 
     /**
-     * Shell с ОЧЕРЕДЬЮ, как у настоящего `AdbClient`: команда может быть отдана в устройство
-     * позже; вызывающий получает таймаут (rc=137, `ERR_ADB_TIMEOUT`), а работа продолжается.
+     * Shell с очередью, как настоящий `AdbClient`: команда может уйти в устройство позже, а
+     * вызывающий получит таймаут (`rc=137`, `ERR_ADB_TIMEOUT`). Задание при этом НЕ отменяется.
      */
-    class QueueShell(private val stand: JitIsoStand? = null) : JitShell {
-        /** Ещё не выполненные команды (в порядке постановки). */
+    class QueueShell(private val stand: JitIsoStand? = null) : JitRef.JitShell {
+
         val pending = ArrayDeque<Pair<String, Int>>()
-        /** Уже выполненные — с результатом. */
         val executed = mutableListOf<Triple<String, Int, String>>()
-        /** Ответ на `getprop` в этом «устройстве». */
+
         var getprop: String = "true"
         var getpropRc: Int = 0
         var cache: Boolean? = true
-        /** Сколько команд отдать устройству синхронно (0 — всё в очередь). */
+
+        /** Сколько команд отдать устройству сразу (0 — всё в очередь). */
         var runInline = 0
 
         override fun exec(command: String, timeoutMs: Int): Pair<Int, String> {
             if (command.startsWith("getprop ")) {
-                // как настоящий канал: при rc≠0 вывода значения нет, есть только код ошибки
                 return if (getpropRc == 0) Pair(0, getprop)
                 else Pair(getpropRc, "ERR_ROOT_CHANNEL_UNAVAILABLE after ${timeoutMs}ms")
             }
@@ -178,7 +180,7 @@ object JitFake {
 
         override fun cacheVisible(): Boolean? = cache
 
-        /** Сценарий «очередь наконец исполнилась» — то, что происходит на устройстве позже. */
+        /** «Очередь наконец исполнилась» — то, что происходит на устройстве позже. */
         fun drain(onCommand: (String) -> Unit = {}): Int {
             var n = 0
             while (pending.isNotEmpty()) {

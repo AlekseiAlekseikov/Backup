@@ -192,11 +192,8 @@ object AppPerformance {
         val steps = mutableListOf<ToolsStep>()
         val now = System.currentTimeMillis()
         try {
-            // iter33p-review2 §0.1(3): preference пишется НЕ здесь. Раньше запись шла до попытки
-            // применить JIT, и отказ (незавершённая операция, неизвестное состояние сети,
-            // несозданный снимок) всё равно выглядел как «включено» — и в UI, и в логе.
-            // Теперь ключ `perf_auto_otimizar` пишет ядро операции ([JitOp.prepare]) ПОСЛЕ
-            // подтверждённого снимка, то есть только для реально начатого клика.
+            // preference пишет клик — как `w0/j9.onClick`: `perf_auto_otimizar` входит в тот же
+            // `commit()`, что `jit_pedido` и `jit_restaurar` (`JitNet.click` → `JitOp.click`).
             steps.add(
                 ToolsStep(
                     step = "perf_pref",
@@ -811,41 +808,27 @@ object AppPerformance {
     }
 
     /**
-     * Продолжение операции и сверка на старте процесса (референс: `CentralWatchdogService.onCreate`
-     * → `w0/e2.run`, затем `w0/bb`/`w0/r7`).
+     * Продолжение операции на старте процесса — дословно `CentralWatchdogService.onCreate`:
+     * строка `jit_restaurar` совпала с `^wifi=([01]),ap=([01])$` → снять строку → через 15 с
+     * `w0/e2` (AP, затем Wi-Fi).
      *
-     * Возврат сети выполняется ТОЛЬКО когда доказаны две вещи: снимок относится к этой загрузке
-     * (`boot_id`, не `epoch`) И скрипт доказанно завершился — транспорт ответил на НАШ вызов
-     * (`shell=replied`, см. [JitRef.Shell]). Не считаются доказательством: выключенный Wi-Fi/AP
-     * (его мог выключить кто угодно, а `svc wifi disable` — первая команда скрипта), совпадение
-     * `getprop`, истёкшее время, `ARMED`/`SENT`, смерть приложения, пустой журнал, `rc=137`.
-     * Если доказательства нет — `HOLD_UNSAFE_PHASE`: ноль записей, ноль сети, решение за владельцем
-     * (REVIEW 3-го захода, пп.1,2,6).
-     *
-     * Блокировки «одна попытка на процесс» больше нет: решение принимается на каждом старте по
-     * фактам, а не по факту «мы уже пробовали» (§0.1(2)).
+     * Своих условий здесь нет: ни метки загрузки, ни проверки «а выполнялся ли скрипт», ни
+     * блокировок. Так делает референс — и это описано в отчёте как его поведение, включая риск:
+     * снимок применяется на ЛЮБОМ старте процесса, пока строка не снята, а снимается она до
+     * выполнения, поэтому смерть процесса в эти 15 с отменяет возврат сети навсегда.
      */
     fun jitPendingVerify(context: Context): Boolean {
         val app = context.applicationContext
-        val bootTag = currentBootTag()
-        val out = runCatching { JitNet.onProcessStart(app, bootTag) }.getOrNull()
-        if (out == null) {
-            AppLog.i(TAG, "JIT_START_RESULT decision=error boot=$bootTag (исключение в адаптере: сеть не трогаем)")
-            return false
-        }
-        AppLog.i(TAG, "JIT_START_RESULT decision=${out.decision.name.lowercase()} " +
-            "op=${out.op?.log() ?: "none"} boot=$bootTag " +
-            "verify=${out.verify?.verdict?.let { JitRef.verifyLabel(it) } ?: "none"} " +
-            "restore=${out.restore?.summary ?: "none"} internet=not_checked " +
-            "action=${when (out.decision) {
-                JitRef.StartDecision.RESTORE -> "net_restore_begin"
-                JitRef.StartDecision.HOLD_UNSAFE_PHASE -> "none_need_owner_decision"
-                JitRef.StartDecision.NOTHING_TO_RESTORE -> "none_nothing_to_restore"
-                JitRef.StartDecision.KEEP_PREVIOUS_BOOT, JitRef.StartDecision.KEEP_UNKNOWN_BOOT ->
-                    "none_need_owner_decision"
-                JitRef.StartDecision.IDLE, JitRef.StartDecision.DONE -> "none"
-            }}")
-        return out.decision == JitRef.StartDecision.RESTORE
+        val out = runCatching { JitNet.onProcessStart(app) }
+            .onFailure { AppLog.i(TAG, "JIT_START_RESULT exception=${it.javaClass.simpleName} (сеть не тронута)") }
+            .getOrNull()
+        if (out == null) return false
+        val restored = out.report != null
+        AppLog.i(TAG, "JIT_START_RESULT snapshot=${out.snapshot?.wire() ?: "none"} " +
+            "restarted=$restored ap=${out.report?.apUp?.toString() ?: "none"} " +
+            "wifi=${out.report?.wifiOn?.toString() ?: "none"} " +
+            "internet=not_checked action=${if (restored) "net_restore_done" else "none"}")
+        return restored
     }
 
     /**
@@ -867,17 +850,16 @@ object AppPerformance {
      *
      * ЧЕСТНОЕ ПРАВИЛО (REVIEW 3-го захода, п.5): `off` нельзя показывать по одному preference и
      * нельзя выводить из «не прочитали». Поэтому:
-     *  • runtime прочитан и `true` ⇒ `on` (факт);
-     *  • runtime прочитан и `false` И есть подтверждённая операция с `want=false`
-     *    (phase=DONE) ⇒ `off` (факт, а не обещание);
-     *  • всё остальное, включая ошибку транспорта и «ещё не читали» ⇒ `unknown`.
+     *  • `getprop` прочитан и `true` ⇒ `on` (как `toggle.setActive(getprop)` в `w0/r7`);
+     *  • `getprop` прочитан и `false` ⇒ `off`;
+     *  • прочитать нельзя или ещё не читали ⇒ `unknown` («состояние неизвестно»).
+     *
+     * Референс в последнем случае показывает «выключено» (любая строка кроме `true` — `false`).
+     * Это отличие сделано по требованию владельца: неизвестное не выдаётся за факт.
      *
      * Значение читается из кэша: shell из UI-потока не вызывается.
      */
-    fun jitConfirmedState(context: Context): String {
-        val op = runCatching { readJitOp(context.applicationContext) }.getOrNull()
-        return JitRef.confirmedState(LAST_JIT_FACT, op)
-    }
+    fun jitConfirmedState(context: Context): String = JitRef.confirmedState(LAST_JIT_FACT)
 
     /**
      * Асинхронное чтение факта с гарантированным обновлением UI.
@@ -901,9 +883,6 @@ object AppPerformance {
         }
     }
 
-    fun readJitOp(context: Context): JitRef.Op? =
-        runCatching { JitRef.decodeOp(JitNet.read(context.applicationContext, JitRef.KEY_OP)) }.getOrNull()
-
     // ═══════════ JIT_ZYGOTE_BEGIN ═══════════
     /*
      * ЕДИНСТВЕННОЕ место в коде, где разрешён перезапуск фреймворка (владелец, 08.11):
@@ -912,14 +891,14 @@ object AppPerformance {
      *   zygote` последней командой) → `CentralWatchdogService.onCreate` → `w0/e2.run`
      *   (возврат AP, затем Wi-Fi) → `w0/bb`/`w0/r7` (getprop + `dalvik-jit-code-cache`).
      *
-     * Наши отличия — только те, без которых требование §1.3 не выполнить: метка загрузки в снимке,
-     * подтверждение записи чтением, отказ второго клика, выключенный шаг монтирований (§3 отчёта).
+     * Отличий в последовательности нет. Не включён только шаг `umount -l` точек `/data/app/`
+     * (обратимость не доказана на живой ГУ) — он не «спрятан флагом»: каждая отправка цепочки
+     * пишет `mount_step=absent reason=reversibility_unproven need=owner_decision`.
      */
 
     /**
      * Применение JIT по клику тумблера — один вызов ядра [JitOp.click] (референс `w0/j9.onClick`
-     * → `w0/la.run`). Своей логики здесь нет: только строка статуса шага и запись preference
-     * ровно для начатого клика (её делает ядро после подтверждённого снимка).
+     * → `w0/la.run`). Своей логики здесь нет: только строка статуса шага.
      *
      * Статус честный: `PARTIAL` — «скрипт отправлен, итог дочитается на следующем старте»: и
      * `getprop`, и `maps` из процесса, который умрёт от рестарта zygote, прочитать нельзя.
@@ -928,57 +907,45 @@ object AppPerformance {
         BgWorker.assertNotMain("AppPerformance.jitApplyWithZygote")
         val app = context.applicationContext
         val t0 = System.currentTimeMillis()
-        val bootTag = currentBootTag()
-        AppLog.i(TAG, "JIT_APPLIED_REQUEST want=$enabled boot=$bootTag " +
-            "mount_step=${if (JitRef.MOUNT_STEP_ENABLED) "on" else "off (§1.1: обратимость не доказана, решение владельца)"} " +
+        AppLog.i(TAG, "JIT_APPLIED_REQUEST want=$enabled ${JitRef.mountStepNote()} " +
             "warning=\"фреймворк перезапустится: экран гаснет на 10–20 с, приложения закрываются\"")
-        val click = runCatching { JitNet.click(app, enabled, bootTag, t0) }
-            .getOrElse { JitOp.Click(JitOp.ClickResult.SNAPSHOT_FAILED, null, null, false) }
+        val click = runCatching { JitNet.click(app, enabled) }
+            .onFailure { AppLog.i(TAG, "JIT_CLICK exception=${it.javaClass.simpleName}") }
+            .getOrNull()
         val fact = runCatching { JitNet.usejitFact(app) }
             .getOrDefault(JitRef.PropFact(JitRef.Prop.UNKNOWN, "", 1, "exception"))
-        val started = click.result == JitOp.ClickResult.STARTED
-        val why = when (click.result) {
-            JitOp.ClickResult.STARTED -> ""
-            JitOp.ClickResult.BUSY ->
-                "не запускалось: прямо сейчас идёт другая операция JIT (клик или продолжение после " +
-                    "рестарта фреймворка) — повторный клик не перезаписывает снимок"
-            JitOp.ClickResult.REFUSED_PENDING ->
-                "не запускалось: незавершённая операция (${click.op?.log() ?: "снимок этой загрузки"}); " +
-                    "завершение скрипта не подтверждено — нужно решение владельца (см. лог)"
-            JitOp.ClickResult.REFUSED_UNRESOLVED ->
-                "не запускалось: снимок повреждён — нужно решение владельца (см. JIT_APPLIED_REQUEST в логе)"
-            JitOp.ClickResult.REFUSED_STATE_UNKNOWN -> "не запускалось: состояние сети неизвестно"
-            JitOp.ClickResult.SNAPSHOT_FAILED -> "не запускалось: снимок не подтверждён записью"
-        }
-        AppLog.i(TAG, "JIT_APPLIED_RESULT started=$started click=${click.result.name.lowercase()} " +
-            "${fact.log} want=$enabled restart=not_claimed " +
-            "rc=${click.run?.exitCode ?: -1} " +
-            "outcome=${click.run?.let { JitRef.chainOutcomeLabel(it.outcome) } ?: "none"}")
+        val sent = click != null
+        AppLog.i(TAG, "JIT_APPLIED_RESULT started=$sent saved=${click?.saved ?: false} " +
+            "${fact.log} want=$enabled restart=not_claimed rc=${click?.exitCode ?: -1} " +
+            "outcome=${click?.let { JitRef.chainOutcomeLabel(it.outcome) } ?: "none"}")
+        val shellReply = click != null && click.outcome == JitRef.ChainOutcome.REPLY_RECEIVED
         return listOf(
             ToolsStep(
                 step = "perf_zygote",
-                command = if (started)
-                    "setprop $PROP_USEJIT=${if (enabled) "true" else "false"} · " +
-                        "setprop ctl.restart zygote (скрипт референса; " +
-                        "завершение: ${click.op?.shell?.name?.lowercase() ?: "unknown"})"
-                else "нет: $why",
+                command = if (sent)
+                    "setprop $PROP_USEJIT=${if (enabled) "true" else "false"} + " +
+                        "setprop ctl.restart zygote (скрипт референса w0/la.run; " +
+                        "${JitRef.mountStepNote()})"
+                else "нет: клик не дошёл до отправки скрипта (см. лог)",
                 startedAtMs = t0, finishedAtMs = System.currentTimeMillis(),
-                exitCode = if (started) (click.run?.exitCode ?: 1) else 1,
-                expected = "JIT_APPLIED result=ok на следующем старте (сверка getprop + code-cache)",
-                actual = "click=${click.result.name.lowercase()} " +
-                    "getprop=${fact.raw.ifEmpty { "unknown" }} fact=${fact.value.name.lowercase()} " +
-                    "rc=${click.run?.exitCode ?: -1} restart=not_claimed",
-                stdout = if (started && click.op?.shell == JitRef.Shell.REPLIED)
-                    "экран гаснет на 10–20 с · скрипт ответил целиком; сеть вернётся при следующем " +
-                        "запуске как продолжение этой операции (AP, затем Wi-Fi — как e2). Если приложение " +
-                        "не запустится, сеть останется выключенной — это ограничение референса, " +
-                        "см. отчёт §9"
-                else if (started)
-                    "команда отправлена, но ответа транспорта нет (${click.run?.exitCode ?: -1}): " +
-                        "поздняя команда и рестарт фреймворка возможны. Возврат сети и второй клик " +
-                        "заблокированы до решения владельца (JIT_NET_CONT reason=unsafe_phase)"
-                else why,
-                status = if (started) ToolsStep.Status.PARTIAL else ToolsStep.Status.BLOCKED
+                exitCode = if (sent) (click!!.exitCode) else 1,
+                expected = "JIT pedido=… getprop=… result=ok на следующем старте (w0/bb + w0/r7)",
+                actual = "saved=${click?.saved ?: false} rc=${click?.exitCode ?: -1} " +
+                    "outcome=${click?.let { JitRef.chainOutcomeLabel(it.outcome) } ?: "none"} " +
+                    "getprop=${fact.raw.ifEmpty { "unknown" }} restart=not_claimed",
+                stdout = when {
+                    shellReply ->
+                        "экран гаснет на 10–20 с · транспорт ответил целиком; сеть вернётся при " +
+                            "следующем запуске приложения — AP, затем Wi-Fi (как e2). Если приложение " +
+                            "после рестарта фреймворка не запустится, сеть останется выключенной: " +
+                            "это ограничение референса, см. отчёт"
+                    sent ->
+                        "команда отправлена, ответа транспорта нет (rc=${click?.exitCode ?: -1}): " +
+                            "рестарт фреймворка мог не произойти, а команда могла остаться в очереди. " +
+                            "Итог покажет только сверка на следующем старте"
+                    else -> "клик не отправлен"
+                },
+                status = if (sent) ToolsStep.Status.PARTIAL else ToolsStep.Status.BLOCKED
             )
         )
     }
@@ -993,13 +960,8 @@ object AppPerformance {
      */
     fun verifyJitOnly(context: Context) {
         val app = context.applicationContext
-        val fact = jitRuntimeFact(app)
-        val cache = runCatching { JitNet.codeCacheVisible() }.getOrNull()
-        val op = readJitOp(app)
-        val verdict = if (op == null) JitRef.Verify.UNKNOWN else JitRef.verify(op.want, fact, cache)
-        AppLog.i(TAG, "JIT_PROBE ${fact.log} code_cache_executavel=${cache?.toString() ?: "unknown"} " +
-            "want=${op?.want ?: "none"} result=${JitRef.verifyLabel(verdict)} write=none " +
-            "boot_tag=${currentBootTag()}")
+        val out = runCatching { JitNet.verifyApplied(app) }.getOrNull() ?: return
+        AppLog.i(TAG, "JIT_PROBE write=none (сверка w0/bb + w0/r7; рестарт не заявляется)")
     }
 
     private fun runSuCommand(command: String): ExecResult {

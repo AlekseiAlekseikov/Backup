@@ -1155,11 +1155,7 @@ class ToolsPanel(
             fact.value == JitRef.Prop.FALSE -> "выключен (getprop dalvik.vm.usejit = false)"
             else -> "неизвестно (getprop не прочитан: ${fact.reason})"
         }
-        val op = runCatching { AppPerformance.readJitOp(activity) }.getOrNull()
-        val opLine = if (op == null) ""
-        else " · операция: ${op.phase.name.lowercase()}, скрипт: ${op.shell.name.lowercase()}, " +
-            "сеть была ${op.net.wire()}"
-        return "Сейчас на устройстве: $shown$opLine"
+        return "Сейчас на устройстве: $shown"
     }
 
     private fun addText(title: String, body: String) {

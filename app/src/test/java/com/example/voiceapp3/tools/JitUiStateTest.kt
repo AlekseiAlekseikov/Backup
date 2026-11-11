@@ -7,72 +7,63 @@ import org.junit.Test
 import java.io.File
 
 /**
- * Что видит водитель: тумблер JIT и строка факта (REVIEW 3-го захода, п.5).
+ * Что видит водитель.
  *
- * Правило одно: `on`/`off` — только по подтверждённому факту, иначе `unknown`. Ложное «выключено»
- * (из preference или из «ещё не читали») запрещено. Новых кнопок нет — это проверяется по коду.
+ * Референс (`w0/bb` → `w0/r7`) ставит тумблер по `getprop`: `trim()=="true"` → включён, любая
+ * другая строка → выключен. Мы делаем то же для подтверждённых значений, но **нечитаемое
+ * значение показываем как «состояние неизвестно»**, а не как «выключено» (требование владельца,
+ * отличие описано в отчёте §3). Новых кнопок и тумблеров нет — проверяется по исходнику.
  */
 class JitUiStateTest {
 
-    private val id = "7b2c4d5e-6f70-4a8b-9c1d-2e3f4a5b6c7d"
-
-    private fun fact(v: JitRef.Prop) = JitRef.PropFact(v, if (v == JitRef.Prop.TRUE) "true" else "false", 0, "ok")
-
-    private fun op(phase: JitRef.Phase, want: Boolean) =
-        JitRef.Op(phase, want, JitRef.Net(true, false), id, 5L)
+    private fun fact(v: JitRef.Prop, raw: String = "") =
+        JitRef.PropFact(v, raw.ifEmpty { v.name.lowercase() }, 0, "ok")
 
     @Test
     fun onOnlyWhenRuntimeIsTrue() {
-        assertEquals("on", JitRef.confirmedState(fact(JitRef.Prop.TRUE), null))
-        assertEquals("on", JitRef.confirmedState(fact(JitRef.Prop.TRUE), op(JitRef.Phase.DONE, false)))
+        assertEquals("on", JitRef.confirmedState(fact(JitRef.Prop.TRUE, "true")))
     }
 
     @Test
-    fun offOnlyWithProvenOperation() {
-        assertEquals("выключено — только факт: прочитано false И завершённая операция want=false",
-            "off", JitRef.confirmedState(fact(JitRef.Prop.FALSE), op(JitRef.Phase.DONE, false)))
-        assertEquals("операция не завершена ⇒ unknown",
-            "unknown", JitRef.confirmedState(fact(JitRef.Prop.FALSE), op(JitRef.Phase.SENT, false)))
-        assertEquals("операция была на включение ⇒ unknown",
-            "unknown", JitRef.confirmedState(fact(JitRef.Prop.FALSE), op(JitRef.Phase.DONE, true)))
+    fun offOnlyWhenRuntimeIsFalse() {
+        assertEquals("off", JitRef.confirmedState(fact(JitRef.Prop.FALSE, "false")))
     }
 
     @Test
     fun unknownIsShownHonestly() {
-        assertEquals("ещё не читали", "unknown", JitRef.confirmedState(null, null))
+        assertEquals("ещё не читали", "unknown", JitRef.confirmedState(null))
         assertEquals("транспорт не ответил", "unknown",
-            JitRef.confirmedState(JitRef.PropFact(JitRef.Prop.UNKNOWN, "", 137, "rc_nonzero"), null))
+            JitRef.confirmedState(JitRef.PropFact(JitRef.Prop.UNKNOWN, "", 137, "rc_nonzero")))
+        assertEquals("пустой вывод", "unknown",
+            JitRef.confirmedState(JitRef.PropFact(JitRef.Prop.UNKNOWN, "", 0, "empty")))
+    }
+
+    @Test
+    fun preferenceDoesNotDriveTheToggle() {
+        // Значение тумблера выводится ТОЛЬКО из факта: функция не принимает ни префы, ни операцию.
+        assertEquals("unknown", JitRef.confirmedState(null))
+        val store = JitFake.Store()
+        store.values[JitRef.KEY_AUTO] = true
+        assertEquals("preference сама по себе ничего не доказывает", "unknown",
+            JitRef.confirmedState(null))
     }
 
     @Test
     fun panelHasNoNewButtonsAndUpdatesWidget() {
         fun code(rel: String): String =
-            listOf(File(rel), File("app/$rel")).first { it.isFile }.readLines()
-                .filterNot {
-                    val t = it.trim()
-                    t.startsWith("*") || t.startsWith("//") || t.startsWith("/*")
-                }.joinToString("\n")
+            listOf(File(rel), File("app/$rel")).first { it.isFile }.readText()
+
         val panel = code("src/main/java/com/example/voiceapp3/ui/ToolsPanel.kt")
-        // строка факта — это TextView, а не кнопка; тумблер JIT по-прежнему один
         assertTrue(panel.contains("private fun addJitRuntimeLine()"))
         assertTrue("после ответа текст обновляется", panel.contains("view.text = jitRuntimeLineText(fresh)"))
-        assertFalse("никаких новых кнопок для JIT", panel.contains("addButton(\"JIT") || panel.contains("Button(activity).apply { text = \"JIT"))
-        // в тумблере состояние берётся из подтверждённого факта
-        assertTrue(panel.contains("strState(\"perfJitConfirmed\")"))
         assertTrue("unknown показывается словами", panel.contains("состояние неизвестно"))
-        // backend отдаёт подтверждённое состояние отдельным полем
+        assertTrue("состояние тумблера — из подтверждённого факта",
+            panel.contains("strState(\"perfJitConfirmed\")"))
+        assertFalse("никаких новых кнопок для JIT",
+            panel.contains("addButton(\"JIT") || panel.contains("Button(activity).apply { text = \"JIT"))
+
         val backend = code("src/main/java/com/example/voiceapp3/tools/ToolsBackend.kt")
         assertTrue(backend.contains("addProperty(\"perfJitConfirmed\""))
         assertTrue(backend.contains("addProperty(\"perfJitRuntime\""))
-    }
-
-    @Test
-    fun refreshCallbackIsCalledOnce() {
-        // Логика «обновить виджет после чтения» проверяется на уровне адаптера: колбэк вызывается
-        // ровно один раз и с тем значением, которое прочитано (см. AppPerformance.refreshJitRuntimeAsync).
-        var calls = 0
-        val cb: (JitRef.PropFact) -> Unit = { calls++ }
-        cb(fact(JitRef.Prop.TRUE))
-        assertEquals(1, calls)
     }
 }

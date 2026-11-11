@@ -18,10 +18,10 @@ class JitRulesReadOnlyTest {
 
     @Test
     fun codeOnlyCountsRules() {
-        val c = code("src/main/java/com/example/voiceapp3/tools/JitNet.kt")
-        assertTrue(c.contains("grep -c 'oif wlan0'"))
+        val c = code("src/main/java/com/example/voiceapp3/tools/JitNetCore.kt")
+        assertTrue("правило только считается", c.contains("grep -c 'oif wlan0'"))
         for (bad in listOf("ip rule del", "ip rule flush", "ndc ", "settings put", "setenforce", "route add")) {
-            assertFalse("JitNet не содержит «$bad»", c.contains(bad))
+            assertFalse("JitNetCore не содержит «$bad»", c.contains(bad))
         }
     }
 
