@@ -5,9 +5,11 @@ import java.io.File
 /**
  * Изолированный стенд: настоящий `/bin/sh` + подставные команды устройства.
  *
- * Нужен, чтобы исполнять РЕАЛЬНЫЙ текст цепочки (`JitRef.chainScript`) без ГУ. Каждая подставная
- * команда пишет свой вызов в `calls.log`, поэтому проверяется фактический порядок, а не совпадение
- * строк в исходнике. `grep` подменяет только путь `/proc/mounts` — шаблон остаётся из референса.
+ * Нужен, чтобы исполнять РЕАЛЬНЫЙ текст цепочки (`JitRef.chainScript`) локально. Каждая подставная
+ * команда пишет свой вызов в `calls.log`, поэтому проверяется фактический порядок, а не «похожесть»
+ * исходника. `grep` подменяет только путь `/proc/mounts` — сам шаблон остаётся из референса.
+ *
+ * На ГУ этот стенд не запускается: здесь нет её `/proc/mounts`, её WifiManager и её zygote.
  */
 class JitIsoStand(rules: Int = 0) {
 
@@ -69,7 +71,7 @@ class JitIsoStand(rules: Int = 0) {
     fun callsText(): String = callsFile.readText()
     fun resetCalls() = callsFile.writeText("")
 
-    /** Исполнить скрипт подставным окружением. */
+    /** Исполнить скрипт подставным окружением; [getprop] — ответ подставного `getprop`. */
     fun exec(script: String, getprop: String = "true"): Pair<Int, String> {
         val f = File(dir, "chain.sh")
         f.writeText(script)

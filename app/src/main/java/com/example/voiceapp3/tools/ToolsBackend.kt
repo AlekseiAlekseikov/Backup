@@ -183,7 +183,18 @@ enum class Choice(
         addProperty("windowOppositeOnDoor", WindowDoors.isWindowOppositeOnDoor(appContext))
         addProperty("ttl65", NetworkTtl.isTtl65Active(appContext))
         addProperty("perfVideo", AppPerformance.isVideo60FpsEnabled(appContext))
+        /* iter33p-review2 §0.1(3): `perfJit` — это ЗАПРОШЕННОЕ состояние (preference тумблера),
+           а не подтверждение применения. Факт читается отдельно и честно: on / off / unknown. */
         addProperty("perfJit", AppPerformance.isAutoOptimizeEnabled(appContext))
+        val jitFact = AppPerformance.jitRuntimeFactCached()
+        addProperty("perfJitRuntime", when (jitFact?.value) {
+            JitRef.Prop.TRUE -> "true"
+            JitRef.Prop.FALSE -> "false"
+            null -> "unknown"
+            JitRef.Prop.UNKNOWN -> "unknown"
+        })
+        addProperty("perfJitRuntimeRaw", jitFact?.raw ?: "")
+        addProperty("perfJitRuntimeReason", jitFact?.reason ?: "not_read_yet")
         addProperty("unlockSound", LockSound.isUnlockSoundEnabled(appContext))
         addProperty("unlockSoundPath", LockSound.getUnlockSelectedPath(appContext))
         add("keepAliveApps", AppPerformance.getKeepAliveAppsJson(appContext))

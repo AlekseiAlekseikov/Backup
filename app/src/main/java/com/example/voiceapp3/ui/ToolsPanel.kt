@@ -28,6 +28,8 @@ import android.widget.TextView
 import android.widget.Toast
 import com.example.voiceapp3.R
 import com.example.voiceapp3.nav.NavTheme
+import com.example.voiceapp3.tools.AppPerformance
+import com.example.voiceapp3.tools.JitRef
 import com.google.gson.JsonArray
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
@@ -618,6 +620,9 @@ class ToolsPanel(
         addToggle("perfVideo", "Оптимизация видео (1080p 60fps)", "desc.perfVideo", def = false)
         addDiv()
         addToggle("perfJit", "Учиться и оптимизировать самостоятельно (JIT)", "desc.perfJit", def = false)
+        // iter33p-review2 §0.1(3): факт отдельно от запроса. Тумблер показывает намерение,
+        // эта строка — что реально отвечает `getprop dalvik.vm.usejit` (или `unknown`).
+        addJitRuntimeLine()
         addDiv()
         // Как в JS: длина списка либо 4 (если список пуст)
         val keepCount = state.get("keepAliveApps")?.takeIf { it.isJsonArray }?.asJsonArray?.size()
@@ -1115,6 +1120,27 @@ class ToolsPanel(
             setPadding(0, dp(6f), 0, 0)
         }, matchWrap())
         return box
+    }
+
+    /** Read-only строка фактического состояния JIT (не кнопка, не тумблер). */
+    private fun addJitRuntimeLine() {
+        // Только кэш: shell из UI-потока не вызываем, факт обновляется в фоне.
+        val fact = runCatching { AppPerformance.jitRuntimeFactCached() }.getOrNull()
+        runCatching { AppPerformance.refreshJitRuntimeAsync(activity) }
+        val shown = when (fact?.value) {
+            JitRef.Prop.TRUE -> "включён (getprop dalvik.vm.usejit = true)"
+            JitRef.Prop.FALSE -> "выключен (getprop dalvik.vm.usejit = false)"
+            null -> "ещё не прочитано — значение появится после фоновой проверки"
+            JitRef.Prop.UNKNOWN -> "неизвестно (getprop не прочитан: ${fact.reason})"
+        }
+        val op = runCatching { AppPerformance.readJitOp(activity) }.getOrNull()
+        val opLine = if (op == null) "" else " · операция: ${op.phase.name.lowercase()}, сеть была ${op.net.wire()}"
+        val box = LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(2f), 0, dp(2f), dp(8f))
+        }
+        box.addView(text("Сейчас на устройстве: $shown$opLine", 11.5f, palette.muted, bold = false))
+        page.addView(box, matchWrap())
     }
 
     private fun addText(title: String, body: String) {

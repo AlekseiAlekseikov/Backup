@@ -1,18 +1,18 @@
 package com.example.voiceapp3.tools
 
 import android.content.Context
+import android.content.SharedPreferences
 import android.net.wifi.WifiConfiguration
 import android.net.wifi.WifiManager
 
 /**
- * Android-адаптеры для ядра операции [JitOp]. Здесь нет ни одного решения: только чтение
- * состояния, запуск скрипта через [AdbClient] и запрос сети. Вся последовательность — в [JitRef]
- * и [JitOp] (без `android.*`, покрыта JVM-тестами `JitRefTest`, `JitChainScriptTest`,
- * `JitChainEndToEndTest`).
+ * Android-адаптеры для ядра [JitOp]. Решений здесь нет: только чтение состояния, запись префов с
+ * проверкой результата, запуск скрипта и запрос сети.
  *
  * Границы (мандат §1.2): сетевые команды — только в клике JIT и в продолжении этой же операции;
  * `ip rule` только читается; `ctl.restart zygote` — единственная команда рестарта; никаких
- * persist-свойств JIT, `kill`/`pkill`, `ip rule del`, `settings`, `umount` по умолчанию.
+ * persist-свойств JIT, `kill`/`pkill`, `ip rule del`, `flush`, `route`, `settings`,
+ * `umount` по умолчанию (`JitRef.MOUNT_STEP_ENABLED=false`).
  */
 object JitNet {
 
@@ -21,50 +21,105 @@ object JitNet {
     internal const val KEY_PEDIDO = JitRef.KEY_PEDIDO
     internal const val KEY_AUTO = JitRef.KEY_AUTO
     internal const val KEY_RESTORE = JitRef.KEY_RESTORE
-    internal const val KEY_RESTORE_BOOT = JitRef.KEY_RESTORE_BOOT
-    internal const val KEY_RESTORE_TS = JitRef.KEY_RESTORE_TS
+    internal const val KEY_OP = JitRef.KEY_OP
     internal const val PROP_USEJIT = JitRef.PROP_USEJIT
     internal const val DRAIN_MAX_S = JitRef.DRAIN_MAX_S
     internal const val RESTORE_DELAY_MS = JitRef.RESTORE_DELAY_MS
     internal const val CHAIN_TIMEOUT_MS = JitRef.CHAIN_TIMEOUT_MS
+    internal const val MOUNT_STEP_ENABLED = JitRef.MOUNT_STEP_ENABLED
 
-    fun chainScript(want: Boolean, mountStep: Boolean = JitRef.MOUNT_STEP_ENABLED): String =
-        JitRef.chainScript(want, mountStep)
-
-    fun parseRestore(raw: String?): JitRef.Net? = JitRef.parseRestore(raw)
-
-    fun verify(pedido: Boolean, getprop: String, cache: Boolean?): JitRef.Verify =
-        JitRef.verify(pedido, getprop, cache)
-
-    /** Лог операции — одной функцией, чтобы строки шли и в файл, и в logcat. */
     private val log: (String) -> Unit = { AppLog.i(TAG, it) }
 
-    // ─────────────────────────── Android-реализации швов ───────────────────────────
+    // ─────────────────────────── shell ───────────────────────────
 
     private object AndroidShell : JitShell {
         override fun exec(command: String, timeoutMs: Int): Pair<Int, String> = runCatching {
             AdbClient.execute(command, timeoutMs)
-        }.getOrDefault(Pair(1, "ERR_EXCEPTION"))
+        }.getOrElse { t -> Pair(1, "ERR_EXCEPTION:${t.javaClass.simpleName}") }
 
         override fun cacheVisible(): Boolean? = runCatching {
             java.io.File("/proc/self/maps").useLines { l -> l.any { it.contains("dalvik-jit-code-cache") } }
         }.getOrNull()
     }
 
+    internal object AndroidWaiter : JitWaiter {
+        override fun sleep(ms: Long) { runCatching { Thread.sleep(ms) } }
+        override fun nowMs(): Long = System.currentTimeMillis()
+    }
+
+    /**
+     * Хранилище операции поверх CPS+DPS.
+     *
+     * `Prefs2` писать результат `commit()` наружу не умеет и глотает ошибки, поэтому здесь свои
+     * два `commit()` с проверкой и обратным чтением. Общая семантика `Prefs2` для остальных
+     * функций НЕ меняется (REVIEW §0.1(5)).
+     */
     internal class AndroidStore(private val app: Context) : JitStore {
-        override fun get(key: String): String? = Prefs2.getString(app, key)
-        override fun put(key: String, value: String?): Boolean {
-            Prefs2.putString(app, key, value)
-            return Prefs2.getString(app, key) == value
+
+        private fun cps(): SharedPreferences? = runCatching { Prefs2.cps(app) }.getOrNull()
+        private fun dps(): SharedPreferences? = runCatching { Prefs2.dps(app) }.getOrNull()
+
+        override fun getString(key: String): String? {
+            val c = runCatching { cps()?.getString(key, null) }.getOrNull()
+            val d = runCatching { dps()?.getString(key, null) }.getOrNull()
+            return c ?: d
         }
-        override fun getBool(key: String, def: Boolean): Boolean = Prefs2.getBoolean(app, key, def)
-        override fun putBool(key: String, value: Boolean): Boolean {
-            Prefs2.putBoolean(app, key, value)
-            return Prefs2.getBoolean(app, key, !value) == value
+
+        /**
+         * Запись ОДНОГО ключа в оба хранилища + подтверждение чтением.
+         *
+         * Подтверждено = хотя бы одна запись вернула `commit()==true`, И чтение обратно (та же
+         * логика приоритета, что в `Prefs2.getString`) дало ровно записанное значение.
+         * Для `null` подтверждаем «ключа больше нет ни в одном хранилище».
+         */
+        override fun putStringConfirmed(key: String, value: String?): Boolean {
+            var cpsOk = false
+            var dpsOk = false
+            runCatching {
+                cps()?.let { p ->
+                    val ed = p.edit()
+                    if (value == null) ed.remove(key) else ed.putString(key, value)
+                    cpsOk = ed.commit()
+                }
+            }
+            runCatching {
+                dps()?.let { p ->
+                    val ed = p.edit()
+                    if (value == null) ed.remove(key) else ed.putString(key, value)
+                    dpsOk = ed.commit()
+                }
+            }
+            val back = getString(key)
+            val ok = (cpsOk || dpsOk) && back == value
+            AppLog.i(TAG, "JIT_STORE put key=$key confirmed=$ok cps=$cpsOk dps=$dpsOk " +
+                "back=${if (back == null) "null" else "len${back.length}"}")
+            return ok
+        }
+
+        override fun getBool(key: String): Boolean? {
+            val c = runCatching { cps()?.getBoolean(key, false) }.getOrNull()
+            val d = runCatching { dps()?.getBoolean(key, false) }.getOrNull()
+            val hasC = runCatching { cps()?.contains(key) }.getOrNull() == true
+            val hasD = runCatching { dps()?.contains(key) }.getOrNull() == true
+            if (!hasC && !hasD) return null
+            return (c == true) || (d == true)
+        }
+
+        override fun putBoolConfirmed(key: String, value: Boolean): Boolean {
+            var cpsOk = false
+            var dpsOk = false
+            runCatching { cps()?.let { cpsOk = it.edit().putBoolean(key, value).commit() } }
+            runCatching { dps()?.let { dpsOk = it.edit().putBoolean(key, value).commit() } }
+            val back = getBool(key)
+            val ok = (cpsOk || dpsOk) && back == value
+            AppLog.i(TAG, "JIT_STORE put key=$key(bool=$value) confirmed=$ok cps=$cpsOk dps=$dpsOk")
+            return ok
         }
     }
 
+    /** Реальное состояние сети. */
     internal class AndroidNetState(private val app: Context) : JitNetState {
+
         private fun wm(): WifiManager? = runCatching {
             app.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
         }.getOrNull()
@@ -76,27 +131,36 @@ object JitNet {
             ni.isUp && ni.inetAddresses.hasMoreElements()
         }.getOrNull()
 
-        override fun setWifi(on: Boolean): Boolean {
-            val w = wm() ?: return false
-            return runCatching { w.isWifiEnabled = on }.isSuccess
+        /**
+         * Запрос включения/выключения Wi-Fi. Как в референсе (`w0/e2`), результат запроса не
+         * считается состоянием: фактическое состояние потом читается отдельно.
+         */
+        @Suppress("DEPRECATION")
+        override fun setWifi(on: Boolean): Pair<Boolean, String> {
+            val w = wm() ?: return Pair(false, "wifi_manager_absent")
+            return runCatching { Pair(w.setWifiEnabled(on), "request_sent") }
+                .getOrElse { t -> Pair(false, "throw:${t.javaClass.simpleName}") }
         }
 
-        override fun startAp(): Boolean {
-            val w = wm() ?: return false
+        /** Как `U`/`d`: рефлексия `startSoftAp(WifiConfiguration)`, аргумент `null`. */
+        override fun startAp(): Pair<Boolean, String> {
+            val w = wm() ?: return Pair(false, "wifi_manager_absent")
             return runCatching {
-                w.javaClass.getMethod("startSoftAp", WifiConfiguration::class.java).invoke(w, null)
-            }.isSuccess
+                val m = w.javaClass.getDeclaredMethod("startSoftAp", WifiConfiguration::class.java)
+                m.isAccessible = true
+                m.invoke(w, null)
+                Pair(true, "reflection_invoked")
+            }.getOrElse { t -> Pair(false, "throw:${t.javaClass.simpleName}") }
         }
     }
 
     // ─────────────────────────── чтение состояния (read-only) ───────────────────────────
 
-    fun read(app: Context, key: String): String? = AndroidStore(app).get(key)
-    fun readBool(app: Context, key: String, def: Boolean = false): Boolean =
-        AndroidStore(app).getBool(key, def)
+    fun read(app: Context, key: String): String? = AndroidStore(app).getString(key)
+    fun readBool(app: Context, key: String): Boolean? = AndroidStore(app).getBool(key)
 
-    fun usejitNow(@Suppress("UNUSED_PARAMETER") app: Context): String =
-        AndroidShell.exec("getprop $PROP_USEJIT", 6_000).second.trim()
+    /** Факт `getprop dalvik.vm.usejit` с rc и причиной (для UI и логов). */
+    fun usejitFact(app: Context): JitRef.PropFact = JitOp.readProp(AndroidShell)
 
     fun codeCacheVisible(): Boolean? = AndroidShell.cacheVisible()
 
@@ -115,7 +179,7 @@ object JitNet {
         return out.trim().toIntOrNull() ?: -1
     }
 
-    // ─────────────────────────── операция (делегируется в [JitOp]) ───────────────────────────
+    // ─────────────────────────── операция ───────────────────────────
 
     fun click(app: Context, want: Boolean, bootTag: String, nowMs: Long): JitOp.Click {
         BgWorker.assertNotMain("JitNet.click")
@@ -130,56 +194,30 @@ object JitNet {
             log = log
         )
         log("JIT_CLICK result=${res.result.name.lowercase()} want=$want boot=$bootTag " +
-            "net=${res.net?.log() ?: "unknown"} rc=${res.run?.exitCode ?: -1} " +
+            "op=${res.op?.log() ?: "none"} rc=${res.run?.exitCode ?: -1} " +
             "outcome=${res.run?.let { JitRef.chainOutcomeLabel(it.outcome) } ?: "none"} " +
             "mount_step=${if (res.mountStep) "on" else "off"} (рестарт фреймворка не заявляем)")
         return res
     }
 
-    fun runChain(app: Context, want: Boolean, mountStep: Boolean = JitRef.MOUNT_STEP_ENABLED): JitOp.ChainRun {
-        BgWorker.assertNotMain("JitNet.runChain")
-        val script = JitRef.chainScript(want, mountStep)
-        log("JIT_CHAIN_SENT want=$want bytes=${script.toByteArray(Charsets.UTF_8).size} " +
-            "timeout_ms=$CHAIN_TIMEOUT_MS mount_step=${if (mountStep) "on" else "off"}")
-        val run = AndroidShell.exec(script, CHAIN_TIMEOUT_MS).let { JitOp.ChainRun(it.first, it.second) }
-        log("JIT_CHAIN_RETURN rc=${run.exitCode} outcome=${JitRef.chainOutcomeLabel(run.outcome)} " +
-            "out=\"${run.output.replace('\n', ' ').trim().take(200)}\" restart=unknown " +
-            "(ответ транспорта сам по себе не доказывает ни рестарт, ни его отсутствие)")
-        return run
-    }
-
-    fun restoreNetwork(app: Context, net: JitRef.Net, reason: String): Boolean {
-        BgWorker.assertNotMain("JitNet.restoreNetwork")
-        val ok = JitOp.restoreNetwork(AndroidNetState(app), net, reason, log)
-        log("JIT_NET_RESTORE link=${linkUp(app)} oif_wlan0_rules=${oifWlan0Rules(app)} " +
-            "confirmed=$ok (правила только читаем; подтверждено состояние, а не наличие интернета)")
-        return ok
-    }
-
-    fun continueAfterBoot(app: Context, bootTag: String): JitOp.RestoreResult {
-        BgWorker.assertNotMain("JitNet.continueAfterBoot")
-        return JitOp.continueAfterBoot(
+    fun onProcessStart(app: Context, bootTag: String): JitOp.StartOutcome {
+        BgWorker.assertNotMain("JitNet.onProcessStart")
+        val out = JitOp.onProcessStart(
             store = AndroidStore(app),
             netState = AndroidNetState(app),
+            shell = AndroidShell,
             bootTag = bootTag,
-            sleep = { ms -> runCatching { Thread.sleep(ms) } },
+            waiter = AndroidWaiter,
             log = log
         )
+        log("JIT_START_RESULT decision=${out.decision.name.lowercase()} " +
+            "restore=${out.restore?.summary ?: "none"} verify=${out.verify?.verdict?.let { JitRef.verifyLabel(it) } ?: "none"} " +
+            "link=${linkUp(app)} oif_wlan0_rules=${oifWlan0Rules(app)} (правила только читаем)")
+        return out
     }
 
-    fun verifyApplied(app: Context, wantFallback: Boolean): JitOp.VerifyState {
+    fun verifyApplied(app: Context, wantFallback: Boolean?): JitOp.VerifyState {
         BgWorker.assertNotMain("JitNet.verifyApplied")
-        return JitOp.verifyApplied(AndroidStore(app), AndroidShell, wantFallback, log)
-    }
-
-    fun clearPedido(app: Context) {
-        AndroidStore(app).put(KEY_PEDIDO, null)
-    }
-
-    fun clearRestore(app: Context) {
-        val st = AndroidStore(app)
-        st.put(KEY_RESTORE, null)
-        st.put(KEY_RESTORE_BOOT, null)
-        st.put(KEY_RESTORE_TS, null)
+        return JitOp.verifyApplied(AndroidStore(app), AndroidShell, wantFallback, true, log)
     }
 }
