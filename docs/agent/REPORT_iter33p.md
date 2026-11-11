@@ -33,30 +33,36 @@
 | CI по handoff правки 1 | run **`42956152521`**, job **`130311632733`** — **SUCCESS**, `BUILD SUCCESSFUL in 2m 57s`, **186 PASSED / 0 FAILED**, artifact `13827676157` |
 | база правки 2 | **`6436be8`** (было в CI: run `42957218012`, job `130315052654`, **186 / 0**) |
 | **код правки 2** | **`61bfddd`** (`61bfddd0c55352156c34a55706c2811ae07e9634`) — только JIT-файлы, UI-строка и тесты |
-| **CI по коду правки 2** | заполняется в handoff-коммите ниже (прогон идёт по последнему push) |
-| локальный прогон @ `61bfddd` | **`OK (95 tests)`** — JIT/лог-подмножество на стабах и настоящем `/bin/sh` (§7) |
+| handoff правки 2 | `25ff688` — только `docs/agent/**` + `app/buildinfo.properties` |
+| **правка компиляции** | **`1d64e54`** — в `ToolsPanel.addOneShot` осталась ссылка на локальную `jitConfirmed` (лишняя вставка при патче): CI `42960987191` по `25ff688` упал на `:app:compileDebugKotlin`, `e: ToolsPanel.kt:923:49 Unresolved reference 'jitConfirmed'`. Строка убрана, поведение не менялось |
+| **CI по коду правки 2** | run **`42962463984`**, job **`130331961735`** (SHA `1d64e54`) — **SUCCESS**, `BUILD SUCCESSFUL in 3m 5s` |
+| тесты в CI | **210 PASSED / 0 FAILED** (`grep -c 'Z .* PASSED$'` = 210, `FAILED$` = 0 по полному логу джобы); из них JIT/лог — те же 95, что локально (§0.1) |
+| artifact | `app-debug`, id `13829668249`, 177 178 359 Б |
+| `SOURCE_SHA` | **`1d64e54`** — последний коммит кода, прошедший CI (§0.3) |
+| локальный прогон | **`OK (95 tests)`** @ `61bfddd`/`1d64e54` — JIT/лог-подмножество на стабах и настоящем `/bin/sh` (§7) |
 
 `SKIPPED` в логе — только Gradle-задачи (`checkKotlinGradlePluginConfigurationErrors`,
 `kspDebugUnitTestKotlin`), ни одного пропущенного теста.
 
 ### 0.1 Разбивка JIT-тестов в CI (из полного лога той же джобы)
 
-| класс | локально (правка 2) | было (правка 1) | что нового |
-|---|---|---|---|
-| `JitOrchestratorTest` | **23** | 20 | `lostChainNeverRestoresEvenWhenNetworkIsDown`, `bothRadiosOffWaitsForProvenCompletion`, `bothRadiosOffWithRepliedChainIsDoneAndNextClickAllowed` |
-| `JitRefTest` | **14** | 13 | `startDecisionRequiresProvenShellCompletion`, `shellFieldRoundTripsAndOldSnapshotIsUnknown` |
-| `JitLifecycleTest` | **7** | — | барьеры на каждом шаге цепочки (см. §4) |
-| `JitStoreConsistencyTest` | **8** | — | CPS/DPS: `commit=false`, расхождение, приоритет, одно/оба хранилища, удаление ключа |
-| `JitUiStateTest` | **5** | — | тумблер = подтверждённый факт, новых кнопок нет |
-| `JitChainScriptTest` | 8 | 8 | без изменений |
-| `JitStartZeroWritesTest` | 5 | 5 | без изменений |
-| `JitLogsCancelTest` | 5 | 5 | `restoreOnlyTurnsNetworkOn` переписан на `runInline=1`; `HOLD` убран из чёрного списка |
-| `AvasIndependenceTest` | 5 | 5 | без изменений |
-| `JitBootBoundaryTest` | 4 | 4 | без изменений |
-| `JitNoPersistTest` | 3 | 3 | без изменений |
-| `JitRulesReadOnlyTest` | 2 | 2 | без изменений |
-| `LogFilesTest` (§9, лог по датам) | 6 | 6 | без изменений |
-| **итого** | **95** | **71** | +24 |
+| класс | в CI правки 2 | локально | было (правка 1) | что нового |
+|---|---|---|---|---|
+| `JitOrchestratorTest` | **23** | 23 | 20 | `lostChainNeverRestoresEvenWhenNetworkIsDown`, `bothRadiosOffWaitsForProvenCompletion`, `bothRadiosOffWithRepliedChainIsDoneAndNextClickAllowed` |
+| `JitRefTest` | **14** | 14 | 13 | `startDecisionRequiresProvenShellCompletion`, `shellFieldRoundTripsAndOldSnapshotIsUnknown` |
+| `JitLifecycleTest` | **7** | 7 | — | барьеры на каждом шаге цепочки (см. §4) |
+| `JitStoreConsistencyTest` | **8** | 8 | — | CPS/DPS: `commit=false`, расхождение, приоритет, одно/оба хранилища, удаление ключа |
+| `JitUiStateTest` | **5** | 5 | — | тумблер = подтверждённый факт, новых кнопок нет |
+| `JitChainScriptTest` | 8 | 8 | 8 | без изменений |
+| `JitStartZeroWritesTest` | 5 | 5 | 5 | без изменений |
+| `JitLogsCancelTest` | 5 | 5 | 5 | `restoreOnlyTurnsNetworkOn` переписан на `runInline=1`; `HOLD` убран из чёрного списка |
+| `AvasIndependenceTest` | 5 | 5 | 5 | без изменений |
+| `JitBootBoundaryTest` | 4 | 4 | 4 | без изменений |
+| `JitNoPersistTest` | 3 | 3 | 3 | без изменений |
+| `JitRulesReadOnlyTest` | 2 | 2 | 2 | без изменений |
+| `LogFilesTest` (§9, лог по датам) | 6 | 6 | 6 | без изменений |
+| **итого JIT/лог** | **95** | **95** | 71 | +24 |
+| **весь набор в CI** | **210** | — | 186 | +24 |
 
 Полный набор проекта (Android-модуль) исполняется только в CI — локально нет Android SDK.
 Поэтому здесь и далее «95» — это JIT/лог-подмножество, а не весь набор: цифры CI по коду
@@ -78,10 +84,11 @@
 
 ### 0.3 `SOURCE_SHA`
 
-`app/buildinfo.properties`: `SOURCE_SHA=e8f5e23` → **`aed18fb`** в handoff-коммите. `git rev-parse`
-в сборке не используется — сборка читает файл-маркер (владелец собирает в Android Studio).
+`app/buildinfo.properties` → `SOURCE_SHA=1d64e54` — последний коммит КОДА, прошедший CI
+(`42962463984`, 210/0). `git rev-parse` в сборке не используется: значение читает
+`app/build.gradle.kts` и кладёт в `BuildConfig.GIT_COMMIT`. Коммит `61bfddd` — та же логика,
+`1d64e54` отличается только удалением одной ошибочной строки в `ToolsPanel.addOneShot`.
 
-### 0.4 Замечания REVIEW → что сделано (по одному)
 ### 0.4 История: замечания REVIEW к `78a3248` (правка 1, `aed18fb`)
 
 > Номера строк в таблице ниже относятся к `aed18fb`. В `61bfddd` часть кода переписана —

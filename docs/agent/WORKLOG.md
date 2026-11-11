@@ -907,9 +907,13 @@ id `13826483630`, 177 171 113 Б.
 монтирования, чистка остатков `persist.*` JIT, остаточный `avas_snapshot`, `ACTION_BOOT_HU`.
 ## iter33p (1.0.61) — ТРЕТИЙ ЗАХОД, ПРАВКА 2: 10 проблем §0.0 мандата, код `61bfddd`
 
-**База:** `6436be8`. **Код:** `61bfddd` (`61bfddd0c55352156c34a55706c2811ae07e9634`, `fix/v2`,
-fast-forward, без `--force`). **CI:** заполняется этим handoff-коммитом (прогон по последнему
-push — см. отчёт §0). **Локально:** `OK (95 tests)` — JIT/лог-подмножество на стабах и настоящем
+**База:** `6436be8`. **Код:** `61bfddd` (`61bfddd0c55352156c34a55706c2811ae07e9634`) + `1d64e54`
+(правка компиляции одной строки в `ToolsPanel.addOneShot`), `fix/v2`, fast-forward, без `--force`.
+**CI:** run `42962463984`, job `130331961735` — `BUILD SUCCESSFUL in 3m 5s`, **210 PASSED / 0 FAILED**
+(`grep -c 'Z .* PASSED$'` = 210, `FAILED$` = 0), artifact `app-debug` id `13829668249`, 177 178 359 Б.
+Промежуточный прогон `42960987191` по `25ff688` упал на `:app:compileDebugKotlin`
+(`ToolsPanel.kt:923 Unresolved reference 'jitConfirmed'` — лишняя вставка при патче, убрана).
+**Локально:** `OK (95 tests)` — JIT/лог-подмножество на стабах и настоящем
 `/bin/sh` (`/home/user/runtests.sh`), это НЕ полный набор CI.
 
 **Причина правки.** В `aed18fb` признаком завершения нашего скрипта оставалось выключенное
@@ -936,7 +940,7 @@ CPS/DPS), +`JitUiStateTest` (5), +`JitLifecycleShell`; переписаны `Jit
 переходит в рабочую копию (`cd $W`) и компилирует `JitNet.kt` + стабы, иначе source-тесты падали
 на чужом cwd.
 
-**SOURCE_SHA** в handoff-коммите: `6436be8` → `61bfddd` (`app/buildinfo.properties`).
+**SOURCE_SHA** в handoff-коммите: `6436be8` → `1d64e54` (последний коммит кода) (`app/buildinfo.properties`).
 
 **Открыто:** решение владельца по шагу монтирований (в §3.2 отчёта даны четыре read-only команды:
 mountinfo root-транспорта + сравнение namespace с PID 1; `cat /proc/mounts` сам по себе ничего не
