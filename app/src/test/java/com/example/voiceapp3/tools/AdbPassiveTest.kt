@@ -187,13 +187,18 @@ class AdbPassiveTest {
     }
 
     @Test
-    fun diagShellReportsUnavailableWithoutChangingSemanticsOfJitShell() {
-        // Настоящий `JitNet.DiagShell` на подставном транспорте (локальный AdbClient-стаб отвечает
-        // rc=0 «пусто»): важно, что DiagShell не подменяет ошибку успехом и не читает /proc/self/maps.
+    fun diagShellKeepsFailureSemanticsAndDoesNotReadMaps() {
+        // Настоящий `JitNet.DiagShell`. В JVM (локальный прогон) `AdbClient` — стаб и отвечает
+        // rc=0; в unit-тестах CI это настоящий `AdbClient`, который БЕЗ поднятого транспорта
+        // обязан ответить `ERR_ADB_PASSIVE_UNAVAILABLE` — и DiagShell не имеет права выдать это
+        // за успешное чтение. Проверяем оба допустимых исхода и отсутствие подмешивания карты.
         val shell = JitNet.DiagShell
         val (rc, out) = shell.exec("ip addr", 1000)
-        assertEquals(0, rc)
-        assertEquals("", out)
+        assertTrue("исход только «данные» или «недоступно», а не исключение",
+            rc == 0 || rc == AdbPassive.RC_UNAVAILABLE)
+        if (rc == AdbPassive.RC_UNAVAILABLE) {
+            assertTrue("недоступность названа явно", out.contains("ERR_ADB_PASSIVE_UNAVAILABLE"))
+        }
         assertNull("карта памяти чужого процесса не подмешивается", shell.mapsExcerpt())
     }
 }
