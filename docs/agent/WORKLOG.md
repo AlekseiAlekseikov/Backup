@@ -955,3 +955,48 @@ mountinfo root-транспорта + сравнение namespace с PID 1; `ca
 доказывает), остатки `persist.*` JIT, остаточный `avas_snapshot`, `ACTION_BOOT_HU`, полевой прогон
 (не запускался, полевого успеха нет).
 
+
+## iter34 (1.0.61) — JIT переписан как копия референса, свои механизмы удалены
+
+Мандат: «ПРОМПТ_ТОЧНАЯ_КОПИЯ_JIT_РЕФЕРЕНСА_1.0.61». База: `fix/v2` @ `460f3b5`. Коммиты:
+**`e0479a1`** (перенос ядра), **`9de9dce`** (шаг `umount -l` включён).
+
+**Ядро перезаписано целиком** (`tools/JitNetCore.kt`, 1262 → 575 строк) под smali референса
+`CentralEXAuto_v3.3.9.apk` (md5 `c3f16641…`, ZIP `8a65c6c2…`): `JitRef` — константы (20 итераций
+слива, 40000 мс транспорта, 15000 мс до `e2`, 8000 мс на `getprop`, 25/20000/1000/3/2000 для `U`),
+литерал `w0/la.run` символ в символ (392 симв.), `parseRestore` (`^wifi=([01]),ap=([01])$`,
+`matchEntire`, без trim), `parseProp`, `verify`, `confirmedState`, `chainOutcome`; `JitOp` —
+`click` (= `w0/j9.onClick`), `onProcessStart` (= `CentralWatchdogService.onCreate`: parse → remove →
+sleep 15 000 → restore), `restoreNetwork` (= `w0/e2.run`), `openAp` (= `U(String,boolean)`),
+`verifyApplied` (= `w0/bb` + `w0/r7`). `tools/JitNet.kt` — `AndroidShell`/`AndroidStore`/
+`AndroidNetState`/`AndroidWaiter` под этот API. `AppPerformance.kt` и `ui/ToolsPanel.kt` переведены
+на `JitRef`/`JitNet`; `readJitOp` и строка «операция: …» удалены.
+
+**Удалено:** `HOLD_*`, фазы и журнал фаз, `Op`/`decodeOp`, `KEY_OP`, `ClickResult`, `StartDecision`,
+второй watcher/`FileObserver`, файл отмены, `sleep 8`, boot-backfill и автоприменение JIT на boot,
+метка загрузки, TTL снимков, PID-проверки, `jit_verified`/`jit_pending_verify`, санация `ip rule`.
+Скрытый выключатель шага монтирований (`MOUNT_STEP`/`MOUNT_STEP_REASON`) **убран**: отправляется
+ровно литерал референса, в логе `mount_step=present`.
+
+**Тесты:** `JitOrchestratorTest` (24), `JitRefTest` (12), `JitChainScriptTest` (8),
+`JitStartZeroWritesTest` (5), `JitLogsCancelTest` (5), `JitUiStateTest` (5),
+`JitNoPersistTest` (3), `JitBootBoundaryTest` (4), `JitRulesReadOnlyTest` (2),
+`AvasIndependenceTest` (5), `LogFilesTest` (6) — **локально `OK (79 tests)`**. Удалены
+`JitLifecycleTest` (7), `JitLifecycleShell`, `JitStoreConsistencyTest` (8): они проверяли ровно
+удалённую машину состояний, инварианты перенесены в `JitOrchestratorTest`/`JitStartZeroWritesTest`.
+
+**CI опубликованного кода** (`9de9dce`): run `42994299986`, job `130434558159` — `success`,
+`PASSED` 194 / `FAILED` 0 (полный лог: 194 строки `PASSED`, 0 строк `FAILED`, `BUILD SUCCESSFUL`),
+artifact `app-debug` id `13843339117` (177 161 925 Б).
+
+**Отличия от референса (все заявлены):** нечитаемый `getprop` = «неизвестно» и `jit_pedido` не
+снимается; тумблер показывает «состояние неизвестно»; два хранилища prefs проекта вместо одного;
+продолжение вешает `VoiceAssistantService` (нет класса `CentralWatchdogService`); `U` без
+`CountDownLatch` (опрос в `BgWorker` с теми же таймаутами); индикатор `postDelayed(ua, 45000)` —
+строка лога. Ни одна команда цепочки и ни один ключ префов отличиями не затронуты.
+
+**SOURCE_SHA** = `9de9dce` (коммит кода, прошедший CI).
+
+**Открыто:** `umount -l` на живом ГУ не исполнялся (нужны read-only `mountinfo` root-транспорта +
+сравнение namespace с PID 1 либо явное «идём как есть»); остатки `persist.*` JIT и `avas_snapshot`
+только фиксируются; полевой прогон не запускался, полевого успеха нет.
