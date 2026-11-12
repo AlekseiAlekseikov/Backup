@@ -300,8 +300,11 @@ object AppLog {
     /** Для тестов/диагностики: сколько строк диагностики усечено в текущем окне. */
     internal fun diagDropped(): Long = diagBudget.droppedLines()
 
-    /** Для тестов/диагностики: был ли факт усечения объявлен. */
+    /** Для тестов/диагностики: был ли факт усечения объявлен (любой блок). */
     internal fun diagTruncated(): Boolean = diagBudget.truncated()
+
+    /** §3.1 iter40: усечение ИМЕННО этого блока (`INTERNET_DIAG` / `JIT_MOUNT_DIAG`). */
+    internal fun diagTruncatedFor(label: String): Boolean = diagBudget.truncatedFor(label)
 
     /** Строка действия (exempt-список §4.5). */
     internal fun isActionLine(msg: String): Boolean {

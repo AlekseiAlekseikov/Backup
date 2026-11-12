@@ -286,7 +286,7 @@ class JitIter39Test {
         JitOp.resetStateForTest()
         val out = JitOp.onProcessStart(store, net, JitFake.Scheduler(), ::log)
         assertTrue("возврат по снимку планируется", out.scheduled)
-        assertTrue(lines().contains("outcome=unknown action=restore_only"))
+        assertTrue(lines().contains("outcome=unknown action=restore_state_only"))
 
         val c = JitOp.click(store, net, JitFake.QueueShell(), want = true, log = ::log)
         assertEquals("новый клик заблокирован после рестарта", "chain_undefined", c.blocked)
@@ -304,7 +304,7 @@ class JitIter39Test {
     }
 
     @Test
-    fun undefinedIsClearedOnlyByConfirmedNetworkRestore() {
+    fun undefinedIsNotClearedByNetworkRestoreOnly() {
         val store = JitFake.Store().seedOp(op = "op-lost", state = JitRef.OpMark.UNDEFINED)
         val net = JitFake.Net(wifi = false, setWifiResult = false)   // отказ: восстановления нет
         JitOp.resetStateForTest()
@@ -324,11 +324,13 @@ class JitIter39Test {
         JitOp.onProcessStart(store, net, sched2, ::log)
         sched2.drain()
 
-        assertFalse("снято по подтверждённому состоянию сети", JitOp.chainUndefined())
+        // iter40 §2.1: восстановление СЕТИ не разрешает неопределённую операцию — старая команда
+        // могла остаться в очереди и выключить Wi-Fi позже.
+        assertTrue("флаг не снят восстановлением сети", JitOp.chainUndefined())
         assertTrue(lines().contains("outcome=still_unknown"))
-        assertTrue(lines().contains("resolution=network_state_restored"))
+        assertTrue(lines().contains("network_state=restored operation=unresolved"))
         val next = JitOp.click(store, net, JitFake.QueueShell(), want = false, log = ::log)
-        assertNull("клик больше не блокируется исходом прошлой команды", next.blocked)
+        assertEquals("клик по-прежнему заблокирован", "chain_undefined", next.blocked)
     }
 
     @Test
@@ -476,12 +478,12 @@ class JitIter39Test {
 
         val out = JitOp.onProcessStart(store, net, JitFake.Scheduler(), ::log)
 
-        assertEquals("legacy_or_unknown", out.reason)
+        assertEquals("stored_ambiguous", out.reason)
         assertFalse("снимок не исполняется", out.scheduled)
         assertTrue("сеть не менялась", net.requests.isEmpty())
         assertTrue("ни одной shell-команды (нет пробных umount/zygote)", shell.pending.isEmpty())
         assertEquals("снимок 1.0.60 сохранён на диске", "wifi=1", cpsDisk[JitRef.KEY_RESTORE])
         assertEquals("второе хранилище не тронуто", "wifi=1", dpsDisk[JitRef.KEY_RESTORE])
-        assertTrue(lines().contains("reason=legacy_or_unknown"))
+        assertTrue(lines().contains("reason=stored_ambiguous"))
     }
 }

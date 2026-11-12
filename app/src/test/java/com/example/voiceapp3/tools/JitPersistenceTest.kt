@@ -369,7 +369,7 @@ class JitPersistenceTest {
         val net = JitFake.Net(wifi = false)
         val sched = JitFake.Scheduler()
         val out = JitOp.onProcessStart(store(cps, dps), net, sched, {})
-        assertEquals("legacy_or_unknown", out.reason)
+        assertEquals("stored_ambiguous", out.reason)
         assertFalse(out.scheduled)
         assertTrue(sched.scheduled.isEmpty())
         assertTrue("ни одной команды/запроса", net.requests.isEmpty())

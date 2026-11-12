@@ -117,6 +117,19 @@ object JitRef {
         fun mapsExcerpt(): String?
     }
 
+    /**
+     * §2.1 — транспорт, который может сообщить о ПОЗДНЕМ завершении уже «потерянной» команды.
+     *
+     * Это единственное принимаемое свидетельство того, что старая команда больше не может
+     * исполниться: ответ ИМЕННО ЭТОЙ команды (её rc) пришёл после того, как вызывающий уже
+     * решил, что время вышло. Ни новый процесс, ни boot id, ни `getprop`, ни включённый Wi-Fi,
+     * ни IP такого свидетельства не дают.
+     */
+    interface JitLateEvidence {
+        /** Зарегистрировать обработчик завершения ТЕКУЩЕЙ команды; вызывается не более одного раза. */
+        fun onLateOutcome(cb: (rc: Int, out: String) -> Unit)
+    }
+
     /** Результат `remove` по хранилищам. */
     data class WriteResult(val attempted: Int, val ok: Int, val detail: String) {
         val allOk: Boolean get() = attempted > 0 && ok == attempted
@@ -223,6 +236,12 @@ object JitRef {
         fun readRestore(): SnapshotRead
 
         /**
+         * §2.5 — прочитать пару «снимок + отметка» ПО КАЖДОМУ хранилищу одним проходом,
+         * вместе с ошибками чтения и фактическим порядком доступа.
+         */
+        fun readOperation(): List<StoreOp>
+
+        /**
          * `remove(key)` — как `r7`/`onCreate` референса (не запись `false`).
          *
          * @param onlyStores если задано — трогать только эти хранилища (по имени). Нужно, чтобы не
@@ -304,10 +323,28 @@ object JitRef {
         /** `true` — ключ есть, `false` — ключа нет, `null` — ЧТЕНИЕ НЕ УДАЛОСЬ (не «нет»). */
         val present: Boolean?,
         val bool: Boolean?,
-        val str: String?
+        val str: String?,
+        /**
+         * §2.4: ключ есть, но ЗНАЧЕНИЕ прочитать нельзя (исключение, неожиданный тип,
+         * недостоверный `null`). Такой ключ НЕ считается известным: удалять/перезаписывать его
+         * нельзя, потому что прежнее значение неизвестно.
+         */
+        val error: String? = null
     ) {
-        /** Значение известно достоверно. */
-        val known: Boolean get() = present != null
+        /** Значение известно достоверно (ключ есть или его точно нет, и ошибки чтения нет). */
+        val known: Boolean get() = present != null && error == null
+
+        /** Ключа достоверно нет. */
+        val absent: Boolean get() = present == false && error == null
+
+        fun brief(): String = when {
+            error != null -> "unknown($error)"
+            present == null -> "unknown(read)"
+            present == false -> "none"
+            str != null -> "\"${str.take(28)}\""
+            bool != null -> bool.toString()
+            else -> "unknown(value)"
+        }
     }
 
     /** Прежнее состояние ключей операции в одном хранилище. */
@@ -316,16 +353,145 @@ object JitRef {
         val complete: Boolean get() = keys.all { it.known }
         fun has(key: String): Boolean = keys.any { it.key == key && it.present == true }
         fun value(key: String): KeyPrev? = keys.firstOrNull { it.key == key }
-        fun brief(): String = keys.joinToString("") { k ->
-            val v = when {
-                !k.known -> "unknown"
-                k.present == false -> "none"
-                k.str != null -> "\"${k.str.take(28)}\""
-                k.bool != null -> k.bool.toString()
-                else -> "value"
-            }
-            "${k.key}=$v;"
+        fun brief(): String = keys.joinToString("") { k -> "${k.key}=${k.brief()};" }
+    }
+
+    /**
+     * §2.5 — прочитанная пара «снимок + отметка» ОДНОГО хранилища.
+     *
+     * Читается и оценивается целиком, чтобы нельзя было собрать пару из разных копий/операций
+     * (например, снимок из CPS, отметку из DPS). `error` — чтение этого хранилища не удалось.
+     */
+    data class StoreOp(
+        val name: String,
+        val snapshot: String?,
+        val mark: String?,
+        val error: String? = null
+    ) {
+        val empty: Boolean get() = error == null && snapshot == null && mark == null
+        fun brief(): String =
+            "$name:snapshot=${snapshot?.take(24) ?: "none"},mark=${mark?.take(24) ?: "none"}" +
+                (error?.let { ",error=$it" } ?: "")
+    }
+
+    /**
+     * Состояние СОХРАНЁННОЙ операции по всем хранилищам (§2.1–2.3, §2.5).
+     *
+     * Это единственный барьер перед новым кликом и перед любой записью: событие старта
+     * приложения не является барьером.
+     */
+    enum class StoredState {
+        /** Достоверно ничего нет: ни снимка, ни отметки, ошибок чтения нет. */
+        NONE,
+
+        /** Хотя бы одно хранилище не читается — «данных нет» утверждать нельзя. */
+        UNREADABLE,
+
+        /** Пара неполная или копии расходятся (снимок без отметки, разные ID, разные значения). */
+        AMBIGUOUS,
+
+        /** Снимок есть, но он не нашего формата — выполнять нельзя, удалять без разбора нельзя. */
+        BROKEN_SNAPSHOT,
+
+        /** Операция с потерянным ответом: старая команда могла остаться в очереди. */
+        UNDEFINED,
+
+        /** Операция опознана и не завершена: снимок ждёт подтверждённого возврата сети. */
+        PENDING
+    }
+
+    /** Оценка сохранённой операции: состояние + что именно прочитано + пояснение для лога. */
+    data class StoredOp(
+        val state: StoredState,
+        val snapshot: Restore? = null,
+        val mark: OpMark? = null,
+        val detail: String = "none",
+        /** Сколько хранилищ реально прочитано (для честного «1 из 2»). */
+        val readable: Int = 0,
+        val total: Int = 0
+    ) {
+        /** Новый клик конфликтует с сохранённой операцией. */
+        val blocksClick: Boolean get() = state != StoredState.NONE
+
+        fun brief(): String =
+            "${state.name.lowercase()} snapshot=${snapshot?.snap?.wire() ?: "none"} " +
+                "mark=${mark?.let { it.op + "/" + it.state } ?: "none"} " +
+                "readable=$readable/$total detail=$detail"
+    }
+
+    /**
+     * §2.5: оценка сохранённой операции по парам каждого хранилища.
+     *
+     * Правила (проверяются тестами):
+     *  • ошибка чтения любого хранилища ⇒ `UNREADABLE` (не «пусто»);
+     *  • ровно один компонент пары ⇒ `AMBIGUOUS` (пара не восстанавливается догадкой);
+     *  • разные ID операций или разные значения снимка ⇒ `AMBIGUOUS`;
+     *  • неразбираемая отметка ⇒ `AMBIGUOUS`, неразбираемый снимок ⇒ `BROKEN_SNAPSHOT`;
+     *  • `sending`/`undefined` ⇒ `UNDEFINED` (исход старой команды неизвестен);
+     *  • всё целое и `replied` ⇒ `PENDING` (снимок ждёт подтверждённого возврата).
+     */
+    fun assessStored(reads: List<StoreOp>): StoredOp {
+        val readable = reads.count { it.error == null }
+        if (reads.isEmpty()) {
+            return StoredOp(StoredState.UNREADABLE, detail = "no_store", readable = 0, total = 0)
         }
+        val errors = reads.filter { it.error != null }
+        if (errors.isNotEmpty()) {
+            return StoredOp(
+                StoredState.UNREADABLE, detail = errors.joinToString(",") { it.brief() },
+                readable = readable, total = reads.size
+            )
+        }
+        val used = reads.filterNot { it.empty }
+        if (used.isEmpty()) {
+            return StoredOp(StoredState.NONE, detail = "empty", readable = readable, total = reads.size)
+        }
+        val half = used.filter { it.snapshot == null || it.mark == null }
+        if (half.isNotEmpty()) {
+            return StoredOp(
+                StoredState.AMBIGUOUS,
+                detail = "incomplete_pair " + half.joinToString(",") { it.brief() },
+                readable = readable, total = reads.size
+            )
+        }
+        val marks = used.mapNotNull { OpMark.parse(it.mark) }
+        if (marks.size != used.size) {
+            return StoredOp(
+                StoredState.AMBIGUOUS, detail = "mark_unparsable " + used.joinToString(",") { it.brief() },
+                readable = readable, total = reads.size
+            )
+        }
+        val restores = used.map { parseSnapshot(it.snapshot) }
+        if (restores.any { it == null }) {
+            return StoredOp(
+                StoredState.BROKEN_SNAPSHOT,
+                detail = "snapshot_unparsable " + used.joinToString(",") { it.brief() },
+                readable = readable, total = reads.size
+            )
+        }
+        val ops = marks.map { it.op }.distinct()
+        if (ops.size > 1) {
+            return StoredOp(
+                StoredState.AMBIGUOUS, detail = "op_conflict ops=${ops.joinToString("/")}",
+                readable = readable, total = reads.size
+            )
+        }
+        val wires = restores.filterNotNull().map { it.snap.wire() }.distinct()
+        if (wires.size > 1) {
+            return StoredOp(
+                StoredState.AMBIGUOUS, detail = "snapshot_conflict values=${wires.joinToString("/")}",
+                readable = readable, total = reads.size
+            )
+        }
+        val mark = marks.first()
+        val restore = restores.filterNotNull().first()
+        val state = if (mark.state == OpMark.SENDING || mark.state == OpMark.UNDEFINED)
+            StoredState.UNDEFINED else StoredState.PENDING
+        return StoredOp(
+            state, restore, mark,
+            detail = "stores=${used.joinToString(",") { it.name }}",
+            readable = readable, total = reads.size
+        )
     }
 
     /**
@@ -672,7 +838,9 @@ object JitOp {
         /** `true` — до этого клика уже была команда с потерянным ответом (могла остаться в очереди). */
         val previousUndefined: Boolean = false,
         /** Сколько раз этот вызов был отклонён из-за уже выполняющегося клика (для лога). */
-        val attempt: Int = 1
+        val attempt: Int = 1,
+        /** §2.2: оценка сохранённой операции, снятая ПЕРЕД любым решением этого клика. */
+        val stored: JitRef.StoredOp? = null
     ) {
         val sent: Boolean get() = blocked == null
         val outcome: JitRef.ChainOutcome get() = JitRef.chainOutcome(exitCode, output)
@@ -710,30 +878,61 @@ object JitOp {
         }
         val previousUndefined = CHAIN_UNDEFINED.get()
         try {
-            // §2.3: неопределённость переносится через смерть процесса (из отметки операции).
-            if (previousUndefined) {
-                log(
-                    "JIT_CLICK want=$want blocked=chain_undefined action=none commands=0 " +
-                        "(прошлая команда осталась без ответа и могла выполниться позже — " +
-                        "исход НЕ известен. Ни таймаут, ни getprop, ни boot id, ни новый процесс, " +
-                        "ни запись ID доказательством не являются. Вторая цепочка не отправляется, " +
-                        "снимок не перезаписывается; блокировка снимется только подтверждённым " +
-                        "восстановлением состояния сети по этому же снимку)"
-                )
-                return Click(want, null, null, null, -1, "", "chain_undefined", previousUndefined)
+            // ─── §2.2 iter40: единственный барьер — сохранённое состояние, прочитанное ЗДЕСЬ,
+            // под тем же локом, что и последующая запись, и ДО любой записи/shell.
+            // Событие старта приложения (`onProcessStart`) барьером больше не является: если клик
+            // выиграл гонку и старт получил `click_in_flight`, клик всё равно видит старую пару.
+            var stored = JitRef.StoredOp(JitRef.StoredState.UNREADABLE, detail = "not_read")
+            var restoreBusy = false
+            synchronized(INTENT_LOCK) {
+                restoreBusy = scheduledTask != null || RESTORE_SLOT.get() != null
+                val reads = runCatching { store.readOperation() }.getOrElse { t ->
+                    listOf(JitRef.StoreOp("read", null, null, "exception:" + t.javaClass.simpleName))
+                }
+                stored = JitRef.assessStored(reads)
             }
-            // §2.4: решение «клик/возврат» принимается под одним локом.
-            val restorePending = synchronized(INTENT_LOCK) {
-                scheduledTask != null || RESTORE_SLOT.get() != null
+            val blockedReason = when {
+                // Неопределённость в RAM — то же состояние, что и в отметке; порядок важен.
+                CHAIN_UNDEFINED.get() || stored.state == JitRef.StoredState.UNDEFINED -> "chain_undefined"
+                restoreBusy -> "restore_pending"
+                stored.state == JitRef.StoredState.PENDING -> "previous_unfinished"
+                stored.state == JitRef.StoredState.AMBIGUOUS -> "previous_ambiguous"
+                stored.state == JitRef.StoredState.BROKEN_SNAPSHOT -> "previous_broken"
+                stored.state == JitRef.StoredState.UNREADABLE -> "prev_unknown"
+                else -> null
             }
-            if (restorePending) {
+            if (blockedReason != null) {
+                val why = when (blockedReason) {
+                    "chain_undefined" ->
+                        "прошлая команда осталась без ответа и могла выполниться позже — исход НЕ " +
+                            "известен. Ни таймаут, ни getprop, ни boot id, ни новый процесс, ни " +
+                            "запись ID доказательством не являются; включённый Wi-Fi/IP тоже. " +
+                            "Свидетельство ровно одно: ответ ИМЕННО той команды (поздний callback " +
+                            "транспорта), после которого её выполнение уже невозможно. До него " +
+                            "вторая цепочка не отправляется, снимок не перезаписывается"
+                    "restore_pending" ->
+                        "возврат клиентского Wi-Fi по прошлому снимку запланирован или уже " +
+                            "выполняется: новый клик перезаписал бы снимок и мог бы поставить вторую " +
+                            "цепочку поверх отложенного возврата"
+                    "previous_unfinished" ->
+                        "сохранённая операция не завершена (возврат сети не подтверждён или очистка " +
+                            "не прошла). Перезапись снимка новым состоянием потеряла бы исходное"
+                    "previous_ambiguous" ->
+                        "сохранённая пара «снимок+отметка» неполная или копии CPS/DPS расходятся: " +
+                            "какая операция и какое состояние верны — достоверно неизвестно"
+                    "previous_broken" ->
+                        "сохранённый снимок не нашего формата: выполнять его нельзя, а затирать " +
+                            "новым значением — потерять данные владельца"
+                    else ->
+                        "сохранённое состояние прочитать не удалось: «данных нет» утверждать нельзя"
+                }
                 log(
-                    "JIT_CLICK want=$want blocked=restore_pending action=none commands=0 " +
-                        "(возврат клиентского Wi-Fi по прошлому снимку запланирован или уже " +
-                        "выполняется: новый клик перезаписал бы снимок и мог бы поставить вторую " +
-                        "цепочку поверх отложенного возврата)"
+                    "JIT_CLICK want=$want blocked=$blockedReason action=none commands=0 " +
+                        "stored=«${stored.brief()}» " +
+                        "(ни записи, ни shell: $why)"
                 )
-                return Click(want, null, null, null, -1, "", "restore_pending")
+                return Click(want, null, null, null, -1, "", blockedReason, previousUndefined,
+                    1, stored)
             }
             val wifi = runCatching { netState.wifiOn() }.getOrNull()
             if (wifi == null) {
@@ -841,13 +1040,109 @@ object JitOp {
                     "JIT_CHAIN_ERROR op=$opId rc=$rc reason=channel_lost action=none " +
                         "(команда могла остаться в очереди: это НЕ «не выполнено» и НЕ «выполнено». " +
                         "Отметка state=undefined сохранена на диск, поэтому блокировка переживёт " +
-                        "смерть процесса; повторный клик будет отклонён, пока состояние сети не " +
-                        "восстановлено по этому снимку подтверждённо)"
+                        "смерть процесса; повторный клик будет отклонён, пока не появится " +
+                        "достоверное свидетельство завершения ЭТОЙ команды)"
                 )
+                armLateEvidence(store, shell, opId, log)
             }
             return Click(want, snap, write, read, rc, out, null, previousUndefined)
         } finally {
             CLICK_SLOT.compareAndSet(token, null)
+        }
+    }
+
+    /**
+     * §2.1 iter40 — взвести единственное принимаемое свидетельство: ответ ИМЕННО потерянной
+     * команды. Пока его нет, `CHAIN_UNDEFINED` остаётся `true`, снимок не удаляется, новый клик
+     * заблокирован (это переживает смерть процесса через отметку `undefined`).
+     *
+     * Если транспорт такого свидетельства не умеет, честно пишем `armed=none`: тогда
+     * неопределённость не снимается ничем, кроме нового подтверждённого свидетельства,
+     * и блокировка остаётся.
+     */
+    private fun armLateEvidence(
+        store: JitRef.JitStore,
+        shell: JitRef.JitShell,
+        opId: String,
+        log: (String) -> Unit
+    ) {
+        val ev = shell as? JitRef.JitLateEvidence
+        if (ev == null) {
+            log(
+                "JIT_CHAIN_LATE op=$opId armed=none reason=transport_has_no_late_callback " +
+                    "(транспорт не сообщает о позднем завершении: свидетельства не будет, " +
+                    "неопределённость сохраняется, снимок и блокировка остаются)"
+            )
+            return
+        }
+        val once = java.util.concurrent.atomic.AtomicBoolean(false)
+        runCatching {
+            ev.onLateOutcome { lrc, lout ->
+                if (once.compareAndSet(false, true)) {
+                    runCatching { onLateOutcome(store, opId, lrc, lout, log) }
+                }
+            }
+        }.onFailure { t ->
+            log(
+                "JIT_CHAIN_LATE op=$opId armed=failed reason=${t.javaClass.simpleName} " +
+                    "(подписка не удалась: свидетельства не будет, блокировка остаётся)"
+            )
+            return
+        }
+        log(
+            "JIT_CHAIN_LATE op=$opId armed=transport_callback " +
+                "(свидетельством считается только ответ этой команды: он доказывает, что " +
+                "команда завершилась. Включённый Wi-Fi, IP, getprop, boot id и новый процесс " +
+                "свидетельством НЕ являются)"
+        )
+    }
+
+    /**
+     * Пришёл ответ потерянной команды: она завершилась, позднего исполнения больше не будет.
+     *
+     * Снимаем неопределённость (`chain_undefined`) и помечаем операцию как ожидающую возврата
+     * сети (`pending`). Снимок НЕ удаляется и сеть здесь не меняется: возврат выполнит обычный
+     * старт (или он уже выполняется — тогда задача увидит `replied` и сможет завершиться).
+     */
+    internal fun onLateOutcome(
+        store: JitRef.JitStore,
+        opId: String,
+        rc: Int,
+        out: String,
+        log: (String) -> Unit = {}
+    ) {
+        synchronized(INTENT_LOCK) {
+            val cur = runCatching { JitRef.assessStored(store.readOperation()) }
+                .getOrNull()
+            if (cur == null) {
+                log(
+                    "JIT_CHAIN_LATE op=$opId ignored reason=store_unreadable " +
+                        "(прочитать состояние операции нельзя: неопределённость сохраняется)"
+                )
+                return
+            }
+            // Данных уже нет (возврат и очистка прошли раньше): обновлять нечего, но ответ
+            // именно этой команды — свидетельство, что она завершилась.
+            val cleaned = cur.state == JitRef.StoredState.NONE
+            if (!cleaned && cur.mark?.op != opId) {
+                log(
+                    "JIT_CHAIN_LATE op=$opId ignored reason=operation_changed " +
+                        "now=«${cur.brief()}» (данные текущей операции не трогаем)"
+                )
+                return
+            }
+            val upd = if (cleaned) JitRef.WriteResult.none("operation_already_cleaned") else
+                runCatching { store.updateMark(cur.mark!!.copy(state = JitRef.OpMark.REPLIED)) }
+                    .getOrElse { t -> JitRef.WriteResult.none("exception:" + t.javaClass.simpleName) }
+            CHAIN_UNDEFINED.set(false)
+            log(
+                "JIT_CHAIN_LATE op=$opId evidence=command_finished rc=$rc " +
+                    "out=${out.trim().take(160).ifEmpty { "empty" }} " +
+                    "mark=replied cleaned=$cleaned mark_write=${upd.ok}/${upd.attempted} " +
+                    "chain_undefined=false clique=allowed_after_restore " +
+                    "(это свидетельство завершения команды, а НЕ успеха JIT и НЕ наличия интернета; " +
+                    "снимок остаётся до подтверждённого возврата сети)"
+            )
         }
     }
 
@@ -903,55 +1198,76 @@ object JitOp {
             if (CLICK_SLOT.get() != null) {
                 log(
                     "JIT_START skipped reason=click_in_flight action=none " +
-                        "(идёт клик: планировать возврат по старому снимку нельзя)"
+                        "(идёт клик: планировать возврат по старому снимку нельзя. Барьером для " +
+                        "клика событие старта НЕ является — клик сам читает сохранённую операцию)"
                 )
                 return StartOutcome(null, null, null, null, false, "click_in_flight")
             }
-            val raw = runCatching { store.getString(JitRef.KEY_RESTORE) }.getOrNull()
+            // §2.5 iter40: читаем ПАРУ «снимок + отметка» по каждому хранилищу одним проходом.
+            val reads = runCatching { store.readOperation() }.getOrElse { t ->
+                listOf(JitRef.StoreOp("read", null, null, "exception:" + t.javaClass.simpleName))
+            }
+            val stored = JitRef.assessStored(reads)
+            val raw = stored.snapshot?.snap?.wire()?.takeIf { stored.state != JitRef.StoredState.NONE }
+                ?: reads.firstNotNullOfOrNull { it.snapshot }
             if (scheduledTask != null) {
-                val known = JitRef.parseSnapshot(raw)
                 log(
-                    "JIT_START snapshot=${known?.snap?.wire() ?: if (raw == null) "none" else "unparsed"} " +
-                        "duplicate=true action=none (эта же задача уже запланирована: onCreate и " +
-                        "onStartCommand не запускают e2 дважды; флаг относится к задаче, а не к процессу)"
+                    "JIT_START snapshot=${stored.snapshot?.snap?.wire() ?: "none"} duplicate=true " +
+                        "stored=«${stored.brief()}» action=none (эта же задача уже запланирована: " +
+                        "onCreate и onStartCommand не запускают e2 дважды; флаг относится к задаче)"
                 )
-                return StartOutcome(known?.snap, raw, known?.format, null, false, "duplicate")
+                return StartOutcome(stored.snapshot?.snap, raw, stored.snapshot?.format, null, false,
+                    "duplicate", stored.mark)
             }
-            val restore = JitRef.parseSnapshot(raw)
-            if (restore == null) {
-                log(
-                    "JIT_START snapshot=${if (raw == null) "none" else "unparsed"} " +
-                        "raw=\"${raw?.take(60) ?: ""}\" format=none action=none " +
-                        "(ни wifi=0|1, ни старый wifi=0|1,ap=0|1 → e2 не запускается)"
-                )
-                return StartOutcome(null, raw, null, null, false, "no_snapshot")
+            when (stored.state) {
+                JitRef.StoredState.UNREADABLE -> {
+                    log(
+                        "JIT_START stored=«${stored.brief()}» reason=stored_unreadable action=none " +
+                            "write=none (прочитать сохранённое состояние не удалось: это НЕ «данных " +
+                            "нет». Ничего не выполняем и не удаляем; клик будет заблокирован)"
+                    )
+                    return StartOutcome(null, null, null, null, false, "stored_unreadable")
+                }
+                JitRef.StoredState.NONE -> {
+                    log(
+                        "JIT_START snapshot=none stored=«${stored.brief()}» action=none " +
+                            "(ни снимка, ни отметки: e2 не запускается)"
+                    )
+                    return StartOutcome(null, null, null, null, false, "no_snapshot")
+                }
+                JitRef.StoredState.AMBIGUOUS -> {
+                    log(
+                        "JIT_START stored=«${stored.brief()}» reason=stored_ambiguous action=none " +
+                            "write=none (пара «снимок+отметка» неполная или копии CPS/DPS расходятся: " +
+                            "какая операция верна — неизвестно, поэтому ни выполнения, ни удаления)"
+                    )
+                    return StartOutcome(stored.snapshot?.snap, raw, stored.snapshot?.format, null,
+                        false, "stored_ambiguous")
+                }
+                JitRef.StoredState.BROKEN_SNAPSHOT -> {
+                    log(
+                        "JIT_START stored=«${stored.brief()}» reason=snapshot_unparsable " +
+                            "format=none action=none write=none (снимок не нашего формата: не " +
+                            "выполняем; данные владельца не удаляем)"
+                    )
+                    return StartOutcome(null, raw, null, null, false, "snapshot_unparsable")
+                }
+                JitRef.StoredState.PENDING, JitRef.StoredState.UNDEFINED -> Unit
             }
-            val markRaw = runCatching { store.getString(JitRef.KEY_MARK) }.getOrNull()
-            val mark = JitRef.OpMark.parse(markRaw)
-            if (mark == null) {
-                log(
-                    "JIT_START snapshot=${restore.snap.wire()} format=${restore.format} " +
-                        "identification=none mark=\"${markRaw?.take(60) ?: "none"}\" action=none " +
-                        "reason=legacy_or_unknown write=none " +
-                        "(снимок есть, но КОНКРЕТНАЯ операция не опознана — так выглядят данные " +
-                        "1.0.60 и записи до обновления. Ничего не удаляем и не выполняем: разбор " +
-                        "строки сам по себе не разрешает запуск неопознанной операции)"
-                )
-                return StartOutcome(restore.snap, raw, restore.format, null, false, "legacy_or_unknown")
-            }
-            // §2.3: неопределённость переносится через смерть процесса.
-            // `sending` — снимок записан, ответа ещё нет (команда могла уйти и остаться в очереди);
-            // `undefined` — ответа не было вовсе. Обе — «исход неизвестен».
-            val persistedUndefined = mark.state == JitRef.OpMark.SENDING ||
-                mark.state == JitRef.OpMark.UNDEFINED
+            val restore = stored.snapshot!!
+            val mark = stored.mark!!
+            val persistedUndefined = stored.state == JitRef.StoredState.UNDEFINED
             if (persistedUndefined) {
                 CHAIN_UNDEFINED.set(true)
                 log(
-                    "JIT_START op=${mark.op} mark_state=${mark.state} outcome=unknown action=restore_only " +
-                        "clicks=blocked (команда могла остаться в очереди прошлого процесса. " +
-                        "Записанный ID не доказывает ни выполнения, ни невыполнения. Возврат клиентского " +
-                        "Wi-Fi по снимку выполняется как безопасное действие, новый клик заблокирован " +
-                        "до подтверждённого восстановления состояния сети по этому же снимку)"
+                    "JIT_START op=${mark.op} mark_state=${mark.state} outcome=unknown " +
+                        "action=restore_state_only clicks=blocked " +
+                        "(команда могла остаться в очереди прошлого процесса. Записанный ID не " +
+                        "доказывает ни выполнения, ни невыполнения, а включённый Wi-Fi/IP — тем более. " +
+                        "Возврат клиентского Wi-Fi выполняется ОТДЕЛЬНО от разрешения операции: он " +
+                        "возвращает то, что было до клика, и НЕ означает, что старая команда " +
+                        "завершилась. Неопределённость снимается только ответом самой этой команды " +
+                        "(поздний callback транспорта), иначе остаётся ⛔)"
                 )
             }
             val token = Any()
@@ -975,6 +1291,7 @@ object JitOp {
             log(
                 "JIT_START snapshot=${restore.snap.wire()} format=${restore.format} op=${mark.op} " +
                     "mark_state=${mark.state} mark_ts=${mark.ts} identification=ok removed=none " +
+                    "stored=«${stored.brief()}» " +
                     "delay_ms=${JitRef.RESTORE_DELAY_MS} scheduled=$scheduled " +
                     "action=${if (scheduled) "restore_scheduled" else "none"} internet=not_checked " +
                     "(снимок НЕ удаляется до подтверждённого возврата: смерть процесса в эти 15 с " +
@@ -1022,9 +1339,10 @@ object JitOp {
             } else if (CLICK_SLOT.get() != null) {
                 skip = "click_in_flight"
             } else {
-                val cur = JitRef.OpMark.parse(runCatching { store.getString(JitRef.KEY_MARK) }.getOrNull())
-                if (cur == null || cur.op != opId) {
-                    skip = "snapshot_belongs_to_other_op"
+                // §2.5: принадлежность проверяется по ЦЕЛОЙ паре, а не по одной отметке.
+                val cur = runCatching { JitRef.assessStored(store.readOperation()) }.getOrNull()
+                if (cur == null || cur.mark?.op != opId) {
+                    skip = if (cur == null) "store_unreadable" else "snapshot_belongs_to_other_op"
                 } else {
                     RESTORE_SLOT.set(token)
                     claimed = true
@@ -1072,26 +1390,39 @@ object JitOp {
                             " write=remove(restore+mark, own op)"
                     )
                     if (wasUndefined) {
-                        // §2.3: снимаем блокировку по ФАКТУ восстановленного состояния сети,
-                        // а не по «известному исходу». Исход по-прежнему неизвестен.
-                        CHAIN_UNDEFINED.set(false)
+                        // §2.1 iter40: восстановление СЕТИ и разрешение НЕОПРЕДЕЛЁННОЙ операции —
+                        // разные вещи. Текущий Wi-Fi ничего не говорит о старой команде: она могла
+                        // остаться в очереди и выключить сеть позже. Поэтому флаг НЕ снимается.
+                        // Свидетельство ровно одно — ответ самой этой команды (armLateEvidence).
                         log(
                             "JIT_UNDEFINED op=$opId outcome=still_unknown " +
-                                "resolution=network_state_restored clicks=allowed " +
-                                "(восстановление подтверждено чтением состояния; это НЕ доказывает, " +
-                                "что старая команда не выполнилась — если она исполнится позже, она " +
-                                "снова выключит Wi-Fi, и вернуть его сможет только клик по новому " +
-                                "снимку, который снимет уже восстановленное состояние)"
+                                "network_state=restored operation=unresolved clicks=blocked " +
+                                "evidence=command_finished_missing " +
+                                "(сеть возвращена, но исход старой команды по-прежнему неизвестен: " +
+                                "включённый Wi-Fi, IP, getprop, boot id и новый процесс им не " +
+                                "являются. Пока нет ответа этой команды, новый клик заблокирован — " +
+                                "⛔ без обещаний авторазрешения)"
                         )
                     }
                 } else {
                     log(
                         "JIT_RESTORE_PENDING op=$opId completion=${completion?.name?.lowercase() ?: "none"} " +
-                            "data=kept write=none " +
-                            "(снимок и отметка ОСТАВЛЕНЫ: включение не подтверждено чтением состояния. " +
-                            "Принятый запрос, IP-адрес и internet=not_checked успехом не считаются. " +
+                            "data=kept write=none clicks=blocked reason=previous_unfinished " +
+                            "(снимок и отметка ОСТАВЛЕНЫ и остаются принадлежащими этой операции: " +
+                            "включение не подтверждено чтением состояния, поэтому новый клик " +
+                            "заблокирован — иначе он перезаписал бы исходный снимок. Принятый " +
+                            "запрос, IP-адрес и internet=not_checked успехом не считаются. " +
                             "Повторная попытка — при следующем обычном запуске, без сторожа)"
                     )
+                    if (wasUndefined) {
+                        CHAIN_UNDEFINED.set(true)
+                        log(
+                            "JIT_UNDEFINED op=$opId outcome=still_unknown " +
+                                "network_state=not_restored operation=unresolved clicks=blocked " +
+                                "(сеть не восстановлена подтверждённо И исход старой команды " +
+                                "неизвестен: двух независимых условий для продолжения нет — ⛔)"
+                        )
+                    }
                 }
             }
         }

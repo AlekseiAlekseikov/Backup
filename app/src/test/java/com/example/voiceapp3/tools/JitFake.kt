@@ -33,6 +33,8 @@ object JitFake {
         var throwOnEdit: Boolean = false,
         var partialKeys: Set<String> = emptySet(),
         var throwOnRead: Boolean = false,
+        /** §2.4 iter40: чтение ИМЕННО этих ключей бросает (ошибка значения, не «ключа нет»). */
+        var throwOnKeys: Set<String> = emptySet(),
     ) : SharedPreferences {
 
         /** Текущая память процесса: стартует с того, что лежит на «диске». */
@@ -42,7 +44,7 @@ object JitFake {
         val commits = mutableListOf<Map<String, Any?>>()
 
         /** «Новый процесс»: память = диск. */
-        fun newProcess() = Prefs(disk, commitOk, throwOnEdit, partialKeys, throwOnRead)
+        fun newProcess() = Prefs(disk, commitOk, throwOnEdit, partialKeys, throwOnRead, throwOnKeys)
 
         fun diskKeys(): Set<String> = disk.keys.toSet()
         fun memKeys(): Set<String> = mem.keys.toSet()
@@ -50,8 +52,10 @@ object JitFake {
         override fun getAll(): MutableMap<String, *> = LinkedHashMap(mem)
 
         override fun getString(key: String, defValue: String?): String? {
-            if (throwOnRead) throw IllegalStateException("read failed")
-            return mem[key] as? String ?: defValue
+            if (throwOnRead || key in throwOnKeys) throw IllegalStateException("read failed: $key")
+            val v = mem[key] ?: return defValue
+            // Как в Android: неожиданный тип — ClassCastException, а не «значение по умолчанию».
+            return v as String
         }
 
         override fun getStringSet(key: String, defValues: MutableSet<String>?) =
@@ -62,8 +66,10 @@ object JitFake {
         override fun getLong(key: String, defValue: Long): Long = mem[key] as? Long ?: defValue
         override fun getFloat(key: String, defValue: Float): Float = mem[key] as? Float ?: defValue
         override fun getBoolean(key: String, defValue: Boolean): Boolean {
-            if (throwOnRead) throw IllegalStateException("read failed")
-            return mem[key] as? Boolean ?: defValue
+            if (throwOnRead || key in throwOnKeys) throw IllegalStateException("read failed: $key")
+            val v = mem[key] ?: return defValue
+            // Как в Android: String вместо Boolean — ClassCastException.
+            return v as Boolean
         }
 
         override fun contains(key: String): Boolean = mem.containsKey(key)
@@ -264,6 +270,15 @@ object JitFake {
             }
             return JitRef.WriteResult(prev.size, ok, failed.joinToString(",").ifEmpty { "all_ok" })
         }
+
+        /** Хранилища, у которых чтение пары «снимок+отметка» не удаётся (§2.5). */
+        val readOperationFails = mutableSetOf<Int>()
+
+        override fun readOperation(): List<JitRef.StoreOp> =
+            maps.mapIndexed { i, m ->
+                if (i in readOperationFails) JitRef.StoreOp(name(i), null, null, "read:IllegalStateException")
+                else JitRef.StoreOp(name(i), m[JitRef.KEY_RESTORE] as? String, m[JitRef.KEY_MARK] as? String)
+            }
 
         override fun readRestore(): JitRef.SnapshotRead {
             val conflicts = mutableListOf<String>()

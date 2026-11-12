@@ -101,14 +101,19 @@ object InternetDiag {
      * скрывает MAC в `ip addr`: `link/ether 02:00:00:00:00:00`/`**:**:**:**:**:**`).
      */
     private val MAC_RE = Regex(
-        "(?i)(?<![0-9a-z])(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}(?![0-9a-z])" + "|" +
-            "(?i)(?<![0-9a-z])(?:[0-9a-f]{4}\\.){2}[0-9a-f]{4}(?![0-9a-z])" + "|" +
-            "(?i)(?<![0-9a-z])(?:[0-9a-f*]{2}:){5}[0-9a-f*]{2}(?![0-9a-z])"
+        // Границы: слева не hex/`:`/`.`/`-` (иначе вырежем хвост IPv6 вида
+        // `fe80::1a:2b:3c:4d:5e:6f`), справа не hex/`:`/`.` (иначе разрежем длинную группу).
+        "(?i)(?<![0-9a-f:.\\-])(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}(?![0-9a-f:.])" + "|" +
+            // Cisco-формат aabb.ccdd.eeff — только когда вокруг нет hex/двоеточий.
+            "(?i)(?<![0-9a-f:.])(?:[0-9a-f]{4}\\.){2}[0-9a-f]{4}(?![0-9a-f:.])" + "|" +
+            // Скрытый MAC Android: **:**:**:**:**:**  (только звёздочки, не пересекается с IPv6)
+            "(?:\\*{2}:){5}\\*{2}"
     )
 
     /** SSID/BSSID/имя сети в выводе `ip`/`wpa_cli`/`dumpsys`: значение удаляем, поле оставляем. */
     private val SSID_RE = Regex(
-        "(?i)\\b(ssid|bssid|wifi_ssid|wlan_ssid|current_ssid|ap_ssid)\\b(\\s*[:=]\\s*)(\\S+)"
+        "(?i)\\b(ssid|bssid|wifi_ssid|wlan_ssid|current_ssid|ap_ssid)\\b(\\s*[:=]\\s*)" +
+            "(\"[^\"\\n]*\"|'[^'\\n]*'|[^\\s,;\\n]+)"
     )
 
     /** Признак строки, которую нельзя писать в лог как есть. */
@@ -125,10 +130,23 @@ object InternetDiag {
      * Ограничение: это фильтр известных форматов. Он не доказывает, что полный общий лог
      * приложения не содержит иных сведений — об этом сказано в предупреждении владельцу.
      */
-    fun redact(text: String): String {
-        var t = MAC_RE.replace(text, "<удалён:MAC>")
-        t = SSID_RE.replace(t) { m -> m.groupValues[1] + m.groupValues[2] + "<удалён:SSID/BSSID>" }
-        return t
+    fun redact(text: String): String = redactWithFlag(text).first
+
+    /**
+     * §3.2 iter40: редактирование + ФАКТИЧЕСКАЯ замена.
+     *
+     * Второй элемент — `true`, если хотя бы одна замена реально произошла. Флаг нельзя вычислять
+     * по уже отредактированному тексту (раньше из-за этого мог печататься `redacted=no` после
+     * успешного удаления MAC).
+     */
+    fun redactWithFlag(text: String): Pair<String, Boolean> {
+        var changed = false
+        var t = MAC_RE.replace(text) { changed = true; "<удалён:MAC>" }
+        t = SSID_RE.replace(t) { m ->
+            changed = true
+            m.groupValues[1] + m.groupValues[2] + "<удалён:SSID/BSSID>"
+        }
+        return t to changed
     }
 
     /** Строки, несущие признаки отказа в правах или отсутствия утилиты. */
@@ -249,7 +267,13 @@ object InternetDiag {
         netInfo: NetInfo?,
         log: (String) -> Unit,
         source: String,
-        appVersion: String = "unknown"
+        appVersion: String = "unknown",
+        /**
+         * §3.1: «были ли строки этого блока усечены бюджетом лога». Нужен, чтобы сводка `END`
+         * отличала прочитанное от реально записанного. `null` — проверить нельзя (честно пишем
+         * `written=unknown`, а не `full`).
+         */
+        truncatedProbe: (() -> Boolean)? = null
     ): List<Section> {
         val t0 = System.currentTimeMillis()
         log(
@@ -276,8 +300,11 @@ object InternetDiag {
             val cmd = wrap(c.name, c.body)
             val (trcRaw, outRaw) = runCatching { shell.exec(cmd, c.timeoutMs) }
                 .getOrElse { t -> Pair(1, "ERR_EXCEPTION:${t.javaClass.simpleName}") }
-            // §3.2: любой путь (включая ошибки транспорта) идёт в лог только через redact.
-            val out = redact(outRaw)
+            // §3.2: любой путь (включая ошибки транспорта) идёт в лог только через redact,
+            // а флаг считается по ИСХОДНОМУ выводу (иначе после успешной замены было бы "no").
+            val redactedPair = redactWithFlag(outRaw)
+            val out = redactedPair.first
+            val wasRedacted = redactedPair.second
             val trc = trcRaw
             val rc = rcOf(out, c.name)
             val content = body(out)
@@ -287,7 +314,7 @@ object InternetDiag {
             log(
                 "$SECTION name=${c.name} status=$status transport_rc=$trc rc=${rc ?: -1} " +
                     "lines=${content.lines().count { it.isNotBlank() }} parts=${parts.size} " +
-                    "redacted=${if (needsRedaction(out)) "yes" else "no"} " +
+                    "redacted=${if (wasRedacted || needsRedaction(outRaw)) "yes" else "no"} " +
                     "command=\"${redact(c.body)}\"" +
                     (if (verdict != null) " verdict=$verdict" else "") +
                     (if (c.ping) " note=\"это проверка ICMP до ${
@@ -295,7 +322,11 @@ object InternetDiag {
                     }: отсутствие ответа НЕ доказывает отсутствия интернета\"" else "")
             )
             parts.forEachIndexed { i, part ->
-                log("$DATA name=${c.name} part=${i + 1}/${parts.size} ${redact(part)}")
+                val rp = redactWithFlag(part)
+                log(
+                    "$DATA name=${c.name} part=${i + 1}/${parts.size}" +
+                        (if (rp.second) " redacted=yes" else "") + " ${rp.first}"
+                )
             }
             sections += Section(c.name, status, trc, content.lines().count { it.isNotBlank() }, parts.size, verdict)
         }
@@ -338,7 +369,12 @@ object InternetDiag {
             sections += Section("android_connectivity", status, -1, lines.size, parts.size)
         }
 
-        val extra = "elapsed_ms=${System.currentTimeMillis() - t0} network_changes=0"
+        val written = when (val t = runCatching { truncatedProbe?.invoke() }.getOrNull()) {
+            null -> "unknown"
+            true -> "truncated"
+            false -> "full"
+        }
+        val extra = "elapsed_ms=${System.currentTimeMillis() - t0} network_changes=0 written=$written"
         log("$END ${summary(sections, extra)}")
         return sections
     }

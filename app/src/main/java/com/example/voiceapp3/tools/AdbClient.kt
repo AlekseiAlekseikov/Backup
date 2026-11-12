@@ -485,7 +485,7 @@ object AdbClient {
         }
 
         override fun execRoot(cmd: String, timeoutMs: Int): Pair<Int, String> =
-            execAdbSocket(cmd, workingPort.get(), timeoutMs)
+            execAdbSocket(cmd, workingPort.get(), timeoutMs, diagDump = false)
 
         override fun execUnix(cmd: String, timeoutMs: Int): Pair<Int, String> {
             // `execAdbLocalSocket` отдаёт только вывод (код возврата сокета — в [lastUnixRc]),
@@ -641,12 +641,20 @@ object AdbClient {
             // не показывал, чем команда закончилась.
             try {
                 // iter33 A1: rc — НАСТОЯЩИЙ код возврата команды на устройстве (а не «канал ответил»).
-                AppLog.d(TAG, "← execute dt=${dt}ms rc=${out.first} len=${out.second.length} port=${workingPort.get()} state=${state.get()} cmd=${job.cmd.replace('\n', ' ').take(120)}")
-                LogKit.noteJobRc(out.first)
-                // iter33h H1.2: итог по пропущенным контрольным суммам — одной строкой на команду.
-                reportChecksumSkip()
-                // iter33b B3.2: провал — повтор трассировки ЭТОЙ команды (hex+ASCII), пока op ещё жив.
-                if (out.first != 0) LogKit.failJobTrace(out.first, "rc")
+                // iter40 §3.2: у пассивного (диагностического) job НЕ печатаем ни команду, ни
+                // сырой обмен — в ответе `ip addr` бывает MAC/SSID. Остаётся безопасная сводка.
+                if (job.passive) {
+                    AppLog.d(TAG, "← passive dt=${dt}ms rc=${out.first} len=${out.second.length} " +
+                        "state=${state.get()} (payload/hex не печатается: диагностика, личные данные)")
+                    LogKit.noteJobRc(out.first)
+                } else {
+                    AppLog.d(TAG, "← execute dt=${dt}ms rc=${out.first} len=${out.second.length} port=${workingPort.get()} state=${state.get()} cmd=${job.cmd.replace('\n', ' ').take(120)}")
+                    LogKit.noteJobRc(out.first)
+                    // iter33h H1.2: итог по пропущенным контрольным суммам — одной строкой на команду.
+                    reportChecksumSkip()
+                    // iter33b B3.2: провал — повтор трассировки ЭТОЙ команды (hex+ASCII), пока op ещё жив.
+                    if (out.first != 0) LogKit.failJobTrace(out.first, "rc")
+                }
             } finally {
                 LogKit.setThreadOp(null)
             }
@@ -2043,7 +2051,15 @@ object AdbClient {
      * Низкоуровневое выполнение одной shell-команды через ADB-сокет.
      * Поведение совпадает с kotlinx.coroutines.scheduling.h (порт CentralEXAuto).
      */
-    private fun execAdbSocket(command: String, port: Int, timeoutMs: Int, connectTimeoutMs: Int = PROBE_CONNECT_MS, variant: Int = -1): Pair<Int, String> {
+    private fun execAdbSocket(
+        command: String,
+        port: Int,
+        timeoutMs: Int,
+        connectTimeoutMs: Int = PROBE_CONNECT_MS,
+        variant: Int = -1,
+        /** `false` — пассивный (диагностический) вызов: без дополнительных команд при AUTH. */
+        diagDump: Boolean = true
+    ): Pair<Int, String> {
         // iter30c F4: по умолчанию — вариант, которым ответил адрес (workingVariant), а не жёсткий 0.
         // Явное значение (-1 = «не задано») остаётся для особых случаев.
         val effVariant = if (variant < 0) workingVariant else variant
@@ -2092,7 +2108,15 @@ object AdbClient {
                         // iter33 A1: rc берётся из маркера __ADB_RC, а не «канал ответил = 0».
                         return splitRc(out.toString("UTF-8"))
                     }
-                    AUTH -> { val m="adbd AUTH after OPEN on port $port"; AppLog.e(TAG,"ADB: $m"); portDiagnosticDump(m); throw IOException(m) }
+                    AUTH -> {
+                        val m = "adbd AUTH after OPEN on port $port"
+                        AppLog.e(TAG, "ADB: $m")
+                        // iter40 §4.1: пассивный путь не запускает дополнительных команд
+                        // (portDiagnosticDump = getenforce/netstat/ps/logcat). Обычный путь — как был.
+                        if (diagDump) portDiagnosticDump(m) else
+                            AppLog.i(TAG, "ADB_PASSIVE auth_dump=skipped reason=read_only")
+                        throw IOException(m)
+                    }
                     else -> Log.d(TAG, "ADB $port rx ${cmdName(msg.cmd)} (ignored)")
                 }
             }

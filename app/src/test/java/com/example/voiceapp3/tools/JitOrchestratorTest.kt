@@ -138,11 +138,13 @@ class JitOrchestratorTest {
 
         val c = JitOp.click(store, net, shell, want = true, log = ::log)
 
-        assertTrue("будущее чтение вернуло бы CPS", c.read!!.value == "wifi=0")
-        assertEquals("первое хранилище не подтвердило запись — блок до любых команд",
-            "snapshot_not_saved", c.blocked)
+        // iter40 §2.2: снимок без отметки — неполная пара, клик блокируется ДО записи,
+        // поэтому противоречие даже не успевает возникнуть в хранилище.
+        assertEquals("неполная сохранённая пара — блок до любых команд", "previous_ambiguous", c.blocked)
         assertTrue(shell.pending.isEmpty())
-        assertTrue("противоречие видно в логе", lines().contains("conflicts="))
+        assertTrue(net.requests.isEmpty())
+        assertEquals("ничего не записано", 0, store.writeCount())
+        assertTrue("причина видна в логе", lines().contains("blocked=previous_ambiguous"))
     }
 
     @Test
@@ -158,10 +160,11 @@ class JitOrchestratorTest {
 
         val c = JitOp.click(store, net, shell, want = true, log = ::log)
 
-        assertEquals("wifi=1", c.read!!.value)
-        assertEquals("snapshot_conflict", c.blocked)
-        assertTrue(c.read!!.conflicts.isNotEmpty())
+        // iter40 §2.2: та же причина — неполная пара в DPS.
+        assertEquals("previous_ambiguous", c.blocked)
         assertTrue(shell.pending.isEmpty())
+        assertTrue(net.requests.isEmpty())
+        assertEquals("ничего не записано", 0, store.writeCount())
     }
 
     @Test
@@ -202,11 +205,13 @@ class JitOrchestratorTest {
         val net = JitFake.Net(wifi = true)
         val shell = JitFake.QueueShell(stand())
         val c = JitOp.click(store, net, shell, want = true, log = ::log)
-        assertEquals("snapshot_not_saved", c.blocked)
+        // iter40 §2.2/§2.3: чужой/прежний снимок больше не перезаписывается — блок до записи.
+        assertEquals("previous_ambiguous", c.blocked)
         assertEquals("прежнее значение DPS на месте", "wifi=0", store.maps[1][JitRef.KEY_RESTORE])
         assertFalse("наш pedido в CPS не остался", store.maps[0].containsKey(JitRef.KEY_PEDIDO))
         assertFalse("наш pedido в DPS не остался", store.maps[1].containsKey(JitRef.KEY_PEDIDO))
         assertTrue("ничего не отправлено", shell.pending.isEmpty())
+        assertEquals("ни одной записи", 0, store.writeCount())
     }
 
     @Test
@@ -219,12 +224,11 @@ class JitOrchestratorTest {
         val net = JitFake.Net(wifi = true)
         val shell = JitFake.QueueShell(stand())
         val c = JitOp.click(store, net, shell, want = true, log = ::log)
-        assertEquals("первое по порядку чтения хранилище не подтвердило запись → блок",
-            "snapshot_not_saved", c.blocked)
-        assertEquals("неудавшаяся запись в CPS не стёрла прежнее там", "wifi=1",
-            store.maps[0][JitRef.KEY_RESTORE])
-        assertFalse("наша запись повторно снята только в DPS", store.maps[1].containsKey(JitRef.KEY_PEDIDO))
-        assertFalse("и снимок в DPS тоже снят", store.maps[1].containsKey(JitRef.KEY_RESTORE))
+        assertEquals("неполная сохранённая пара блокирует клик до записи",
+            "previous_ambiguous", c.blocked)
+        assertEquals("прежний снимок CPS не тронут", "wifi=1", store.maps[0][JitRef.KEY_RESTORE])
+        assertFalse("нашей записи в DPS нет", store.maps[1].containsKey(JitRef.KEY_PEDIDO))
+        assertFalse("и снимка в DPS нет", store.maps[1].containsKey(JitRef.KEY_RESTORE))
     }
 
     @Test
@@ -397,11 +401,14 @@ class JitOrchestratorTest {
         val shell = JitFake.QueueShell(stand())
         val c = JitOp.click(store, net, shell, want = true, log = ::log)
 
-        assertEquals("snapshot_not_saved", c.blocked)
-        assertEquals("прежняя настройка восстановлена", false, store.maps[0][JitRef.KEY_AUTO])
-        assertEquals("прежний снимок восстановлен", "wifi=0", store.maps[0][JitRef.KEY_RESTORE])
-        assertTrue("прежнее намерение восстановлено", store.maps[0][JitRef.KEY_PEDIDO] == true)
-        assertFalse("нашей отметки не осталось", store.maps[0].containsKey(JitRef.KEY_MARK))
+        // iter40 §2.2: пара «снимок без отметки» блокирует клик до записи — прежние значения
+        // остаются ровно такими, какими были, и откат не нужен.
+        assertEquals("previous_ambiguous", c.blocked)
+        assertEquals("прежняя настройка не тронута", false, store.maps[0][JitRef.KEY_AUTO])
+        assertEquals("прежний снимок не тронут", "wifi=0", store.maps[0][JitRef.KEY_RESTORE])
+        assertTrue("прежнее намерение не тронуто", store.maps[0][JitRef.KEY_PEDIDO] == true)
+        assertFalse("нашей отметки нет", store.maps[0].containsKey(JitRef.KEY_MARK))
+        assertEquals("ни одной записи", 0, store.writeCount())
         assertTrue("shell не вызван", shell.pending.isEmpty())
     }
 
@@ -582,24 +589,30 @@ class JitOrchestratorTest {
         val net = JitFake.Net(wifi = false)
         val sched = JitFake.Scheduler()
         val out = JitOp.onProcessStart(store, net, sched, ::log)
-        assertEquals("legacy_or_unknown", out.reason)
+        // iter40 §2.5: снимок БЕЗ отметки — неполная пара, а не «legacy_or_unknown по догадке».
+        assertEquals("stored_ambiguous", out.reason)
         assertFalse(out.scheduled)
         assertTrue(sched.scheduled.isEmpty())
         assertEquals("данные сохранены", "wifi=1", store.rawRestore())
         assertEquals("ни одной записи/удаления", 0, store.writeCount())
         assertTrue(net.requests.isEmpty())
-        assertTrue(lines().contains("reason=legacy_or_unknown"))
+        assertTrue(lines().contains("reason=stored_ambiguous"))
     }
 
     @Test
     fun brokenSnapshotIsNotExecuted() {
-        val store = JitFake.Store().apply { setIn(0, JitRef.KEY_RESTORE, "wifi=1,ap=0,extra=1") }
+        // Пара полная (снимок + наша отметка), но снимок не нашего формата.
+        val store = JitFake.Store().apply {
+            setIn(0, JitRef.KEY_RESTORE, "wifi=1,ap=0,extra=1")
+            setIn(0, JitRef.KEY_MARK,
+                JitRef.OpMark.of("op-broken", true, JitRef.OpMark.REPLIED).wire())
+        }
         val net = JitFake.Net(wifi = true)
         val sched = JitFake.Scheduler()
         val out = JitOp.onProcessStart(store, net, sched, ::log)
-        assertEquals("no_snapshot", out.reason)
+        assertEquals("snapshot_unparsable", out.reason)
         assertTrue(sched.scheduled.isEmpty())
-        assertTrue(store.contains(JitRef.KEY_RESTORE))
+        assertTrue("данные не удалены", store.contains(JitRef.KEY_RESTORE))
         assertTrue(net.requests.isEmpty())
     }
 

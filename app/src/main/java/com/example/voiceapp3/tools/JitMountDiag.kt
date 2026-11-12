@@ -232,7 +232,14 @@ object JitMountDiag {
      * @param channelReady готовность существующего канала на момент сбора. `false` ⇒ честный
      *   `channel_not_ready` по всем разделам и НИ ОДНОЙ команды (это не «нет root»).
      */
-    fun collect(shell: JitRef.JitShell, channelReady: Boolean, log: (String) -> Unit, source: String): List<Section> {
+    fun collect(
+        shell: JitRef.JitShell,
+        channelReady: Boolean,
+        log: (String) -> Unit,
+        source: String,
+        /** §3.1: были ли строки этого блока усечены бюджетом лога (`null` — неизвестно). */
+        truncatedProbe: (() -> Boolean)? = null
+    ): List<Section> {
         val t0 = System.currentTimeMillis()
         log(
             "$BEGIN ts=$t0 source=$source mode=read_only transport=jit_shell channel_ready=$channelReady " +
@@ -330,6 +337,8 @@ object JitMountDiag {
                 "truncated=${sections.count { it.status == STATUS_TRUNCATED }} " +
                 "unknown=${sections.count { it.status == STATUS_UNKNOWN }} " +
                 "elapsed_ms=${System.currentTimeMillis() - t0} system_writes=0 " +
+                "written=${when (runCatching { truncatedProbe?.invoke() }.getOrNull()) {
+                    null -> "unknown"; true -> "truncated"; false -> "full" }} " +
                 "note=\"данные для оценки обратимости umount -l; сами по себе её не доказывают\""
         )
         return sections

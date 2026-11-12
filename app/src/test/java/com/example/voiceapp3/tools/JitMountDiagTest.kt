@@ -262,8 +262,12 @@ class JitMountDiagTest {
         assertTrue("честный статус при неготовом канале", fn.contains("channel_not_ready"))
         assertFalse("никаких циклов ожидания", fn.contains("while ("))
         val sched = src.substring(src.indexOf("fun requestDiagOnce"), src.indexOf("internal fun resetDiagForTest"))
+        // iter40 §4.2: при неготовом канале Android API-часть всё равно читается
+        // (`InternetDiag.collect` с `channelReady=false`), поэтому отдельного
+        // `collectChannelNotReady` в этом пути больше нет.
         assertTrue("у каждой части свои метки", sched.contains("JitMountDiag.collect") &&
-            sched.contains("InternetDiag.collect") && sched.contains("InternetDiag.collectChannelNotReady"))
+            sched.contains("InternetDiag.collect"))
+        assertTrue("Android-часть собирается и без shell", sched.contains("DiagShell, false"))
     }
 
     @Test

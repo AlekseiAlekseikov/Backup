@@ -157,12 +157,36 @@ object JitNet {
                     }
                     if (present == null) {
                         JitRef.KeyPrev(key, null, null, null)
+                    } else if (!present) {
+                        // Ключа достоверно нет — это НЕ ошибка чтения.
+                        JitRef.KeyPrev(key, false, null, null)
                     } else {
-                        val str = try { s.getString(key, null) } catch (t: Throwable) { null }
-                        val bool = try {
-                            if (present && (key == KEY_PEDIDO || key == KEY_AUTO)) s.getBoolean(key, false) else null
-                        } catch (t: Throwable) { null }
-                        JitRef.KeyPrev(key, present, bool, str)
+                        // §2.4 iter40: ключ есть, но значение прочитать нельзя (исключение,
+                        // неожиданный тип, недостоверный null) — это `error`, а НЕ «известное
+                        // значение». Такой ключ нельзя ни удалять, ни перезаписывать.
+                        // Тип чтения — по СМЫСЛУ ключа: `getString` на булевом ключе в Android
+                        // бросает ClassCastException, и это была бы ложная «ошибка значения».
+                        var error: String? = null
+                        val isBool = key == KEY_PEDIDO || key == KEY_AUTO
+                        val str: String? = if (isBool) null else try {
+                            s.getString(key, null)
+                        } catch (t: Throwable) {
+                            error = "read:" + t.javaClass.simpleName
+                            null
+                        }
+                        val bool: Boolean? = if (isBool) {
+                            try {
+                                s.getBoolean(key, false)
+                            } catch (t: Throwable) {
+                                error = "type:" + t.javaClass.simpleName
+                                null
+                            }
+                        } else null
+                        if (error == null && str == null && bool == null) {
+                            // Ключ есть (contains=true), а значения не получили: доверять нельзя.
+                            error = "null_value"
+                        }
+                        JitRef.KeyPrev(key, present, bool, str, error)
                     }
                 }
             )
@@ -210,6 +234,22 @@ object JitNet {
             val r = JitRef.WriteResult(prev.size, ok, detail.ifEmpty { "all_ok" }.toString())
             log("JIT_STORE restore_previous attempted=${r.attempted} ok=${r.ok} detail=${r.detail}")
             return r
+        }
+
+        /**
+         * §2.5 iter40: пара «снимок + отметка» ПО КАЖДОМУ хранилищу, одним проходом, в порядке
+         * чтения (CPS→DPS). Ошибка чтения попадает в `error`, поэтому «не удалось прочитать» не
+         * превращается в «данных нет», а пара никогда не собирается из разных хранилищ.
+         */
+        override fun readOperation(): List<JitRef.StoreOp> = stores().map { (name, s) ->
+            try {
+                val snap = s.getString(KEY_RESTORE, null)
+                val mark = s.getString(KEY_MARK, null)
+                JitRef.StoreOp(name, snap, mark)
+            } catch (t: Throwable) {
+                log("JIT_STORE read_operation store=$name exception=${t.javaClass.simpleName}")
+                JitRef.StoreOp(name, null, null, "read:" + t.javaClass.simpleName)
+            }
         }
 
         /**
@@ -516,12 +556,20 @@ object JitNet {
 
         val runBoth: (String) -> Unit = { via ->
             if (diagRan.compareAndSet(false, true)) {
-                runCatching { JitMountDiag.collect(DiagShell, true, log, "$source/$via") }
+                runCatching {
+                    JitMountDiag.collect(DiagShell, true, log, "$source/$via") {
+                        AppLog.diagTruncatedFor("JIT_MOUNT_DIAG")
+                    }
+                }
                     .onFailure { t ->
                         AppLog.i(TAG, "JIT_MOUNT_DIAG source=$source/$via status=unknown " +
                             "reason=${t.javaClass.simpleName} (сбой сборщика, не результат чтения)")
                     }
-                runCatching { InternetDiag.collect(DiagShell, true, netInfo, log, "$source/$via", appVersion) }
+                runCatching {
+                    InternetDiag.collect(DiagShell, true, netInfo, log, "$source/$via", appVersion) {
+                        AppLog.diagTruncatedFor("INTERNET_DIAG")
+                    }
+                }
                     .onFailure { t ->
                         AppLog.i(TAG, "INTERNET_DIAG source=$source/$via status=unknown " +
                             "reason=${t.javaClass.simpleName} (сбой сборщика, сеть не менялась)")
@@ -537,10 +585,20 @@ object JitNet {
                 if (fallbackWrote) false else { fallbackWrote = true; true }
             }
             if (once) {
-                runCatching { JitMountDiag.collect(DiagShell, false, log, source) }
-                    .onFailure { t -> AppLog.i(TAG, "JIT_MOUNT_DIAG status=unknown reason=${t.javaClass.simpleName}") }
-                runCatching { InternetDiag.collectChannelNotReady(log, source, why) }
-                    .onFailure { t -> AppLog.i(TAG, "INTERNET_DIAG status=unknown reason=${t.javaClass.simpleName}") }
+                runCatching {
+                    JitMountDiag.collect(DiagShell, false, log, source) {
+                        AppLog.diagTruncatedFor("JIT_MOUNT_DIAG")
+                    }
+                }.onFailure { t -> AppLog.i(TAG, "JIT_MOUNT_DIAG status=unknown reason=${t.javaClass.simpleName}") }
+                // §4.2 iter40: канал недоступен, но Android API-часть читается независимо —
+                // её и записываем (shell-разделы честно `channel_not_ready`).
+                runCatching {
+                    InternetDiag.collect(DiagShell, false, netInfo, log, "$source/fallback:$why", appVersion) {
+                        AppLog.diagTruncatedFor("INTERNET_DIAG")
+                    }
+                }.onFailure { t ->
+                    AppLog.i(TAG, "INTERNET_DIAG status=unknown reason=${t.javaClass.simpleName}")
+                }
             }
         }
 

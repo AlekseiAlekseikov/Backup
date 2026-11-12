@@ -123,6 +123,20 @@ internal object LogBudget {
     /**
      * Бюджет диагностических блоков. Не зависит от [AppState]: строки диагностики не «съедают»
      * общий лимит и не подменяются его уведомлением.
+     *
+     * §3.1 iter40: усечение считается ОТДЕЛЬНО ПО КАЖДОМУ БЛОКУ/СЕССИИ (`INTERNET_DIAG`,
+     * `JIT_MOUNT_DIAG`). Раньше один флаг на оба означал: если бюджет исчерпали монтирования
+     * (они идут первыми), отдельной `INTERNET_DIAG_TRUNCATED` не было и потеря сетевых строк была
+     * не видна.
+     *
+     * Гарантии и обещания:
+     *  • `*_BEGIN`, `*_END` и строка `*_TRUNCATED` для СВОЕГО блока пишутся всегда;
+     *  • строки `SECTION`/`DATA` ограничены — сохранять их при исчерпании бюджета НЕ обещаем,
+     *    и уведомление об этом больше не утверждает обратного;
+     *  • факт усечения по каждому блоку запрашивается отдельно ([truncated]) и используется
+     *    сборщиком в `END` (`written=full|truncated`), чтобы сводка отличала «прочитано» от
+     *    «записано в файл»;
+     *  • окно сбрасывается по времени, поэтому блоки не пропадают навсегда.
      */
     class DiagState(
         private val bytes: Long = DIAG_BYTES,
@@ -133,7 +147,9 @@ internal object LogBudget {
         private var used = 0L
         private var dataLines = 0
         private var dropped = 0L
-        private var truncatedAnnounced = false
+        /** Усечение по каждому блоку отдельно: `INTERNET_DIAG` / `JIT_MOUNT_DIAG`. */
+        private val announced = LinkedHashMap<String, Boolean>()
+        private val droppedPerBlock = LinkedHashMap<String, Long>()
 
         @Synchronized
         fun decide(msg: String, lenBytes: Int, nowMs: Long): Verdict {
@@ -143,21 +159,26 @@ internal object LogBudget {
                 used = 0L
                 dataLines = 0
                 dropped = 0L
-                truncatedAnnounced = false
+                announced.clear()
+                droppedPerBlock.clear()
             }
+            val label = diagLabel(msg)
             // Начало и конец блока не теряются: без них блок в логе не читается.
             if (isDiagAlways(msg)) return Verdict(true)
             if (used + lenBytes > bytes || dataLines >= lines) {
                 dropped++
-                if (!truncatedAnnounced) {
-                    truncatedAnnounced = true
-                    val label = diagLabel(msg)
+                droppedPerBlock[label] = (droppedPerBlock[label] ?: 0L) + 1
+                if (announced[label] != true) {
+                    announced[label] = true
                     return Verdict(
                         false,
-                        "$label" + "_TRUNCATED truncated=true dropped=$dropped " +
-                            "bytes=$used limit_bytes=$bytes limit_lines=$lines " +
-                            "reason=diag_budget_exhausted (дальнейшие строки блока не пишутся; " +
-                            "начала/окончания блоков, разделы и сводка сохраняются; " +
+                        label + "_TRUNCATED truncated=true dropped=" +
+                            (droppedPerBlock[label] ?: 1L) + " bytes=$used " +
+                            "limit_bytes=$bytes limit_lines=$lines block=$label " +
+                            "reason=diag_budget_exhausted " +
+                            "(дальнейшие строки ЭТОГО блока не пишутся: SECTION/DATA ограничены и " +
+                            "их сохранение не обещается; BEGIN/END и эта строка сохранены; " +
+                            "состояние канала/сети в сводке END помечено written=truncated; " +
                             "общий бюджет приложения не отключался)"
                     )
                 }
@@ -174,7 +195,15 @@ internal object LogBudget {
         @Synchronized
         fun droppedLines(): Long = dropped
 
+        /** Общее «было ли хоть одно усечение в окне». */
         @Synchronized
-        fun truncated(): Boolean = truncatedAnnounced
+        fun truncated(): Boolean = announced.values.any { it }
+
+        /** §3.1: усечение ИМЕННО этого блока (`INTERNET_DIAG` / `JIT_MOUNT_DIAG`). */
+        @Synchronized
+        fun truncatedFor(label: String): Boolean = announced[label] == true
+
+        @Synchronized
+        fun droppedFor(label: String): Long = droppedPerBlock[label] ?: 0L
     }
 }
