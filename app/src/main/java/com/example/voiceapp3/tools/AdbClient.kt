@@ -412,7 +412,8 @@ object AdbClient {
         start()
         val callerIsMain = Looper.myLooper() == Looper.getMainLooper()
         if (callerIsMain) {
-            val shortCmd = command.take(120).replace("\n", " ")
+            // iter43 §1.4: даже «ошибочная» строка не должна нести payload.
+            val shortCmd = LogKit.redactCmd(command, 120)
             Log.e(TAG, "AdbClient.execute on main thread — это БАГ (команда: $shortCmd)", Exception("main-thread call"))
             AppLog.e(TAG, "VERIFY THREAD: AdbClient.execute вызван с main! Команда будет выполнена в фоне, но результат не вернётся вызывающему. cmd=$shortCmd")
             // Ставим в очередь на фоновое выполнение и возвращаем ошибку сразу, не блокируя main.
@@ -507,7 +508,7 @@ object AdbClient {
     private fun runPassive(cmd: String, timeoutMs: Int): Pair<Int, String> {
         val r = AdbPassive.run(cmd, timeoutMs, passiveIo)
         AppLog.i(TAG, "ADB_PASSIVE path=${r.path} rc=${r.rc} len=${r.out.length} " +
-            "recovery=none cmd=${cmd.replace('\n', ' ').take(120)}")
+            "recovery=none cmd=${LogKit.redactCmd(cmd, 120)}")
         return Pair(r.rc, r.out)
     }
 
@@ -572,7 +573,7 @@ object AdbClient {
                 }
                 // Предохранитель сработал — это ФАКТ, его надо доставить наверх (A0.2), а не глотать.
                 AppLog.e(TAG, "SCRIPT_UPLOAD FAIL name=$name attempt=$attempt expect=${bytes.size} rc=$rc " +
-                    "out=${out.replace('\n', ' ').take(300)}")
+                    "out=${LogKit.redactCmd(out.replace('\n', ' '), 300)}")
             }
             AppLog.e(TAG, "SCRIPT_UPLOAD GIVEUP name=$name bytes=${bytes.size} tries=$SCRIPT_UPLOAD_TRIES rc=$lastRc")
             return Pair(lastRc, lastOut)
@@ -650,7 +651,7 @@ object AdbClient {
                         "state=${state.get()} (payload/hex не печатается: диагностика, личные данные)")
                     LogKit.noteJobRc(out.first)
                 } else {
-                    AppLog.d(TAG, "← execute dt=${dt}ms rc=${out.first} len=${out.second.length} port=${workingPort.get()} state=${state.get()} cmd=${job.cmd.replace('\n', ' ').take(120)}")
+                    AppLog.d(TAG, "← execute dt=${dt}ms rc=${out.first} len=${out.second.length} port=${workingPort.get()} state=${state.get()} cmd=${LogKit.redactCmd(job.cmd, 120)}")
                     LogKit.noteJobRc(out.first)
                     // iter33h H1.2: итог по пропущенным контрольным суммам — одной строкой на команду.
                     reportChecksumSkip()
