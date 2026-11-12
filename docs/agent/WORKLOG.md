@@ -1398,3 +1398,80 @@ in-flight) и пишет `SNAP reason=… status=scheduled|skipped|completed`. �
 `usableSpace`, фоллбэк на `filesDir`), реальные `SharedPreferences`/`WifiManager` ГУ, поведение
 системы при полном диске. Полевых данных нет; `umount`/`mount`/zygote/reboot не выполнялись, клик JIT
 у владельца не запрашивался.
+
+## iter43 — никакой бесследной потери: журнал, TTL-снимки, JIT-оркестрация
+
+Мандат: `ПРОМПТ_iter43_ИСПРАВИТЬ_ПОТЕРЮ_ЛОГОВ_TTL_JIT.md`. Ветка `fix/v2`, база iter42 (`9debbd5`).
+Коммиты: `6f1042b` (код + тесты), `9c311df` (маркер сборки), `ddabcab` (§1.4 остатки).
+
+**Найдено тестами и исправлено (два настоящих дефекта потери данных).**
+
+1. `LogFiles.writeSplit` уходил в бесконечную рекурсию на строках > 256 КиБ: кусок был ровно
+   `MAX_LINE_BYTES`, «кусок + маркер» снова превышал лимит → `writeAt` → `writeSplit` → … (стек).
+   Теперь кусок = `MAX_LINE_BYTES - SPLIT_MARKER_RESERVE(96)`.
+2. Там же разрез многобайтового символа проверялся по `bytes[cut-1]` вместо `bytes[cut]`, поэтому
+   кириллица могла разрезаться посередине (`0xD1 | 0x8F`) и в файле появлялся `U+FFFD` — фактическая
+   потеря байтов. Проверка исправлена; тест читает байты обратно и требует отсутствия `U+FFFD`.
+3. `JitRef.EventSnapshots`: окно часовой квоты определялось как `windowStartMs == 0L`, из-за чего при
+   старте с `nowMs = 0` окно сбрасывалось на КАЖДОМ вызове и квота не набиралась. Введён `windowStarted`.
+
+**§1.1.** Подмены исходной строки уведомлением нет: `AppLog.writeRaw` пишет ровно исходную строку, а
+уведомление (`*_TRUNCATED`, `LOG_WRITE_FAILED`, `LOG_LEGACY_FAILED`) — отдельная запись со своим
+результатом (`AppLog.kt:400–470`). `budgetAllow` больше не режет по объёму: ограничение делает только
+ротация по размеру, поэтому «ротировать каждые 150 КиБ» больше нечему.
+
+**§1.2/§1.3 `LogFiles`.** Возрастающая нумерация частей на дату/tier, лимиты по числу файлов и байтам
+(не по диапазону номеров), блокировка каталога `.logfiles.lock`, `rotateNow` без подтверждённого
+маркера ≠ `true`, `freeSpace` различает «место есть/нет/неизвестно» (`LogFiles.kt:198`), при неизвестном
+месте пишется `LOGFILES_SPACE_UNKNOWN`. Добавлен честный суммарный учёт
+(`LogFiles.kt:616–700`): `DirTotal` отделяет СВОИ байты от `voiceapp3.log` (legacy) и
+`voiceapp3-important.log`, `reportTotals()` печатает `LOG_TOTALS`/`LOG_TOTALS_SUM` с оговоркой, что
+`64 МиБ + 16 МиБ` — лимит НА КАТАЛОГ, а не абсолютный предел (каталогов два). `partsOf` не задевает
+важный/legacy файлы (тест на фактических файлах).
+
+**§1.4 приватность.** Новый `LogRedact` (`LogRedact.kt:23`): тела литералов → `'<N bytes>'`, длинные
+base64/hex-блоки → `<blob:N>`, значения `key/token/secret/...` → `<redacted>`, длина считается в
+БАЙТАХ UTF-8. Через него идут `last_cmd` (`AdbClient.kt:275`), `VERIFY EXEC … cmd=` (`:1898`), хвост
+вывода при провале (`:1966`), диагностический dump (`:2221`), logcat adbd (`:2232`), строка о вызове
+с main-потока (`:415`) и `recovery=none cmd=`/`ADB_TRACE`-путь (`:511`, `:654`).
+
+**§2.1/§2.2.** `END` строится из фактов ДО записи и содержит `written=unconfirmed`; факт пишется
+отдельной `_END_CONFIRM` со `written=full|partial|truncated|none|unknown`, отказ —
+`*_END_NOT_CONFIRMED`/`*_END_CONFIRM_NOT_WRITTEN`. `completed` ⟺ канал готов ∧ секции непусты ∧ все
+`ok|empty` ∧ `verdict=full`; `truncated` → `partial`, причина `truncation_not_checkable` при
+невозможности пробы усечения (проверено тестом `endSummaryIsFactsNotDiagnosis`).
+
+**§2.3 оркестрация.** `JitRef.DiagRunner` (`JitNetCore.kt:1003`): не более одного сбора одновременно
+(`in_flight`), отказ при `already_completed`/`attempts_exhausted`, ограниченные повторы через `post` с
+проверкой поколения, отмена страховки «через 30 с» после успеха, строки `DIAG_ORCH …`. Исправлена
+ловушка: повтор получал обёртку над самим собой (`runRef` → `StackOverflowError`), теперь повтор
+получает ИСХОДНОЕ тело попытки. `JitNet.requestDiagOnce` использует `startWithRetry`.
+
+**§3 TTL-снимки.** `JitRef.TtlSnapshotFlow` (`JitNetCore.kt:1178`) — метки `pre_confirmed`/`pre_overlap`/
+`pre_late`/`pre_unknown` и `post_after_apply`/`post_without_confirmed_apply` считаются по ФАКТИЧЕСКИМ
+временам; `EventSnapshots` получил отдельную квоту на действия владельца (`userMaxPerHour=12`,
+`tryAcquireUser`/`tryAcquireUserPaired`), `remainingMs()` для trailing-снимка; `JitNet.requestEventSnapshot`
+получил `userEvent`/`phaseLabelProvider`/`onCollected`/`scheduleTrailing` (один trailing-снимок),
+`beginTtlSnapshot`/`finishTtlSnapshot` пишут `TTL_SNAP_PAIR`. `ToolsBackend.Toggle.TTL_65` заказывает пару
+«до/после» реального переключения. Сеть и TTL не меняются.
+
+**§4 CPS/DPS.** `Prefs2.dpsOrNull` (`Prefs2.kt:33`) — без скрытого фоллбэка на CPS; `JitNet` берёт DPS
+только через него (`JitNet.kt:116`), поэтому «две копии» больше не могут оказаться одной. Если DPS вернул
+ту же копию, что CPS, это явно пишется (`dps_distinct=false … одна копия`). `SnapshotWrite` получил
+`appeared`/`absent`: хранилище, появившееся между чтением и записью, и пропавшее — перечисляются явно,
+клик блокируется (fail closed). Откат по-прежнему только по своим ключам, с честным отчётом о частичном
+отказе.
+
+**§5 сборка/CI.** Привязки тестов к `assemble*` нет (iter42). CI `Build APK` (`assembleDebug`) по
+`ddabcab`/`6f1042b`: см. статус ниже. Полный `--dry-run` реального проекта в песочнице НЕ выполнялся —
+2 ГБ RAM, daemon падает (OOM); выдавать это за выполненное нельзя.
+
+**Тесты.** Новый `JitIter43Test.kt` (29 тестов, 5 классов): учёт своих/чужих байтов, недоступный
+каталог, `partsOf`/`pruneTier` не трогают важный и legacy файлы, 12 частей с уникальными возрастающими
+номерами и одним активным файлом, разбиение длинной строки по БАЙТАМ UTF-8 без `U+FFFD`, приватность на
+маркерах искусственных секретов, `DiagRunner` на синтетическом планировщике, метки TTL-снимков и
+user-квота. Локально: **351 тест, 0 падений** (`/home/user/runtests.sh`), `APOLOG_TYPES_OK`.
+
+**Не проверено (честно).** Android-интеграция `LogFiles.append(context)`/`rotateNow(context)` (внешний
+каталог, `usableSpace`, фоллбэк на `filesDir`), реальные `SharedPreferences`/`WifiManager` ГУ, поведение
+при полном диске, `umount`/`mount`/zygote/reboot — на ГУ ничего не запускалось, JIT-клик не выполнялся.
