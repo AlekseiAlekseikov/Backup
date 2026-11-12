@@ -18,6 +18,14 @@ class JitIsoStand(rules: Int = 0) {
     private val rulesLeft: File = File(dir, "rules_left")
     private val mountsFile: File = File(dir, "mounts.fake")
 
+    /**
+     * iter42 §6: путь к `grep` не должен быть зашит как `/bin/grep` — на macOS его там нет
+     * (и в любом случае это делает стенд непереносимым). Ищем существующий бинарь.
+     */
+    private val grepBin: String = listOf("/bin/grep", "/usr/bin/grep", "/usr/local/bin/grep", "grep")
+        .firstOrNull { File(it).canExecute() }
+        ?: "grep"
+
     private val sh: String = listOf("/bin/sh", "/usr/bin/sh", "sh")
         .firstOrNull { File(it).canExecute() }
         ?: throw IllegalStateException("нет /bin/sh для прогона скрипта")
@@ -38,14 +46,14 @@ class JitIsoStand(rules: Int = 0) {
         put("setprop", "echo \"setprop \$*\" >> \"\$CALLS\"")
         put("grep", """
             case "${'$'}1" in
-              -*) exec /bin/grep "${'$'}@" ;;
+              -*) exec "${'$'}GREP_BIN" "${'$'}@" ;;
             esac
             pat="${'$'}1"; shift
             for f in "${'$'}@"; do
               case "${'$'}f" in
                 /proc/mounts) f="${'$'}FAKE_MOUNTS" ;;
               esac
-              /bin/grep -- "${'$'}pat" "${'$'}f"
+              "${'$'}GREP_BIN" -- "${'$'}pat" "${'$'}f"
             done
         """.trimIndent())
         put("ip", """
@@ -77,6 +85,7 @@ class JitIsoStand(rules: Int = 0) {
         f.writeText(script)
         val pb = ProcessBuilder(sh, f.absolutePath).redirectErrorStream(true)
         pb.environment()["PATH"] = "${dir.absolutePath}:${System.getenv("PATH") ?: "/bin:/usr/bin"}"
+        pb.environment()["GREP_BIN"] = grepBin
         pb.environment()["CALLS"] = callsFile.absolutePath
         pb.environment()["RULES_LEFT"] = rulesLeft.absolutePath
         pb.environment()["FAKE_MOUNTS"] = mountsFile.absolutePath

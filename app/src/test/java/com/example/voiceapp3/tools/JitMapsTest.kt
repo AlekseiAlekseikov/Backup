@@ -3,6 +3,7 @@ package com.example.voiceapp3.tools
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assume
 import org.junit.Test
 import java.io.File
 
@@ -52,6 +53,11 @@ class JitMapsTest {
 
     @Test
     fun ownProcessMapsIsReallyRead() {
+        // iter42 §6: настоящая Linux-проверка; на macOS файла нет ⇒ честный skip с причиной.
+        Assume.assumeTrue(
+            "нужен Linux: файла /proc/self/maps на macOS нет",
+            File("/proc/self/maps").isFile
+        )
         val own = read(File("/proc/self/maps"))
         assertTrue("карта процесса читается", own != null && own.contains(" r-xp "))
         // В процессе JVM строк jit-cache нет ⇒ null по семантике j5.d (не false).

@@ -4,6 +4,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assume
 import org.junit.Test
 import java.io.File
 
@@ -253,6 +254,13 @@ class JitRefTest {
 
     @Test
     fun realProcSelfMapsOfThisProcessIsRead() {
+        // iter42 §6: это НАСТОЯЩАЯ Linux-проверка чтения /proc/self/maps. На macOS/Darwin
+        // такого файла нет, поэтому тест честно ПРОПУСКАЕТСЯ с причиной (не «зелёный PASS»),
+        // и не отключается на Linux.
+        Assume.assumeTrue(
+            "нужен Linux: файла /proc/self/maps на macOS нет",
+            File("/proc/self/maps").isFile
+        )
         // Не фейк: читается настоящий /proc/self/maps процесса JVM, где идёт тест.
         val text = File("/proc/self/maps").readText()
         assertTrue("карта процесса читается и не пуста", text.contains(" r-xp ") || text.contains(" r--p "))
