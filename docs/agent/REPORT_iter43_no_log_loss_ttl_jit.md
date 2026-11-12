@@ -2,8 +2,9 @@
 
 **Ветка:** `fix/v2` (только она; `--force` не использовался, `main` не пушился).
 **База:** `9debbd5` (iter42, CI `43274357006` success).
-**Финальный код:** `ddabcab` (`6f1042b` — код+тесты, `9c311df` — маркер, `ddabcab` — §1.4 остатки).
-**`SOURCE_SHA`** (`app/buildinfo.properties`): указывает на последний коммит с кодом.
+**Финальный код:** `ddabcab`; **HEAD ветки:** `0b9070a` (`6f1042b` — код+тесты, `9c311df` — маркер,
+`ddabcab` — §1.4 остатки, `a538b5c` — WORKLOG + отчёт, `0b9070a` — маркер сборки).
+**`SOURCE_SHA`** (`app/buildinfo.properties`): `a538b5c` — коммит, который содержит код и документацию.
 **versionCode/versionName:** `61` / `1.0.61` — **не менялись** (установленная у владельца версия).
 **Уровни доказательности:** код / JVM-модель / Android-интеграция / CI / ГУ. Ниже у каждого пункта указано,
 чем именно он подтверждён. **На головном устройстве (ГУ) ничего не выполнялось**: JIT-клик, `umount`,
@@ -99,6 +100,7 @@ DIAG_ORCH reason=… status=started|completed|retry_scheduled|exhausted|skipped|
 | `43274357006` | `9debbd5` (база, iter42) | success | — |
 | `43288136880` | `9c311df` | **success**, `BUILD SUCCESSFUL in 3m 36s`, 43 задачи | job `131426893391` |
 | `43290598424` | `ddabcab` | **success** | — |
+| `43293595763` | `0b9070a` (HEAD: отчёт + `SOURCE_SHA`) | **success** | — |
 
 Локально: `bash /home/user/runtests.sh` → `OK (351 tests)`; `bash /home/user/scripts/localjvm/check_applog.sh`
 → `APOLOG_TYPES_OK`.
