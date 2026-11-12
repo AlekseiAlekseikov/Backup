@@ -543,7 +543,7 @@ object AppLog {
                 try { out?.close() } catch (_: Throwable) {}
             }
         }
-        return runCatching { LogFiles.append(cx, line) }.getOrDefault(false)
+        return runCatching { LogFiles.append(cx, line).written }.getOrDefault(false)
     }
 
     private fun formatLine(lvl: String, tag: String, msg: String, _th: Throwable?): String {
