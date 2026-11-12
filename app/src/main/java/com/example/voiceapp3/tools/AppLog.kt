@@ -266,25 +266,31 @@ object AppLog {
         if (thrown != null) Log.e(TAG_BASE, "flushEarly: ${thrown.message}")
     }
 
-    // ─── H1.6 (iter33h): жёсткий бюджет файла-лога ───────────────────────────────────────
-    /** Лимит: 150 КБ за 10 минут. */
-    private const val BUDGET_BYTES = 150 * 1024L
-    private const val BUDGET_WINDOW_MS = 10 * 60_000L
-    /** В режиме trim — одна сводка в минуту. */
-    private const val TRIM_SUMMARY_MS = 60_000L
+    // ─── iter43 §1.1: лимита скорости на основной журнал БОЛЬШЕ НЕТ ────────────────────────
+    //
+    // Раньше здесь жил «бюджет» 150 КиБ / 10 минут: по превышении он либо резал строки
+    // (`action=trim`, потеряно 127 строк в логе владельца 12.11), либо (iter42) ротировал файл
+    // каждые ~150 КиБ и, кроме того, ПОДМЕНЯЛ очередную полезную строку уведомлением
+    // `LOG_BUDGET …`. Объём журнала ограничен РАЗМЕРОМ частей и их количеством
+    // (`LogFiles.MAX_FILE_BYTES` × `MAX_FILES_PER_DAY` + суммарный cap), поэтому отдельный
+    // лимит по скорости ничего не защищает, а только уничтожает историю.
+    //
+    // Теперь: каждая строка пишется как есть; уведомление (если оно нужно) — ОТДЕЛЬНАЯ запись,
+    // результат каждой записи учитывается отдельно; факт отказа объявляется, но не подменяет
+    // исходное событие.
 
-    private var budgetWindowStartMs = 0L
-    private var budgetBytes = 0L
-    private var budgetTrim = false
-    private var budgetDropped = 0L
-    private var budgetLastSummaryMs = 0L
+    private val linesWritten = java.util.concurrent.atomic.AtomicLong(0)
+    private val writeFailures = java.util.concurrent.atomic.AtomicLong(0)
+    private val legacyFailures = java.util.concurrent.atomic.AtomicLong(0)
+    private val noticeDropped = java.util.concurrent.atomic.AtomicLong(0)
 
-    /**
-     * Решение по строке: писать или свернуть.
-     * Возвращает `true`, если строку пишем. При превышении бюджета один раз печатает
-     * `LOG_BUDGET exceeded=… action=trim` и переходит на одну строку-сводку в минуту.
-     * [len] — длина строки в байтах UTF-8.
-     */
+    /** Счётчики журнала: видны в `LOG_STATS` и в отчёте, без чтения logcat. */
+    internal fun logStats(): String =
+        "LOG_STATS lines=$linesWritten failed=$writeFailures legacy_failed=$legacyFailures " +
+            "notice_unwritten=$noticeDropped io_errors=${LogFiles.ioErrors()} " +
+            "rotations=${LogFiles.rotations()} parts_deleted=${LogFiles.deleted()} " +
+            "split=${LogFiles.splits()} file=«${LogFiles.currentPath()}»"
+
     /**
      * iter33n §4.5 — префиксы строк ДЕЙСТВИЙ, которые бюджет не имеет права выбрасывать.
      * Список ровно из мандата: `OP_*`, `TOGGLE*`, `TTL_*`, `EXT_PROBE*`, `FLAG_*`, `JIT_*`, `ADB_*`,
@@ -351,55 +357,13 @@ object AppLog {
     }
 
     /**
-     * iter42 §2.2 — лимит скорости больше НЕ выбрасывает полезные строки.
+     * Нужна ли строка в основном журнале — решает ТОЛЬКО наличие контекста.
      *
-     * Прежнее поведение (`action=trim`) молча отбрасывало последующие записи: в логе владельца
-     * 12.11.2026 после `LOG_BUDGET exceeded=153744 action=trim` потеряно 127 строк, среди которых
-     * могли быть события сети/TTL/JIT. Теперь при достижении лимита окна выполняется РОТАЦИЯ
-     * ЦЕЛОГО файла ([LogFiles.rotateNow]) и запись продолжается — счётчики окна сбрасываются.
-     *
-     * `false` возвращается только если ротация невозможна (нет места/каталога): тогда строка
-     * действительно не сохранена, и это отдельно объявляется (`LOG_BUDGET action=drop_after_limit`),
-     * а не выдаётся за запись.
+     * iter43 §1.1: функция оставлена для совместимости сигнатуры; ограничение объёма теперь
+     * делается исключительно ротацией по размеру ([LogFiles]), поэтому здесь нет ни «trim»,
+     * ни подмены строки уведомлением.
      */
-    private fun budgetAllow(len: Int): Boolean {
-        val now = android.os.SystemClock.elapsedRealtime()
-        synchronized(lock) {
-            if (budgetWindowStartMs == 0L) budgetWindowStartMs = now
-            if (now - budgetWindowStartMs > BUDGET_WINDOW_MS) {
-                budgetWindowStartMs = now
-                budgetBytes = 0L
-                budgetTrim = false
-                budgetDropped = 0L
-            }
-            budgetBytes += len
-            if (budgetBytes <= BUDGET_BYTES) return true
-            // Лимит окна достигнут: закрываем файл целиком и продолжаем писать в новый.
-            val rotated = ctx?.let { c -> runCatching { LogFiles.rotateNow(c, "budget") }.getOrDefault(false) } ?: false
-            if (rotated) {
-                budgetBytes = 0L
-                budgetTrim = false
-                budgetNotices++
-                budgetNotice = "LOG_BUDGET exceeded=$budgetBytes action=rotate window=10min " +
-                    "limit=${BUDGET_BYTES} rotations=$budgetNotices " +
-                    "(строки не обрезаются: закрыт целый файл, запись продолжена в новый)"
-                return true
-            }
-            budgetDropped++
-            budgetLastSummaryMs = now
-            budgetNotice = "LOG_BUDGET action=drop_after_limit dropped=$budgetDropped bytes=$budgetBytes " +
-                "reason=rotate_unavailable (ротация невозможна: нет места/каталога; " +
-                "эта строка НЕ сохранена)"
-            Log.e(TAG_BASE, "LOG_BUDGET rotate_unavailable dropped=$budgetDropped")
-            return true     // пишем саму строку-уведомление
-        }
-    }
-
-    /** Сколько раз бюджет вызывал ротацию (видно в логе и тестах). */
-    private var budgetNotices = 0
-
-    /** Строка-уведомление бюджета, подменяющая очередную запись. */
-    @Volatile private var budgetNotice: String? = null
+    internal fun budgetAllow(len: Int): Boolean = ctx != null
 
     /**
      * Прямая запись строки в файл (только после init).
@@ -410,82 +374,98 @@ object AppLog {
      */
     private fun writeRaw(lvl: String, tag: String, msg: String, th: Throwable?): LogFiles.Result {
         val c = ctx ?: return LogFiles.Result.fail("no_context")
-        // §2.4 iter42: низкоуровневые ADB-трассы — в отдельный verbose-tier, мимо общего бюджета.
+        // §2.4 iter42: низкоуровневые ADB-трассы — в отдельный verbose-tier, мимо основного журнала.
         if (isVerboseLine(msg)) {
             val line = formatLine(lvl, tag, msg, null)
             val r = runCatching { LogFiles.appendVerbose(c, line) }
                 .getOrElse { t -> LogFiles.Result.fail("io:" + t.javaClass.simpleName) }
-            if (r.written) verboseWritten.incrementAndGet() else verboseFailed.incrementAndGet()
+            if (r.written) verboseWritten.incrementAndGet() else {
+                verboseFailed.incrementAndGet()
+                writeFailures.incrementAndGet()
+                announceFailure("verbose", r)
+            }
             return r
         }
-        var thrown: Throwable? = null
-        var line = formatLine(lvl, tag, msg, null)
-        // H1.6: бюджет считается по уже сформированной строке; уведомление бюджета
-        // подменяет собой очередную запись (порядок важен: сначала budgetAllow).
-        // iter33n §4.5: строки ДЕЙСТВИЙ не режутся бюджетом никогда — иначе из лога пропадают
-        // клики тумблеров и пробы (в прогоне 08.11 из файла исчезли TTL_*/TOGGLE*).
+
+        val line = formatLine(lvl, tag, msg, null)
         val lineBytes = line.toByteArray(Charsets.UTF_8).size
-        // §3.3: диагностические блоки (INTERNET_DIAG_*/JIT_MOUNT_DIAG_*) идут по СВОЕМУ бюджету:
-        // общий trim их не выбрасывает и не подменяет своей сводкой. Ограничение объёма и числа
-        // строк остаётся, а факт усечения объявляется одной явной строкой `*_TRUNCATED`.
-        if (isDiagLine(msg)) {
-            val v = diagBudget.decide(msg, lineBytes, android.os.SystemClock.elapsedRealtime())
-            if (!v.write) {
-                // Строку не пишем, но факт усечения объявляем ОДНОЙ явной строкой.
-                if (v.notice != null && linesDiagNoticeWritten(v.notice)) {
-                    writeRawLine(c, formatLine("INFO", "CENTRAL_LogDiag", v.notice, null), null)
-                }
-                return LogFiles.Result.fail("dropped:diag_budget")
-            }
-        } else {
-            val exempt = isActionLine(msg)
-            val allowed = if (exempt) true else budgetAllow(lineBytes)
-            val notice = budgetNotice
-            budgetNotice = null
-            if (notice != null) line = formatLine("INFO", "CENTRAL_LogBudget", notice, null)
-            else if (!allowed) return LogFiles.Result.fail("dropped:budget")
-        }
-        // iter16: собираем "шапку" (BUILD/App INIT) — пишем её в начало каждого
-        // нового/повёрнутого файла, чтобы после ротации версия не терялась.
+
+        // (1) Шапка (BUILD/INIT) запоминается ДО записи: она попадает в начало нового файла.
         if (isHeaderLine(tag, msg)) {
             synchronized(lock) {
                 if (headerLines.size >= 8) headerLines.removeFirst()
                 headerLines.addLast(line)
             }
         }
-        synchronized(lock) {
-            var out: PrintWriter? = null
-            var target: File? = null
-            try {
-                target = pickFile(c)
-                rotateIfNeeded(target)
-                out = PrintWriter(FileWriter(target, true))
-                out.println(line)
-                th?.printStackTrace(out)
-                out.flush()
-            } catch (x: Throwable) {
-                thrown = x
-                // Фоллбэк в data/data
-                try {
-                    val f2 = File(c.filesDir, "logs").apply { runCatching { if(!exists()) mkdirs() } }.let { File(it, LOG_NAME) }
-                    rotateIfNeeded(f2)
-                    PrintWriter(FileWriter(f2, true)).use {
-                        it.println(line); th?.printStackTrace(it); it.flush()
-                    }
-                    target = f2
-                } catch (xx: Throwable) { Log.e(TAG_BASE, "write failed both: ${x.message} / ${xx.message}") }
-            } finally {
-                try { out?.close() } catch (_: Throwable) {}
-            }
-            if (thrown == null && target != null && target.absolutePath != primaryPath) {
-                primaryPath = target.absolutePath
+
+        // (2) Второй (legacy) писатель `voiceapp3.log`: ограничен 16 МиБ × 2 архива.
+        //     Пишется ДО основной записи и НЕ подменяет её; его отказ учитывается отдельно.
+        val legacyOk = writeLegacy(c, line, th)
+        if (!legacyOk) {
+            legacyFailures.incrementAndGet()
+            writeFailures.incrementAndGet()
+        }
+
+        // (3) Диагностические блоки идут по СВОЕМУ бюджету; при отказе пишется ОТДЕЛЬНАЯ строка
+        //     `*_TRUNCATED`, а не подмена исходной записи.
+        if (isDiagLine(msg)) {
+            val v = diagBudget.decide(msg, lineBytes, android.os.SystemClock.elapsedRealtime())
+            if (!v.write) {
+                if (v.notice != null && linesDiagNoticeWritten(v.notice)) {
+                    val notice = formatLine("INFO", "CENTRAL_LogDiag", v.notice, null)
+                    val nr = runCatching { LogFiles.append(c, notice) }
+                        .getOrElse { t -> LogFiles.Result.fail("io:" + t.javaClass.simpleName) }
+                    if (!nr.written) {
+                        noticeDropped.incrementAndGet()
+                        announceFailure("diag_notice", nr)
+                    } else linesWritten.incrementAndGet()
+                }
+                writeFailures.incrementAndGet()
+                return LogFiles.Result.fail("dropped:diag_budget")
             }
         }
-        // iter33p §4.3: та же строка уходит в дневной файл `voiceapp3-DD.MM.YYYY.log`.
-        // iter42 §2.6: возвращаем ТОЧНЫЙ файл и подтверждённый факт записи (фоллбэк
-        // external→internal учтён внутри LogFiles) — «вызов принят» больше не выдаётся за запись.
-        return runCatching { LogFiles.append(c, line) }
+
+        // (4) ОСНОВНАЯ запись: ровно исходная строка (никакой подмены уведомлением).
+        val r = runCatching { LogFiles.append(c, line) }
             .getOrElse { t -> LogFiles.Result.fail("io:" + t.javaClass.simpleName) }
+        if (r.written) {
+            linesWritten.incrementAndGet()
+            if (primaryPath != r.file && primaryPath != "(not initialised yet)") {
+                // Путь сменился (фоллбэк external→internal) — фиксируем ФАКТ, а не предположение.
+                primaryPath = r.file
+            }
+        } else {
+            writeFailures.incrementAndGet()
+            announceFailure("main", r)
+        }
+        if (!legacyOk) {
+            // Отказ legacy-писателя объявляется отдельной строкой основного журнала (не подменой).
+            val note = formatLine("WARN", TAG_BASE,
+                "LOG_LEGACY_FAILED file=«${pickFile(c).absolutePath}» (запись в legacy-файл не " +
+                    "подтверждена; датированный журнал ведётся отдельно)", null)
+            val nr = runCatching { LogFiles.append(c, note) }
+                .getOrElse { t -> LogFiles.Result.fail("io:" + t.javaClass.simpleName) }
+            if (nr.written) linesWritten.incrementAndGet() else noticeDropped.incrementAndGet()
+        }
+        return r
+    }
+
+    /**
+     * Отказ записи сообщается НЕЗАВИСИМО (logcat + счётчики) и, если возможно, отдельной строкой
+     * датированного журнала. Исходное событие при этом не выдаётся за записанное.
+     */
+    private fun announceFailure(where: String, r: LogFiles.Result) {
+        runCatching {
+            Log.e(TAG_BASE, "LOG_WRITE_FAILED where=$where reason=${r.reason} " +
+                "written=false lines=${linesWritten.get()} failed=${writeFailures.get()}")
+        }
+        val c = ctx ?: return
+        val note = formatLine("ERROR", TAG_BASE,
+            "LOG_WRITE_FAILED where=$where reason=${r.reason} (строка НЕ сохранена в " +
+                "датированном журнале; см. LOG_STATS)", null)
+        val nr = runCatching { LogFiles.append(c, note) }
+            .getOrElse { t -> LogFiles.Result.fail("io:" + t.javaClass.simpleName) }
+        if (nr.written) linesWritten.incrementAndGet() else noticeDropped.incrementAndGet()
     }
 
     /**
@@ -607,6 +587,42 @@ object AppLog {
             delegate?.uncaughtException(t, e)
         }
     }
+
+    /**
+     * Второй (legacy) писатель `voiceapp3.log` в каталоге приложения — ограничен
+     * [MAX] × ([MAX_ARCHIVES] + 1) архива. Возвращает ФАКТ записи (не «вызов принят»).
+     *
+     * iter43: результат учитывается отдельно от датированного журнала; отказ не скрывается.
+     */
+    private fun writeLegacy(c: Context, line: String, th: Throwable?): Boolean {
+        synchronized(legacyLock) {
+            var out: PrintWriter? = null
+            return try {
+                val target = pickFile(c)
+                rotateIfNeeded(target)
+                out = PrintWriter(FileWriter(target, true))
+                out.println(line)
+                th?.printStackTrace(out)
+                out.flush()
+                true
+            } catch (x: Throwable) {
+                try {
+                    val f2 = intFile(c)
+                    rotateIfNeeded(f2)
+                    PrintWriter(FileWriter(f2, true)).use { it.println(line); th?.printStackTrace(it); it.flush() }
+                    primaryPath = f2.absolutePath
+                    true
+                } catch (xx: Throwable) {
+                    runCatching { Log.e(TAG_BASE, "AppLog legacy write failed both: ${x.message} / ${xx.message}") }
+                    false
+                }
+            } finally {
+                runCatching { out?.close() }
+            }
+        }
+    }
+
+    private val legacyLock = Any()
 
     private fun pickFile(c: Context): File {
         val dir = (try { c.getExternalFilesDir(null) } catch (_: Throwable) { null }) ?: c.filesDir

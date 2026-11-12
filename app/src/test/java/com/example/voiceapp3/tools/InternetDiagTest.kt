@@ -245,9 +245,17 @@ class InternetDiagTest {
     @Test
     fun endSummaryIsFactsNotDiagnosis() {
         val sections = InternetDiag.collect(okShell(), true, FakeNet(), sink(), "t", "v")
-        val end = logs.last()
-        assertTrue(end.contains("это факты, а не диагноз"))
+        // iter43 §2.1: END — провизионная (written=unconfirmed), итог — в отдельной строке
+        // `_END_CONFIRM` уже после записи END.
+        val end = logs.last { it.startsWith("INTERNET_DIAG_END ") }
+        val confirm = logs.last { it.startsWith("INTERNET_DIAG_END_CONFIRM ") }
+        assertTrue("END не заявляет подтверждённый итог", end.contains("written=unconfirmed"))
         assertTrue(end.contains("network_changes=0"))
+        assertTrue("итог: это факты, а не диагноз", confirm.contains("это факты, а не диагноз"))
+        // Проба усечения в этом тесте не передана (`null`) ⇒ честная метка `unknown`,
+        // а не `full`: «проверить нельзя» не выдаётся за подтверждённую полноту.
+        assertTrue("неизвестность честно помечена", confirm.contains("written=unknown"))
+        assertTrue(confirm.contains("write_reason=truncation_not_checkable"))
         assertEquals(7, sections.size)
     }
 

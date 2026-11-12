@@ -184,7 +184,15 @@ object JitRef {
     data class SnapshotWrite(
         val want: Boolean,
         val snap: WifiSnapshot,
-        val stores: List<StoreReport>
+        val stores: List<StoreReport>,
+        /**
+         * iter43 §4: хранилища, которые стали доступны ПОСЛЕ предварительного чтения и потому
+         * не участвовали в записи. Их имена не попадают в сравнение наборов, поэтому перечисляем
+         * явно — иначе «появившаяся копия» тихо исчезала бы из отчёта.
+         */
+        val appeared: List<String> = emptyList(),
+        /** Хранилища из [target], которые к моменту записи стали недоступны. */
+        val absent: List<String> = emptyList()
     ) {
         val attempted: Int get() = stores.size
         val committed: Int get() = stores.count { it.committed }
@@ -820,12 +828,22 @@ object JitRef {
      */
     class EventSnapshots(
         private val minIntervalMs: Long = 90_000L,
-        private val maxPerHour: Int = 6
+        private val maxPerHour: Int = 6,
+        /** Отдельная квота на ДЕЙСТВИЯ владельца: они не должны теряться из-за авто-лимита. */
+        private val userMaxPerHour: Int = 12
     ) {
         private var lastAtMs = 0L
         private var lastKey: String? = null
         private var windowStartMs = 0L
+        /**
+         * Отдельный флаг начала окна. Раньше окно определялось как `windowStartMs == 0L`, и при
+         * первом вызове с `nowMs = 0` (синтетическое время в тестах) окно обнулялось НА КАЖДОМ
+         * вызове — часовая квота не набиралась вовсе. На реальном времени это не проявлялось,
+         * но правило должно быть корректным при любом старте.
+         */
+        private var windowStarted = false
         private var inWindow = 0
+        private var inWindowUser = 0
         private val inFlight = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
         private val log = ArrayList<String>()
         private val maxLog = 32
@@ -837,6 +855,19 @@ object JitRef {
          * @return `null` — снимок разрешён (можно запускать); иначе причина пропуска.
          */
         fun tryAcquire(key: String, nowMs: Long): String? = acquire(key, nowMs, null)
+
+        /**
+         * iter43 §3.2 — снимок по ДЕЙСТВИЮ ВЛАДЕЛЬЦА (переключение TTL).
+         *
+         * Такие события не должны теряться из-за общего ограничения частоты: у них отдельная
+         * квота ([userMaxPerHour]) и нет минимального интервала. Общий часовой лимит и дедуп
+         * in-flight продолжают действовать, а каждый пропуск пишется с причиной.
+         */
+        fun tryAcquireUser(key: String, nowMs: Long): String? = acquire(key, nowMs, null, userEvent = true)
+
+        /** Парный снимок пользовательского события (`_pre` → `_post`). */
+        fun tryAcquireUserPaired(key: String, nowMs: Long, pairWith: String): String? =
+            acquire(key, nowMs, pairWith, userEvent = true)
 
         /**
          * Снимок, парный к предыдущему (`pairWith`) — например «до» и «после» РЕАЛЬНОГО
@@ -857,14 +888,26 @@ object JitRef {
             else -> null
         }
 
-        private fun acquire(key: String, nowMs: Long, pairWith: String?): String? {
+        private fun acquire(
+            key: String,
+            nowMs: Long,
+            pairWith: String?,
+            userEvent: Boolean = false
+        ): String? {
             synchronized(this) {
                 if (inFlight.putIfAbsent(key, true) != null) return "duplicate_in_flight"
-                if (windowStartMs == 0L || nowMs - windowStartMs > 3_600_000L) {
+                if (!windowStarted || nowMs - windowStartMs > 3_600_000L) {
+                    windowStarted = true
                     windowStartMs = nowMs
                     inWindow = 0
+                    inWindowUser = 0
                 }
-                if (inWindow >= maxPerHour) {
+                if (userEvent) {
+                    if (inWindowUser >= userMaxPerHour) {
+                        inFlight.remove(key)
+                        return "user_hour_limit_$userMaxPerHour"
+                    }
+                } else if (inWindow >= maxPerHour) {
                     inFlight.remove(key)
                     return "hour_limit_$maxPerHour"
                 }
@@ -872,13 +915,14 @@ object JitRef {
                 val paired = pairWith != null && pairWith == lastKey &&
                     pairBase(key) != null && pairBase(key) == pairBase(pairWith) &&
                     since in 0..PAIR_WINDOW_MS
-                if (!paired && lastAtMs != 0L && since in 0 until minIntervalMs) {
+                if (!userEvent && !paired && lastAtMs != 0L && since in 0 until minIntervalMs) {
                     inFlight.remove(key)
                     return "rate_limited ${since}ms<$minIntervalMs"
                 }
                 lastAtMs = nowMs
                 lastKey = key
                 inWindow++
+                if (userEvent) inWindowUser++
                 return null
             }
         }
@@ -888,6 +932,13 @@ object JitRef {
         }
 
         fun used(): Int = synchronized(this) { inWindow }
+
+        fun usedUser(): Int = synchronized(this) { inWindowUser }
+
+        /** Сколько миллисекунд осталось до разрешённого авто-снимка (для trailing). */
+        fun remainingMs(nowMs: Long): Long = synchronized(this) {
+            if (lastAtMs == 0L) 0L else (minIntervalMs - (nowMs - lastAtMs)).coerceAtLeast(0L)
+        }
 
         fun note(line: String) {
             synchronized(this) {
@@ -900,7 +951,8 @@ object JitRef {
 
         fun resetForTest() {
             synchronized(this) {
-                lastAtMs = 0L; lastKey = null; windowStartMs = 0L; inWindow = 0
+                lastAtMs = 0L; lastKey = null; windowStartMs = 0L; windowStarted = false
+                inWindow = 0; inWindowUser = 0
                 inFlight.clear(); log.clear()
             }
         }
@@ -927,6 +979,261 @@ object JitRef {
         val reason: String
     ) {
         val completed: Boolean get() = status == "completed"
+    }
+
+    /**
+     * iter43 §2.3 — ОРКЕСТРАЦИЯ сбора диагностики: единственный запуск, ограниченные повторы,
+     * отмена устаревших отложенных задач.
+     *
+     * Почему отдельный класс: [`DiagOnce`] — это счётчик попыток, а не планировщик. Он не мешал
+     * параллельному запуску двух сборов, не планировал повтор после частичного результата и не
+     * отменял «страховочную» проверку через 30 с после того, как сбор уже удался.
+     *
+     * Гарантии:
+     *  • одновременно выполняется не более ОДНОГО сбора ([start] возвращает `false`, если занято);
+     *  • после успеха ([Outcome.COMPLETED]) повторов нет, а все ранее запланированные задачи
+     *    становятся no-op (проверка поколения);
+     *  • после `PARTIAL`/`CHANNEL_NOT_READY` — не более [maxAttempts] попыток, каждая через
+     *    [retryDelayMs]; после исчерпания — честный статус `exhausted`;
+     *  • нет бесконечных циклов и утечек: число запланированных задач ограничено.
+     *
+     * Время и планировщик передаются снаружи ([post]), поэтому оркестрацию можно проверить
+     * синтетическим временем без Android.
+     */
+    class DiagRunner(
+        private val maxAttempts: Int = 3,
+        private val retryDelayMs: Long = 20_000L,
+        private val post: (name: String, delayMs: Long, task: () -> Unit) -> Unit
+    ) {
+        enum class Outcome { COMPLETED, PARTIAL, CHANNEL_NOT_READY, FAILED }
+
+        private val lock = Any()
+        private var generation = 0
+        private var inFlight = false
+        private var attempts = 0
+        private var done = false
+        private var exhausted = false
+        private val notes = ArrayList<String>(32)
+
+        fun completedNow(): Boolean = synchronized(lock) { done }
+        fun attempts(): Int = synchronized(lock) { attempts }
+        fun isExhausted(): Boolean = synchronized(lock) { exhausted }
+        fun isBusy(): Boolean = synchronized(lock) { inFlight }
+        fun notes(): List<String> = synchronized(lock) { notes.toList() }
+        fun resetForTest() = synchronized(lock) {
+            generation++; inFlight = false; attempts = 0; done = false; exhausted = false; notes.clear()
+        }
+
+        private fun note(s: String) = synchronized(lock) {
+            if (notes.size > 48) notes.removeAt(0)
+            notes.add(s)
+        }
+
+        /**
+         * Запустить сбор.
+         *
+         * @return `false` — сбор не запущен (уже выполнен, идёт другой или попытки исчерпаны);
+         *   причина видна в [notes].
+         */
+        fun start(
+            reason: String,
+            run: () -> Outcome
+        ): Boolean {
+            val gen: Int
+            synchronized(lock) {
+                if (done) { note("DIAG_ORCH reason=$reason status=skipped why=already_completed"); return false }
+                if (inFlight) { note("DIAG_ORCH reason=$reason status=skipped why=in_flight"); return false }
+                if (attempts >= maxAttempts) {
+                    exhausted = true
+                    note("DIAG_ORCH reason=$reason status=skipped why=attempts_exhausted " +
+                        "attempts=$attempts/$maxAttempts (это ограничение, а не «данных нет»)")
+                    return false
+                }
+                attempts++
+                inFlight = true
+                // Запоминаем тело попытки ЗДЕСЬ: повтор обязан выполнять ту же операцию.
+                runRef = run
+                gen = generation
+                note("DIAG_ORCH reason=$reason status=started attempt=$attempts/$maxAttempts")
+            }
+            var outcome = Outcome.FAILED
+            try {
+                outcome = run()
+            } catch (t: Throwable) {
+                outcome = Outcome.FAILED
+                note("DIAG_ORCH reason=$reason status=failed why=exception:${t.javaClass.simpleName}")
+            } finally {
+                synchronized(lock) { inFlight = false }
+            }
+            finish(reason, gen, outcome)
+            return true
+        }
+
+        private fun finish(reason: String, gen: Int, outcome: Outcome) {
+            synchronized(lock) {
+                if (generation != gen) {
+                    // Пока шёл сбор, состояние сброшено/сменилось — результат не применяем.
+                    note("DIAG_ORCH reason=$reason status=stale_result outcome=${outcome.name.lowercase()}")
+                    return
+                }
+                when (outcome) {
+                    Outcome.COMPLETED -> {
+                        done = true
+                        // Устаревшие отложенные задачи (страховка «через 30 с», повторы) отменяются
+                        // сменой поколения: они проверяют его перед запуском.
+                        generation++
+                        note("DIAG_ORCH reason=$reason status=completed attempt=$attempts/$maxAttempts " +
+                            "pending_cancelled=true")
+                    }
+                    Outcome.PARTIAL, Outcome.CHANNEL_NOT_READY -> {
+                        if (attempts >= maxAttempts) {
+                            exhausted = true
+                            note("DIAG_ORCH reason=$reason status=exhausted " +
+                                "outcome=${outcome.name.lowercase()} attempts=$attempts/$maxAttempts")
+                        } else {
+                            note("DIAG_ORCH reason=$reason status=retry_scheduled " +
+                                "outcome=${outcome.name.lowercase()} delay_ms=$retryDelayMs " +
+                                "attempt=$attempts/$maxAttempts")
+                        }
+                    }
+                    Outcome.FAILED -> {
+                        if (attempts >= maxAttempts) {
+                            exhausted = true
+                            note("DIAG_ORCH reason=$reason status=exhausted outcome=failed " +
+                                "attempts=$attempts/$maxAttempts")
+                        } else {
+                            note("DIAG_ORCH reason=$reason status=retry_scheduled outcome=failed " +
+                                "delay_ms=$retryDelayMs attempt=$attempts/$maxAttempts")
+                        }
+                    }
+                }
+            }
+            if (outcome != Outcome.COMPLETED && attempts < maxAttempts) {
+                val myGen = synchronized(lock) { generation }
+                post("JitNet.diagRetry", retryDelayMs) {
+                    val go = synchronized(lock) {
+                        generation == myGen && !done && !inFlight && attempts < maxAttempts
+                    }
+                    // ВАЖНО: повтор получает ИСХОДНОЕ тело попытки, а не обёртку над собой —
+                    // иначе `runRef` указывал бы на самого себя (StackOverflowError).
+                    val original = synchronized(lock) { runRef }
+                    if (go && original != null) {
+                        start("retry_after_${outcome.name.lowercase()}", original)
+                    }
+                    else note("DIAG_ORCH reason=retry_after_${outcome.name.lowercase()} " +
+                        "status=skipped why=stale_or_completed")
+                }
+            }
+        }
+
+        /**
+         * Тело следующей попытки задаётся при первом [start]; храним его, чтобы повтор
+         * выполнял ТУ ЖЕ операцию (без дублирования логики в вызывающем коде).
+         */
+        private var runRef: (() -> Outcome)? = null
+
+        /** Запуск с запоминанием тела попытки (используется повторами). */
+        fun startWithRetry(reason: String, run: () -> Outcome): Boolean = start(reason, run)
+
+        /**
+         * Запланировать «страховочную» проверку готовности канала: если сбор так и не удался,
+         * через [delayMs] сообщается честный статус. После успешного сбора задача становится
+         * no-op (проверка поколения и [done]).
+         */
+        fun scheduleNotReadyReport(
+            reason: String,
+            delayMs: Long,
+            report: () -> Unit
+        ) {
+            val myGen = synchronized(lock) { generation }
+            post("JitNet.diagNotReady", delayMs) {
+                val go = synchronized(lock) { generation == myGen && !done }
+                if (go) {
+                    note("DIAG_ORCH reason=$reason status=not_ready_report fired=true")
+                    report()
+                } else {
+                    note("DIAG_ORCH reason=$reason status=not_ready_report fired=false " +
+                        "why=completed_or_stale")
+                }
+            }
+        }
+    }
+
+    /**
+     * iter43 §3.1 — КОНТРАКТ снимков «до/после включения TTL».
+     *
+     * Реальность: сбор снимка асинхронен и может занять секунды, а применение TTL выполняется
+     * сразу — задерживать переключение тумблера на произвольное время недопустимо (это лишило бы
+     * владельца управления). Поэтому «до» НЕ объявляется гарантированным состоянием до изменения:
+     * каждая пара получает ЯВНУЮ метку по фактам времени:
+     *
+     *  • `pre_confirmed` — сбор «до» завершился РАНЬШЕ применения TTL;
+     *  • `pre_overlap`   — сбор «до» пересёкся с применением (часть данных уже после изменения);
+     *  • `pre_late`      — сбор «до» начался ПОСЛЕ применения: это не «до», а повторный снимок.
+     *
+     * Для «после» метка `post_after_apply` с ID операции, результатом применения и фактической
+     * задержкой стабилизации. Отказ/пропуск диагностики НЕ меняет результат тумблера и не
+     * задерживает его.
+     */
+    class TtlSnapshotFlow {
+        /** Фаза снимка (не «машина состояний» JIT: только метка для отчёта). */
+        enum class SnapPart { PRE, POST }
+        data class Op(
+            val id: String,
+            val want: Boolean,
+            val requestedAt: Long,
+            var appliedAt: Long? = null,
+            var appliedResult: String = "unknown",
+            var preStartedAt: Long? = null,
+            var preFinishedAt: Long? = null,
+            var postScheduledAt: Long? = null
+        )
+
+        private val lock = Any()
+        private var current: Op? = null
+        private var counter = 0
+
+        fun begin(want: Boolean, nowMs: Long): Op = synchronized(lock) {
+            counter++
+            val op = Op("ttl-" + counter, want, nowMs)
+            current = op
+            op
+        }
+
+        fun preStarted(nowMs: Long) = synchronized(lock) { current?.preStartedAt = nowMs }
+        fun preFinished(nowMs: Long) = synchronized(lock) { current?.preFinishedAt = nowMs }
+        fun applied(nowMs: Long, result: String) = synchronized(lock) {
+            current?.appliedAt = nowMs; current?.appliedResult = result
+        }
+        fun postScheduled(nowMs: Long) = synchronized(lock) { current?.postScheduledAt = nowMs }
+        fun currentOp(): Op? = synchronized(lock) { current }
+
+        /**
+         * Метка фазы «до» — по ФАКТИЧЕСКИМ временам, а не по намерению.
+         */
+        fun preLabel(op: Op): String {
+            val started = op.preStartedAt ?: return "pre_unknown"
+            val applied = op.appliedAt ?: return "pre_confirmed"
+            return when {
+                started > applied -> "pre_late"
+                (op.preFinishedAt ?: Long.MAX_VALUE) > applied -> "pre_overlap"
+                else -> "pre_confirmed"
+            }
+        }
+
+        fun postLabel(op: Op): String =
+            if (op.appliedAt == null) "post_without_confirmed_apply" else "post_after_apply"
+
+        fun describe(op: Op, part: SnapPart, snapshotLabel: String): String = when (part) {
+            SnapPart.PRE -> "op=${op.id} want=${op.want} phase=pre label=${preLabel(op)} " +
+                "requested_at=${op.requestedAt} applied_at=${op.appliedAt ?: "n/a"} " +
+                "snapshot=$snapshotLabel"
+            SnapPart.POST -> "op=${op.id} want=${op.want} phase=post label=${postLabel(op)} " +
+                "applied_at=${op.appliedAt ?: "n/a"} applied_result=«${op.appliedResult}» " +
+                "scheduled_at=${op.postScheduledAt ?: "n/a"} snapshot=$snapshotLabel"
+        }
+
+        fun resetForTest() = synchronized(lock) { current = null; counter = 0 }
     }
 
     class DiagOnce(private val maxRuns: Int = 2) {

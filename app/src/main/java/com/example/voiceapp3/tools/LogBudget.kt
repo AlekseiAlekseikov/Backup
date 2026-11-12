@@ -93,9 +93,13 @@ internal object LogBudget {
         var dropped: Int = 0; private set
         var failed: Int = 0; private set
         private var firstFailure: String? = null
+
         private val locations = LinkedHashSet<String>()
         /** Строка `…_END`: её собственный факт записи тоже проверяется. */
         var endOutcome: WriteOutcome? = null; private set
+        /** Строка `…_END_CONFIRM` (первая после END): её факт записи тоже важен. */
+        var endConfirmOutcome: WriteOutcome? = null; private set
+        private var endSeen = false
 
         fun emit(line: String, isEnd: Boolean = false) {
             offered++
@@ -116,8 +120,16 @@ internal object LogBudget {
                     }
                 }
             }
-            if (isEnd) endOutcome = lw.outcome
+            if (isEnd) {
+                endOutcome = lw.outcome
+                endSeen = true
+            } else if (endSeen && endConfirmOutcome == null) {
+                endConfirmOutcome = lw.outcome
+            }
         }
+
+        /** Первая неудачная строка (для причины в отчёте). */
+        fun firstFailure(): String = firstFailure ?: "none"
 
         fun sinkList(): String = locations.joinToString("+").ifEmpty { "none" }
 
@@ -155,6 +167,32 @@ internal object LogBudget {
             "written=${verdict(truncated)} sink=«${sinkList()}» " +
                 "lines=${written}/${offered} skipped_by_budget=$dropped " +
                 "write_failed=$failed write_reason=${reason(truncated)}"
+
+        /**
+         * iter43 §2.1 — ПРОВИЗИОННЫЕ поля для строки `…_END`.
+         *
+         * `…_END` физически не может подтвердить саму себя: в момент её формирования неизвестно,
+         * в какой файл она попадёт (фоллбэк/ротация могут случиться именно на ней). Поэтому END
+         * пишет `written=unconfirmed` и счётчики БЕЗ себя, а итог (`written=…`) сообщается отдельной
+         * строкой `…_END_CONFIRM` уже после записи END.
+         *
+         * Неустранимый предел: последняя строка (`…_END_CONFIRM`) тоже не подтверждает себя —
+         * её факт виден только в возвращённом [JitRef.DiagReport] и в независимом канале.
+         */
+        fun provisionalFields(truncated: Boolean?): String {
+            val linesBeforeEnd = (offered - 1).coerceAtLeast(0)
+            return "written=unconfirmed lines_before_end=$written/$linesBeforeEnd " +
+                "skipped_by_budget=$dropped write_failed=$failed " +
+                "sink_hint=«${sinkList()}» truncation=${truncated?.toString() ?: "unknown"} " +
+                "note=\"итог сообщается отдельной строкой _END_CONFIRM: END не подтверждает сам себя\""
+        }
+
+        /** Итоговые поля для `…_END_CONFIRM` (после записи END). */
+        fun confirmFields(block: String, truncated: Boolean?): String =
+            "block=$block written=${verdict(truncated)} sink=«${sinkList()}» " +
+                "lines=${written}/${offered} skipped_by_budget=$dropped write_failed=$failed " +
+                "write_reason=${reason(truncated)} end_written=${endOutcome?.name?.lowercase() ?: "unknown"} " +
+                "note=\"эта строка сама себя не подтверждает; её факт — в DiagReport и независимом канале\""
     }
 
     fun isDiagLine(msg: String): Boolean {

@@ -111,7 +111,9 @@ object JitNet {
          */
         constructor(app: Context) : this(
             { try { Prefs2.cps(app) } catch (t: Throwable) { null } },
-            { try { Prefs2.dps(app) } catch (t: Throwable) { null } }
+            // iter43 §4: БЕЗ скрытого фоллбэка — иначе CPS выдавался бы за DPS и «две копии»
+            // были бы фикцией. `null` честно означает «второй копии нет».
+            { try { Prefs2.dpsOrNull(app) } catch (t: Throwable) { null } }
         )
 
         private fun cps(): SharedPreferences? = runCatching { cpsProvider() }.getOrNull()
@@ -157,7 +159,11 @@ object JitNet {
             }
             if (d != null) {
                 if (out.none { it.second === d }) out += "dps" to d
-                // иначе DPS == CPS: одна физическая копия, второй пары не существует
+                else log(
+                    "JIT_STORE acquire dps_distinct=false copies=1 " +
+                        "ids=cps:${System.identityHashCode(c)} dps:${System.identityHashCode(d)} " +
+                        "(DPS вернул ТУ ЖЕ копию: это одна копия, а не две; вход в одну точку данных)"
+                )
             } else if (errors.none { it.name == "dps" }) {
                 log("JIT_STORE acquire store=dps error=provider_null")
                 errors += JitRef.StoreOp("dps", null, null, "provider_null")
@@ -412,14 +418,24 @@ object JitNet {
         ): JitRef.SnapshotWrite {
             // §2.5: набор хранилищ фиксируется моментом чтения прежних значений; если хранилище
             // исчезло или появилось между этапами — отчёт покажет это, а не «тихо» переедет.
-            val all = stores().filter { target == null || it.first in target }
+            val available = stores()
+            val all = available.filter { target == null || it.first in target }
+            // §4 iter43: и ПОЯВИВШИЕСЯ, и ПРОПАВШИЕ копии перечисляются явно — имена не должны
+            // «тихо» исчезать из сравнения набора. Появившаяся копия НЕ участвует в записи
+            // (её прежнее состояние неизвестно), поэтому клик будет заблокирован.
+            val appeared = if (target == null) emptyList()
+            else available.map { it.first }.filter { it !in target }
+            val absent = if (target == null) emptyList()
+            else target.filter { t -> all.none { it.first == t } }
             if (all.isEmpty()) {
-                log("JIT_STORE snapshot attempted=0 reason=no_store")
-                return JitRef.SnapshotWrite(want, snap, emptyList())
+                log("JIT_STORE snapshot attempted=0 reason=no_store appeared=${appeared.ifEmpty { listOf("none") }}")
+                return JitRef.SnapshotWrite(want, snap, emptyList(), appeared, absent)
             }
-            val absent = target?.filter { t -> all.none { it.first == t } } ?: emptyList()
-            if (absent.isNotEmpty()) {
-                log("JIT_STORE snapshot note=store_absent names=${absent.joinToString(",")}")
+            if (absent.isNotEmpty() || appeared.isNotEmpty()) {
+                log("JIT_STORE snapshot note=store_set_changed " +
+                    "absent=${absent.ifEmpty { listOf("none") }} " +
+                    "appeared=${appeared.ifEmpty { listOf("none") }} " +
+                    "(состав копий CPS/DPS изменился между чтением и записью)")
             }
             val reports = ArrayList<JitRef.StoreReport>(all.size)
             for ((name, s) in all) {
@@ -448,7 +464,7 @@ object JitNet {
                 }.getOrDefault(false)
                 reports += JitRef.StoreReport(name, commit, readback, err)
             }
-            val w = JitRef.SnapshotWrite(want, snap, reports)
+            val w = JitRef.SnapshotWrite(want, snap, reports, appeared, absent)
             log(
                 "JIT_STORE snapshot keys=$KEY_PEDIDO,$KEY_AUTO,$KEY_RESTORE,$KEY_MARK op=${mark.op} " +
                     "value=${snap.wire()} " +
@@ -748,25 +764,44 @@ object JitNet {
             }
         }
 
-        val task: () -> Unit = {
+        /**
+         * §2.3 iter43 — оркестрация: один сбор одновременно, ограниченные повторы по факту
+         * готовности канала/частичного результата, отмена устаревшей «страховки» после успеха.
+         */
+        val runner = JitRef.DiagRunner(
+            maxAttempts = 2,
+            retryDelayMs = 20_000L
+        ) { name, delay, task -> BgWorker.postDelayed(name, delay, task) }
+
+        lateinit var attempt: () -> JitRef.DiagRunner.Outcome
+        attempt = attempt@{
             BgWorker.assertNotMain("JitNet.requestDiagOnce")
             val ready = runCatching { AdbClient.isChannelReady() }.getOrDefault(false)
-            if (ready) {
-                runBoth("immediate")
-            } else {
+            if (!ready) {
                 AppLog.i(TAG, "DIAG source=$source status=channel_not_ready action=wait_event " +
                     "(канал приложения ещё не готов: это НЕ отсутствие root; ждём существующее " +
-                    "событие готовности, повторов нет)")
+                    "событие готовности, повторов без него нет)")
                 runCatching {
                     AdbClient.onChannelReadyOnce {
-                        BgWorker.post("JitNet.diagOnReady") { runBoth("after_ready_event") }
+                        BgWorker.post("JitNet.diagOnReady") {
+                            runner.startWithRetry("after_ready_event", attempt)
+                        }
                     }
                 }
-                // Одна отложенная проверка: если канал так и не поднялся, статус будет честным.
-                BgWorker.postDelayed("JitNet.diagFallback", 30_000L) {
+                // Одна ограниченная «страховка»: если канал так и не поднялся, статус будет честным.
+                runner.scheduleNotReadyReport("channel_not_ready", 30_000L) {
                     treatNotReady("channel_not_ready_after_30s")
                 }
+                JitRef.DiagRunner.Outcome.CHANNEL_NOT_READY
+            } else {
+                val ok = runBoth("attempt")
+                if (ok) JitRef.DiagRunner.Outcome.COMPLETED else JitRef.DiagRunner.Outcome.PARTIAL
             }
+        }
+
+        val task: () -> Unit = {
+            runner.startWithRetry("initial", attempt)
+            for (n in runner.notes()) AppLog.i(TAG, n)
         }
         if (delayMs > 0) BgWorker.postDelayed("JitNet.diag", delayMs, task)
         else BgWorker.post("JitNet.diag", task)
@@ -800,27 +835,50 @@ object JitNet {
         netInfo: InternetDiag.NetInfo? = null,
         stableDelayMs: Long = 15_000L,
         /** Снимок парный к предыдущему (`ttl_on_pre` → `ttl_on_post`): интервал не режет пару. */
-        pairWith: String? = null
+        pairWith: String? = null,
+        /** `true` — событие вызвано ДЕЙСТВИЕМ ВЛАДЕЛЬЦА (переключение TTL): своя квота. */
+        userEvent: Boolean = false,
+        /** Явная метка фазы (из [JitRef.TtlSnapshotFlow]): `pre_confirmed`/`pre_overlap`/`post_after_apply`. */
+        phaseLabel: String? = null,
+        /**
+         * Метка фазы, вычисляемая В МОМЕНТ фактического сбора: «до» может пересёкся с применением
+         * TTL, и честная метка зависит от времени сбора, а не от времени заказа.
+         */
+        phaseLabelProvider: (() -> String)? = null,
+        /** Вызывается после фактического сбора (для меток «до»/«после»). */
+        onCollected: (() -> Unit)? = null
     ) {
         val appVersion = runCatching {
             app.packageManager.getPackageInfo(app.packageName, 0).versionName
         }.getOrNull() ?: "unknown"
         val key = "snap:" + reason.substringBefore(':')
         val now = System.currentTimeMillis()
-        val skip = if (pairWith != null) eventSnaps.tryAcquirePaired(key, now, "snap:$pairWith")
-        else eventSnaps.tryAcquire(key, now)
+        val skip = when {
+            userEvent && pairWith != null -> eventSnaps.tryAcquireUserPaired(key, now, "snap:$pairWith")
+            userEvent -> eventSnaps.tryAcquireUser(key, now)
+            pairWith != null -> eventSnaps.tryAcquirePaired(key, now, "snap:$pairWith")
+            else -> eventSnaps.tryAcquire(key, now)
+        }
+        val label = if (phaseLabel != null) " label=$phaseLabel" else ""
         if (skip != null) {
-            AppLog.i(TAG, "SNAP reason=$reason status=skipped why=$skip " +
-                "used_last_hour=${eventSnaps.used()} " +
+            AppLog.i(TAG, "SNAP reason=$reason status=skipped why=$skip$label " +
+                "used_last_hour=${eventSnaps.used()} used_user=${eventSnaps.usedUser()} " +
                 "(снимок не делается: ограничение частоты/дубль; состояние сети не менялось)")
+            // §3.3 iter43: шторм не должен «съесть» итоговое состояние — планируется ОДИН
+            // trailing-снимок после окна частоты (не периодический watchdog, не цикл).
+            if (skip.startsWith("rate_limited")) {
+                scheduleTrailing(reason, netInfo, appVersion, label)
+            }
             return
         }
         if (eventInFlight.putIfAbsent(key, true) != null) {
             eventSnaps.release(key)
-            AppLog.i(TAG, "SNAP reason=$reason status=skipped why=in_flight (второй снимок не нужен)")
+            AppLog.i(TAG, "SNAP reason=$reason status=skipped why=in_flight$label " +
+                "(второй снимок не нужен)")
             return
         }
         AppLog.i(TAG, "SNAP reason=$reason status=scheduled delay_ms=$stableDelayMs " +
+            "pair=${pairWith ?: "none"}$label " +
             "note=\"снимок после стабилизации: одно событие сетевого шторма не даёт серию снимков\"")
         BgWorker.postDelayed("JitNet.eventSnapshot", stableDelayMs) {
             try {
@@ -830,16 +888,112 @@ object JitNet {
                         "event:$reason", appVersion
                     ) { AppLog.diagTruncatedFor("INTERNET_DIAG") }
                 }.onFailure { t ->
-                    AppLog.i(TAG, "SNAP reason=$reason status=failed " +
+                    AppLog.i(TAG, "SNAP reason=$reason status=failed$label " +
                         "why=collector_exception:${t.javaClass.simpleName} (сеть не менялась)")
                 }.getOrNull()
-                AppLog.i(TAG, "SNAP reason=$reason status=${report?.info?.status ?: "failed"} " +
+                val labelDone = phaseLabelProvider?.let { p ->
+                    runCatching { " label_done=" + p() }.getOrDefault("")
+                } ?: ""
+                AppLog.i(TAG, "SNAP reason=$reason status=${report?.info?.status ?: "failed"}$label$labelDone " +
                     "sections=${report?.info?.sectionCount ?: 0} written=${report?.info?.verdict ?: "none"} " +
                     "sink=«${report?.info?.sink ?: "none"}» why=${report?.info?.reason ?: "failed"} " +
-                    "(это факты, а не диагноз: единый снимок до/после события; сеть не менялась)")
+                    "(это факты, а не диагноз: единый снимок на событие; сеть не менялась)")
             } finally {
                 eventInFlight.remove(key)
                 eventSnaps.release(key)
+                runCatching { onCollected?.invoke() }
+            }
+        }
+    }
+
+    // ───────────────── §3.1 iter43: пара снимков «до/после» включения-выключения TTL ─────────────────
+
+    /** Состояние пары «до/после» для переключения TTL (одна операция на переключение). */
+    private val ttlFlow = JitRef.TtlSnapshotFlow()
+
+    internal fun ttlSnapshotForTest(): JitRef.TtlSnapshotFlow.Op? = ttlFlow.currentOp()
+
+    /**
+     * Начать пару снимков для РЕАЛЬНОГО переключения TTL.
+     *
+     * Контракт (§3.1): «до» не задерживает переключение и не гарантируется как состояние строго до
+     * изменения — метка (`pre_confirmed`/`pre_overlap`/`pre_late`) вычисляется по фактическим
+     * временам и пишется в лог. Отказ сбора не влияет на результат тумблера.
+     */
+    fun beginTtlSnapshot(app: Context, want: Boolean, netInfo: InternetDiag.NetInfo? = null):
+        JitRef.TtlSnapshotFlow.Op {
+        val op = ttlFlow.begin(want, System.currentTimeMillis())
+        ttlFlow.preStarted(System.currentTimeMillis())
+        requestEventSnapshot(
+            app, "ttl_" + (if (want) "on" else "off") + "_pre", netInfo,
+            stableDelayMs = 0L, userEvent = true,
+            phaseLabelProvider = { ttlFlow.preLabel(op) },
+            onCollected = { ttlFlow.preFinished(System.currentTimeMillis()) }
+        )
+        return op
+    }
+
+    /**
+     * Завершить пару: зафиксировать ФАКТ применения TTL (его результат) и заказать «после»
+     * с ограниченной задержкой стабилизации. Метка `post_after_apply` подтверждает порядок.
+     */
+    fun finishTtlSnapshot(
+        app: Context,
+        op: JitRef.TtlSnapshotFlow.Op,
+        appliedResult: String,
+        netInfo: InternetDiag.NetInfo? = null,
+        stableDelayMs: Long = 15_000L
+    ) {
+        ttlFlow.applied(System.currentTimeMillis(), appliedResult)
+        ttlFlow.postScheduled(System.currentTimeMillis())
+        requestEventSnapshot(
+            app, "ttl_" + (if (op.want) "on" else "off") + "_post", netInfo,
+            stableDelayMs = stableDelayMs, pairWith = "ttl_" + (if (op.want) "on" else "off") + "_pre",
+            userEvent = true,
+            phaseLabel = ttlFlow.postLabel(op),
+            phaseLabelProvider = { ttlFlow.postLabel(op) }
+        )
+        AppLog.i(TAG, "TTL_SNAP_PAIR " + ttlFlow.describe(op, JitRef.TtlSnapshotFlow.SnapPart.POST, "ordered") +
+            " pre_label_now=" + ttlFlow.preLabel(op) +
+            " (метка «до» окончательна после сбора; сеть/TTL этим кодом не менялись)")
+    }
+
+    internal fun resetTtlSnapshotsForTest() {
+        ttlFlow.resetForTest()
+        trailingScheduled.set(false)
+    }
+
+    /** Не более одного запланированного trailing-снимка одновременно. */
+    private val trailingScheduled = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /**
+     * §3.3 iter43 — ОДИН отложенный снимок устойчивого состояния после затихания шторма.
+     * Ограничен по времени (≤ окна частоты) и по количеству (один одновременно), без повторов.
+     */
+    private fun scheduleTrailing(
+        reason: String,
+        netInfo: InternetDiag.NetInfo?,
+        appVersion: String,
+        label: String
+    ) {
+        if (!trailingScheduled.compareAndSet(false, true)) return
+        val delay = eventSnaps.remainingMs(System.currentTimeMillis()).coerceIn(1_000L, 90_000L)
+        AppLog.i(TAG, "SNAP reason=$reason status=trailing_scheduled delay_ms=$delay$label " +
+            "note=\"шторм не теряет итоговое состояние: снимок один, не цикл\"")
+        BgWorker.postDelayed("JitNet.eventSnapshotTrailing", delay) {
+            trailingScheduled.set(false)
+            runCatching {
+                InternetDiag.collectWithReport(
+                    DiagShell, AdbClient.isChannelReady(), netInfo, DiagSink,
+                    "event:trailing:$reason", appVersion
+                ) { AppLog.diagTruncatedFor("INTERNET_DIAG") }
+            }.onFailure { t ->
+                AppLog.i(TAG, "SNAP reason=trailing:$reason status=failed " +
+                    "why=${t.javaClass.simpleName}")
+            }.onSuccess { r ->
+                AppLog.i(TAG, "SNAP reason=trailing:$reason status=${r.info.status} " +
+                    "written=${r.info.verdict} sink=«${r.info.sink}» why=${r.info.reason} " +
+                    "(устойчивое состояние после шторма; сеть не менялась)")
             }
         }
     }

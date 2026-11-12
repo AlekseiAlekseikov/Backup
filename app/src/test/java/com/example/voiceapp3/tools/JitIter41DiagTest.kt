@@ -57,7 +57,8 @@ class DiagWriteConfirmation41Test {
         }
 
         fun textOf(d: File = dir): String =
-            d.listFiles()?.filter { it.isFile }?.joinToString("\n") { it.readText() } ?: ""
+            d.listFiles()?.filter { it.isFile && it.name.endsWith(".log") }
+                ?.joinToString("\n") { it.readText() } ?: ""
     }
 
     private fun okShell(): JitRef.JitShell = object : JitRef.JitShell {
@@ -75,11 +76,18 @@ class DiagWriteConfirmation41Test {
         override fun mapsExcerpt(): String? = null
     }
 
+    // prefix + пробел: иначе `…_END` совпал бы с `…_END_CONFIRM`
     private fun endOf(lines: List<String>, prefix: String): String =
-        lines.lastOrNull { it.startsWith(prefix) }
+        lines.lastOrNull { it.startsWith("$prefix ") || it == prefix }
             ?: error("нет строки $prefix; было:\n" + lines.joinToString("\n") {
                 it.substringBefore(" note=").take(110)
             })
+
+    /**
+     * iter43 §2.1: ИТОГ блока — строка `…_END_CONFIRM` (END провизионная, `written=unconfirmed`).
+     */
+    private fun confirmOf(lines: List<String>, block: String): String =
+        endOf(lines, "${block}_END_CONFIRM")
 
     // ─────────────────────────── §5.1: сеть ───────────────────────────
 
@@ -90,17 +98,20 @@ class DiagWriteConfirmation41Test {
         InternetDiag.collect(okShell(), true, null, sink, "test", "1.0.61") { false }
 
         val end = endOf(sink.written, "INTERNET_DIAG_END")
-        assertTrue("подтверждение записи: $end", end.contains("written=full"))
+        assertTrue("END не заявляет подтверждённый итог: $end", end.contains("written=unconfirmed"))
+        val confirm = confirmOf(sink.written, "INTERNET_DIAG")
+        assertTrue("подтверждение записи: $confirm", confirm.contains("written=full"))
         // iter42 §2.6: указывается ТОЧНЫЙ файл строки, а не каталог.
-        assertTrue("указан конкретный файл: $end",
-            end.contains("sink=«${dir.absolutePath}/${LogFiles.fileNameFor(System.currentTimeMillis())}»"))
-        // `END` тоже прошёл через приёмник, поэтому из списка подтверждённых его надо вычесть.
+        assertTrue("указан конкретный файл: $confirm",
+            confirm.contains("sink=«${dir.absolutePath}/${LogFiles.fileNameFor(System.currentTimeMillis())}»"))
+        // `_END_CONFIRM` сама себя не считает: в её тексте все строки ДО неё.
         val blockLines = sink.written.size - 1
-        assertTrue("число строк подтверждено: $end",
-            end.contains("lines=$blockLines/$blockLines"))
-        assertTrue("усечения не было видно", end.contains("skipped_by_budget=0"))
+        assertTrue("число строк подтверждено: $confirm",
+            confirm.contains("lines=$blockLines/$blockLines"))
+        assertTrue("усечения не было видно", confirm.contains("skipped_by_budget=0"))
 
-        val files = dir.listFiles()!!.map { it.name }
+        // iter43: `.logfiles.lock` — служебный файл координации, не часть журнала.
+        val files = dir.listFiles()!!.map { it.name }.filter { it.endsWith(".log") }
         assertEquals("один файл на сутки", 1, files.size)
         assertTrue("имя файла по образцу владельца: $files",
             files[0].matches(Regex("voiceapp3-\\d{2}\\.\\d{2}\\.\\d{4}\\.log")))
@@ -118,21 +129,22 @@ class DiagWriteConfirmation41Test {
         val sink = DirSink(dir, failOn = { it.startsWith("INTERNET_DIAG_DATA name=wlan0_addr") })
         InternetDiag.collect(okShell(), true, null, sink, "test", "1.0.61") { false }
 
-        val end = endOf(sink.written, "INTERNET_DIAG_END")
-        assertFalse("нельзя утверждать full: $end", end.contains("written=full"))
-        assertTrue("честная метка: $end", end.contains("written=partial"))
-        assertTrue("видно число неудачных записей: $end", end.contains("write_failed=1"))
-        assertTrue("виден первый сбой: $end", end.contains("write_reason=write_failed=1"))
+        val confirm = confirmOf(sink.written, "INTERNET_DIAG")
+        assertFalse("нельзя утверждать full: $confirm", confirm.contains("written=full"))
+        assertTrue("честная метка: $confirm", confirm.contains("written=partial"))
+        assertTrue("видно число неудачных записей: $confirm", confirm.contains("write_failed=1"))
+        assertTrue("виден первый сбой: $confirm", confirm.contains("write_reason=write_failed=1"))
         assertFalse("эта строка действительно не в файле", sink.written.any { it.contains("__FAILED__") })
     }
 
     @Test
     fun failingEndIsReportedThroughIndependentChannel() {
         val dir = tmpDir()
-        val sink = DirSink(dir, failOn = { it.startsWith("INTERNET_DIAG_END") })
+        // Отказ ровно у `…_END` (не у подтверждающей строки).
+        val sink = DirSink(dir, failOn = { it.startsWith("INTERNET_DIAG_END ") })
         InternetDiag.collect(okShell(), true, null, sink, "test", "1.0.61") { false }
 
-        assertTrue("сводка не попала в файл", sink.written.none { it.startsWith("INTERNET_DIAG_END") })
+        assertTrue("сводка не попала в файл", sink.written.none { it.startsWith("INTERNET_DIAG_END ") })
         val msg = sink.independent.joinToString("\n")
         assertTrue("факт ушёл в независимый канал: $msg", msg.contains("INTERNET_DIAG_END_NOT_CONFIRMED"))
         assertTrue("указан sink: $msg", msg.contains("sink=«"))
@@ -144,10 +156,10 @@ class DiagWriteConfirmation41Test {
         val sink = DirSink(dir, dropOn = { it.contains("_DATA") })
         InternetDiag.collect(okShell(), true, null, sink, "test", "1.0.61") { false }
 
-        val end = endOf(sink.written, "INTERNET_DIAG_END")
-        assertTrue("пропуск бюджетом виден отдельно: $end", end.contains("skipped_by_budget="))
-        assertFalse("не full", end.contains("written=full"))
-        assertTrue("метка truncated: $end", end.contains("written=truncated"))
+        val confirm = confirmOf(sink.written, "INTERNET_DIAG")
+        assertTrue("пропуск бюджетом виден отдельно: $confirm", confirm.contains("skipped_by_budget="))
+        assertFalse("не full", confirm.contains("written=full"))
+        assertTrue("метка truncated: $confirm", confirm.contains("written=truncated"))
     }
 
     @Test
@@ -167,10 +179,10 @@ class DiagWriteConfirmation41Test {
         }
         InternetDiag.collect(okShell(), true, null, switching, "test", "1.0.61") { false }
 
-        val end = endOf(sink.written, "INTERNET_DIAG_END")
-        assertTrue("части в разных файлах видны: $end", end.contains("written=partial"))
-        assertTrue("указаны оба места: $end",
-            end.contains("split_across_sinks") && end.contains("+"))
+        val confirm = confirmOf(sink.written, "INTERNET_DIAG")
+        assertTrue("части в разных файлах видны: $confirm", confirm.contains("written=partial"))
+        assertTrue("указаны оба места: $confirm",
+            confirm.contains("split_across_sinks") && confirm.contains("+"))
         assertTrue("в первом каталоге есть файл", (first.listFiles()?.isNotEmpty() == true))
         assertTrue("во втором каталоге есть файл", (second.listFiles()?.isNotEmpty() == true))
         assertTrue("BEGIN ушёл в первый файл", sink.textOf(first).contains("INTERNET_DIAG_BEGIN"))
@@ -199,8 +211,8 @@ class DiagWriteConfirmation41Test {
         )) {
             val sink = DirSink(dir)
             InternetDiag.collect(okShell(), true, null, sink, "test", "1.0.61", probe)
-            val end = endOf(sink.written, "INTERNET_DIAG_END")
-            assertTrue("ожидалась метка $expected, получено: $end", end.contains(expected))
+            val confirm = confirmOf(sink.written, "INTERNET_DIAG")
+            assertTrue("ожидалась метка $expected, получено: $confirm", confirm.contains(expected))
         }
     }
 
@@ -212,10 +224,15 @@ class DiagWriteConfirmation41Test {
         val sink = DirSink(dir)
         JitMountDiag.collect(mountShell(), true, sink, "test") { false }
 
+        // iter43 §2.1: END больше НЕ заявляет подтверждённый итог (она не может подтвердить саму
+        // себя). Итог сообщается отдельной строкой `…_END_CONFIRM` уже после записи END.
         val end = endOf(sink.written, "JIT_MOUNT_DIAG_END")
-        assertTrue("подтверждено в конкретном файле: $end", end.contains("written=full"))
-        assertTrue("указан файл: $end",
-            end.contains("sink=«${dir.absolutePath}/${LogFiles.fileNameFor(System.currentTimeMillis())}»"))
+        assertTrue("END не выдаёт себя за подтверждённый итог: $end", end.contains("written=unconfirmed"))
+        assertFalse("в END нет ложного full: $end", end.contains("written=full"))
+        val confirm = endOf(sink.written, "JIT_MOUNT_DIAG_END_CONFIRM")
+        assertTrue("итог подтверждён в конкретном файле: $confirm", confirm.contains("written=full"))
+        assertTrue("указан файл: $confirm",
+            confirm.contains("sink=«${dir.absolutePath}/${LogFiles.fileNameFor(System.currentTimeMillis())}»"))
         assertTrue("сеть не трогали", end.contains("system_writes=0"))
     }
 
@@ -224,9 +241,9 @@ class DiagWriteConfirmation41Test {
         val dir = tmpDir("diag41m2")
         val sink = DirSink(dir, failOn = { it.startsWith("JIT_MOUNT_DIAG_DATA name=identity") })
         JitMountDiag.collect(mountShell(), true, sink, "test") { false }
-        val end = endOf(sink.written, "JIT_MOUNT_DIAG_END")
-        assertFalse("не full: $end", end.contains("written=full"))
-        assertTrue("partial: $end", end.contains("written=partial"))
+        val confirm = confirmOf(sink.written, "JIT_MOUNT_DIAG")
+        assertFalse("не full: $confirm", confirm.contains("written=full"))
+        assertTrue("partial: $confirm", confirm.contains("written=partial"))
     }
 
     // ─────────────────────────── §5.1: сам писатель ───────────────────────────
@@ -239,7 +256,9 @@ class DiagWriteConfirmation41Test {
         // кириллица при записи в файл заменялась бы на '?'. Кодировка здесь ни при чём.
         assertTrue(LogFiles.appendToDir(dir, "first line", now))
         assertTrue(LogFiles.appendToDir(dir, "second line", now))
-        val file = dir.listFiles()!!.single()
+        // iter43: в каталоге есть служебный `.logfiles.lock` (межпроцессная координация) —
+        // частью журнала он не является, поэтому выбираем именно файл лога.
+        val file = dir.listFiles()!!.single { it.name.endsWith(".log") }
         assertEquals(LogFiles.fileNameFor(now), file.name)
         assertEquals(listOf("first line", "second line"), file.readLines())
 

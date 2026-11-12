@@ -42,6 +42,9 @@ object InternetDiag {
     internal const val DATA = "INTERNET_DIAG_DATA"
     internal const val END = "INTERNET_DIAG_END"
 
+    /** iter43 §2.1: отдельная строка подтверждения итога (END не подтверждает саму себя). */
+    internal const val END_CONFIRM = "INTERNET_DIAG_END_CONFIRM"
+
     /** Итог по одному разделу. */
     data class Section(
         val name: String,
@@ -392,8 +395,10 @@ object InternetDiag {
         // ОДНОМ датированном файле и бюджет этого блока не объявлял усечения. Иначе — честные
         // `truncated` / `partial` (в т.ч. части в разных файлах после фоллбэка) / `unknown`.
         val truncated = runCatching { truncatedProbe?.invoke() }.getOrNull()
+        // §2.1 iter43: END НЕ заявляет подтверждённый итог — она физически не может подтвердить
+        // саму себя (фоллбэк/ротация могут произойти именно на ней).
         val extra = "elapsed_ms=${System.currentTimeMillis() - t0} network_changes=0 " +
-            tally.fields(truncated)
+            tally.provisionalFields(truncated)
         tally.emit("$END ${summary(sections, extra)}", isEnd = true)
         if (tally.endOutcome != LogBudget.WriteOutcome.WRITTEN) {
             // Самоподтверждающегося ложного заявления быть не должно: если даже `END` не записан,
@@ -404,6 +409,21 @@ object InternetDiag {
                     "skipped_by_budget=${tally.dropped} write_failed=${tally.failed} " +
                     "(строки этого блока могли остаться только в logcat/фрагментарно; " +
                     "полноту лога не подтверждаем)"
+            )
+        }
+        // §2.1 iter43: отдельная строка подтверждения — ПОСЛЕ END, с фактическим итогом
+        // (включая файл самой END). Её собственный факт остаётся за пределами файла — это
+        // честно указано в тексте и видно в DiagReport.
+        val confirmLine = "$END_CONFIRM " + tally.confirmFields("INTERNET_DIAG", truncated) +
+            " note=\"это факты, а не диагноз: ping без ответа и пустые свойства DNS не доказывают " +
+            "отсутствия интернета; смена подключения не выполнялась\""
+        tally.emit(confirmLine)
+        if (tally.endConfirmOutcome != LogBudget.WriteOutcome.WRITTEN) {
+            sink.independent(
+                "INTERNET_DIAG_END_CONFIRM_NOT_WRITTEN reason=" +
+                    (tally.endConfirmOutcome?.name?.lowercase() ?: "unknown") +
+                    " sink=«${tally.sinkList()}» written=${tally.verdict(truncated)} " +
+                    "lines=${tally.written}/${tally.offered} (итог блока виден только здесь)"
             )
         }
         return Report(sections, JitRef.DiagReport(
@@ -437,8 +457,13 @@ object InternetDiag {
     internal fun status(verdict: String, sections: List<Section>, channelReady: Boolean): String = when {
         !channelReady -> "channel_not_ready"
         sections.isEmpty() -> "failed"
-        sections.any { it.status == STATUS_UNKNOWN || it.status == STATUS_TIMEOUT } -> "partial"
-        verdict == "full" || verdict == "truncated" -> "completed"
+        // §2.2 iter43: «определённость» секции — не только «не unknown/timeout».
+        // denied/unavailable/rc!=0 и усечённые данные НЕ дают completed: обязательные данные
+        // не получены. Частичный/пропущенный сбор честно остаётся partial.
+        sections.any { it.status != STATUS_OK && it.status != STATUS_EMPTY } -> "partial"
+        // Усечение бюджета — тоже не полный успешный сбор (данные могли быть пропущены).
+        verdict == "full" -> "completed"
+        verdict == "truncated" -> "partial"
         verdict == "partial" -> "partial"
         else -> "failed"
     }
@@ -450,13 +475,14 @@ object InternetDiag {
         truncated: Boolean?
     ): String {
         if (!channelReady) return "channel_not_ready"
-        val bad = sections.filter { it.status == STATUS_UNKNOWN || it.status == STATUS_TIMEOUT }
-            .map { it.name }
+        val bad = sections.filter { it.status != STATUS_OK && it.status != STATUS_EMPTY }
+            .map { "${it.name}:${it.status}" }
         return buildList {
-            if (bad.isNotEmpty()) add("sections_unknown_or_timeout=${bad.joinToString(",")}")
-            if (tally.failed > 0) add("write_failed=${tally.failed}")
+            if (bad.isNotEmpty()) add("sections_not_ok=${bad.joinToString(",")}")
+            if (tally.failed > 0) add("write_failed=${tally.failed} first=${tally.firstFailure()}")
             if (tally.dropped > 0) add("skipped_by_budget=${tally.dropped}")
             if (truncated == null) add("truncation_not_checkable")
+            if (truncated == true) add("budget_truncated_this_block")
         }.joinToString(";").ifEmpty { "all_criteria_met" }
     }
 

@@ -48,6 +48,9 @@ object JitMountDiag {
     internal const val DATA = "JIT_MOUNT_DIAG_DATA"
     internal const val END = "JIT_MOUNT_DIAG_END"
 
+    /** iter43 §2.1: отдельная строка подтверждения итога (END не подтверждает саму себя). */
+    internal const val END_CONFIRM = "JIT_MOUNT_DIAG_END_CONFIRM"
+
     /** Итог по разделу. */
     data class Section(
         val name: String,
@@ -371,7 +374,7 @@ object JitMountDiag {
                 "truncated=${sections.count { it.status == STATUS_TRUNCATED }} " +
                 "unknown=${sections.count { it.status == STATUS_UNKNOWN }} " +
                 "elapsed_ms=${System.currentTimeMillis() - t0} system_writes=0 " +
-                tally.fields(truncated) + " " +
+                tally.provisionalFields(truncated) + " " +
                 "note=\"данные для оценки обратимости umount -l; сами по себе её не доказывают\"",
             isEnd = true
         )
@@ -383,12 +386,25 @@ object JitMountDiag {
                     "(сводка блока не подтверждена в датированном файле; полноту не обещаем)"
             )
         }
+        // §2.1 iter43: отдельная строка подтверждения после END (END не подтверждает себя).
+        tally.emit("$END_CONFIRM " + tally.confirmFields("JIT_MOUNT_DIAG", truncated))
+        if (tally.endConfirmOutcome != LogBudget.WriteOutcome.WRITTEN) {
+            sink.independent(
+                "JIT_MOUNT_DIAG_END_CONFIRM_NOT_WRITTEN reason=" +
+                    (tally.endConfirmOutcome?.name?.lowercase() ?: "unknown") +
+                    " sink=«${tally.sinkList()}» written=${tally.verdict(truncated)} " +
+                    "lines=${tally.written}/${tally.offered} (итог блока виден только здесь)"
+            )
+        }
         val definite = sections.count { it.status != STATUS_UNKNOWN && it.status != STATUS_TIMEOUT }
+        // §2.2 iter43: completed только при отсутствии любых «не ok/empty» секций
+        // (denied/unavailable/timeout/unknown/truncated — не полный успешный сбор)
+        // И подтверждённой записи всех строк (verdict=full).
         val st = when {
             sections.isEmpty() -> "failed"
-            definite < sections.size -> "partial"
-            tally.verdict(truncated) == "full" || tally.verdict(truncated) == "truncated" -> "completed"
-            tally.verdict(truncated) == "partial" -> "partial"
+            sections.any { it.status != STATUS_OK && it.status != STATUS_EMPTY } -> "partial"
+            tally.verdict(truncated) == "full" -> "completed"
+            tally.verdict(truncated) == "partial" || tally.verdict(truncated) == "truncated" -> "partial"
             else -> "failed"
         }
         return Report(sections, JitRef.DiagReport(

@@ -270,7 +270,9 @@ object AdbClient {
     @Volatile private var lastCmdStartedAtMs: Long = 0L
 
     private fun noteCmd(cmd: String) {
-        lastCmdForLog = cmd.replace(Regex("\\s+"), " ").take(70)
+        // iter43 §1.4: в журнал и в `last_cmd` попадает только БЕЗОПАСНОЕ представление
+        // (без тел литералов/base64/значений секретов).
+        lastCmdForLog = LogKit.redactCmd(cmd, 70)
         lastCmdStartedAtMs = android.os.SystemClock.uptimeMillis()
     }
 
@@ -1892,7 +1894,8 @@ object AdbClient {
     ): Pair<Int, String> {
         // iter39 §3.1: пассивный путь решается ДО любых веток восстановления канала.
         if (passive) return runPassive(cmd, timeoutMs)
-        val shortCmd = cmd.replace("\\s+".toRegex(), " ").take(160)
+        // iter43 §1.4: тип команды/rc/время — да; содержимое payload — нет.
+        val shortCmd = LogKit.redactCmd(cmd, 120)
         noteCmd(cmd)
         val st = state.get()
 
@@ -1959,7 +1962,8 @@ object AdbClient {
         val portLabel = if (port == 0) "sh" else port.toString()
         AppLog.i(TAG, "VERIFY EXEC port=$portLabel rc=$finalRc expectRoot=$expectRoot cmd=${shortCmd} → $verdict")
         if (finalRc != 0) {
-            val tail = out.replace('\n', ' ').take(300)
+            // Вывод команды тоже может содержать payload/секреты: печатаем безопасно.
+            val tail = LogKit.redactCmd(out.replace('\n', ' '), 300)
             AppLog.w(TAG, "VERIFY EXEC tail: $tail")
         }
         return Pair(finalRc, out)
@@ -2212,8 +2216,9 @@ object AdbClient {
         // diag через shell-фоллбэк (не через ADB — он и так сломан).
         for ((c, n) in diagCmds) {
             try {
-                val r = runShellFallback(c, 2000).replace('\n',' ').trim()
-                AppLog.e(TAG, "ADB diag [$n]: $r")
+                val r = runShellFallback(c, 2000).replace('\n', ' ').trim()
+                // iter43 §1.4: вывод диагностики — тоже через безопасное представление.
+                AppLog.e(TAG, "ADB diag [$n]: ${LogKit.redactCmd(r, 400)}")
             } catch (t: Throwable) {
                 AppLog.w(TAG, "ADB diag [$n] failed: ${t.message}")
             }
@@ -2221,7 +2226,11 @@ object AdbClient {
         // logcat adbd
         try {
             val lc = runShellFallback("logcat -b all -d -t 30 -s adbd '*:S' 2>/dev/null | tail -30", 2000)
-            AppLog.e(TAG, "ADB logcat adbd tail: $lc")
+            // iter43 §1.4: logcat — построчно и безопасно (без base64/литералов/ключей).
+            for (line in lc.lineSequence().take(30)) {
+                if (line.isBlank()) continue
+                AppLog.e(TAG, "ADB logcat adbd: ${LogKit.redactCmd(line, 300)}")
+            }
         } catch (_: Throwable) {}
     }
 

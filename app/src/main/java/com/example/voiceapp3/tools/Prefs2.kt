@@ -24,6 +24,19 @@ object Prefs2 {
     fun cps(c: Context): SharedPreferences =
         c.getSharedPreferences(FILE, Context.MODE_PRIVATE)
 
+    /**
+     * iter43 §4: DPS БЕЗ скрытого фоллбэка — `null`, если device-protected storage недоступен.
+     *
+     * Глобальное поведение [dps] остальных функций не меняется (там fallback на CPS нужен),
+     * но JIT обязан ЗНАТЬ, что второй копии фактически нет, а не считать CPS за DPS.
+     */
+    fun dpsOrNull(c: Context): SharedPreferences? = try {
+        c.applicationContext.createDeviceProtectedStorageContext()
+            .getSharedPreferences(FILE, Context.MODE_PRIVATE)
+    } catch (_: Throwable) {
+        null
+    }
+
     fun dps(c: Context): SharedPreferences = try {
         c.createDeviceProtectedStorageContext().getSharedPreferences(FILE, Context.MODE_PRIVATE)
     } catch (_: Throwable) {

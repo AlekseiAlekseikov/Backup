@@ -365,27 +365,24 @@ enum class Choice(
                 return WindowDoors.setWindowOppositeOnDoor(appContext, value)
             }
             Toggle.TTL_65 -> {
-                // iter42 §3: снимки «до» и «после» СУЩЕСТВУЮЩЕГО события владельца (переключение
-                // TTL). Только чтение; сеть/TTL не меняются этим кодом, кнопок не добавляем.
-                // Пара снимается один раз на РЕАЛЬНОЕ изменение состояния, «до» — с нулевой
-                // задержкой (сбор идёт в фоновом worker'е, не в UI-потоке), «после» — после
-                // стабилизации. Механику TTL этот код не трогает.
-                val wasActive = runCatching { NetworkTtl.isTtl65Active(appContext) }.getOrDefault(value == false)
-                val tag = if (value) "on" else "off"
-                if (wasActive != value) {
+                // iter43 §3.1: пара read-only снимков «до/после» РЕАЛЬНОГО переключения TTL.
+                // Переключение НЕ задерживается диагностикой; метка «до» честная
+                // (`pre_confirmed`/`pre_overlap`/`pre_late`) и пишется по факту сбора.
+                val wasActive = runCatching { NetworkTtl.isTtl65Active(appContext) }
+                    .getOrDefault(!value)
+                val changing = wasActive != value
+                val op = if (changing) {
                     runCatching {
-                        JitNet.requestEventSnapshot(
-                            appContext, "ttl_" + tag + "_pre", NetInfoAndroid(appContext),
-                            stableDelayMs = 0L
-                        )
-                    }
-                }
+                        JitNet.beginTtlSnapshot(appContext, value, NetInfoAndroid(appContext))
+                    }.getOrNull()
+                } else null
                 val r = NetworkTtl.setTtl65Active(appContext, value)
-                if (wasActive != value) {
+                if (op != null) {
                     runCatching {
-                        JitNet.requestEventSnapshot(
-                            appContext, "ttl_" + tag + "_post", NetInfoAndroid(appContext),
-                            stableDelayMs = 15_000L, pairWith = "ttl_" + tag + "_pre"
+                        JitNet.finishTtlSnapshot(
+                            appContext, op,
+                            appliedResult = if (r.ok) "ok" else "failed:${r.summary.take(80)}",
+                            netInfo = NetInfoAndroid(appContext)
                         )
                     }
                 }
