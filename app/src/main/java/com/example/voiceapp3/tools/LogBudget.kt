@@ -60,12 +60,24 @@ internal object LogBudget {
      * это видно в сводке (`sink=…`), а не выдаётся за один файл.
      */
     interface Sink {
-        fun write(line: String): WriteOutcome
+        /**
+         * Записать строку и вернуть ФАКТ записи вместе с ТОЧНЫМ файлом.
+         *
+         * Файл возвращается каждой записью, а не запрашивается заранее: `LogFiles.append` может
+         * переключиться external→internal посреди блока, и тогда части окажутся в разных файлах —
+         * это видно в сводке, а не выдаётся за один файл (§2.6 iter42).
+         */
+        fun write(line: String): LogWrite
+
+        /** Файл, который сейчас считался бы активным (для лога; истина — в [write]). */
         fun location(): String
 
         /** Независимый канал (logcat/AppLog), когда сама строка блока не подтверждена. */
         fun independent(line: String) {}
     }
+
+    /** Результат записи одной строки: исход + точный файл (пусто, если не записано). */
+    data class LogWrite(val outcome: WriteOutcome, val file: String = "")
 
     /**
      * Учёт фактической записи ОДНОГО диагностического блока.
@@ -87,22 +99,24 @@ internal object LogBudget {
 
         fun emit(line: String, isEnd: Boolean = false) {
             offered++
-            val loc = runCatching { sink.location() }.getOrDefault("unknown")
-            val out = runCatching { sink.write(line) }.getOrElse { WriteOutcome.FAILED }
-            when (out) {
+            val lw = runCatching { sink.write(line) }
+                .getOrElse { LogWrite(WriteOutcome.FAILED, "") }
+            when (lw.outcome) {
                 WriteOutcome.WRITTEN -> {
                     written++
-                    locations += loc
+                    // Точный файл ИМЕННО этой строки (а не «предполагаемый активный»).
+                    locations += lw.file.ifEmpty { runCatching { sink.location() }.getOrDefault("unknown") }
                 }
                 WriteOutcome.DROPPED -> dropped++
                 WriteOutcome.FAILED -> {
                     failed++
                     if (firstFailure == null) {
-                        firstFailure = "line=${line.take(48).replace('\n', ' ')} at=«$loc»"
+                        firstFailure = "line=${line.take(48).replace('\n', ' ')} at=«" +
+                            (lw.file.ifEmpty { "none" }) + "»"
                     }
                 }
             }
-            if (isEnd) endOutcome = out
+            if (isEnd) endOutcome = lw.outcome
         }
 
         fun sinkList(): String = locations.joinToString("+").ifEmpty { "none" }

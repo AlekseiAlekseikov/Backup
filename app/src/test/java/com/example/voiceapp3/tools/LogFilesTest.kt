@@ -89,8 +89,8 @@ class LogFilesTest {
         val old = File(dir, LogFiles.fileNameOf(today.minusDays(30))).apply { writeText("old\n") }
         val foreign = File(dir, "voiceapp3.log").apply { writeText("foreign\n") }
         val nowMs = today.atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli()
-        val removed = LogFiles.prune(dir, nowMs)
-        assertEquals("удалён ровно один просроченный файл", 1, removed)
+        val removed = LogFiles.pruneTier(dir, nowMs)
+        assertEquals("удалён ровно один просроченный файл", 1, removed.size)
         assertTrue("свежий файл остался", fresh.isFile)
         assertFalse("просроченный удалён", old.exists())
         assertTrue("чужой файл не тронут", foreign.isFile)

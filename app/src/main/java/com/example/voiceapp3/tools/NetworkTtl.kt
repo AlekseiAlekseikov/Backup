@@ -418,6 +418,13 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
                     val out = res.second
                     val (status, reason) = parseVerifyResult(true, out)
                     AppLog.i(TAG, "VERIFY TTL networkChange: rc=$rc → $status ($reason)")
+                    // iter42 §3: снимок устойчивого состояния после переприменения правил по
+                    // событию сети (одно событие шторма = один снимок, с ограничением частоты).
+                    runCatching {
+                        JitNet.requestEventSnapshot(
+                            rcvCtx, "ttl_network_change", NetInfoAndroid(rcvCtx)
+                        )
+                    }
                     if (status == ToolsStep.Status.FAILED) {
                         AppLog.w(TAG, "TTL networkChange: failed to re-apply — turning toggle off")
                         Prefs2.putBoolean(rcvCtx, PREF_TTL_65_ACTIVE, false)

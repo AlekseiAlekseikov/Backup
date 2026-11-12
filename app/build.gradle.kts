@@ -235,12 +235,16 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 }
 
-// iter33 A0.3: тест чанкера обязан выполняться в CI. Файл workflow править нельзя
-// (у токена нет scope `workflow`), поэтому тесты цепляются к самой сборке debug-варианта:
-// если тест упал — упал `assembleDebug`, и приёмка CI это покажет.
-tasks.matching { it.name == "assembleDebug" || it.name == "assembleRelease" }.configureEach {
-    dependsOn("testDebugUnitTest")
-}
+// iter42 §6: привязка тестов к `assembleDebug|assembleRelease` УДАЛЕНА по требованию владельца.
+//
+// Причина: `./gradlew :app:assembleRelease` не должен запускать тесты (сборка релиза не должна
+// падать/удлиняться из-за тестов, и наоборот). Возвращать эту привязку — ни прямо, ни через
+// finalizer/`mustRunAfter` — нельзя.
+//
+// Тесты запускаются ОТДЕЛЬНОЙ командой: `./gradlew :app:testDebugUnitTest`
+// (в CI — отдельным шагом; см. docs/agent/WORKLOG.md, раздел iter42, и отчёт итерации:
+// у токена нет scope `workflow`, поэтому шаг в .github/workflows/build.yml не добавлен,
+// а diff предложен владельцу).
 
 // iter33c A3: в лог CI должны попадать ИМЕНА и ЧИСЛО выполненных тестов — иначе «тест зелёный»
 // ничем не доказан (задача могла быть NO-SOURCE/UP-TO-DATE). Workflow не правим (нет scope `workflow`).

@@ -1325,3 +1325,76 @@ fallback `Prefs2`), — это ОДНО хранилище, а не ошибка
 JIT на ГУ не просить (⛔, §6/§7).
 
 **SOURCE_SHA** = `c97416c`.
+
+---
+
+## iter42 — полный журнал без потерь, TTL-снимки по событиям, оценка `umount`
+
+Мандат: `ПРОМПТ_iter42_ПОЛНЫЙ_ЛОГ_TTL_И_UMOUNT.md`. Ветка `fix/v2`, база — iter41 (`544b04e`).
+
+**§2 «не выбрасывать полезные записи».** Причина потери в логе владельца — не текст предупреждения, а
+`LOG_BUDGET exceeded … action=trim`: последующие строки отбрасывались (`dropped` 1→57→106→127).
+Теперь общий бюджет НЕ режет строки: он ротирует ЦЕЛЫЙ файл (`LogFiles.rotateNow`, `action=rotate`), а
+если ротация невозможна — честный `action=drop_after_limit reason=rotate_unavailable`, который виден
+в независимом канале. `LogFiles` переписан: tier'ы `MAIN`/`VERBOSE`, лимит файла 8 МиБ, ≤6 файлов
+на сутки, суммарный cap 64 МиБ, retention 14 дней, ротация только целыми файлами, `Result(written,
+file, reason)` на каждую запись, счётчики `ioErrors/rotations/dropped/lastIoError`.
+**Найдено и исправлено в этой итерации:** `partsOf` считал verbose-файлы частями основного журнала
+(префикс `voiceapp3-` — префикс `voiceapp3-verbose-`), а `activeFile` выбирал «последний по имени»,
+из-за чего после ротации активным снова становился базовый файл и почти каждая строка открывала
+новую часть. Теперь индекс части разбирается строго (`0` — базовый, `n` — `<base>.<n>.log`), активный
+файл — с максимальным индексом, лимит частей — суммарно на сутки.
+
+**§2.4/§2.5 шум отдельно от журнала.** `AppLog.isVerboseLine` + `VERBOSE_PREFIXES` (ADB_TX/RX,
+execute-трассы) уходят в отдельный tier (`voiceapp3-verbose-DD.MM.YYYY.log`, 4 МиБ × 4), счётчики —
+`AppLog.verboseStats()` → строка `ADB_VERBOSE_STATS lines=… failed=… tier=verbose`. Обязательная
+диагностика сети/JIT/TTL от verbose-шторма больше не страдает.
+
+**§2.6 подтверждение записи.** `LogBudget.Sink.write` возвращает `LogWrite(outcome, file)`; `WriteTally`
+учитывает ФАКТИЧЕСКИЙ файл каждой строки, поэтому смена приёмника (external→internal→END) больше не
+даёт ложного `written=full`; неподтверждённая `…_END` уходит в `…_END_NOT_CONFIRMED`.
+
+**§2.7 раздельные статусы.** `InternetDiag.collectWithReport()` / `JitMountDiag.collectWithReport()`
+возвращают `JitRef.DiagReport` и `Report(sections, info)`: число секций, «определённых» секций,
+строк, подтверждённых в файле, отказов записи, пропусков, вердикт и статус
+`completed|partial|channel_not_ready|failed`. `completed` — только по проверяемым критериям (канал
+готов, нет `unknown`/`timeout`, `failed==0`, вердикт `full|truncated`). `runBoth` пишет
+`DIAG_SECTION_RESULT block=… status=…` и общий `status=…`; `runCatching.isSuccess` больше не считается
+успехом.
+
+**§3 TTL — только диагностика.** Добавлен `JitNet.requestEventSnapshot(app, reason, netInfo,
+stableDelayMs, pairWith)`: снимок привязан к СУЩЕСТВУЮЩЕМУ событию (переключение TTL, значимое изменение
+сети), выполняется в фоновом worker'е (не в UI-потоке), ограничен частотой (≥90 с, ≤6/час, дедуп
+in-flight) и пишет `SNAP reason=… status=scheduled|skipped|completed`. Для пары «до/после» сделана
+`JitRef.EventSnapshots.tryAcquirePaired`: `<событие>_pre` → `<событие>_post` не режется минимальным
+интервалом (иначе «после» всегда отбрасывалось бы), ограничение часа действует, пара допускается только
+внутри одного события и не позже 10 минут. Хуки: `ToolsBackend` (тумблер TTL — только при РЕАЛЬНОМ
+изменении состояния) и `NetworkTtl` (после переприменения правил по событию сети). Сеть/TTL этим кодом
+не меняются, новых кнопок нет.
+
+**§5 недостатки iter41.** (а) Набор хранилищ CPS/DPS, прочитанный до записи, сверяется с набором, куда
+запись реально прошла: расхождение ⇒ `blocked=store_set_changed`, ни записи, ни shell (fail closed),
+с объяснением причины в логе; блокировка не липкая — как только оба хранилища снова читаются, клик
+проходит. (б) Пара `sending/undefined` сохранена как была (iter41): позднего свидетельства в
+`AndroidShell` нет (`armed=none`), авторазблокировки по таймеру не обещаем.
+
+**§6 сборка без тестов.** Удалена привязка `assembleDebug|assembleRelease → dependsOn("testDebugUnitTest")`
+(`app/build.gradle.kts`). Тесты запускаются отдельно: `./gradlew :app:testDebugUnitTest`. Проверка
+семантики на минимальном проекте Gradle 9.1 (тот же JDK 17): без привязки `--dry-run` для
+`:app:assembleRelease` печатает только `:app:assembleRelease SKIPPED`; со старой привязкой —
+`:app:testDebugUnitTest SKIPPED` + `:app:assembleRelease SKIPPED`. Полный `--dry-run` реального проекта
+в песочнице не выполнен: нет предустановленных Gradle/SDK, а на 2 ГБ RAM daemon падает
+(`Gradle build daemon disappeared unexpectedly`). **CI-покрытие тестами при этом теряется:** workflow
+запускает только `assembleDebug`, а прав на `.github/workflows/` у токена нет (scope `repo`, без
+`workflow`) — предложен diff (`docs/agent/ci-unit-tests.diff`), который нужно применить вручную.
+
+**Тесты.** Новый `JitIter42Test.kt` (20): содержимое ФАЙЛОВ (ротация без потерь, лимит файла, verbose-
+шторм не задевает основной журнал, смена даты, индекс ротации не путается с датой, retention не трогает
+чужие файлы, недоступный каталог — честный отказ, конкурентные писатели), `store_set_changed`
+(fail closed + возврат к работе), `EventSnapshots` (частота, дедуп, час, пара «до/после»).
+Всего локально: **322 теста, 0 падений**.
+
+**Не проверено:** Android-интеграция `LogFiles.append(context)`/`rotateNow(context)` (внешний каталог,
+`usableSpace`, фоллбэк на `filesDir`), реальные `SharedPreferences`/`WifiManager` ГУ, поведение
+системы при полном диске. Полевых данных нет; `umount`/`mount`/zygote/reboot не выполнялись, клик JIT
+у владельца не запрашивался.

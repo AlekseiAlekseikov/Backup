@@ -268,13 +268,28 @@ object InternetDiag {
         sink: LogBudget.Sink,
         source: String,
         appVersion: String = "unknown",
+        truncatedProbe: (() -> Boolean)? = null
+    ): List<Section> = collectWithReport(
+        shell, channelReady, netInfo, sink, source, appVersion, truncatedProbe
+    ).sections
+
+    /**
+     * §2.7 iter42 — сбор с ОТЧЁТОМ: секции + фактическая запись + выполнимые критерии статуса.
+     */
+    internal fun collectWithReport(
+        shell: JitRef.JitShell,
+        channelReady: Boolean,
+        netInfo: NetInfo?,
+        sink: LogBudget.Sink,
+        source: String,
+        appVersion: String = "unknown",
         /**
          * §3.1: «были ли строки этого блока усечены бюджетом лога». Нужен, чтобы сводка `END`
          * отличала прочитанное от реально записанного. `null` — проверить нельзя (честно пишем
          * `written=unknown`, а не `full`).
          */
         truncatedProbe: (() -> Boolean)? = null
-    ): List<Section> {
+    ): Report {
         val t0 = System.currentTimeMillis()
         // §5.1 iter41: каждая строка блока идёт через приёмник, который возвращает ФАКТ записи
         // (WRITTEN/DROPPED/FAILED). «Сборщик сформировал строку» ≠ «строка в датированном файле».
@@ -391,7 +406,58 @@ object InternetDiag {
                     "полноту лога не подтверждаем)"
             )
         }
-        return sections
+        return Report(sections, JitRef.DiagReport(
+            block = "INTERNET_DIAG",
+            sectionCount = sections.size,
+            sectionsDefinite = sections.count {
+                it.status != STATUS_UNKNOWN && it.status != STATUS_TIMEOUT
+            },
+            offered = tally.offered,
+            written = tally.written,
+            failed = tally.failed,
+            dropped = tally.dropped,
+            verdict = tally.verdict(truncated),
+            sink = tally.sinkList(),
+            status = status(tally.verdict(truncated), sections, channelReady),
+            reason = reason(tally, sections, channelReady, truncated)
+        ))
+    }
+
+    /** §2.7 iter42: секции + отчёт (критерии `completed`). */
+    internal data class Report(val sections: List<Section>, val info: JitRef.DiagReport)
+
+    /**
+     * §2.7 iter42 — ЯВНЫЕ критерии `completed`:
+     *  • канал был готов, иначе сбор физически не мог состояться ⇒ `channel_not_ready`;
+     *  • нет секций со статусом `unknown`/`timeout` (неопределённость — не успех);
+     *  • нет неудачных записей (`failed == 0`), вердикт записи `full` или `truncated`
+     *    (пропуск бюджетом честно виден), но не `partial`/`none`/`unknown`.
+     * Всё остальное — `partial`/`failed` с причиной, а не «успех без исключения».
+     */
+    internal fun status(verdict: String, sections: List<Section>, channelReady: Boolean): String = when {
+        !channelReady -> "channel_not_ready"
+        sections.isEmpty() -> "failed"
+        sections.any { it.status == STATUS_UNKNOWN || it.status == STATUS_TIMEOUT } -> "partial"
+        verdict == "full" || verdict == "truncated" -> "completed"
+        verdict == "partial" -> "partial"
+        else -> "failed"
+    }
+
+    private fun reason(
+        tally: LogBudget.WriteTally,
+        sections: List<Section>,
+        channelReady: Boolean,
+        truncated: Boolean?
+    ): String {
+        if (!channelReady) return "channel_not_ready"
+        val bad = sections.filter { it.status == STATUS_UNKNOWN || it.status == STATUS_TIMEOUT }
+            .map { it.name }
+        return buildList {
+            if (bad.isNotEmpty()) add("sections_unknown_or_timeout=${bad.joinToString(",")}")
+            if (tally.failed > 0) add("write_failed=${tally.failed}")
+            if (tally.dropped > 0) add("skipped_by_budget=${tally.dropped}")
+            if (truncated == null) add("truncation_not_checkable")
+        }.joinToString(";").ifEmpty { "all_criteria_met" }
     }
 
     /** Честная запись случая «канал не готов» без единой команды. */

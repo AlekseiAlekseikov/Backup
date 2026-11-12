@@ -32,11 +32,11 @@ object JitFake {
         val independent = mutableListOf<String>()
         val locations = LinkedHashSet<String>()
 
-        override fun write(line: String): LogBudget.WriteOutcome {
+        override fun write(line: String): LogBudget.LogWrite {
             locations += loc
             val o = outcome(line)
             if (o == LogBudget.WriteOutcome.WRITTEN) lines += line
-            return o
+            return LogBudget.LogWrite(o, if (o == LogBudget.WriteOutcome.WRITTEN) loc else "")
         }
 
         override fun location(): String = loc
@@ -242,6 +242,9 @@ object JitFake {
             val reports = mutableListOf<JitRef.StoreReport>()
             for ((i, m) in maps.withIndex()) {
                 if (target != null && name(i) !in target) continue
+                // iter42 §5(а): хранилище «исчезло» уже ПОСЛЕ чтения прежних значений
+                // (провайдер вернул null / хранилище недоступно) — в отчёте его нет.
+                if (i in vanishAfterRead) continue
                 if (i in throwOn) {
                     reports += JitRef.StoreReport(name(i), "exception:IllegalStateException", false)
                     continue

@@ -808,6 +808,127 @@ object JitRef {
      * Что делает: не больше [maxRuns] попыток за процесс; успех фиксируется только по факту
      * завершения сборщиков; повтор не бесконечный, сторожа и новых кнопок нет.
      */
+    /**
+     * §3 iter42 — ограничитель событийных снимков сети (сравнимых «до/после»).
+     *
+     * Снимок делается только по СУЩЕСТВУЮЩИМ событиям владельца/системы (изменение TTL, событие
+     * Wi-Fi/активной сети). Своих кнопок, включения TTL и любых изменений сети здесь нет.
+     *
+     * Ограничения: не чаще [minIntervalMs] и не больше [maxPerHour] за час; один снимок на ключ
+     * одновременно (без параллельных дублей); при шторме выполняется ОДИН итоговый снимок
+     * устойчивого состояния после debounce, а не серия.
+     */
+    class EventSnapshots(
+        private val minIntervalMs: Long = 90_000L,
+        private val maxPerHour: Int = 6
+    ) {
+        private var lastAtMs = 0L
+        private var lastKey: String? = null
+        private var windowStartMs = 0L
+        private var inWindow = 0
+        private val inFlight = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+        private val log = ArrayList<String>()
+        private val maxLog = 32
+
+        /** «После» принимается парным к «до», если прошло не больше 10 минут. */
+        private val PAIR_WINDOW_MS = 600_000L
+
+        /**
+         * @return `null` — снимок разрешён (можно запускать); иначе причина пропуска.
+         */
+        fun tryAcquire(key: String, nowMs: Long): String? = acquire(key, nowMs, null)
+
+        /**
+         * Снимок, парный к предыдущему (`pairWith`) — например «до» и «после» РЕАЛЬНОГО
+         * изменения TTL. Пара не должна теряться из-за минимального интервала: иначе «после»
+         * всегда отбрасывалось бы, и сравнивать было бы не с чем. Ограничение часа при этом
+         * действует: шторм по-прежнему не превращается в поток снимков.
+         */
+        fun tryAcquirePaired(key: String, nowMs: Long, pairWith: String): String? =
+            acquire(key, nowMs, pairWith)
+
+        /**
+         * База имени пары: `<событие>_pre` ↔ `<событие>_post`. Пара разрешена только внутри
+         * ОДНОГО события — иначе «парностью» можно было бы обойти ограничение частоты.
+         */
+        private fun pairBase(k: String): String? = when {
+            k.endsWith("_pre") -> k.removeSuffix("_pre")
+            k.endsWith("_post") -> k.removeSuffix("_post")
+            else -> null
+        }
+
+        private fun acquire(key: String, nowMs: Long, pairWith: String?): String? {
+            synchronized(this) {
+                if (inFlight.putIfAbsent(key, true) != null) return "duplicate_in_flight"
+                if (windowStartMs == 0L || nowMs - windowStartMs > 3_600_000L) {
+                    windowStartMs = nowMs
+                    inWindow = 0
+                }
+                if (inWindow >= maxPerHour) {
+                    inFlight.remove(key)
+                    return "hour_limit_$maxPerHour"
+                }
+                val since = nowMs - lastAtMs
+                val paired = pairWith != null && pairWith == lastKey &&
+                    pairBase(key) != null && pairBase(key) == pairBase(pairWith) &&
+                    since in 0..PAIR_WINDOW_MS
+                if (!paired && lastAtMs != 0L && since in 0 until minIntervalMs) {
+                    inFlight.remove(key)
+                    return "rate_limited ${since}ms<$minIntervalMs"
+                }
+                lastAtMs = nowMs
+                lastKey = key
+                inWindow++
+                return null
+            }
+        }
+
+        fun release(key: String) {
+            inFlight.remove(key)
+        }
+
+        fun used(): Int = synchronized(this) { inWindow }
+
+        fun note(line: String) {
+            synchronized(this) {
+                if (log.size >= maxLog) log.removeAt(0)
+                log.add(line)
+            }
+        }
+
+        fun drain(): List<String> = synchronized(this) { log.toList().also { log.clear() } }
+
+        fun resetForTest() {
+            synchronized(this) {
+                lastAtMs = 0L; lastKey = null; windowStartMs = 0L; inWindow = 0
+                inFlight.clear(); log.clear()
+            }
+        }
+    }
+
+    /**
+     * §2.7/§3 iter42 — итог работы ОДНОГО сборщика диагностики.
+     *
+     * Отличается от «не было исключения»: здесь видно, сколько секций реально получено, сколько
+     * строк подтверждено в файле, и только при выполнении явных критериев сбор считается
+     * `completed`. Иначе — `partial` с причиной; недоступный канал — `channel_not_ready`.
+     */
+    data class DiagReport(
+        val block: String,
+        val sectionCount: Int,
+        val sectionsDefinite: Int,
+        val offered: Int,
+        val written: Int,
+        val failed: Int,
+        val dropped: Int,
+        val verdict: String,
+        val sink: String,
+        val status: String,
+        val reason: String
+    ) {
+        val completed: Boolean get() = status == "completed"
+    }
+
     class DiagOnce(private val maxRuns: Int = 2) {
         private val runs = java.util.concurrent.atomic.AtomicInteger(0)
         private val completed = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -1065,7 +1186,15 @@ object JitOp {
                     "previous=«${briefPrev(prev)}» " +
                     "(снимок ДО любых изменений; формат wifi_only — AP не снимается и не поднимается)"
             )
+            // §5 iter42: набор CPS/DPS мог измениться МЕЖДУ предварительным чтением и записью
+            // (провайдер вернул null/бросил, хранилище «пропало»). Раньше это логировалось
+            // (`store_absent`), но отправку не блокировало — снимок мог оказаться не там, где его
+            // прочитает продолжение. Теперь fail closed: набор обязан совпасть.
+            val readNames = prev.map { it.name }.toSet()
+            val writtenNames = write.stores.map { it.name }.toSet()
+            val storeSetChanged = readNames != writtenNames
             val blocked = when {
+                storeSetChanged -> "store_set_changed"
                 write.attempted == 0 -> "snapshot_not_saved"
                 write.confirmed == 0 -> "snapshot_not_saved"
                 !write.firstReadable -> "snapshot_not_saved"
@@ -1074,6 +1203,21 @@ object JitOp {
                 else -> null
             }
             if (blocked != null) {
+                val why = when (blocked) {
+                    "store_set_changed" ->
+                        "набор хранилищ CPS/DPS изменился между чтением прежних значений и записью " +
+                            "снимка (провайдер вернул null/хранилище стало недоступно): где снимок " +
+                            "прочитает продолжение — неизвестно, поэтому не отправляем (fail closed)"
+                    "snapshot_not_saved" ->
+                        "ни одно хранилище не подтвердило запись снимка чтением: продолжение " +
+                            "прочитает прежнее состояние, значит отправлять нельзя"
+                    "snapshot_conflict" ->
+                        "хранилища расходятся по ключам операции: какое состояние прочитает " +
+                            "продолжение — неизвестно"
+                    "snapshot_not_readable" ->
+                        "чтение после записи вернуло не наш снимок: отправка запрещена"
+                    else -> "состояние снимка недостоверно"
+                }
                 if (write.confirmed > 0 && !write.firstReadable) {
                     log(
                         "JIT_CLICK snapshot_order=first_store_not_durable " +
@@ -1094,7 +1238,8 @@ object JitOp {
                         "prev_restore=${rb.ok}/${rb.attempted} prev_restore_detail=${rb.detail} " +
                         "left_pedido=$leftPedido left_restore=${leftRestore ?: "none"} " +
                         "action=none commands=0 " +
-                        "(сеть и системные свойства НЕ менялись; commit=false сам по себе не " +
+                        "(ни записи, ни shell: $why. Сеть и системные свойства НЕ менялись; " +
+                        "commit=false сам по себе не " +
                         "доказывает отсутствия значения в памяти. Прежние значения восстановлены " +
                         "там, где хранилище приняло запись; если восстановление не прошло — это " +
                         "видно здесь и в left_*, и клик остаётся заблокированным)"

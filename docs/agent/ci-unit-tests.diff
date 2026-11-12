@@ -1,0 +1,29 @@
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@
+       - name: Gradle build (debug)
+         run: |
+           chmod +x gradlew
+           ./gradlew --no-daemon --stacktrace assembleDebug
++
++      # iter42 §6: тесты больше НЕ привязаны к assembleDebug/assembleRelease,
++      # поэтому в CI они запускаются отдельным шагом (иначе покрытия тестами нет).
++      # Шаг намеренно ПОСЛЕ сборки: сборка не должна падать/удлиняться из-за тестов,
++      # но и «зелёная сборка без тестов» приёмкой не считается.
++      - name: Unit tests (JVM)
++        if: always()
++        run: |
++          chmod +x gradlew
++          ./gradlew --no-daemon --stacktrace :app:testDebugUnitTest
++
++      - name: Upload unit test reports
++        if: always()
++        uses: actions/upload-artifact@v4
++        with:
++          name: unit-test-reports
++          path: |
++            app/build/reports/tests/**
++            app/build/test-results/**
++          if-no-files-found: warn
++          retention-days: 30
+

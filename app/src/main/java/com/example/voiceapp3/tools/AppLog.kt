@@ -234,14 +234,17 @@ object AppLog {
 
     // ───────────── internal ─────────────
     /** До init() — складываем в буфер; после init() — пишем сразу. */
-    private fun enqueueOrWrite(lvl: String, tag: String, msg: String, th: Throwable?): Boolean {
+    private fun enqueueOrWrite(lvl: String, tag: String, msg: String, th: Throwable?): Boolean =
+        enqueueOrWriteLine(lvl, tag, msg, th).written
+
+    private fun enqueueOrWriteLine(lvl: String, tag: String, msg: String, th: Throwable?): LogFiles.Result {
         if (!inited) synchronized(lock) {
             if (!inited) {
                 val line = formatLine(lvl, tag, msg, th)
                 early.addLast(line)
                 while (early.size > EARLY_CAP) early.removeFirst()
-                // §5.1 iter41: «положено в буфер до init» ≠ «записано в датированный файл».
-                return false
+                // «положено в буфер до init» ≠ «записано в датированный файл».
+                return LogFiles.Result.fail("buffered_before_init")
             }
         }
         return writeRaw(lvl, tag, msg, th)
@@ -307,6 +310,38 @@ object AppLog {
     /** §3.1 iter40: усечение ИМЕННО этого блока (`INTERNET_DIAG` / `JIT_MOUNT_DIAG`). */
     internal fun diagTruncatedFor(label: String): Boolean = diagBudget.truncatedFor(label)
 
+    /**
+     * iter42 §2.4 — шумные НИЗКОУРОВНЕВЫЕ ADB-трассы.
+     *
+     * Это не полезные события, а побайтовые подробности транспорта (`ADB_TX`/`ADB_RX`/hex/повторы
+     * рукопожатия). Они уходят в ОТДЕЛЬНЫЙ ротационный tier ([LogFiles.appendVerbose]) со своими
+     * лимитами и НЕ расходуют бюджет основного журнала — иначе именно они вытесняли сеть/TTL/JIT
+     * (в логе владельца 12.11: `LOG_BUDGET exceeded=153744 action=trim`, дальше dropped=127).
+     *
+     * Факты транспорта остаются в основном логе: `ADB_STATE`, `ADB_SELFTEST`, `ADB_RECOVERY`,
+     * `CHANNEL_LOST`, `SCRIPT_UPLOAD`, `VERIFY EXEC`, `ADB_PORT_READBACK` и сводка
+     * `ADB_VERBOSE_STATS`.
+     */
+    internal fun isVerboseLine(msg: String): Boolean {
+        val m = msg.trimStart()
+        for (p in VERBOSE_PREFIXES) if (m.startsWith(p)) return true
+        // «→ execute …», «← execute …» — тоже низкоуровневые трассы вызовов.
+        return m.startsWith("→ execute") || m.startsWith("← execute")
+    }
+
+    private val VERBOSE_PREFIXES = arrayOf(
+        "ADB_TX", "ADB_RX", "ADB_TRACE_REPLAY", "ADB_ROW", "ADB_CHANNEL", "ADB_PROBE",
+        "ADB_DEST", "ADB_CONST", "ADB_CNXN", "ADB_OPEN", "ADB_AUTH"
+    )
+
+    private val verboseWritten = java.util.concurrent.atomic.AtomicLong(0)
+    private val verboseFailed = java.util.concurrent.atomic.AtomicLong(0)
+
+    /** Для лога/тестов: сколько низкоуровневых строк ушло в verbose-tier и сколько не удалось. */
+    internal fun verboseStats(): String =
+        "ADB_VERBOSE_STATS lines=${verboseWritten.get()} failed=${verboseFailed.get()} " +
+            "tier=verbose file=${runCatching { LogFiles.currentPath() }.getOrDefault("unknown")}"
+
     /** Строка действия (exempt-список §4.5). */
     internal fun isActionLine(msg: String): Boolean {
         val m = msg.trimStart()
@@ -315,6 +350,18 @@ object AppLog {
         return false
     }
 
+    /**
+     * iter42 §2.2 — лимит скорости больше НЕ выбрасывает полезные строки.
+     *
+     * Прежнее поведение (`action=trim`) молча отбрасывало последующие записи: в логе владельца
+     * 12.11.2026 после `LOG_BUDGET exceeded=153744 action=trim` потеряно 127 строк, среди которых
+     * могли быть события сети/TTL/JIT. Теперь при достижении лимита окна выполняется РОТАЦИЯ
+     * ЦЕЛОГО файла ([LogFiles.rotateNow]) и запись продолжается — счётчики окна сбрасываются.
+     *
+     * `false` возвращается только если ротация невозможна (нет места/каталога): тогда строка
+     * действительно не сохранена, и это отдельно объявляется (`LOG_BUDGET action=drop_after_limit`),
+     * а не выдаётся за запись.
+     */
     private fun budgetAllow(len: Int): Boolean {
         val now = android.os.SystemClock.elapsedRealtime()
         synchronized(lock) {
@@ -325,25 +372,31 @@ object AppLog {
                 budgetTrim = false
                 budgetDropped = 0L
             }
-            if (!budgetTrim) {
-                budgetBytes += len
-                if (budgetBytes > BUDGET_BYTES) {
-                    budgetTrim = true
-                    budgetLastSummaryMs = 0L
-                    budgetNotice = "LOG_BUDGET exceeded=$budgetBytes action=trim window=10min limit=${BUDGET_BYTES}"
-                    return true     // сама строка-уведомление пишется этим вызовом
-                }
+            budgetBytes += len
+            if (budgetBytes <= BUDGET_BYTES) return true
+            // Лимит окна достигнут: закрываем файл целиком и продолжаем писать в новый.
+            val rotated = ctx?.let { c -> runCatching { LogFiles.rotateNow(c, "budget") }.getOrDefault(false) } ?: false
+            if (rotated) {
+                budgetBytes = 0L
+                budgetTrim = false
+                budgetNotices++
+                budgetNotice = "LOG_BUDGET exceeded=$budgetBytes action=rotate window=10min " +
+                    "limit=${BUDGET_BYTES} rotations=$budgetNotices " +
+                    "(строки не обрезаются: закрыт целый файл, запись продолжена в новый)"
                 return true
             }
             budgetDropped++
-            if (now - budgetLastSummaryMs >= TRIM_SUMMARY_MS) {
-                budgetLastSummaryMs = now
-                budgetNotice = "LOG_BUDGET action=trim dropped=$budgetDropped bytes=$budgetBytes (сводка раз в минуту)"
-                return true
-            }
-            return false
+            budgetLastSummaryMs = now
+            budgetNotice = "LOG_BUDGET action=drop_after_limit dropped=$budgetDropped bytes=$budgetBytes " +
+                "reason=rotate_unavailable (ротация невозможна: нет места/каталога; " +
+                "эта строка НЕ сохранена)"
+            Log.e(TAG_BASE, "LOG_BUDGET rotate_unavailable dropped=$budgetDropped")
+            return true     // пишем саму строку-уведомление
         }
     }
+
+    /** Сколько раз бюджет вызывал ротацию (видно в логе и тестах). */
+    private var budgetNotices = 0
 
     /** Строка-уведомление бюджета, подменяющая очередную запись. */
     @Volatile private var budgetNotice: String? = null
@@ -355,8 +408,16 @@ object AppLog {
      * ([LogFiles.append]). `false` — строка не попала в датированный sink: её пропустил бюджет,
      * она осталась в буфере до init, либо запись не удалась/не подтверждена.
      */
-    private fun writeRaw(lvl: String, tag: String, msg: String, th: Throwable?): Boolean {
-        val c = ctx ?: return false
+    private fun writeRaw(lvl: String, tag: String, msg: String, th: Throwable?): LogFiles.Result {
+        val c = ctx ?: return LogFiles.Result.fail("no_context")
+        // §2.4 iter42: низкоуровневые ADB-трассы — в отдельный verbose-tier, мимо общего бюджета.
+        if (isVerboseLine(msg)) {
+            val line = formatLine(lvl, tag, msg, null)
+            val r = runCatching { LogFiles.appendVerbose(c, line) }
+                .getOrElse { t -> LogFiles.Result.fail("io:" + t.javaClass.simpleName) }
+            if (r.written) verboseWritten.incrementAndGet() else verboseFailed.incrementAndGet()
+            return r
+        }
         var thrown: Throwable? = null
         var line = formatLine(lvl, tag, msg, null)
         // H1.6: бюджет считается по уже сформированной строке; уведомление бюджета
@@ -374,7 +435,7 @@ object AppLog {
                 if (v.notice != null && linesDiagNoticeWritten(v.notice)) {
                     writeRawLine(c, formatLine("INFO", "CENTRAL_LogDiag", v.notice, null), null)
                 }
-                return false
+                return LogFiles.Result.fail("dropped:diag_budget")
             }
         } else {
             val exempt = isActionLine(msg)
@@ -382,7 +443,7 @@ object AppLog {
             val notice = budgetNotice
             budgetNotice = null
             if (notice != null) line = formatLine("INFO", "CENTRAL_LogBudget", notice, null)
-            else if (!allowed) return false
+            else if (!allowed) return LogFiles.Result.fail("dropped:budget")
         }
         // iter16: собираем "шапку" (BUILD/App INIT) — пишем её в начало каждого
         // нового/повёрнутого файла, чтобы после ротации версия не терялась.
@@ -420,11 +481,21 @@ object AppLog {
                 primaryPath = target.absolutePath
             }
         }
-        // iter33p §4.3: та же строка уходит в дневной файл `voiceapp3-DD.MM.YYYY.log`
-        // (ошибки записи не пробрасываем — дневной лог не имеет права ломать приложение, но и
-        // НЕ выдаём их за успешную запись: результат возвращается вызывающему, а для диагностики
-        // он ещё и виден в `LogFiles.ioErrors()/lastIoError()`).
-        return runCatching { LogFiles.append(c, line) }.getOrDefault(false)
+        // iter33p §4.3: та же строка уходит в дневной файл `voiceapp3-DD.MM.YYYY.log`.
+        // iter42 §2.6: возвращаем ТОЧНЫЙ файл и подтверждённый факт записи (фоллбэк
+        // external→internal учтён внутри LogFiles) — «вызов принят» больше не выдаётся за запись.
+        return runCatching { LogFiles.append(c, line) }
+            .getOrElse { t -> LogFiles.Result.fail("io:" + t.javaClass.simpleName) }
+    }
+
+    /**
+     * §2.6 iter42 — запись строки диагностики с подтверждением и ТОЧНЫМ файлом.
+     * Возвращает результат production-пути (`LogFiles.append`), а не «принято в очередь».
+     */
+    @JvmStatic
+    fun diagLineResult(tag: String, m: String): LogFiles.Result {
+        Log.i(tag, m)
+        return enqueueOrWriteLine("INFO", tag, m, null)
     }
 
     /**
@@ -436,10 +507,7 @@ object AppLog {
      * ничего не проверив.
      */
     @JvmStatic
-    fun diagLine(tag: String, m: String): Boolean {
-        Log.i(tag, m)
-        return enqueueOrWrite("INFO", tag, m, null)
-    }
+    fun diagLine(tag: String, m: String): Boolean = diagLineResult(tag, m).written
 
     /** Однократность уведомления об усечении: одна строка на факт, а не на каждую запись. */
     private val diagNoticeSeen = java.util.concurrent.ConcurrentHashMap<String, Boolean>()

@@ -39,13 +39,15 @@ class DiagWriteConfirmation41Test {
         val independent = mutableListOf<String>()
         val locationsSeen = LinkedHashSet<String>()
 
-        override fun write(line: String): LogBudget.WriteOutcome {
+        override fun write(line: String): LogBudget.LogWrite {
             locationsSeen += dir.absolutePath
-            if (dropOn(line)) return LogBudget.WriteOutcome.DROPPED
-            if (failOn(line)) return LogBudget.WriteOutcome.FAILED
-            val ok = LogFiles.appendToDir(dir, line)
-            if (ok) written += line
-            return if (ok) LogBudget.WriteOutcome.WRITTEN else LogBudget.WriteOutcome.FAILED
+            if (dropOn(line)) return LogBudget.LogWrite(LogBudget.WriteOutcome.DROPPED)
+            if (failOn(line)) return LogBudget.LogWrite(LogBudget.WriteOutcome.FAILED)
+            // iter42: production-писатель возвращает точный файл (включая ротацию по размеру).
+            val r = LogFiles.appendTierForTest(dir, line, LogFiles.Tier.MAIN)
+            if (r.written) written += line
+            return if (r.written) LogBudget.LogWrite(LogBudget.WriteOutcome.WRITTEN, r.file)
+            else LogBudget.LogWrite(LogBudget.WriteOutcome.FAILED)
         }
 
         override fun location(): String = dir.absolutePath
@@ -89,7 +91,9 @@ class DiagWriteConfirmation41Test {
 
         val end = endOf(sink.written, "INTERNET_DIAG_END")
         assertTrue("подтверждение записи: $end", end.contains("written=full"))
-        assertTrue("указан конкретный файл: $end", end.contains("sink=«${dir.absolutePath}»"))
+        // iter42 §2.6: указывается ТОЧНЫЙ файл строки, а не каталог.
+        assertTrue("указан конкретный файл: $end",
+            end.contains("sink=«${dir.absolutePath}/${LogFiles.fileNameFor(System.currentTimeMillis())}»"))
         // `END` тоже прошёл через приёмник, поэтому из списка подтверждённых его надо вычесть.
         val blockLines = sink.written.size - 1
         assertTrue("число строк подтверждено: $end",
@@ -154,7 +158,7 @@ class DiagWriteConfirmation41Test {
         // Первые 5 строк — во внешний каталог, дальше «переключение» на внутренний.
         var n = 0
         val switching = object : LogBudget.Sink {
-            override fun write(line: String): LogBudget.WriteOutcome {
+            override fun write(line: String): LogBudget.LogWrite {
                 if (n++ == 5) sink.dir = second
                 return sink.write(line)
             }
@@ -210,7 +214,8 @@ class DiagWriteConfirmation41Test {
 
         val end = endOf(sink.written, "JIT_MOUNT_DIAG_END")
         assertTrue("подтверждено в конкретном файле: $end", end.contains("written=full"))
-        assertTrue("указан файл: $end", end.contains("sink=«${dir.absolutePath}»"))
+        assertTrue("указан файл: $end",
+            end.contains("sink=«${dir.absolutePath}/${LogFiles.fileNameFor(System.currentTimeMillis())}»"))
         assertTrue("сеть не трогали", end.contains("system_writes=0"))
     }
 

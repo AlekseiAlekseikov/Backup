@@ -609,16 +609,18 @@ object JitNet {
      * `FAILED` — не подтверждено. Сам лог-приёмник ничего решать не может: сеть он не трогает.
      */
     internal object DiagSink : LogBudget.Sink {
-        override fun write(line: String): LogBudget.WriteOutcome {
-            val written = runCatching { AppLog.diagLine(TAG, line) }.getOrDefault(false)
-            if (written) return LogBudget.WriteOutcome.WRITTEN
+        override fun write(line: String): LogBudget.LogWrite {
+            val r = runCatching { AppLog.diagLineResult(TAG, line) }
+                .getOrElse { t -> LogFiles.Result.fail("io:" + t.javaClass.simpleName) }
+            if (r.written) return LogBudget.LogWrite(LogBudget.WriteOutcome.WRITTEN, r.file)
             // Не подтверждено: отличаем «бюджет не пустил» от «запись не удалась».
             val label = LogBudget.diagLabel(line)
-            return if (LogBudget.isDiagAlways(line) || !AppLog.diagTruncatedFor(label)) {
+            val out = if (LogBudget.isDiagAlways(line) || !AppLog.diagTruncatedFor(label)) {
                 LogBudget.WriteOutcome.FAILED
             } else {
                 LogBudget.WriteOutcome.DROPPED
             }
+            return LogBudget.LogWrite(out, "")
         }
 
         override fun location(): String = runCatching { LogFiles.currentPath() }.getOrDefault("unknown")
@@ -661,7 +663,14 @@ object JitNet {
             app.packageManager.getPackageInfo(app.packageName, 0).versionName
         }.getOrNull() ?: "unknown"
 
-        /** Полный сбор (канал готов). `true` — оба сборщика дошли до конца. */
+        /**
+         * Полный сбор (канал готов).
+         *
+         * §2.7 iter42: «не было исключения» больше НЕ считается успехом. Статус берётся из
+         * [JitRef.DiagReport]: критерии — готовый канал, отсутствие секций `unknown`/`timeout`,
+         * отсутствие неудачных записей и вердикт записи `full`/`truncated`. Частичный результат
+         * честно остаётся частичным и не закрывает ограниченную повторную попытку.
+         */
         val runBoth: (String) -> Boolean = { via ->
             val attempt = diagOnce.tryRun()
             if (attempt == null) {
@@ -670,29 +679,44 @@ object JitNet {
                     "(попытки сбора исчерпаны: это ограничение, а не «данных нет»)")
                 false
             } else {
-                val mountOk = runCatching {
-                    JitMountDiag.collect(DiagShell, true, DiagSink, "$source/$via") {
+                val mount = runCatching {
+                    JitMountDiag.collectWithReport(DiagShell, true, DiagSink, "$source/$via") {
                         AppLog.diagTruncatedFor("JIT_MOUNT_DIAG")
                     }
                 }.onFailure { t ->
-                    AppLog.i(TAG, "JIT_MOUNT_DIAG source=$source/$via status=unknown " +
-                        "reason=${t.javaClass.simpleName} (сбой сборщика, не результат чтения)")
-                }.isSuccess
-                val netOk = runCatching {
-                    InternetDiag.collect(DiagShell, true, netInfo, DiagSink, "$source/$via", appVersion) {
+                    AppLog.i(TAG, "JIT_MOUNT_DIAG source=$source/$via status=failed " +
+                        "reason=collector_exception:${t.javaClass.simpleName} " +
+                        "(сбой сборщика, а не результат чтения)")
+                }.getOrNull()
+                val net = runCatching {
+                    InternetDiag.collectWithReport(DiagShell, true, netInfo, DiagSink, "$source/$via", appVersion) {
                         AppLog.diagTruncatedFor("INTERNET_DIAG")
                     }
                 }.onFailure { t ->
-                    AppLog.i(TAG, "INTERNET_DIAG source=$source/$via status=unknown " +
-                        "reason=${t.javaClass.simpleName} (сбой сборщика, сеть не менялась)")
-                }.isSuccess
-                val ok = mountOk && netOk
+                    AppLog.i(TAG, "INTERNET_DIAG source=$source/$via status=failed " +
+                        "reason=collector_exception:${t.javaClass.simpleName} " +
+                        "(сбой сборщика, сеть не менялась)")
+                }.getOrNull()
+                for (r in listOfNotNull(mount?.info, net?.info)) {
+                    AppLog.i(TAG, "DIAG_SECTION_RESULT block=${r.block} status=${r.status} " +
+                        "sections=${r.sectionCount} definite=${r.sectionsDefinite} " +
+                        "lines=${r.written}/${r.offered} failed=${r.failed} dropped=${r.dropped} " +
+                        "written=${r.verdict} sink=«${r.sink}» reason=${r.reason}")
+                }
+                val ok = mount?.info?.completed == true && net?.info?.completed == true
                 val completed = diagOnce.finish(ok)
+                val st = when {
+                    ok -> "completed"
+                    mount == null || net == null -> "failed"
+                    mount.info.status == "channel_not_ready" || net.info.status == "channel_not_ready" ->
+                        "channel_not_ready"
+                    else -> "partial"
+                }
                 AppLog.i(TAG, "DIAG via=$via run=$attempt/${diagOnce.maxRunsAllowed()} " +
-                    "status=${if (ok) "completed" else "failed"} mount=$mountOk network=$netOk " +
+                    "status=$st mount=${mount?.info?.status ?: "failed"} network=${net?.info?.status ?: "failed"} " +
                     "collected=$completed " +
-                    "(неудачная попытка НЕ считается собранной: при готовности канала позже " +
-                    "остаётся ещё одна ограниченная попытка, без сторожа и новых кнопок)")
+                    "(успех — только при выполнении критериев; частичный сбор остаётся частичным и " +
+                    "не закрывает ограниченную повторную попытку)")
                 ok
             }
         }
@@ -747,6 +771,87 @@ object JitNet {
         if (delayMs > 0) BgWorker.postDelayed("JitNet.diag", delayMs, task)
         else BgWorker.post("JitNet.diag", task)
     }
+
+    // ─────────────────────── событийные снимки сети: «до/после» (iter42 §3) ───────────────────────
+
+    /**
+     * Ограничитель событийных снимков: не чаще 90 с, не больше 6 в час, без дублей.
+     * Один экземпляр на процесс.
+     */
+    private val eventSnaps = JitRef.EventSnapshots()
+
+    /** Ключи в полёте — чтобы поздний debounce одного события не перекрыл другое. */
+    private val eventInFlight = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+
+    /**
+     * §3 iter42 — СРАВНИМЫЙ снимок сети по СУЩЕСТВУЮЩЕМУ событию (включение/выключение TTL,
+     * смена Wi-Fi/активной сети). Никаких новых кнопок и никаких изменений сети: только чтение.
+     *
+     * Зачем: в логе владельца 12.11 снимок сети есть ДО включения TTL (18:56) и отсутствует
+     * ПОСЛЕ (19:00) — сравнить «до/после» нечем.
+     *
+     * При шторме событий выполняется ОДИН снимок устойчивого состояния: `postDelayed` на
+     * [stableDelayMs], при этом дубли отсекаются, а факт пропуска пишется с причиной.
+     * Результат не объявляется заранее: строка `SNAP reason=… status=…` пишется по факту.
+     */
+    fun requestEventSnapshot(
+        app: Context,
+        reason: String,
+        netInfo: InternetDiag.NetInfo? = null,
+        stableDelayMs: Long = 15_000L,
+        /** Снимок парный к предыдущему (`ttl_on_pre` → `ttl_on_post`): интервал не режет пару. */
+        pairWith: String? = null
+    ) {
+        val appVersion = runCatching {
+            app.packageManager.getPackageInfo(app.packageName, 0).versionName
+        }.getOrNull() ?: "unknown"
+        val key = "snap:" + reason.substringBefore(':')
+        val now = System.currentTimeMillis()
+        val skip = if (pairWith != null) eventSnaps.tryAcquirePaired(key, now, "snap:$pairWith")
+        else eventSnaps.tryAcquire(key, now)
+        if (skip != null) {
+            AppLog.i(TAG, "SNAP reason=$reason status=skipped why=$skip " +
+                "used_last_hour=${eventSnaps.used()} " +
+                "(снимок не делается: ограничение частоты/дубль; состояние сети не менялось)")
+            return
+        }
+        if (eventInFlight.putIfAbsent(key, true) != null) {
+            eventSnaps.release(key)
+            AppLog.i(TAG, "SNAP reason=$reason status=skipped why=in_flight (второй снимок не нужен)")
+            return
+        }
+        AppLog.i(TAG, "SNAP reason=$reason status=scheduled delay_ms=$stableDelayMs " +
+            "note=\"снимок после стабилизации: одно событие сетевого шторма не даёт серию снимков\"")
+        BgWorker.postDelayed("JitNet.eventSnapshot", stableDelayMs) {
+            try {
+                val report = runCatching {
+                    InternetDiag.collectWithReport(
+                        DiagShell, AdbClient.isChannelReady(), netInfo, DiagSink,
+                        "event:$reason", appVersion
+                    ) { AppLog.diagTruncatedFor("INTERNET_DIAG") }
+                }.onFailure { t ->
+                    AppLog.i(TAG, "SNAP reason=$reason status=failed " +
+                        "why=collector_exception:${t.javaClass.simpleName} (сеть не менялась)")
+                }.getOrNull()
+                AppLog.i(TAG, "SNAP reason=$reason status=${report?.info?.status ?: "failed"} " +
+                    "sections=${report?.info?.sectionCount ?: 0} written=${report?.info?.verdict ?: "none"} " +
+                    "sink=«${report?.info?.sink ?: "none"}» why=${report?.info?.reason ?: "failed"} " +
+                    "(это факты, а не диагноз: единый снимок до/после события; сеть не менялась)")
+            } finally {
+                eventInFlight.remove(key)
+                eventSnaps.release(key)
+            }
+        }
+    }
+
+    /** Только для тестов: сбросить ограничитель событийных снимков. */
+    internal fun resetEventSnapshotsForTest() {
+        eventSnaps.resetForTest()
+        eventInFlight.clear()
+    }
+
+    /** Только для тестов: состояние ограничителя. */
+    internal fun eventSnapshotsUsedForTest(): Int = eventSnaps.used()
 
     /** Занять единственную попытку сбора в этом процессе (одноразовый флаг, без повторов). */
     internal fun markDiagAttempted(): Boolean = diagAttempted.compareAndSet(false, true)

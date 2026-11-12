@@ -237,9 +237,18 @@ object JitMountDiag {
         channelReady: Boolean,
         sink: LogBudget.Sink,
         source: String,
+        truncatedProbe: (() -> Boolean)? = null
+    ): List<Section> = collectWithReport(shell, channelReady, sink, source, truncatedProbe).sections
+
+    /** §2.7 iter42 — сбор с отчётом и явными критериями статуса (как в [InternetDiag]). */
+    internal fun collectWithReport(
+        shell: JitRef.JitShell,
+        channelReady: Boolean,
+        sink: LogBudget.Sink,
+        source: String,
         /** §3.1: были ли строки этого блока усечены бюджетом лога (`null` — неизвестно). */
         truncatedProbe: (() -> Boolean)? = null
-    ): List<Section> {
+    ): Report {
         val t0 = System.currentTimeMillis()
         // §5.1 iter41: факт записи каждой строки, а не «вызов состоялся».
         val tally = LogBudget.WriteTally(sink)
@@ -269,7 +278,15 @@ object JitMountDiag {
                         "(сводка блока не подтверждена в датированном файле; полноту не обещаем)"
                 )
             }
-            return none
+            return Report(
+                none,
+                JitRef.DiagReport(
+                    block = "JIT_MOUNT_DIAG", sectionCount = none.size, sectionsDefinite = 0,
+                    offered = tally.offered, written = tally.written, failed = tally.failed,
+                    dropped = tally.dropped, verdict = tally.verdict(null), sink = tally.sinkList(),
+                    status = "channel_not_ready", reason = "channel_not_ready"
+                )
+            )
         }
         val sections = ArrayList<Section>(4)
 
@@ -366,8 +383,40 @@ object JitMountDiag {
                     "(сводка блока не подтверждена в датированном файле; полноту не обещаем)"
             )
         }
-        return sections
+        val definite = sections.count { it.status != STATUS_UNKNOWN && it.status != STATUS_TIMEOUT }
+        val st = when {
+            sections.isEmpty() -> "failed"
+            definite < sections.size -> "partial"
+            tally.verdict(truncated) == "full" || tally.verdict(truncated) == "truncated" -> "completed"
+            tally.verdict(truncated) == "partial" -> "partial"
+            else -> "failed"
+        }
+        return Report(sections, JitRef.DiagReport(
+            block = "JIT_MOUNT_DIAG",
+            sectionCount = sections.size,
+            sectionsDefinite = definite,
+            offered = tally.offered,
+            written = tally.written,
+            failed = tally.failed,
+            dropped = tally.dropped,
+            verdict = tally.verdict(truncated),
+            sink = tally.sinkList(),
+            status = st,
+            reason = buildList {
+                val bad = sections.filter { it.status == STATUS_UNKNOWN || it.status == STATUS_TIMEOUT }
+                    .map { it.name }
+                if (bad.isNotEmpty()) add("sections_unknown_or_timeout=${bad.joinToString(",")}")
+                if (tally.failed > 0) add("write_failed=${tally.failed}")
+                if (tally.dropped > 0) add("skipped_by_budget=${tally.dropped}")
+            }.joinToString(";").ifEmpty { "all_criteria_met" }
+        ))
     }
+
+    /**
+     * §2.7 iter42: результат сборщика — секции + отчёт. `collect()` возвращает только секции
+     * (совместимость), `collectWithReport()` — оба, включая фактические критерии `completed`.
+     */
+    internal data class Report(val sections: List<Section>, val info: JitRef.DiagReport)
 
     private fun exec(shell: JitRef.JitShell, cmd: String): Raw = runCatching {
         val (rc, out) = shell.exec(cmd, SECTION_TIMEOUT_MS)

@@ -365,7 +365,31 @@ enum class Choice(
                 return WindowDoors.setWindowOppositeOnDoor(appContext, value)
             }
             Toggle.TTL_65 -> {
-                return NetworkTtl.setTtl65Active(appContext, value)
+                // iter42 §3: снимки «до» и «после» СУЩЕСТВУЮЩЕГО события владельца (переключение
+                // TTL). Только чтение; сеть/TTL не меняются этим кодом, кнопок не добавляем.
+                // Пара снимается один раз на РЕАЛЬНОЕ изменение состояния, «до» — с нулевой
+                // задержкой (сбор идёт в фоновом worker'е, не в UI-потоке), «после» — после
+                // стабилизации. Механику TTL этот код не трогает.
+                val wasActive = runCatching { NetworkTtl.isTtl65Active(appContext) }.getOrDefault(value == false)
+                val tag = if (value) "on" else "off"
+                if (wasActive != value) {
+                    runCatching {
+                        JitNet.requestEventSnapshot(
+                            appContext, "ttl_" + tag + "_pre", NetInfoAndroid(appContext),
+                            stableDelayMs = 0L
+                        )
+                    }
+                }
+                val r = NetworkTtl.setTtl65Active(appContext, value)
+                if (wasActive != value) {
+                    runCatching {
+                        JitNet.requestEventSnapshot(
+                            appContext, "ttl_" + tag + "_post", NetInfoAndroid(appContext),
+                            stableDelayMs = 15_000L, pairWith = "ttl_" + tag + "_pre"
+                        )
+                    }
+                }
+                return r
             }
             Toggle.PERF_VIDEO -> {
                 return AppPerformance.setVideo60Fps(appContext, value)
