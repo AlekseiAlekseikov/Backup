@@ -42,6 +42,15 @@ object JitNet {
 
     // ─────────────────────────── shell ───────────────────────────
 
+    /**
+     * §3.2 iter41: НЕ реализует `JitRef.JitLateEvidence` — и это осознанно, а не недоделка.
+     *
+     * `AdbClient.execute` по таймауту возвращает `ERR_ADB_TIMEOUT`, но job остаётся в очереди и
+     * может выполниться позже; слушателя у него уже нет, а пережить смерть процесса и «донести»
+     * ответ некому. Значит достоверного свидетельства «старая команда больше не выполнится»
+     * реальный транспорт не даёт, и выдавать `rc`/обрыв сокета/новый процесс за такое
+     * свидетельство нельзя. Пока это не доказано кодом и тестами, JIT остаётся ⛔ по §7.
+     */
     internal object AndroidShell : JitRef.JitShell {
         override fun exec(command: String, timeoutMs: Int): Pair<Int, String> = runCatching {
             AdbClient.execute(command, timeoutMs)
@@ -108,13 +117,56 @@ object JitNet {
         private fun cps(): SharedPreferences? = runCatching { cpsProvider() }.getOrNull()
         private fun dps(): SharedPreferences? = runCatching { dpsProvider() }.getOrNull()
 
-        /** Порядок тот же, что в [getString]: CPS первым. `distinct()` — если DPS недоступен. */
-        private fun stores(): List<Pair<String, SharedPreferences>> {
+        /**
+         * §4.2 iter41 — ПОЛУЧЕНИЕ хранилищ с отчётом о сбоях.
+         *
+         * Раньше исключение провайдера превращалось в `null`, хранилище просто исчезало из
+         * `stores()`, и `readOperation()` об этом ничего не сообщал: «копия не прочитана» выглядело
+         * как «копии нет». Здесь это разделено:
+         *  • `absent:same_store` — DPS совпал с CPS (штатная конфигурация `Prefs2`, когда
+         *    device-protected storage недоступен): это ОДНО хранилище, а не ошибка;
+         *  • `provider_null` / `provider:<Тип>` — хранилище не получено: состояние неизвестно,
+         *    выдавать его за «данных нет» нельзя.
+         */
+        private class Acquired(
+            val stores: List<Pair<String, SharedPreferences>>,
+            val errors: List<JitRef.StoreOp>
+        )
+
+        private fun acquire(): Acquired {
             val out = ArrayList<Pair<String, SharedPreferences>>(2)
-            cps()?.let { out += "cps" to it }
-            dps()?.let { d -> if (out.none { it.second === d }) out += "dps" to d }
-            return out
+            val errors = ArrayList<JitRef.StoreOp>(2)
+            val c = try {
+                cpsProvider()
+            } catch (t: Throwable) {
+                log("JIT_STORE acquire store=cps error=${t.javaClass.simpleName}")
+                errors += JitRef.StoreOp("cps", null, null, "provider:" + t.javaClass.simpleName)
+                null
+            }
+            if (c != null) out += "cps" to c
+            else if (errors.none { it.name == "cps" }) {
+                log("JIT_STORE acquire store=cps error=provider_null")
+                errors += JitRef.StoreOp("cps", null, null, "provider_null")
+            }
+            val d = try {
+                dpsProvider()
+            } catch (t: Throwable) {
+                log("JIT_STORE acquire store=dps error=${t.javaClass.simpleName}")
+                errors += JitRef.StoreOp("dps", null, null, "provider:" + t.javaClass.simpleName)
+                null
+            }
+            if (d != null) {
+                if (out.none { it.second === d }) out += "dps" to d
+                // иначе DPS == CPS: одна физическая копия, второй пары не существует
+            } else if (errors.none { it.name == "dps" }) {
+                log("JIT_STORE acquire store=dps error=provider_null")
+                errors += JitRef.StoreOp("dps", null, null, "provider_null")
+            }
+            return Acquired(out, errors)
         }
+
+        /** Порядок тот же, что в [getString]: CPS первым. `distinct()` — если DPS недоступен. */
+        private fun stores(): List<Pair<String, SharedPreferences>> = acquire().stores
 
         override fun getString(key: String): String? {
             val a = runCatching { cps()?.getString(key, null) }.getOrNull()
@@ -143,7 +195,21 @@ object JitNet {
          * Прежнее состояние ключей операции по каждому хранилищу, в порядке чтения (CPS→DPS).
          * Снимается ДО записи; при неудаче оно же возвращается отккатом.
          */
-        override fun readSnapshotState(): List<JitRef.StorePrev> = stores().map { (name, s) ->
+        override fun readSnapshotState(): List<JitRef.StorePrev> {
+            val acq = acquire()
+            val known = acq.stores.map { (name, s) -> readStorePrev(name, s) }
+            // §4.2: если хотя бы одно хранилище не получено, прежнее состояние недостоверно —
+            // откат по нему запрещён (ключи с present=null).
+            val missing = acq.errors.map { e ->
+                JitRef.StorePrev(
+                    e.name,
+                    (JitRef.SNAPSHOT_KEYS + KEY_MARK).map { k -> JitRef.KeyPrev(k, null, null, null) }
+                )
+            }
+            return known + missing
+        }
+
+        private fun readStorePrev(name: String, s: SharedPreferences): JitRef.StorePrev =
             JitRef.StorePrev(
                 name,
                 (JitRef.SNAPSHOT_KEYS + KEY_MARK).map { key ->
@@ -190,7 +256,6 @@ object JitNet {
                     }
                 }
             )
-        }
 
         /**
          * Вернуть прежние значения. Один `commit()` на хранилище; отчёт — по каждому.
@@ -241,15 +306,21 @@ object JitNet {
          * чтения (CPS→DPS). Ошибка чтения попадает в `error`, поэтому «не удалось прочитать» не
          * превращается в «данных нет», а пара никогда не собирается из разных хранилищ.
          */
-        override fun readOperation(): List<JitRef.StoreOp> = stores().map { (name, s) ->
-            try {
-                val snap = s.getString(KEY_RESTORE, null)
-                val mark = s.getString(KEY_MARK, null)
-                JitRef.StoreOp(name, snap, mark)
-            } catch (t: Throwable) {
-                log("JIT_STORE read_operation store=$name exception=${t.javaClass.simpleName}")
-                JitRef.StoreOp(name, null, null, "read:" + t.javaClass.simpleName)
+        override fun readOperation(): List<JitRef.StoreOp> {
+            val acq = acquire()
+            val reads = acq.stores.map { (name, s) ->
+                try {
+                    val snap = s.getString(KEY_RESTORE, null)
+                    val mark = s.getString(KEY_MARK, null)
+                    JitRef.StoreOp(name, snap, mark)
+                } catch (t: Throwable) {
+                    log("JIT_STORE read_operation store=$name exception=${t.javaClass.simpleName}")
+                    JitRef.StoreOp(name, null, null, "read:" + t.javaClass.simpleName)
+                }
             }
+            // §4.2: недоступное хранилище — это НЕ «данных нет». Ошибка получения идёт отдельной
+            // записью с `error`, поэтому `assessStored` даёт UNREADABLE, а не NONE.
+            return reads + acq.errors
         }
 
         /**
@@ -521,11 +592,43 @@ object JitNet {
 
     // ─────────────────────────── одноразовая read-only диагностика ───────────────────────────
 
-    /** Процессный флаг: попытка сбора была (не чаще одной за процесс). */
+    /** Процессный флаг: право на попытку уже занято (вход в диагностику один раз за процесс). */
     private val diagAttempted = java.util.concurrent.atomic.AtomicBoolean(false)
 
-    /** Процессный флаг: сбор УЖЕ выполнен (успешный или честно-неуспешный — второй не начинаем). */
-    private val diagRan = java.util.concurrent.atomic.AtomicBoolean(false)
+    /**
+     * §5.2 iter41: попытки сбора (не более двух за процесс) и ФАКТ успешного завершения.
+     * «Запущен» больше не выдаётся за «собран».
+     */
+    @Volatile private var diagOnce = JitRef.DiagOnce(2)
+
+    /**
+     * §5.1 iter41 — приёмник диагностических строк для боевого пути.
+     *
+     * Возвращает ФАКТ записи: `AppLog.diagLine` отдаёт результат `LogFiles.append` (датированный
+     * файл), а не «вызов принят». `DROPPED` — строку сознательно не писали (бюджет диагностики);
+     * `FAILED` — не подтверждено. Сам лог-приёмник ничего решать не может: сеть он не трогает.
+     */
+    internal object DiagSink : LogBudget.Sink {
+        override fun write(line: String): LogBudget.WriteOutcome {
+            val written = runCatching { AppLog.diagLine(TAG, line) }.getOrDefault(false)
+            if (written) return LogBudget.WriteOutcome.WRITTEN
+            // Не подтверждено: отличаем «бюджет не пустил» от «запись не удалась».
+            val label = LogBudget.diagLabel(line)
+            return if (LogBudget.isDiagAlways(line) || !AppLog.diagTruncatedFor(label)) {
+                LogBudget.WriteOutcome.FAILED
+            } else {
+                LogBudget.WriteOutcome.DROPPED
+            }
+        }
+
+        override fun location(): String = runCatching { LogFiles.currentPath() }.getOrDefault("unknown")
+
+        override fun independent(line: String) {
+            // Независимый канал: logcat + обычный (не диагностический) путь лога.
+            runCatching { android.util.Log.e("CENTRAL_DiagWrite", line) }
+            runCatching { AppLog.e(TAG, line) }
+        }
+    }
 
     /** Лок на однократную отложенную запись «канал пока не готов» (§3.4). */
     private val diagFallbackLock = Any()
@@ -542,6 +645,10 @@ object JitNet {
      * готовности (`AdbClient.onChannelReadyOnce`) и одна отложенная проверка на 30 с. Бесконечных
      * повторов и нового сторожа нет; при неготовности пишется честный `channel_not_ready`, а не
      * «нет root» и не «нет интернета».
+     *
+     * §5.2 iter41: успешный сбор фиксируется ТОЛЬКО по факту завершения обоих сборщиков при
+     * готовом канале; неудачная попытка не считается собранной и не лишает владельца ограниченной
+     * повторной попытки ([JitRef.DiagOnce], максимум 2 внешних набора проверок).
      */
     fun requestDiagOnce(
         app: Context,
@@ -554,31 +661,42 @@ object JitNet {
             app.packageManager.getPackageInfo(app.packageName, 0).versionName
         }.getOrNull() ?: "unknown"
 
-        val runBoth: (String) -> Unit = { via ->
-            if (diagRan.compareAndSet(false, true)) {
-                runCatching {
-                    JitMountDiag.collect(DiagShell, true, log, "$source/$via") {
+        /** Полный сбор (канал готов). `true` — оба сборщика дошли до конца. */
+        val runBoth: (String) -> Boolean = { via ->
+            val attempt = diagOnce.tryRun()
+            if (attempt == null) {
+                AppLog.i(TAG, "DIAG via=$via status=exhausted runs=${diagOnce.runsUsed()}/" +
+                    "${diagOnce.maxRunsAllowed()} completed=${diagOnce.completedNow()} " +
+                    "(попытки сбора исчерпаны: это ограничение, а не «данных нет»)")
+                false
+            } else {
+                val mountOk = runCatching {
+                    JitMountDiag.collect(DiagShell, true, DiagSink, "$source/$via") {
                         AppLog.diagTruncatedFor("JIT_MOUNT_DIAG")
                     }
-                }
-                    .onFailure { t ->
-                        AppLog.i(TAG, "JIT_MOUNT_DIAG source=$source/$via status=unknown " +
-                            "reason=${t.javaClass.simpleName} (сбой сборщика, не результат чтения)")
-                    }
-                runCatching {
-                    InternetDiag.collect(DiagShell, true, netInfo, log, "$source/$via", appVersion) {
+                }.onFailure { t ->
+                    AppLog.i(TAG, "JIT_MOUNT_DIAG source=$source/$via status=unknown " +
+                        "reason=${t.javaClass.simpleName} (сбой сборщика, не результат чтения)")
+                }.isSuccess
+                val netOk = runCatching {
+                    InternetDiag.collect(DiagShell, true, netInfo, DiagSink, "$source/$via", appVersion) {
                         AppLog.diagTruncatedFor("INTERNET_DIAG")
                     }
-                }
-                    .onFailure { t ->
-                        AppLog.i(TAG, "INTERNET_DIAG source=$source/$via status=unknown " +
-                            "reason=${t.javaClass.simpleName} (сбой сборщика, сеть не менялась)")
-                    }
+                }.onFailure { t ->
+                    AppLog.i(TAG, "INTERNET_DIAG source=$source/$via status=unknown " +
+                        "reason=${t.javaClass.simpleName} (сбой сборщика, сеть не менялась)")
+                }.isSuccess
+                val ok = mountOk && netOk
+                val completed = diagOnce.finish(ok)
+                AppLog.i(TAG, "DIAG via=$via run=$attempt/${diagOnce.maxRunsAllowed()} " +
+                    "status=${if (ok) "completed" else "failed"} mount=$mountOk network=$netOk " +
+                    "collected=$completed " +
+                    "(неудачная попытка НЕ считается собранной: при готовности канала позже " +
+                    "остаётся ещё одна ограниченная попытка, без сторожа и новых кнопок)")
+                ok
             }
         }
-        // §3.4: отложенная честная запись «канал пока не готов» НЕ занимает единственный сбор.
-        // Если канал станет готов позже, сбор ещё выполнится (обработчик события остаётся живым),
-        // но не более одного раза — это по-прежнему `diagRan`, а не этот флаг.
+        // §3.4: отложенная честная запись «канал пока не готов» НЕ занимает успешный сбор.
         var fallbackWrote = false
         val treatNotReady: (String) -> Unit = { why ->
             val once = synchronized(diagFallbackLock) {
@@ -586,19 +704,23 @@ object JitNet {
             }
             if (once) {
                 runCatching {
-                    JitMountDiag.collect(DiagShell, false, log, source) {
+                    JitMountDiag.collect(DiagShell, false, DiagSink, source) {
                         AppLog.diagTruncatedFor("JIT_MOUNT_DIAG")
                     }
                 }.onFailure { t -> AppLog.i(TAG, "JIT_MOUNT_DIAG status=unknown reason=${t.javaClass.simpleName}") }
                 // §4.2 iter40: канал недоступен, но Android API-часть читается независимо —
                 // её и записываем (shell-разделы честно `channel_not_ready`).
                 runCatching {
-                    InternetDiag.collect(DiagShell, false, netInfo, log, "$source/fallback:$why", appVersion) {
-                        AppLog.diagTruncatedFor("INTERNET_DIAG")
-                    }
+                    InternetDiag.collect(
+                        DiagShell, false, netInfo, DiagSink, "$source/fallback:$why", appVersion
+                    ) { AppLog.diagTruncatedFor("INTERNET_DIAG") }
                 }.onFailure { t ->
                     AppLog.i(TAG, "INTERNET_DIAG status=unknown reason=${t.javaClass.simpleName}")
                 }
+                AppLog.i(TAG, "DIAG source=$source status=partial_android_only " +
+                    "reason=$why collected=${diagOnce.completedNow()} " +
+                    "(shell-разделы не собраны: это НЕ успешный сбор; сбор по готовности канала " +
+                    "ещё возможен в пределах лимита попыток)")
             }
         }
 
@@ -632,6 +754,9 @@ object JitNet {
     /** Только для тестов: сбросить процессные флаги одноразового сбора. */
     internal fun resetDiagForTest() {
         diagAttempted.set(false)
-        diagRan.set(false)
+        diagOnce = JitRef.DiagOnce(2)
     }
+
+    /** Только для тестов/логов: состояние ограниченного сбора (запущен/завершён/исчерпан). */
+    internal fun diagStatusForTest(): String = diagOnce.status()
 }

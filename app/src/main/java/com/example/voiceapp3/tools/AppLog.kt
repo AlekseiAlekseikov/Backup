@@ -234,16 +234,17 @@ object AppLog {
 
     // ───────────── internal ─────────────
     /** До init() — складываем в буфер; после init() — пишем сразу. */
-    private fun enqueueOrWrite(lvl: String, tag: String, msg: String, th: Throwable?) {
+    private fun enqueueOrWrite(lvl: String, tag: String, msg: String, th: Throwable?): Boolean {
         if (!inited) synchronized(lock) {
             if (!inited) {
                 val line = formatLine(lvl, tag, msg, th)
                 early.addLast(line)
                 while (early.size > EARLY_CAP) early.removeFirst()
-                return
+                // §5.1 iter41: «положено в буфер до init» ≠ «записано в датированный файл».
+                return false
             }
         }
-        writeRaw(lvl, tag, msg, th)
+        return writeRaw(lvl, tag, msg, th)
     }
 
     private fun flushEarly() {
@@ -347,9 +348,15 @@ object AppLog {
     /** Строка-уведомление бюджета, подменяющая очередную запись. */
     @Volatile private var budgetNotice: String? = null
 
-    /** Прямая запись строки в файл (только после init). */
-    private fun writeRaw(lvl: String, tag: String, msg: String, th: Throwable?) {
-        val c = ctx ?: return
+    /**
+     * Прямая запись строки в файл (только после init).
+     *
+     * §5.1 iter41: возвращает `true` ТОЛЬКО если датированный лог подтвердил запись этой строки
+     * ([LogFiles.append]). `false` — строка не попала в датированный sink: её пропустил бюджет,
+     * она осталась в буфере до init, либо запись не удалась/не подтверждена.
+     */
+    private fun writeRaw(lvl: String, tag: String, msg: String, th: Throwable?): Boolean {
+        val c = ctx ?: return false
         var thrown: Throwable? = null
         var line = formatLine(lvl, tag, msg, null)
         // H1.6: бюджет считается по уже сформированной строке; уведомление бюджета
@@ -367,7 +374,7 @@ object AppLog {
                 if (v.notice != null && linesDiagNoticeWritten(v.notice)) {
                     writeRawLine(c, formatLine("INFO", "CENTRAL_LogDiag", v.notice, null), null)
                 }
-                return
+                return false
             }
         } else {
             val exempt = isActionLine(msg)
@@ -375,7 +382,7 @@ object AppLog {
             val notice = budgetNotice
             budgetNotice = null
             if (notice != null) line = formatLine("INFO", "CENTRAL_LogBudget", notice, null)
-            else if (!allowed) return
+            else if (!allowed) return false
         }
         // iter16: собираем "шапку" (BUILD/App INIT) — пишем её в начало каждого
         // нового/повёрнутого файла, чтобы после ротации версия не терялась.
@@ -414,8 +421,24 @@ object AppLog {
             }
         }
         // iter33p §4.3: та же строка уходит в дневной файл `voiceapp3-DD.MM.YYYY.log`
-        // (ошибки записи глушим — дневной лог не имеет права ломать приложение).
-        runCatching { LogFiles.append(c, line) }
+        // (ошибки записи не пробрасываем — дневной лог не имеет права ломать приложение, но и
+        // НЕ выдаём их за успешную запись: результат возвращается вызывающему, а для диагностики
+        // он ещё и виден в `LogFiles.ioErrors()/lastIoError()`).
+        return runCatching { LogFiles.append(c, line) }.getOrDefault(false)
+    }
+
+    /**
+     * §5.1 iter41 — строка диагностики с ПОДТВЕРЖДЕНИЕМ записи в датированный лог.
+     *
+     * Отличается от [i] только тем, что возвращает факт записи: `true` — датированный файл
+     * дописан, `false` — нет (бюджет/ошибка/буфер). Это ровно то, чего не хватало: раньше
+     * `Boolean` из `LogFiles.append` терялся, и сводка блока могла утверждать `written=full`,
+     * ничего не проверив.
+     */
+    @JvmStatic
+    fun diagLine(tag: String, m: String): Boolean {
+        Log.i(tag, m)
+        return enqueueOrWrite("INFO", tag, m, null)
     }
 
     /** Однократность уведомления об усечении: одна строка на факт, а не на каждую запись. */
@@ -425,8 +448,8 @@ object AppLog {
         diagNoticeSeen.putIfAbsent(notice, true) == null
 
     /** Физическая запись готовой строки (файл + fallback). Используется уведомлениями бюджета. */
-    private fun writeRawLine(c: Context?, line: String, th: Throwable?) {
-        val cx = c ?: return
+    private fun writeRawLine(c: Context?, line: String, th: Throwable?): Boolean {
+        val cx = c ?: return false
         synchronized(lock) {
             var out: java.io.PrintWriter? = null
             try {
@@ -452,7 +475,7 @@ object AppLog {
                 try { out?.close() } catch (_: Throwable) {}
             }
         }
-        runCatching { LogFiles.append(cx, line) }
+        return runCatching { LogFiles.append(cx, line) }.getOrDefault(false)
     }
 
     private fun formatLine(lvl: String, tag: String, msg: String, _th: Throwable?): String {

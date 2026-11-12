@@ -169,6 +169,20 @@ object LogFiles {
         return true
     }
 
+    /**
+     * §5.1 iter41 — запись строки в КОНКРЕТНЫЙ каталог датированного лога с подтверждением.
+     *
+     * Вынесено из [append], чтобы тот же самый production-писатель (имя файла `voiceapp3-DD.MM.
+     * YYYY.log`, append, flush) можно было проверить в JVM-тесте на временных каталогах, а не на
+     * модели файла. `false` — запись не подтверждена (исключение записи/нет каталога).
+     */
+    internal fun appendToDir(dir: File, line: String, nowMs: Long = System.currentTimeMillis()): Boolean =
+        runCatching {
+            if (!dir.isDirectory && !dir.mkdirs()) return false
+            write(File(dir, fileNameFor(nowMs)), line)
+            true
+        }.getOrDefault(false)
+
     private fun write(target: File, line: String) {
         FileWriter(target, true).use { w ->
             w.append(line)

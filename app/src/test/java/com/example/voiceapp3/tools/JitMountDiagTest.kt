@@ -30,6 +30,9 @@ class JitMountDiagTest {
         synchronized(logs) { logs.add(s) }
     }
 
+    /** §5.1 iter41: приёмник с подтверждением записи (модель датированного файла). */
+    private fun sink(): JitFake.TestSink = JitFake.TestSink(logs)
+
     /** Shell, отдающий заранее заданные ответы по номеру вызова. */
     private class ScriptedShell(private val answers: List<Pair<Int, String>>) : JitRef.JitShell {
         val commands = mutableListOf<String>()
@@ -69,7 +72,7 @@ class JitMountDiagTest {
     @Test
     fun commandsAreReadOnlyAndFour() {
         val shell = ScriptedShell(okAnswers())
-        JitMountDiag.collect(shell, true, ::log, "test")
+        JitMountDiag.collect(shell, true, sink(), "test")
         assertEquals(4, shell.commands.size)
         for (cmd in shell.commands) {
             val noQuietRedirect = cmd.replace("2>&1", "")
@@ -84,7 +87,7 @@ class JitMountDiagTest {
 
     @Test
     fun goodReadProducesOkSectionsAndFilteredLines() {
-        val sections = JitMountDiag.collect(ScriptedShell(okAnswers()), true, ::log, "service.onCreate")
+        val sections = JitMountDiag.collect(ScriptedShell(okAnswers()), true, sink(), "service.onCreate")
         assertEquals(4, sections.size)
         val identity = sections.first { it.name == "identity" }
         assertEquals(JitMountDiag.STATUS_OK, identity.status)
@@ -105,7 +108,7 @@ class JitMountDiagTest {
     fun identityWithNonZeroUidIsNotRoot() {
         val answers = okAnswers().toMutableList()
         answers[0] = 0 to identityAnswer(uid = 2000)
-        val sections = JitMountDiag.collect(ScriptedShell(answers), true, ::log, "test")
+        val sections = JitMountDiag.collect(ScriptedShell(answers), true, sink(), "test")
         val identity = sections.first { it.name == "identity" }
         assertEquals("ошибки `id` нет", JitMountDiag.STATUS_OK, identity.status)
         assertEquals(2000, identity.uid)
@@ -117,7 +120,7 @@ class JitMountDiagTest {
     fun identityFailureIsRootUnknownNotOk() {
         val answers = okAnswers().toMutableList()
         answers[0] = 0 to "id: not found\n__JMD_ID_RC=127\n__JMD_EOF=1"
-        val sections = JitMountDiag.collect(ScriptedShell(answers), true, ::log, "test")
+        val sections = JitMountDiag.collect(ScriptedShell(answers), true, sink(), "test")
         val identity = sections.first { it.name == "identity" }
         assertEquals(JitMountDiag.STATUS_ROOT_UNKNOWN, identity.status)
         assertNull(identity.root)
@@ -126,7 +129,7 @@ class JitMountDiagTest {
     @Test
     fun emptyOnlyAfterConfirmedCompleteRead() {
         val body = "rootfs / rootfs ro 0 0\n/dev/x /data rw 0 0"
-        val sections = JitMountDiag.collect(ScriptedShell(okAnswers(body)), true, ::log, "test")
+        val sections = JitMountDiag.collect(ScriptedShell(okAnswers(body)), true, sink(), "test")
         assertEquals(JitMountDiag.STATUS_EMPTY, sections.first { it.name == "proc_mounts" }.status)
     }
 
@@ -135,7 +138,7 @@ class JitMountDiagTest {
         val body = "rootfs / rootfs ro 0 0"
         val answers = okAnswers(body).toMutableList()
         answers[1] = 0 to fileAnswer(body).replace("__JMD_EOF=1", "")
-        val sections = JitMountDiag.collect(ScriptedShell(answers), true, ::log, "test")
+        val sections = JitMountDiag.collect(ScriptedShell(answers), true, sink(), "test")
         assertEquals("потерянный хвост не превращается в empty",
             JitMountDiag.STATUS_UNKNOWN, sections.first { it.name == "proc_mounts" }.status)
         assertTrue(logs.any { it.contains("name=proc_mounts") && it.contains("complete=false") })
@@ -145,7 +148,7 @@ class JitMountDiagTest {
     fun catErrorWithShellRcZeroIsNotOk() {
         val answers = okAnswers().toMutableList()
         answers[2] = 0 to fileAnswer(mounts, catRc = 1)
-        val sections = JitMountDiag.collect(ScriptedShell(answers), true, ::log, "test")
+        val sections = JitMountDiag.collect(ScriptedShell(answers), true, sink(), "test")
         assertEquals(JitMountDiag.STATUS_UNKNOWN, sections.first { it.name == "self_mountinfo" }.status)
     }
 
@@ -153,7 +156,7 @@ class JitMountDiagTest {
     fun wcErrorIsUnknownNotOk() {
         val answers = okAnswers().toMutableList()
         answers[3] = 0 to fileAnswer(mounts, wcRc = 1)
-        val sections = JitMountDiag.collect(ScriptedShell(answers), true, ::log, "test")
+        val sections = JitMountDiag.collect(ScriptedShell(answers), true, sink(), "test")
         assertEquals(JitMountDiag.STATUS_UNKNOWN, sections.first { it.name == "init_mountinfo" }.status)
     }
 
@@ -162,7 +165,7 @@ class JitMountDiagTest {
         val answers = okAnswers().toMutableList()
         answers[3] = 1 to "wc: /proc/1/mountinfo: Permission denied\n__JMD_WC_RC=1\n" +
             "cat: /proc/1/mountinfo: Permission denied\n__JMD_CAT_RC=1\n__JMD_EOF=1"
-        val sections = JitMountDiag.collect(ScriptedShell(answers), true, ::log, "test")
+        val sections = JitMountDiag.collect(ScriptedShell(answers), true, sink(), "test")
         assertEquals(JitMountDiag.STATUS_PERMISSION_DENIED, sections.first { it.name == "init_mountinfo" }.status)
     }
 
@@ -170,7 +173,7 @@ class JitMountDiagTest {
     fun timeoutIsReportedAsTimeout() {
         val answers = okAnswers().toMutableList()
         answers[1] = 137 to "ERR_ADB_TIMEOUT after 8000ms"
-        val sections = JitMountDiag.collect(ScriptedShell(answers), true, ::log, "test")
+        val sections = JitMountDiag.collect(ScriptedShell(answers), true, sink(), "test")
         assertEquals(JitMountDiag.STATUS_TIMEOUT, sections.first { it.name == "proc_mounts" }.status)
         assertTrue(logs.any { it.contains("timeout") })
     }
@@ -180,7 +183,7 @@ class JitMountDiagTest {
         // `wc` сообщает больше строк и байт, чем пришло.
         val answers = okAnswers().toMutableList()
         answers[1] = 0 to "  40  5000 /proc/mounts\n__JMD_WC_RC=0\n$mounts\n__JMD_CAT_RC=0\n__JMD_EOF=1"
-        val sections = JitMountDiag.collect(ScriptedShell(answers), true, ::log, "test")
+        val sections = JitMountDiag.collect(ScriptedShell(answers), true, sink(), "test")
         val s = sections.first { it.name == "proc_mounts" }
         assertEquals(JitMountDiag.STATUS_TRUNCATED, s.status)
         assertTrue(logs.any { it.contains("delta_lines=") && it.contains("delta_bytes=") })
@@ -193,7 +196,7 @@ class JitMountDiagTest {
         val sameLines = body.replace("com.bar/base.apk", "com.bar")   // строки те же, байтов меньше
         val answers = okAnswers(body).toMutableList()
         answers[1] = 0 to "   3 ${body.length} /proc/mounts\n__JMD_WC_RC=0\n$sameLines\n__JMD_CAT_RC=0\n__JMD_EOF=1"
-        val sections = JitMountDiag.collect(ScriptedShell(answers), true, ::log, "test")
+        val sections = JitMountDiag.collect(ScriptedShell(answers), true, sink(), "test")
         assertEquals("потеря байт видна", JitMountDiag.STATUS_TRUNCATED,
             sections.first { it.name == "proc_mounts" }.status)
     }
@@ -203,7 +206,7 @@ class JitMountDiagTest {
         val long = "/dev/block/sda1 " + "/data/app/com.very.long.name/".repeat(80) + " ext4 ro 0 0"
         val answers = okAnswers(long).toMutableList()
         answers[1] = 0 to fileAnswer(long)
-        val sections = JitMountDiag.collect(ScriptedShell(answers), true, ::log, "test")
+        val sections = JitMountDiag.collect(ScriptedShell(answers), true, sink(), "test")
         assertEquals(JitMountDiag.STATUS_OK, sections.first { it.name == "proc_mounts" }.status)
         val parts = logs.filter { it.contains("name=proc_mounts part=") }
         assertTrue("строка поделена", parts.size > 1)
@@ -216,7 +219,7 @@ class JitMountDiagTest {
     @Test
     fun channelNotReadyProducesNoCommandsAndHonestStatus() {
         val shell = ScriptedShell(okAnswers())
-        val sections = JitMountDiag.collect(shell, false, ::log, "service.onCreate")
+        val sections = JitMountDiag.collect(shell, false, sink(), "service.onCreate")
         assertTrue("ни одной команды", shell.commands.isEmpty())
         assertTrue(sections.all { it.status == JitMountDiag.STATUS_CHANNEL_NOT_READY })
         assertTrue(logs.any { it.contains("status=channel_not_ready") && it.contains("НЕ отсутствие root") })
@@ -258,7 +261,11 @@ class JitMountDiagTest {
         assertTrue("готовность канала проверяется без блокирующего ожидания",
             fn.contains("isChannelReady") && !fn.contains("awaitReady"))
         assertTrue("одноразовый обработчик события готовности", fn.contains("onChannelReadyOnce"))
-        assertTrue("не чаще одной попытки за процесс", fn.contains("compareAndSet(false, true)"))
+        // §5.2 iter41: вход один раз за процесс (`markDiagAttempted`), а сами попытки сбора
+        // ограничены и учитываются отдельно (`JitRef.DiagOnce`).
+        assertTrue("вход один раз за процесс", fn.contains("markDiagAttempted()"))
+        assertTrue("успех фиксируется по факту завершения", fn.contains("diagOnce.finish("))
+        assertTrue("число попыток ограничено", fn.contains("diagOnce.tryRun()"))
         assertTrue("честный статус при неготовом канале", fn.contains("channel_not_ready"))
         assertFalse("никаких циклов ожидания", fn.contains("while ("))
         val sched = src.substring(src.indexOf("fun requestDiagOnce"), src.indexOf("internal fun resetDiagForTest"))
@@ -273,7 +280,7 @@ class JitMountDiagTest {
     @Test
     fun collectionDoesNotDependOnFindmnt() {
         val shell = ScriptedShell(okAnswers(""))
-        JitMountDiag.collect(shell, true, ::log, "test")
+        JitMountDiag.collect(shell, true, sink(), "test")
         assertTrue("findmnt не используется", shell.commands.none { it.contains("findmnt") })
     }
 }

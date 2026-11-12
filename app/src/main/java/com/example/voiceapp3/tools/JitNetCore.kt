@@ -124,6 +124,20 @@ object JitRef {
      * исполниться: ответ ИМЕННО ЭТОЙ команды (её rc) пришёл после того, как вызывающий уже
      * решил, что время вышло. Ни новый процесс, ни boot id, ни `getprop`, ни включённый Wi-Fi,
      * ни IP такого свидетельства не дают.
+     *
+     * §3.2 iter41 — ЧЕСТНО О РЕАЛЬНОМ ТРАНСПОРТЕ: боевой `JitNet.AndroidShell` (поверх
+     * `AdbClient`) этот интерфейс НЕ реализует, и автоматического разрешения в production нет.
+     * Причины (по коду `AdbClient`, не по догадке):
+     *  • `AdbClient.execute` ставит `Job` в очередь и ЖДЁТ `latch`; по таймауту вызывающему
+     *    возвращается `ERR_ADB_TIMEOUT`, но job остаётся в очереди и может быть выполнен позже —
+     *    его `onResult` уже никто не слушает, а вызывающий об этом никогда не узнает;
+     *  • обрыв сокета/ошибка чтения дают `rc≠0`, но это НЕ доказывает, что команда на устройстве
+     *    завершилась: shell в системе может продолжать выполнение;
+     *  • процесс приложения может умереть раньше, чем придёт что-либо сообщать: пережить смерть
+     *    процесса и «донести» ответ некому.
+     * Поэтому «поздний callback» существует ниже как тестовый интерфейс (проверка логики), а не
+     * как заявление о возможностях `AdbClient`. Пока транспорт не даёт ДОКАЗАННОГО свидетельства,
+     * неопределённость остаётся, снимок и блокировка сохраняются (⛔).
      */
     interface JitLateEvidence {
         /** Зарегистрировать обработчик завершения ТЕКУЩЕЙ команды; вызывается не более одного раза. */
@@ -483,6 +497,35 @@ object JitRef {
                 readable = readable, total = reads.size
             )
         }
+        // §4.1 iter41: одинаковый ID и одинаковый Wi-Fi НЕ означают одинакового состояния.
+        // `state` (`sending`/`replied`/`undefined`), `want` и время записи — существенные поля:
+        // отметка обновляется ОТДЕЛЬНЫМИ `commit()` в CPS и DPS, поэтому копии одной операции
+        // могут разойтись. Если они разошлись, какая из них верна — неизвестно: это конфликт,
+        // а не «берём первую по порядку чтения».
+        val states = marks.map { it.state }.distinct()
+        if (states.size > 1) {
+            return StoredOp(
+                StoredState.AMBIGUOUS,
+                detail = "mark_state_conflict states=${states.joinToString("/")}",
+                readable = readable, total = reads.size
+            )
+        }
+        val wants = marks.map { it.want }.distinct()
+        if (wants.size > 1) {
+            return StoredOp(
+                StoredState.AMBIGUOUS,
+                detail = "mark_want_conflict want=${wants.joinToString("/") { if (it) "1" else "0" }}",
+                readable = readable, total = reads.size
+            )
+        }
+        val stamps = marks.map { it.ts }.distinct()
+        if (stamps.size > 1) {
+            return StoredOp(
+                StoredState.AMBIGUOUS,
+                detail = "mark_ts_conflict ts=${stamps.joinToString("/")}",
+                readable = readable, total = reads.size
+            )
+        }
         val mark = marks.first()
         val restore = restores.filterNotNull().first()
         val state = if (mark.state == OpMark.SENDING || mark.state == OpMark.UNDEFINED)
@@ -753,6 +796,48 @@ object JitRef {
         SetWifiOutcome.REFUSED -> "refused"
         SetWifiOutcome.UNKNOWN -> "unknown"
         SetWifiOutcome.EXCEPTION -> "exception"
+    }
+
+    /**
+     * §5.2 iter41 — учёт ОГРАНИЧЕННОГО числа попыток диагностического сбора.
+     *
+     * Зачем: «сбор запущен» и «необходимый сбор успешно завершён» — разные факты. Раньше флаг
+     * выставлялся до выполнения, поэтому неудачный сбор (канал не готов, пассивный доступ не
+     * состоялся) навсегда лишал владельца возможности получить данные позже.
+     *
+     * Что делает: не больше [maxRuns] попыток за процесс; успех фиксируется только по факту
+     * завершения сборщиков; повтор не бесконечный, сторожа и новых кнопок нет.
+     */
+    class DiagOnce(private val maxRuns: Int = 2) {
+        private val runs = java.util.concurrent.atomic.AtomicInteger(0)
+        private val completed = java.util.concurrent.atomic.AtomicBoolean(false)
+
+        /** `null` — попытки исчерпаны; иначе номер попытки (1..[maxRuns]). */
+        fun tryRun(): Int? {
+            while (true) {
+                val cur = runs.get()
+                if (cur >= maxRuns) return null
+                if (runs.compareAndSet(cur, cur + 1)) return cur + 1
+            }
+        }
+
+        /** Отметить исход попытки: `ok` — оба сборщика завершились без сбоя при готовом канале. */
+        fun finish(ok: Boolean): Boolean {
+            if (ok) completed.set(true)
+            return completed.get()
+        }
+
+        fun completedNow(): Boolean = completed.get()
+        fun runsUsed(): Int = runs.get()
+        fun maxRunsAllowed(): Int = maxRuns
+        fun exhausted(): Boolean = runs.get() >= maxRuns
+
+        fun status(): String = when {
+            completed.get() -> "completed"
+            exhausted() -> "exhausted"
+            runs.get() > 0 -> "started"
+            else -> "idle"
+        }
     }
 }
 
@@ -1100,9 +1185,15 @@ object JitOp {
     /**
      * Пришёл ответ потерянной команды: она завершилась, позднего исполнения больше не будет.
      *
-     * Снимаем неопределённость (`chain_undefined`) и помечаем операцию как ожидающую возврата
-     * сети (`pending`). Снимок НЕ удаляется и сеть здесь не меняется: возврат выполнит обычный
-     * старт (или он уже выполняется — тогда задача увидит `replied` и сможет завершиться).
+     * §3.1 iter41 — чего этот callback НЕ доказывает:
+     *  • он не доказывает успех JIT, рестарт фреймворка и наличие интернета;
+     *  • он не разрешает конфликтующий клик сам по себе: снимок остаётся, пока возврат сети не
+     *    подтверждён отдельно (это разные факты);
+     *  • `NONE` (данных уже нет) — НЕ доказательство разрешения. Если снимок исчез раньше, чем
+     *    команда окончилась, восстановить исходное состояние нечем: честно пишем `unknown`/⛔ и
+     *    НЕ снимаем блокировку;
+     *  • если запись `replied` не подтверждена всеми хранилищами, отметка на диске остаётся
+     *    `undefined` — неопределённость сохраняется, ложно снимать её в памяти нельзя.
      */
     internal fun onLateOutcome(
         store: JitRef.JitStore,
@@ -1121,27 +1212,54 @@ object JitOp {
                 )
                 return
             }
-            // Данных уже нет (возврат и очистка прошли раньше): обновлять нечего, но ответ
-            // именно этой команды — свидетельство, что она завершилась.
-            val cleaned = cur.state == JitRef.StoredState.NONE
-            if (!cleaned && cur.mark?.op != opId) {
+            if (cur.state == JitRef.StoredState.NONE) {
+                // §3.1 iter41: данных нет. Раньше здесь считалось `cleaned=true` и блокировка
+                // снималась. Это неверно: снимок мог быть удалён ДО окончания команды, а сама
+                // команда — затем снова отключить Wi-Fi. Восстанавливать нечего, доказательств
+                // безопасного продолжения нет ⇒ ⛔ и блокировка остаётся.
+                log(
+                    "JIT_CHAIN_LATE op=$opId evidence=command_finished recovered=none " +
+                        "reason=snapshot_lost store_state=none rc=$rc " +
+                        "chain_undefined=true clicks=blocked " +
+                        "(ответ команды получен, но исходного снимка на диске уже нет: заново " +
+                        "оценить состояние сети и восстановить его нечем. Это ⛔, а не разрешение — " +
+                        "новый конфликтующий клик не отправляется)"
+                )
+                return
+            }
+            if (cur.mark?.op != opId) {
                 log(
                     "JIT_CHAIN_LATE op=$opId ignored reason=operation_changed " +
                         "now=«${cur.brief()}» (данные текущей операции не трогаем)"
                 )
                 return
             }
-            val upd = if (cleaned) JitRef.WriteResult.none("operation_already_cleaned") else
-                runCatching { store.updateMark(cur.mark!!.copy(state = JitRef.OpMark.REPLIED)) }
-                    .getOrElse { t -> JitRef.WriteResult.none("exception:" + t.javaClass.simpleName) }
+            val upd = runCatching { store.updateMark(cur.mark.copy(state = JitRef.OpMark.REPLIED)) }
+                .getOrElse { t -> JitRef.WriteResult.none("exception:" + t.javaClass.simpleName) }
+            val persisted = upd.attempted > 0 && upd.ok == upd.attempted
+            if (!persisted) {
+                // §3.1: запись отметки не подтверждена (commit=false/исключение/частичный успех) —
+                // на диске осталось `undefined`, значит следующий процесс снова заблокируется.
+                // Снимать неопределённость в памяти нельзя: это дало бы клик, которого не будет
+                // после перезапуска. Честный блокер вместо ложного разрешения.
+                log(
+                    "JIT_CHAIN_LATE op=$opId evidence=command_finished recovered=none " +
+                        "reason=mark_write_unconfirmed mark_write=${upd.ok}/${upd.attempted} " +
+                        "detail=${upd.detail} chain_undefined=true clicks=blocked " +
+                        "(ответ команды получен, но отметка `replied` не записана во все хранилища: " +
+                        "на диске осталось `undefined`, поэтому блокировка сохраняется — ⛔)"
+                )
+                return
+            }
             CHAIN_UNDEFINED.set(false)
             log(
                 "JIT_CHAIN_LATE op=$opId evidence=command_finished rc=$rc " +
                     "out=${out.trim().take(160).ifEmpty { "empty" }} " +
-                    "mark=replied cleaned=$cleaned mark_write=${upd.ok}/${upd.attempted} " +
-                    "chain_undefined=false clique=allowed_after_restore " +
+                    "mark=replied mark_write=${upd.ok}/${upd.attempted} chain_undefined=false " +
+                    "snapshot=kept operation=pending clicks=blocked " +
                     "(это свидетельство завершения команды, а НЕ успеха JIT и НЕ наличия интернета; " +
-                    "снимок остаётся до подтверждённого возврата сети)"
+                    "снимок остаётся и удаляется только после ПОДТВЕРЖДЁННОГО возврата сети — " +
+                    "следующим обычным запуском)"
             )
         }
     }
@@ -1375,33 +1493,47 @@ object JitOp {
                 if (completion == JitRef.RestoreCompletion.COMPLETE ||
                     completion == JitRef.RestoreCompletion.COMPLETE_WAS_OFF
                 ) {
-                    // Согласованное удаление ТОЛЬКО своей операции (одно commit на хранилище).
-                    val rm = runCatching { store.removeOwned(opId) }
-                        .getOrElse { t ->
-                            JitRef.OwnedRemoval(0, 0, 0, true, true,
-                                "exception:${t.javaClass.simpleName}")
-                        }
-                    log(
-                        "JIT_RESTORE_DONE op=$opId completion=${completion?.name?.lowercase()} " +
-                            "cleanup=owned ${rm.brief()} " +
-                            (if (rm.consistent) "data=removed"
-                             else "data=kept_or_partial (неполная очистка: остаток будет прочитан " +
-                                 "как неопознанный и НЕ выполнится; гарантии продолжения по нему нет)") +
-                            " write=remove(restore+mark, own op)"
-                    )
                     if (wasUndefined) {
-                        // §2.1 iter40: восстановление СЕТИ и разрешение НЕОПРЕДЕЛЁННОЙ операции —
-                        // разные вещи. Текущий Wi-Fi ничего не говорит о старой команде: она могла
-                        // остаться в очереди и выключить сеть позже. Поэтому флаг НЕ снимается.
-                        // Свидетельство ровно одно — ответ самой этой команды (armLateEvidence).
+                        // ─── §2.1/§2.2 iter41: ГЛАВНОЕ ИСПРАВЛЕНИЕ. ───
+                        // Исход операции `sending`/`undefined` неизвестен: старая команда могла
+                        // остаться в очереди транспорта и выполниться позже (в том числе после
+                        // смерти этого процесса и после того, как сеть «выглядит восстановленной»).
+                        // Поэтому здесь НЕ вызывается removeOwned: снимок и отметка остаются на
+                        // диске и остаются принадлежащими этой операции, а новый клик — заблокирован.
+                        // `COMPLETE_WAS_OFF` (снимок `wifi=0`) — то же самое: отсутствие
+                        // необходимости включать Wi-Fi ничего не говорит о shell-команде.
+                        log(
+                            "JIT_RESTORE_KEPT op=$opId completion=${completion.name.lowercase()} " +
+                                "network_state=restored cleanup=none data=kept " +
+                                "mark_state=${JitRef.OpMark.UNDEFINED} write=none " +
+                                "(снимок и отметка НЕ удаляются: сеть восстановлена, но исход старой " +
+                                "команды неизвестен. Свидетельство ровно одно — ответ именно этой " +
+                                "команды; включённый Wi-Fi, IP, getprop, boot id и новый процесс им " +
+                                "не являются. После смерти процесса блокировка восстановится по " +
+                                "отметке на диске)"
+                        )
                         log(
                             "JIT_UNDEFINED op=$opId outcome=still_unknown " +
                                 "network_state=restored operation=unresolved clicks=blocked " +
-                                "evidence=command_finished_missing " +
-                                "(сеть возвращена, но исход старой команды по-прежнему неизвестен: " +
-                                "включённый Wi-Fi, IP, getprop, boot id и новый процесс им не " +
-                                "являются. Пока нет ответа этой команды, новый клик заблокирован — " +
-                                "⛔ без обещаний авторазрешения)"
+                                "evidence=command_finished_missing data=kept cleanup=none " +
+                                "(⛔ без обещаний авторазрешения: пока нет ответа этой команды, " +
+                                "новая цепочка не отправляется и исходный снимок не перезаписывается)"
+                        )
+                    } else {
+                        // Операция опознана и её команда ответила целиком: разрешено согласованное
+                        // удаление ТОЛЬКО своей операции (одно commit на хранилище).
+                        val rm = runCatching { store.removeOwned(opId) }
+                            .getOrElse { t ->
+                                JitRef.OwnedRemoval(0, 0, 0, true, true,
+                                    "exception:${t.javaClass.simpleName}")
+                            }
+                        log(
+                            "JIT_RESTORE_DONE op=$opId completion=${completion.name.lowercase()} " +
+                                "cleanup=owned ${rm.brief()} " +
+                                (if (rm.consistent) "data=removed"
+                                 else "data=kept_or_partial (неполная очистка: остаток будет прочитан " +
+                                     "как неопознанный и НЕ выполнится; гарантии продолжения по нему нет)") +
+                                " write=remove(restore+mark, own op)"
                         )
                     }
                 } else {

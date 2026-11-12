@@ -80,7 +80,10 @@ class JitIter40Test {
         sched.drain()
 
         assertTrue("сеть восстановлена", net.requests.contains("wifi=true"))
-        assertTrue("данные удалены — это про сеть", !store.contains(JitRef.KEY_RESTORE))
+        // §2.1 iter41: восстановление СЕТИ не удаляет снимок неопределённой операции.
+        assertTrue("снимок сохранён до свидетельства", store.contains(JitRef.KEY_RESTORE))
+        assertTrue("отметка сохранена", store.contains(JitRef.KEY_MARK))
+        assertTrue(lines().contains("cleanup=none"))
         assertTrue("неопределённость операции сохранена", JitOp.chainUndefined())
         assertTrue(lines().contains("network_state=restored"))
         assertTrue(lines().contains("operation=unresolved"))
@@ -125,8 +128,11 @@ class JitIter40Test {
         assertFalse("свидетельство снимает неопределённость", JitOp.chainUndefined())
         assertTrue(lines().contains("evidence=command_finished"))
         assertTrue(lines().contains("это свидетельство завершения команды, а НЕ успеха JIT"))
+        // §3.1 iter41: сам callback НЕ разрешает конфликтующий клик. Снимок остаётся, пока
+        // возврат сети не подтверждён ОТДЕЛЬНО (это разные факты), поэтому клик ждёт.
+        assertTrue("снимок сохранён после свидетельства", store.contains(JitRef.KEY_RESTORE))
         val c = JitOp.click(store, net, JitFake.QueueShell(), want = false, log = ::log)
-        assertNull("после свидетельства клик разрешён", c.blocked)
+        assertEquals("снимок ещё не снят подтверждённым возвратом", "previous_unfinished", c.blocked)
     }
 
     @Test
@@ -175,7 +181,11 @@ class JitIter40Test {
 
         assertTrue("неопределённость не снята при неподтверждённой очистке", JitOp.chainUndefined())
         assertTrue("данные остались", store.contains(JitRef.KEY_RESTORE))
-        assertTrue(lines().contains("data=kept_or_partial"))
+        // §2.2 iter41: для неизвестного исхода очистка вообще не запускается — это надёжнее, чем
+        // «попробовать удалить и посмотреть на commit».
+        assertTrue(lines().contains("data=kept"))
+        assertFalse("удаление не подтверждено — значит и не начиналось",
+            lines().contains("cleanup=owned"))
     }
 
     // ─────────── §2.3: неуспешный возврат не даёт перезаписать снимок ───────────
@@ -459,7 +469,9 @@ class JitIter40Test {
         dps = null
         val next = JitOp.click(store, JitFake.Net(wifi = true), okShell,
             want = false, log = ::log)
-        assertEquals("previous_unfinished", next.blocked)
+        // §4.2 iter41: хранилище, которое перестало отдаваться, — это НЕ «данных нет» и не
+        // «операция завершена»: состояние неизвестно, поэтому и причина блокировки честная.
+        assertEquals("prev_unknown", next.blocked)
     }
 
     @Test

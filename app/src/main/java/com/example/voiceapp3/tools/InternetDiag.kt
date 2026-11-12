@@ -261,11 +261,11 @@ object InternetDiag {
      *   которым нужен shell, получают честный `channel_not_ready`, а не «пусто».
      * @param netInfo Android-часть (может быть `null` в тестах — тогда `unavailable`).
      */
-    fun collect(
+    internal fun collect(
         shell: JitRef.JitShell,
         channelReady: Boolean,
         netInfo: NetInfo?,
-        log: (String) -> Unit,
+        sink: LogBudget.Sink,
         source: String,
         appVersion: String = "unknown",
         /**
@@ -276,6 +276,10 @@ object InternetDiag {
         truncatedProbe: (() -> Boolean)? = null
     ): List<Section> {
         val t0 = System.currentTimeMillis()
+        // §5.1 iter41: каждая строка блока идёт через приёмник, который возвращает ФАКТ записи
+        // (WRITTEN/DROPPED/FAILED). «Сборщик сформировал строку» ≠ «строка в датированном файле».
+        val tally = LogBudget.WriteTally(sink)
+        val log: (String) -> Unit = { line -> tally.emit(line) }
         log(
             "$BEGIN ts=$t0 source=$source mode=read_only transport=jit_shell " +
                 "channel_ready=$channelReady app_version=$appVersion " +
@@ -369,19 +373,32 @@ object InternetDiag {
             sections += Section("android_connectivity", status, -1, lines.size, parts.size)
         }
 
-        val written = when (val t = runCatching { truncatedProbe?.invoke() }.getOrNull()) {
-            null -> "unknown"
-            true -> "truncated"
-            false -> "full"
+        // §5.1 iter41: `written=full` разрешено ТОЛЬКО когда каждая строка блока подтверждена в
+        // ОДНОМ датированном файле и бюджет этого блока не объявлял усечения. Иначе — честные
+        // `truncated` / `partial` (в т.ч. части в разных файлах после фоллбэка) / `unknown`.
+        val truncated = runCatching { truncatedProbe?.invoke() }.getOrNull()
+        val extra = "elapsed_ms=${System.currentTimeMillis() - t0} network_changes=0 " +
+            tally.fields(truncated)
+        tally.emit("$END ${summary(sections, extra)}", isEnd = true)
+        if (tally.endOutcome != LogBudget.WriteOutcome.WRITTEN) {
+            // Самоподтверждающегося ложного заявления быть не должно: если даже `END` не записан,
+            // факт уходит в независимый канал, а не «исчезает».
+            sink.independent(
+                "INTERNET_DIAG_END_NOT_CONFIRMED reason=${tally.endOutcome?.name?.lowercase() ?: "unknown"} " +
+                    "sink=«${tally.sinkList()}» lines=${tally.written}/${tally.offered} " +
+                    "skipped_by_budget=${tally.dropped} write_failed=${tally.failed} " +
+                    "(строки этого блока могли остаться только в logcat/фрагментарно; " +
+                    "полноту лога не подтверждаем)"
+            )
         }
-        val extra = "elapsed_ms=${System.currentTimeMillis() - t0} network_changes=0 written=$written"
-        log("$END ${summary(sections, extra)}")
         return sections
     }
 
     /** Честная запись случая «канал не готов» без единой команды. */
-    fun collectChannelNotReady(log: (String) -> Unit, source: String, detail: String): List<Section> {
+    internal fun collectChannelNotReady(sink: LogBudget.Sink, source: String, detail: String): List<Section> {
         val t0 = System.currentTimeMillis()
+        val tally = LogBudget.WriteTally(sink)
+        val log: (String) -> Unit = { line -> tally.emit(line) }
         log(
             "$BEGIN ts=$t0 source=$source mode=read_only channel_ready=false reason=$detail " +
                 "note=\"канал приложения не готов: сбор не выполнялся, root_unknown, а не " +
@@ -389,7 +406,14 @@ object InternetDiag {
         )
         val sections = commands().map { Section(it.name, STATUS_CHANNEL_NOT_READY, -1, 0, 0) } +
             Section("android_connectivity", STATUS_CHANNEL_NOT_READY, -1, 0, 0)
-        log("$END " + summary(sections, "elapsed_ms=${System.currentTimeMillis() - t0} network_changes=0"))
+        tally.emit(
+            "$END " + summary(
+                sections,
+                "elapsed_ms=${System.currentTimeMillis() - t0} network_changes=0 " +
+                    tally.fields(null)
+            ),
+            isEnd = true
+        )
         return sections
     }
 }

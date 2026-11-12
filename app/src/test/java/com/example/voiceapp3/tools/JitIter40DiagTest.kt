@@ -133,7 +133,7 @@ class DiagTruncationPerBlockTest {
             (null as (() -> Boolean)?) to "written=unknown"
         )) {
             val lines = mutableListOf<String>()
-            InternetDiag.collect(shell, true, null, { lines += it }, "test", "1.0.61", probe)
+            InternetDiag.collect(shell, true, null, JitFake.TestSink(lines), "test", "1.0.61", probe)
             val end = lines.last()
             assertTrue("END блока: $expected (получено: $end)", end.contains(expected))
             assertTrue("END — это END", end.startsWith("INTERNET_DIAG_END"))
@@ -149,7 +149,7 @@ class DiagTruncationPerBlockTest {
             override fun mapsExcerpt(): String? = null
         }
         val lines = mutableListOf<String>()
-        JitMountDiag.collect(shell, true, { lines += it }, "test") { true }
+        JitMountDiag.collect(shell, true, JitFake.TestSink(lines), "test") { true }
         val end = lines.last { it.startsWith("JIT_MOUNT_DIAG_END") }
         assertTrue("в сводке видно, что запись усечена: $end", end.contains("written=truncated"))
     }
@@ -213,7 +213,7 @@ class InternetDiagRedaction40Test {
             override fun mapsExcerpt(): String? = null
         }
         val lines = mutableListOf<String>()
-        InternetDiag.collect(shell, true, null, { lines += it }, "test", "1.0.61")
+        InternetDiag.collect(shell, true, null, JitFake.TestSink(lines), "test", "1.0.61")
         val all = lines.joinToString("\n")
         assertFalse("MAC не попал", all.contains("aa:bb:cc:dd:ee:ff"))
         assertFalse("SSID не попал", all.contains("My Private Network"))
@@ -232,7 +232,7 @@ class InternetDiagRedaction40Test {
             override fun mapsExcerpt(): String? = null
         }
         val lines = mutableListOf<String>()
-        InternetDiag.collect(shell, true, null, { lines += it }, "test", "1.0.61")
+        InternetDiag.collect(shell, true, null, JitFake.TestSink(lines), "test", "1.0.61")
         assertTrue(lines.any { it.contains("name=ip_rules") && it.contains("redacted=no") })
     }
 
@@ -244,7 +244,7 @@ class InternetDiagRedaction40Test {
             override fun mapsExcerpt(): String? = null
         }
         val lines = mutableListOf<String>()
-        InternetDiag.collect(shell, true, null, { lines += it }, "test", "1.0.61")
+        InternetDiag.collect(shell, true, null, JitFake.TestSink(lines), "test", "1.0.61")
         val all = lines.joinToString("\n")
         assertFalse(all.contains("34:5b:bb:1a:2c:3d"))
         assertFalse(all.contains("HomeNet"))

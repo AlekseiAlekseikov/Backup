@@ -40,6 +40,109 @@ internal object LogBudget {
         "JIT_MOUNT_DIAG_BEGIN", "JIT_MOUNT_DIAG_END", "JIT_MOUNT_DIAG_TRUNCATED"
     )
 
+    // ─────────────────────────── §5.1 iter41: честный факт записи ───────────────────────────
+
+    /**
+     * Что произошло с ОДНОЙ строкой диагностики.
+     *
+     * Это не «получено сборщиком», а судьба строки в конкретном dated sink:
+     *  • [WRITTEN] — запись подтверждена (датированный файл дописан);
+     *  • [DROPPED] — строку сознательно НЕ писали: её пропустил бюджет диагностики;
+     *  • [FAILED]  — записать не удалось (или подтверждение получить нечем).
+     */
+    enum class WriteOutcome { WRITTEN, DROPPED, FAILED }
+
+    /**
+     * Приёмник строк диагностики. Возвращает ФАКТ записи, а не «принял вызов».
+     *
+     * `location()` — указуемый файл активного sink на момент вызова: при фоллбэке
+     * external→internal он меняется, и тогда части одного блока оказываются в РАЗНЫХ файлах —
+     * это видно в сводке (`sink=…`), а не выдаётся за один файл.
+     */
+    interface Sink {
+        fun write(line: String): WriteOutcome
+        fun location(): String
+
+        /** Независимый канал (logcat/AppLog), когда сама строка блока не подтверждена. */
+        fun independent(line: String) {}
+    }
+
+    /**
+     * Учёт фактической записи ОДНОГО диагностического блока.
+     *
+     * Отвечает на четыре разных вопроса по отдельности: сколько строк предложено, сколько
+     * пропущено бюджетом, сколько подтверждено в датированном файле и в каком файле (одном или
+     * разных). Только при полном подтверждении в ОДНОМ файле и известном отсутствии усечения
+     * разрешено `written=full`; в остальных случаях — честные `truncated`/`partial`/`unknown`.
+     */
+    class WriteTally(private val sink: Sink) {
+        var offered: Int = 0; private set
+        var written: Int = 0; private set
+        var dropped: Int = 0; private set
+        var failed: Int = 0; private set
+        private var firstFailure: String? = null
+        private val locations = LinkedHashSet<String>()
+        /** Строка `…_END`: её собственный факт записи тоже проверяется. */
+        var endOutcome: WriteOutcome? = null; private set
+
+        fun emit(line: String, isEnd: Boolean = false) {
+            offered++
+            val loc = runCatching { sink.location() }.getOrDefault("unknown")
+            val out = runCatching { sink.write(line) }.getOrElse { WriteOutcome.FAILED }
+            when (out) {
+                WriteOutcome.WRITTEN -> {
+                    written++
+                    locations += loc
+                }
+                WriteOutcome.DROPPED -> dropped++
+                WriteOutcome.FAILED -> {
+                    failed++
+                    if (firstFailure == null) {
+                        firstFailure = "line=${line.take(48).replace('\n', ' ')} at=«$loc»"
+                    }
+                }
+            }
+            if (isEnd) endOutcome = out
+        }
+
+        fun sinkList(): String = locations.joinToString("+").ifEmpty { "none" }
+
+        /**
+         * Итоговая метка записи блока.
+         *
+         * @param truncated `true` — бюджет объявил усечение ИМЕННО этого блока; `null` — неизвестно.
+         */
+        fun verdict(truncated: Boolean?): String = when {
+            offered == 0 -> "none"
+            // Ни одна строка не записана и ни одна не пропущена бюджетом — писать некуда.
+            written == 0 && dropped == 0 -> "none"
+            failed > 0 -> "partial"
+            locations.size > 1 -> "partial"
+            dropped > 0 -> "truncated"
+            truncated == true -> "truncated"
+            truncated == null -> "unknown"
+            written == offered -> "full"
+            else -> "unknown"
+        }
+
+        fun reason(truncated: Boolean?): String = when {
+            offered == 0 -> "nothing_offered"
+            written == 0 && dropped == 0 -> "no_line_written first=$firstFailure"
+            failed > 0 -> "write_failed=$failed first=$firstFailure"
+            locations.size > 1 -> "split_across_sinks=${sinkList()}"
+            dropped > 0 -> "skipped_by_budget=$dropped"
+            truncated == true -> "budget_truncated_this_block"
+            truncated == null -> "truncation_not_checkable"
+            else -> "all_lines_confirmed"
+        }
+
+        /** Строки `written=`/`sink=`/`reason=` для `…_END`. */
+        fun fields(truncated: Boolean?): String =
+            "written=${verdict(truncated)} sink=«${sinkList()}» " +
+                "lines=${written}/${offered} skipped_by_budget=$dropped " +
+                "write_failed=$failed write_reason=${reason(truncated)}"
+    }
+
     fun isDiagLine(msg: String): Boolean {
         val m = msg.trimStart()
         for (p in DIAG_PREFIXES) if (m.startsWith(p)) return true

@@ -29,6 +29,9 @@ class InternetDiagTest {
         synchronized(logs) { logs.add(s) }
     }
 
+    /** §5.1 iter41: приёмник с подтверждением записи (модель датированного файла). */
+    private fun sink(): JitFake.TestSink = JitFake.TestSink(logs)
+
     private class ScriptedShell(private val answer: (String) -> Pair<Int, String>) : JitRef.JitShell {
         val commands = mutableListOf<String>()
         override fun exec(command: String, timeoutMs: Int): Pair<Int, String> {
@@ -71,7 +74,7 @@ class InternetDiagTest {
     @Test
     fun onlyReadOnlyCommandsPlusBoundedPings() {
         val shell = okShell()
-        InternetDiag.collect(shell, true, FakeNet(), ::log, "test", "1.0.61")
+        InternetDiag.collect(shell, true, FakeNet(), sink(), "test", "1.0.61")
         assertEquals("шесть shell-разделов", 6, shell.commands.size)
         for (cmd in shell.commands) {
             val noRedirect = cmd.replace("2>&1", "")
@@ -92,7 +95,7 @@ class InternetDiagTest {
 
     @Test
     fun allSectionsOkInNormalCase() {
-        val sections = InternetDiag.collect(okShell(), true, FakeNet(), ::log, "service.onCreate", "1.0.61")
+        val sections = InternetDiag.collect(okShell(), true, FakeNet(), sink(), "service.onCreate", "1.0.61")
         assertEquals(7, sections.size)
         assertTrue(sections.all { it.status == InternetDiag.STATUS_OK })
         assertEquals("echo_received", sections.first { it.name == "ping_ip" }.verdict)
@@ -106,7 +109,7 @@ class InternetDiagTest {
     @Test
     fun missingWlan0IsEmptyReadErrorNotInternetVerdict() {
         val shell = okShell(mapOf("WLAN0_ADDR" to "Device \"wlan0\" does not exist."))
-        val sections = InternetDiag.collect(shell, true, FakeNet(wifi = false, transports = emptySet()), ::log, "t", "v")
+        val sections = InternetDiag.collect(shell, true, FakeNet(wifi = false, transports = emptySet()), sink(), "t", "v")
         val s = sections.first { it.name == "wlan0_addr" }
         assertEquals("команда выполнилась, факта нет — не «нет интернета»", InternetDiag.STATUS_OK, s.status)
         assertTrue(logs.any { it.contains("does not exist") })
@@ -118,7 +121,7 @@ class InternetDiagTest {
             val name = Regex("__JMD_([A-Z0-9_]+)_RC=").find(cmd)?.groupValues?.get(1) ?: "X"
             0 to "/system/bin/sh: ip: not found\n__JMD_${name}_RC=127\n__JMD_EOF=1"
         }
-        val sections = InternetDiag.collect(shell, true, FakeNet(), ::log, "t", "v")
+        val sections = InternetDiag.collect(shell, true, FakeNet(), sink(), "t", "v")
         assertEquals(InternetDiag.STATUS_UNAVAILABLE,
             sections.first { it.name == "ip_rules" }.status)
         assertEquals(InternetDiag.STATUS_UNAVAILABLE,
@@ -131,7 +134,7 @@ class InternetDiagTest {
             val name = Regex("__JMD_([A-Z0-9_]+)_RC=").find(cmd)?.groupValues?.get(1) ?: "X"
             0 to "ip: Permission denied\n__JMD_${name}_RC=1\n__JMD_EOF=1"
         }
-        val sections = InternetDiag.collect(shell, true, FakeNet(), ::log, "t", "v")
+        val sections = InternetDiag.collect(shell, true, FakeNet(), sink(), "t", "v")
         assertEquals(InternetDiag.STATUS_PERMISSION_DENIED, sections.first { it.name == "ip_rules" }.status)
     }
 
@@ -141,14 +144,14 @@ class InternetDiagTest {
             val name = Regex("__JMD_([A-Z0-9_]+)_RC=").find(cmd)?.groupValues?.get(1) ?: "X"
             0 to "some output\n__JMD_${name}_RC=0\n"
         }
-        val sections = InternetDiag.collect(shell, true, FakeNet(), ::log, "t", "v")
+        val sections = InternetDiag.collect(shell, true, FakeNet(), sink(), "t", "v")
         assertEquals(InternetDiag.STATUS_UNKNOWN, sections.first { it.name == "routes" }.status)
     }
 
     @Test
     fun timeoutIsTimeoutNotNoInternet() {
         val shell = ScriptedShell { _ -> 137 to "ERR_ADB_TIMEOUT after 12000ms" }
-        val sections = InternetDiag.collect(shell, true, FakeNet(), ::log, "t", "v")
+        val sections = InternetDiag.collect(shell, true, FakeNet(), sink(), "t", "v")
         assertEquals(InternetDiag.STATUS_TIMEOUT, sections.first { it.name == "ping_ip" }.status)
         assertFalse("нет заявления об отсутствии интернета",
             logs.joinToString("\n").contains("no_internet"))
@@ -157,7 +160,7 @@ class InternetDiagTest {
     @Test
     fun pingFailureIsNotProofOfNoInternet() {
         val shell = okShell(mapOf("PING_IP" to "3 packets transmitted, 0 received, 100% packet loss"))
-        val sections = InternetDiag.collect(shell, true, FakeNet(), ::log, "t", "v")
+        val sections = InternetDiag.collect(shell, true, FakeNet(), sink(), "t", "v")
         val ping = sections.first { it.name == "ping_ip" }
         assertEquals(InternetDiag.STATUS_OK, ping.status)
         assertEquals("no_reply", ping.verdict)
@@ -172,7 +175,7 @@ class InternetDiagTest {
                 "PING_NAME" to "3 packets transmitted, 3 received, 0% packet loss"
             )
         )
-        val sections = InternetDiag.collect(shell, true, FakeNet(), ::log, "t", "v")
+        val sections = InternetDiag.collect(shell, true, FakeNet(), sink(), "t", "v")
         assertEquals("no_reply", sections.first { it.name == "ping_ip" }.verdict)
         assertEquals("echo_received", sections.first { it.name == "ping_name" }.verdict)
         assertTrue(logs.any { it.contains("ping_ip") && it.contains("verdict=no_reply") })
@@ -181,7 +184,7 @@ class InternetDiagTest {
     @Test
     fun emptyDnsPropsAreNotDnsAbsence() {
         val shell = okShell(mapOf("DNS_PROPS" to "net.dns1=\nnet.dns2=\n"))
-        val sections = InternetDiag.collect(shell, true, FakeNet(dns = emptyList()), ::log, "t", "v")
+        val sections = InternetDiag.collect(shell, true, FakeNet(dns = emptyList()), sink(), "t", "v")
         assertEquals(InternetDiag.STATUS_OK, sections.first { it.name == "dns_props" }.status)
         assertTrue(logs.any { it.contains("active_network_dns=empty") })
         assertFalse(logs.joinToString("\n").contains("dns=missing"))
@@ -190,7 +193,7 @@ class InternetDiagTest {
     @Test
     fun channelNotReadyMeansNoCommandsAtAll() {
         val shell = okShell()
-        val sections = InternetDiag.collect(shell, false, FakeNet(), ::log, "service.onCreate", "1.0.61")
+        val sections = InternetDiag.collect(shell, false, FakeNet(), sink(), "service.onCreate", "1.0.61")
         assertTrue("ни одной команды", shell.commands.isEmpty())
         assertTrue("shell-разделы честно не выполнены",
             sections.filter { it.name != "android_connectivity" }
@@ -203,7 +206,7 @@ class InternetDiagTest {
 
     @Test
     fun channelNotReadyHelperWritesHonestMarkers() {
-        val sections = InternetDiag.collectChannelNotReady(::log, "service.onCreate", "channel_not_ready_after_30s")
+        val sections = InternetDiag.collectChannelNotReady(sink(), "service.onCreate", "channel_not_ready_after_30s")
         assertEquals(7, sections.size)
         assertTrue(sections.all { it.status == InternetDiag.STATUS_CHANNEL_NOT_READY })
         assertTrue(logs.first().startsWith("INTERNET_DIAG_BEGIN"))
@@ -213,7 +216,7 @@ class InternetDiagTest {
 
     @Test
     fun androidApiUnavailableIsNotFalse() {
-        val sections = InternetDiag.collect(okShell(), true, null, ::log, "t", "v")
+        val sections = InternetDiag.collect(okShell(), true, null, sink(), "t", "v")
         val s = sections.first { it.name == "android_connectivity" }
         assertEquals(InternetDiag.STATUS_UNAVAILABLE, s.status)
         assertTrue(logs.any { it.contains("name=android_connectivity status=unavailable") })
@@ -221,7 +224,7 @@ class InternetDiagTest {
 
     @Test
     fun validatedIsNotASiteCheckAndNoSsidIsLogged() {
-        InternetDiag.collect(okShell(), true, FakeNet(), ::log, "t", "v")
+        InternetDiag.collect(okShell(), true, FakeNet(), sink(), "t", "v")
         val all = logs.joinToString("\n")
         assertTrue(all.contains("validated≠проверка конкретного сайта") || all.contains("validated="))
         assertFalse("SSID не пишем", all.contains("SSID="))
@@ -232,7 +235,7 @@ class InternetDiagTest {
     fun longLineIsSplitAndMarked() {
         val long = "10.0.0.1/24 " + "x".repeat(4000)
         val shell = okShell(mapOf("WLAN0_ADDR" to long))
-        InternetDiag.collect(shell, true, FakeNet(), ::log, "t", "v")
+        InternetDiag.collect(shell, true, FakeNet(), sink(), "t", "v")
         val parts = logs.filter { it.contains("name=wlan0_addr part=") }
         assertTrue("поделено на части", parts.size > 1)
         assertTrue(parts.any { it.contains("продолжение строки") })
@@ -241,7 +244,7 @@ class InternetDiagTest {
 
     @Test
     fun endSummaryIsFactsNotDiagnosis() {
-        val sections = InternetDiag.collect(okShell(), true, FakeNet(), ::log, "t", "v")
+        val sections = InternetDiag.collect(okShell(), true, FakeNet(), sink(), "t", "v")
         val end = logs.last()
         assertTrue(end.contains("это факты, а не диагноз"))
         assertTrue(end.contains("network_changes=0"))

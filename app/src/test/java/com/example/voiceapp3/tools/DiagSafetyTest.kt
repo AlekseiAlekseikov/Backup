@@ -117,7 +117,7 @@ class InternetDiagRedactionTest {
             override fun mapsExcerpt(): String? = null
         }
         val lines = mutableListOf<String>()
-        InternetDiag.collect(shell, true, null, { lines += it }, "test", "1.0.61")
+        InternetDiag.collect(shell, true, null, JitFake.TestSink(lines), "test", "1.0.61")
         val all = lines.joinToString("\n")
         assertFalse("MAC не попал в датированный лог", all.contains("aa:bb:cc:dd:ee:ff"))
         assertTrue("IP для анализа остался", all.contains("10.0.0.5/24"))

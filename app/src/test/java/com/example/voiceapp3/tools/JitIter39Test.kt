@@ -348,8 +348,13 @@ class JitIter39Test {
         sched.drain()
         assertTrue("состояние сети восстановлено — но исход по-прежнему unknown",
             lines().contains("outcome=still_unknown"))
-        assertTrue("данные удалены только после подтверждённого восстановления",
-            !store.contains(JitRef.KEY_RESTORE))
+        // §2.1/§2.2 iter41: отметка `sending` = исход НЕИЗВЕСТЕН. Восстановление сети это не
+        // разрешает, поэтому снимок и отметка ОСТАЮТСЯ на диске (блокировка переживает смерть
+        // процесса), а не удаляются «за компанию» с восстановлением.
+        assertTrue("снимок сохранён: исход операции неизвестен",
+            store.contains(JitRef.KEY_RESTORE))
+        assertTrue("отметка сохранена", store.contains(JitRef.KEY_MARK))
+        assertTrue(lines().contains("cleanup=none"))
     }
 
     // ─────────────────── §2.4 один протокол ───────────────────

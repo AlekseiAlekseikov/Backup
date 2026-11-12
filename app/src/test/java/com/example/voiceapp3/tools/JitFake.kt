@@ -17,6 +17,36 @@ import java.util.concurrent.atomic.AtomicInteger
  */
 object JitFake {
 
+    /**
+     * §5.1 iter41 — подставной приёмник диагностических строк.
+     *
+     * Уровень проверки: **JVM-модель приёмника**. `outcome`/`loc` управляются тестом, поэтому можно
+     * проверить, как сводка блока реагирует на «записано», «пропущено бюджетом», «не записалось» и
+     * на смену файла посреди блока. Реальный `AppLog`/`LogFiles` на ГУ этим не проверяется.
+     */
+    internal class TestSink(
+        val lines: MutableList<String>,
+        var outcome: (String) -> LogBudget.WriteOutcome = { LogBudget.WriteOutcome.WRITTEN },
+        var loc: String = "/test/voiceapp3-01.01.2026.log"
+    ) : LogBudget.Sink {
+        val independent = mutableListOf<String>()
+        val locations = LinkedHashSet<String>()
+
+        override fun write(line: String): LogBudget.WriteOutcome {
+            locations += loc
+            val o = outcome(line)
+            if (o == LogBudget.WriteOutcome.WRITTEN) lines += line
+            return o
+        }
+
+        override fun location(): String = loc
+
+        override fun independent(line: String) {
+            independent += line
+        }
+    }
+
+
     // ─────────────────────────── реалистичные SharedPreferences ───────────────────────────
 
     /**

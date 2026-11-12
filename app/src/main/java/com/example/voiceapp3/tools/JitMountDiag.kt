@@ -232,15 +232,18 @@ object JitMountDiag {
      * @param channelReady готовность существующего канала на момент сбора. `false` ⇒ честный
      *   `channel_not_ready` по всем разделам и НИ ОДНОЙ команды (это не «нет root»).
      */
-    fun collect(
+    internal fun collect(
         shell: JitRef.JitShell,
         channelReady: Boolean,
-        log: (String) -> Unit,
+        sink: LogBudget.Sink,
         source: String,
         /** §3.1: были ли строки этого блока усечены бюджетом лога (`null` — неизвестно). */
         truncatedProbe: (() -> Boolean)? = null
     ): List<Section> {
         val t0 = System.currentTimeMillis()
+        // §5.1 iter41: факт записи каждой строки, а не «вызов состоялся».
+        val tally = LogBudget.WriteTally(sink)
+        val log: (String) -> Unit = { line -> tally.emit(line) }
         log(
             "$BEGIN ts=$t0 source=$source mode=read_only transport=jit_shell channel_ready=$channelReady " +
                 "note=\"в логе будут пути приложений из /data/app/ — это данные владельца, в " +
@@ -253,8 +256,19 @@ object JitMountDiag {
                 log("$SECTION name=${it.name} status=$STATUS_CHANNEL_NOT_READY rc=-1 command=skipped " +
                     "note=\"канал не готов: это НЕ отсутствие root и НЕ результат чтения\"")
             }
-            log("$END sections=${none.size} ok=0 channel_not_ready=${none.size} " +
-                "elapsed_ms=${System.currentTimeMillis() - t0} system_writes=0")
+            tally.emit(
+                "$END sections=${none.size} ok=0 channel_not_ready=${none.size} " +
+                    "elapsed_ms=${System.currentTimeMillis() - t0} system_writes=0 " +
+                    tally.fields(null),
+                isEnd = true
+            )
+            if (tally.endOutcome != LogBudget.WriteOutcome.WRITTEN) {
+                sink.independent(
+                    "JIT_MOUNT_DIAG_END_NOT_CONFIRMED reason=${tally.endOutcome?.name?.lowercase() ?: "unknown"} " +
+                        "sink=«${tally.sinkList()}» lines=${tally.written}/${tally.offered} " +
+                        "(сводка блока не подтверждена в датированном файле; полноту не обещаем)"
+                )
+            }
             return none
         }
         val sections = ArrayList<Section>(4)
@@ -328,7 +342,10 @@ object JitMountDiag {
             sections += Section(name, status, raw.rc, wcLines ?: seenLines, matched.size, parts.size)
         }
 
-        log(
+        // §5.1 iter41: `written=full` — только при подтверждении ВСЕХ строк блока в одном
+        // датированном файле и известном отсутствии усечения этого блока.
+        val truncated = runCatching { truncatedProbe?.invoke() }.getOrNull()
+        tally.emit(
             "$END sections=${sections.size} ok=${sections.count { it.status == STATUS_OK }} " +
                 "empty=${sections.count { it.status == STATUS_EMPTY }} " +
                 "denied=${sections.count { it.status == STATUS_PERMISSION_DENIED }} " +
@@ -337,10 +354,18 @@ object JitMountDiag {
                 "truncated=${sections.count { it.status == STATUS_TRUNCATED }} " +
                 "unknown=${sections.count { it.status == STATUS_UNKNOWN }} " +
                 "elapsed_ms=${System.currentTimeMillis() - t0} system_writes=0 " +
-                "written=${when (runCatching { truncatedProbe?.invoke() }.getOrNull()) {
-                    null -> "unknown"; true -> "truncated"; false -> "full" }} " +
-                "note=\"данные для оценки обратимости umount -l; сами по себе её не доказывают\""
+                tally.fields(truncated) + " " +
+                "note=\"данные для оценки обратимости umount -l; сами по себе её не доказывают\"",
+            isEnd = true
         )
+        if (tally.endOutcome != LogBudget.WriteOutcome.WRITTEN) {
+            sink.independent(
+                "JIT_MOUNT_DIAG_END_NOT_CONFIRMED reason=${tally.endOutcome?.name?.lowercase() ?: "unknown"} " +
+                    "sink=«${tally.sinkList()}» lines=${tally.written}/${tally.offered} " +
+                    "skipped_by_budget=${tally.dropped} write_failed=${tally.failed} " +
+                    "(сводка блока не подтверждена в датированном файле; полноту не обещаем)"
+            )
+        }
         return sections
     }
 
