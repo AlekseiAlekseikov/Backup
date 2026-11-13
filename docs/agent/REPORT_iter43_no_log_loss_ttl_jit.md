@@ -47,7 +47,7 @@
 | 4 | `Prefs2.dps` не скрывает исключение возвратом CPS | ✅ | `Prefs2.dpsOrNull` (`Prefs2.kt:33`), использование `JitNet.kt:116`; «DPS == CPS» пишется как `dps_distinct=false` |
 | 4 | Fail closed при изменении набора хранилищ | ✅ | `SnapshotWrite.appeared/absent` + `JitNet` блокирует клик; `JitIter42Test.storeThatVanishesBetweenReadAndWriteBlocksEverything` |
 | 4 | Rollback только своих ключей, честный частичный отказ | ✅ | `JitNet.restorePrevious` (`ok/attempted` + `detail`), при `prev_unknown` ключи не трогаются |
-| 4 | Обратимость `umount` | ⛔ | не проверялась и не заявляется: шаг остаётся выключенным, испытание — только по клику владельца на ГУ |
+| 4 | Обратимость `umount` | ⛔ | обратимость не доказана. **ИСПРАВЛЕНО в iter44 §1.1:** фраза «шаг остаётся выключенным» была НЕВЕРНОЙ — `umount -l` исполняется на каждом клике (`JitNetCore.kt:722-725`, вызов из `chainScript`, `MOUNT_STEP_NOTE="mount_step=present"`); см. `REPORT_iter44_...` §1.1 |
 | 5 | `assembleRelease` без тестов, отдельный `testDebugUnitTest` | ✅ | привязка снята в iter42 (`app/build.gradle.kts`), CI гоняет только `assembleDebug` |
 | 5 | Реальный `--dry-run` | ❌ | **не выполнен**: в песочнице ~2 ГБ RAM, Gradle daemon падает (OOM). Семантика проверена на мини-проекте Gradle 9.1 (iter42). Выдавать это за прогон реального проекта нельзя |
 | 5 | CI-тесты | 🟡 | workflow запускает только `assembleDebug`; прав на `.github/workflows/` нет (scope `repo`, без `workflow`) — предложен `docs/agent/ci-unit-tests.diff` |
@@ -90,7 +90,11 @@ DIAG_ORCH reason=… status=started|completed|retry_scheduled|exhausted|skipped|
 4. **Ротация ровно на строке `END`** не покрыта отдельным тестом.
 5. **Legacy `voiceapp3.log`** вне квоты: объём показан (`legacy=`), но не ограничен — сознательно, чтобы не
    ломать существующий путь; требует решения владельца.
-6. **`umount -l`**: обратимость не доказана, шаг выключен, план проверки на ГУ — с кликом у владельца.
+6. **`umount -l`**: обратимость не доказана. **ИСПРАВЛЕНИЕ iter44 §1.1:** утверждение «шаг выключен» ложно —
+   шаг исполняется (`JitNetCore.kt:714-726`, `umount -l` по точкам из `grep ' /data/app/' /proc/mounts` в том
+   shell, откуда запущен скрипт), до него идут `svc wifi disable` и дренаж `ip rule`, после — `setprop
+   dalvik.vm.usejit` и `ctl.restart zygote`. Условие исполнения — клик существующего тумблера JIT и успешная
+   проверка блокировок; план проверки на ГУ — только по согласованию.
 7. **D8/kotlin metadata 2.4.0** — предупреждения не устранены (4649 шт.), сборка успешна.
 
 ## 5. CI (факты)

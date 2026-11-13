@@ -1475,3 +1475,26 @@ user-квота. Локально: **351 тест, 0 падений** (`/home/us
 **Не проверено (честно).** Android-интеграция `LogFiles.append(context)`/`rotateNow(context)` (внешний
 каталог, `usableSpace`, фоллбэк на `filesDir`), реальные `SharedPreferences`/`WifiManager` ГУ, поведение
 при полном диске, `umount`/`mount`/zygote/reboot — на ГУ ничего не запускалось, JIT-клик не выполнялся.
+
+## iter44 — рабочий JIT + интернет после `zygote` + полный лог (база `adf0bcd`, `e21a5a9`/`797c463`)
+
+Полный отчёт: `docs/agent/REPORT_iter44_rabota_jit_polnyj_log.md`. Локально: **370 тестов, 0 падений**,
+`APOLOG_TYPES_OK`. На ГУ ничего не выполнялось.
+
+* **§1.1 (исправление)** Утверждение iter43 «шаг `umount` выключен» — **ложно**. `umount -l` по точкам
+  `grep ' /data/app/' /proc/mounts` исполняется на каждом клике (`JitNetCore.kt:722-725`), между
+  `svc wifi disable`+дренажом `ip rule` и `setprop dalvik.vm.usejit`/`ctl.restart zygote`. Namespace не
+  проверяется (как и в референсе `w0/la.run`). Текст iter43 исправлен пометками на месте.
+* **§1.2/§1.3** `appeared`/`absent`/подмена идентичности блокируют скрипт (`JitNetCore.kt:1631`,
+  `JitNet.identityOf`); `planRestore` → `owned/foreign/unknown`, откат только своим, иначе
+  `nothing_proven_owned`; восстановление Wi-Fi возвращает **исходное** состояние.
+* **§2** `LogBudget.DiagState` не отбрасывает диагностику (`LogBudget.kt:293-358`, `*_BUDGET_HIGH`);
+  `writeSplit` считает каждую часть (`LogFiles.kt:580`), старые части не удаляются до успешной записи;
+  `parseOwn` до 9 цифр; ретеншн во время работы.
+* **§3** `TtlSnapshotFlow` привязан к `opId`: `pre_unknown/pre_unfinished/pre_confirmed/pre_late/
+  pre_overlap`, `post_after_apply[_not_ok:<result>]`; начало сбора — по факту (`onCollectStart`);
+  снимок сети заказывается **независимо** от TTL (`NetworkTtl.kt:388-397`).
+* **§4** Параллельная диагностика убрана: единственный владелец попыток — `DiagRunner`;
+  `CHANNEL_NOT_READY` больше не расходует попытку; флаг «уже пытались» не блокирует сбор после
+  реальной готовности канала.
+* **§5** `--dry-run` реального проекта не выполнялся (OOM); CI — `43367011105` по `797c463`.
