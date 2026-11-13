@@ -231,10 +231,9 @@ enum class Choice(
         // Раньше панель сравнивала пришедшее с зашитой константой — она неизбежно расходилась
         // с реальным составом и давала ложную «неполноту». Теперь счётчик вычисляется здесь.
         o.addProperty("\$keys", o.entrySet().count { !it.key.startsWith("\$") })
-        o.addProperty("$rev", revision())
+        o.addProperty("\$rev", revision())
         return o
     }
-}
 
     /** Значение строковой настройки (для `data-gu`/плиток палитры при загрузке). */
     fun choiceValue(choice: Choice): String =
