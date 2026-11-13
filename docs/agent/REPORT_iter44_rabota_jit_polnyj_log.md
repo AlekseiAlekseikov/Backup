@@ -186,8 +186,12 @@ Wi-Fi ON/OFF — проверено только в модели восстан�
 * `:app:testDebugUnitTest` — отдельная задача: `./gradlew :app:testDebugUnitTest`.
 * `--dry-run` реального проекта в песочнице **не выполнялся**: ~2 ГБ RAM, Gradle daemon падает OOM
   (`kotlinc` тоже падает в psi2ir без `-Xmx`). Это 🟡, а не «пройдено».
-* CI: прогон `43367011105` (ветка `fix/v2`, `797c463`) — статус смотреть в таблице ниже;
-  предыдущий зелёный — `43295574013` (`adf0bcd`). `rerun-failed-jobs` недоступен (403), права на
+* CI: прогон **`43367216355`** (ветка `fix/v2`, `52ad3b3`) — **success**, job `build`:
+  шаги 1–12, 22–25 все `success` (в т.ч. `Gradle build (debug)` и `Upload APK`), 0 `FAILED`, 0 `SKIPPED`.
+  Прогон `43367011105` (`797c463`) — `cancelled` политикой `concurrency` при следующем пуше (не ошибка
+  сборки). Предыдущий зелёный — `43295574013` (`adf0bcd`).
+  ВАЖНО: этот CI **не запускает unit-тесты** (`:app:testDebugUnitTest` в workflow нет) — success сборки
+  не равен success тестов; 370 тестов подтверждены только локально на JVM. `rerun-failed-jobs` недоступен (403), права на
   правку workflow у агента отсутствуют — дифф `docs/agent/ci-unit-tests.diff` владелец применяет сам.
 * `macOS /proc/self/maps` → `SKIPPED` с причиной (`/proc` отсутствует) — по-прежнему честный SKIPPED.
 * 4649 предупреждений `WARNING: D8` и `kotlin metadata 2.4.0` — **не** объявляются косметикой:
