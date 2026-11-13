@@ -166,8 +166,15 @@ class DiagLogBudgetTest {
         assertFalse(text.contains("TRUNCATED"))
     }
 
+    /**
+     * §2.1 iter44 — СЕМАНТИКА ИЗМЕНЕНА: блок больше не обрезается.
+     *
+     * Прежний тест требовал, чтобы дальние части НЕ писались. Владелец потребовал обратного:
+     * полезный лог не должен теряться. Теперь проверяется факт сохранения всех строк и честное
+     * предупреждение о превышении прежнего ориентира.
+     */
     @Test
-    fun longBlockIsTruncatedExplicitlyAndEndsAreKept() {
+    fun longBlockIsFullyKeptAndBudgetIsOnlyReported() {
         val budget = LogBudget.DiagState(bytes = 400, lines = 3)
         val dir = Files.createTempDirectory("diaglog").toFile()
         val f = File(dir, "voiceapp3-01.01.2026.log")
@@ -179,13 +186,15 @@ class DiagLogBudgetTest {
         val lines = f.readLines()
         assertTrue("начало сохранено", lines.any { it.startsWith("INTERNET_DIAG_BEGIN") })
         assertTrue("окончание сохранено", lines.any { it.startsWith("INTERNET_DIAG_END") })
-        val trunc = lines.filter { it.contains("INTERNET_DIAG_TRUNCATED") }
-        assertEquals("усечение объявлено ровно один раз", 1, trunc.size)
-        assertTrue(trunc[0].contains("truncated=true"))
-        assertTrue(trunc[0].contains("limit_bytes=400"))
-        assertTrue("нумерация частей остаётся в данных", lines.any { it.contains("part=1/50") })
-        assertTrue("дальние части не пишутся", lines.none { it.contains("part=40/50") })
-        assertFalse("усечение видно и в состоянии", !budget.truncated())
+        assertEquals("все 50 частей сохранены", 50,
+            lines.count { it.startsWith("INTERNET_DIAG_DATA") })
+        assertTrue("дальняя часть на месте", lines.any { it.contains("part=50/50") })
+        val high = lines.filter { it.contains("INTERNET_DIAG_BUDGET_HIGH") }
+        assertEquals("предупреждение о превышении — одно", 1, high.size)
+        assertTrue("в нём прямо сказано, что потери нет", high[0].contains("dropped=0"))
+        assertFalse("ложного «truncated» нет", lines.any { it.contains("_TRUNCATED") })
+        assertFalse(budget.truncated())
+        assertEquals(0L, budget.droppedLines())
     }
 
     @Test
@@ -206,31 +215,34 @@ class DiagLogBudgetTest {
     }
 
     @Test
-    fun budgetWindowResetsAndDoesNotSilenceDiagnosticsForever() {
+    fun overBudgetIsReportedOncePerWindowButNeverBlocksWriting() {
         val budget = LogBudget.DiagState(bytes = 100, lines = 1, windowMs = 1000)
-        budget.decide("INTERNET_DIAG_DATA a", 80, 0)
+        assertTrue(budget.decide("INTERNET_DIAG_DATA a", 80, 0).write)
         val second = budget.decide("INTERNET_DIAG_DATA b", 80, 100)
-        assertFalse("в окне места нет", second.write)
-        assertTrue("усечение объявлено", second.notice!!.contains("TRUNCATED"))
-        assertTrue(budget.truncated())
-        // Следующее окно: снова можно писать, счётчики сброшены.
-        val next = budget.decide("INTERNET_DIAG_DATA c", 80, 5000)
-        assertTrue("после окна сбор не запрещён навсегда", next.write)
-        assertFalse(budget.truncated())
+        assertTrue("§2.1 iter44: строка пишется даже сверх ориентира", second.write)
+        assertTrue("превышение объявлено", second.notice!!.contains("BUDGET_HIGH"))
+        val third = budget.decide("INTERNET_DIAG_DATA c", 80, 200)
+        assertTrue(third.write)
+        assertTrue("в одном окне — однократно", third.notice == null)
+        assertEquals(2L, budget.overBudgetFor("INTERNET_DIAG"))
+        assertFalse("усечения нет", budget.truncated())
+        assertTrue(budget.decide("INTERNET_DIAG_DATA d", 80, 5000).write)
+        assertEquals("новое окно — счётчик сброшен", 0L, budget.overBudgetFor("INTERNET_DIAG"))
     }
 
     @Test
-    fun competingWritersDoNotExceedTheLimit() {
+    fun competingWritersNeverLoseLines() {
         val budget = LogBudget.DiagState(bytes = 500, lines = 1000)
+        val perThread = 200
         val threads = (1..8).map {
-            Thread {
-                repeat(200) { budget.decide("INTERNET_DIAG_DATA часть", 50, 0) }
-            }
+            Thread { repeat(perThread) { budget.decide("INTERNET_DIAG_DATA часть", 50, 0) } }
         }
         threads.forEach { it.start() }
         threads.forEach { it.join(5000) }
-        assertTrue("лимит байт не превышен с запасом на одну строку", budget.usedBytes() <= 500 + 50)
-        assertTrue("усечение зафиксировано", budget.truncated())
+        // §2.1 iter44: главное — при конкуренции потоков не теряется ни одна строка.
+        assertEquals("ни одна строка не отброшена", 0L, budget.droppedLines())
+        assertEquals("учтены байты всех потоков", (8 * perThread * 50).toLong(), budget.usedBytes())
+        assertTrue("превышение ориентира видно", budget.overBudgetFor("INTERNET_DIAG") > 0)
     }
 
     @Test

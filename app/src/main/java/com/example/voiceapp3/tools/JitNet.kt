@@ -171,6 +171,14 @@ object JitNet {
             return Acquired(out, errors)
         }
 
+        /**
+         * §1.2 iter44: идентичность копии = имя + тождество объекта. Позволяет отличить «ту же
+         * копию» от «другой копии под тем же именем». Это ТОЖДЕСТВО В ПРЕДЕЛАХ ПРОЦЕССА (не путь
+         * к файлу): между процессами сравнивать нечем, и это ограничение заявлено в отчёте.
+         */
+        private fun identityOf(name: String, s: SharedPreferences): String =
+            name + "@" + System.identityHashCode(s)
+
         /** Порядок тот же, что в [getString]: CPS первым. `distinct()` — если DPS недоступен. */
         private fun stores(): List<Pair<String, SharedPreferences>> = acquire().stores
 
@@ -217,8 +225,9 @@ object JitNet {
 
         private fun readStorePrev(name: String, s: SharedPreferences): JitRef.StorePrev =
             JitRef.StorePrev(
-                name,
-                (JitRef.SNAPSHOT_KEYS + KEY_MARK).map { key ->
+                name = name,
+                identity = identityOf(name, s),
+                keys = (JitRef.SNAPSHOT_KEYS + KEY_MARK).map { key ->
                     // §2.5: «ключа нет» и «прочитать нельзя» — РАЗНОЕ. Исключение чтения даёт
                     // present=null (неизвестно), и тогда менять данные нельзя вовсе.
                     val present: Boolean? = try {
@@ -462,7 +471,7 @@ object JitNet {
                     val markOk = s.getString(KEY_MARK, null) == mark.wire()
                     pedidoOk && autoOk && restoreOk && markOk
                 }.getOrDefault(false)
-                reports += JitRef.StoreReport(name, commit, readback, err)
+                reports += JitRef.StoreReport(name, commit, readback, err, identityOf(name, s))
             }
             val w = JitRef.SnapshotWrite(want, snap, reports, appeared, absent)
             log(
@@ -674,7 +683,16 @@ object JitNet {
         delayMs: Long = 0L,
         netInfo: InternetDiag.NetInfo? = null
     ) {
-        if (!markDiagAttempted()) return
+        // §4.2 iter44: одиночный флаг больше не «сжигает» диагностику навсегда. Раньше вторая
+        // попытка после события готовности канала молча ничего не делала. Теперь повторный вход
+        // запрещён только когда сбор УЖЕ завершён; число реальных сборов по-прежнему ограничено
+        // ([JitRef.DiagOnce], 2 запуска на процесс).
+        if (!markDiagAttempted() && diagOnce.completedNow()) {
+            AppLog.i(TAG, "DIAG source=$source status=skipped why=already_completed " +
+                "runs=${diagOnce.runsUsed()}/${diagOnce.maxRunsAllowed()} " +
+                "(сбор уже дал результат: повторный не нужен)")
+            return
+        }
         val appVersion = runCatching {
             app.packageManager.getPackageInfo(app.packageName, 0).versionName
         }.getOrNull() ?: "unknown"
@@ -846,7 +864,12 @@ object JitNet {
          */
         phaseLabelProvider: (() -> String)? = null,
         /** Вызывается после фактического сбора (для меток «до»/«после»). */
-        onCollected: (() -> Unit)? = null
+        onCollected: (() -> Unit)? = null,
+        /**
+         * §3.1 iter44: вызывается В МОМЕНТ фактического начала сбора, а не при заказе.
+         * Именно это время — начало «до»-снимка.
+         */
+        onCollectStart: (() -> Unit)? = null
     ) {
         val appVersion = runCatching {
             app.packageManager.getPackageInfo(app.packageName, 0).versionName
@@ -882,6 +905,8 @@ object JitNet {
             "note=\"снимок после стабилизации: одно событие сетевого шторма не даёт серию снимков\"")
         BgWorker.postDelayed("JitNet.eventSnapshot", stableDelayMs) {
             try {
+                // §3.1 iter44: фактическое начало сбора (не время заказа).
+                runCatching { onCollectStart?.invoke() }
                 val report = runCatching {
                     InternetDiag.collectWithReport(
                         DiagShell, AdbClient.isChannelReady(), netInfo, DiagSink,
@@ -894,6 +919,8 @@ object JitNet {
                 val labelDone = phaseLabelProvider?.let { p ->
                     runCatching { " label_done=" + p() }.getOrDefault("")
                 } ?: ""
+                // §3.1 iter44: статическая метка фазы, посчитанная при заказе, может устареть —
+                // в лог идёт и она (`label=`), и фактическая на момент сбора (`label_done=`).
                 AppLog.i(TAG, "SNAP reason=$reason status=${report?.info?.status ?: "failed"}$label$labelDone " +
                     "sections=${report?.info?.sectionCount ?: 0} written=${report?.info?.verdict ?: "none"} " +
                     "sink=«${report?.info?.sink ?: "none"}» why=${report?.info?.reason ?: "failed"} " +
@@ -923,12 +950,13 @@ object JitNet {
     fun beginTtlSnapshot(app: Context, want: Boolean, netInfo: InternetDiag.NetInfo? = null):
         JitRef.TtlSnapshotFlow.Op {
         val op = ttlFlow.begin(want, System.currentTimeMillis())
-        ttlFlow.preStarted(System.currentTimeMillis())
         requestEventSnapshot(
             app, "ttl_" + (if (want) "on" else "off") + "_pre", netInfo,
             stableDelayMs = 0L, userEvent = true,
+            // §3.1 iter44: «до» начинается тогда, когда сбор РЕАЛЬНО начался, а не при заказе.
+            onCollectStart = { ttlFlow.preStarted(op, System.currentTimeMillis()) },
             phaseLabelProvider = { ttlFlow.preLabel(op) },
-            onCollected = { ttlFlow.preFinished(System.currentTimeMillis()) }
+            onCollected = { ttlFlow.preFinished(op, System.currentTimeMillis()) }
         )
         return op
     }
@@ -944,16 +972,22 @@ object JitNet {
         netInfo: InternetDiag.NetInfo? = null,
         stableDelayMs: Long = 15_000L
     ) {
-        ttlFlow.applied(System.currentTimeMillis(), appliedResult)
-        ttlFlow.postScheduled(System.currentTimeMillis())
+        // §3.2 iter44: изменения применяются ТОЛЬКО к своей операции; если за это время началась
+        // следующая (быстрый ON/OFF), старая отметка не испортит её состояние.
+        val applied = ttlFlow.applied(op, System.currentTimeMillis(), appliedResult)
+        ttlFlow.postScheduled(op, System.currentTimeMillis())
         requestEventSnapshot(
             app, "ttl_" + (if (op.want) "on" else "off") + "_post", netInfo,
             stableDelayMs = stableDelayMs, pairWith = "ttl_" + (if (op.want) "on" else "off") + "_pre",
             userEvent = true,
-            phaseLabel = ttlFlow.postLabel(op),
-            phaseLabelProvider = { ttlFlow.postLabel(op) }
+            // Метка считается В МОМЕНТ СБОРА (при заказе она могла бы устареть).
+            phaseLabelProvider = { ttlFlow.postLabel(op) },
+            onCollected = {
+                ttlFlow.postCollected(op, System.currentTimeMillis())
+            }
         )
-        AppLog.i(TAG, "TTL_SNAP_PAIR " + ttlFlow.describe(op, JitRef.TtlSnapshotFlow.SnapPart.POST, "ordered") +
+        AppLog.i(TAG, "TTL_SNAP_PAIR applied_to_op=$applied " +
+            ttlFlow.describe(op, JitRef.TtlSnapshotFlow.SnapPart.POST, "ordered") +
             " pre_label_now=" + ttlFlow.preLabel(op) +
             " (метка «до» окончательна после сбора; сеть/TTL этим кодом не менялись)")
     }

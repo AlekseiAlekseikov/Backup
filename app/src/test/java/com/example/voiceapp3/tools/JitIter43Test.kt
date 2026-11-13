@@ -254,7 +254,9 @@ class DiagRunner43Test {
         val s = Sched()
         val r = runner(s, attempts = 2)
         var calls = 0
-        r.start("initial") { calls += 1; JitRef.DiagRunner.Outcome.CHANNEL_NOT_READY }
+        // §4.2 iter44: исчерпание считается по РЕАЛЬНЫМ сборам (PARTIAL), а «канал не готов»
+        // попытку не расходует — этот случай проверяется отдельным тестом ниже.
+        r.start("initial") { calls += 1; JitRef.DiagRunner.Outcome.PARTIAL }
         s.runAll()
         assertEquals("не больше maxAttempts", 2, calls)
         assertTrue(r.isExhausted())
@@ -264,6 +266,29 @@ class DiagRunner43Test {
             r.notes().any { it.contains("status=exhausted") }
         )
         assertFalse("после исчерпания новых попыток нет", r.start("again") { JitRef.DiagRunner.Outcome.COMPLETED })
+    }
+
+    @Test
+    fun channelNotReadyDoesNotBurnAttemptsAndLaterReadyCollects() {
+        val s = Sched()
+        val r = runner(s, attempts = 2)
+        var collections = 0
+        // Канал не готов: сбора не было — бюджет попыток не тратится.
+        r.start("initial") { JitRef.DiagRunner.Outcome.CHANNEL_NOT_READY }
+        s.runAll()
+        assertEquals("попытка не израсходована", 0, r.attempts())
+        assertFalse("исчерпания нет", r.isExhausted())
+        assertTrue(
+            "ожидание канала отличимо от исчерпания",
+            r.notes().any { it.contains("status=wait_channel") }
+        )
+        // Канал поднялся — сбор выполняется в пределах того же лимита.
+        r.start("after_ready_event") {
+            collections++
+            JitRef.DiagRunner.Outcome.COMPLETED
+        }
+        assertEquals("сбор выполнен", 1, collections)
+        assertTrue(r.completedNow())
     }
 
     @Test
@@ -286,8 +311,8 @@ class TtlSnapshotFlow43Test {
     fun preSnapshotBeforeApplyIsConfirmed() {
         val f = JitRef.TtlSnapshotFlow()
         val op = f.begin(true, 1_000L)
-        f.preStarted(1_100L); f.preFinished(1_400L)
-        f.applied(1_500L, "ok")
+        f.preStarted(op, 1_100L); f.preFinished(op, 1_400L)
+        f.applied(op, 1_500L, "ok")
         assertEquals("pre_confirmed", f.preLabel(op))
         assertEquals("post_after_apply", f.postLabel(op))
         assertTrue(f.describe(op, JitRef.TtlSnapshotFlow.SnapPart.PRE, "net=validated")
@@ -298,8 +323,8 @@ class TtlSnapshotFlow43Test {
     fun preSnapshotAfterApplyIsHonestlyLabelledLate() {
         val f = JitRef.TtlSnapshotFlow()
         val op = f.begin(true, 1_000L)
-        f.applied(1_200L, "ok")
-        f.preStarted(1_900L); f.preFinished(2_000L)
+        f.applied(op, 1_200L, "ok")
+        f.preStarted(op, 1_900L); f.preFinished(op, 2_000L)
         assertEquals("pre_late", f.preLabel(op))
     }
 
@@ -307,8 +332,8 @@ class TtlSnapshotFlow43Test {
     fun preSnapshotOverlappingApplyIsNotCalledBefore() {
         val f = JitRef.TtlSnapshotFlow()
         val op = f.begin(true, 1_000L)
-        f.preStarted(1_000L); f.preFinished(1_600L)
-        f.applied(1_500L, "ok")
+        f.preStarted(op, 1_000L); f.preFinished(op, 1_600L)
+        f.applied(op, 1_500L, "ok")
         assertEquals("pre_overlap", f.preLabel(op))
     }
 
@@ -316,7 +341,7 @@ class TtlSnapshotFlow43Test {
     fun missingPreSnapshotIsUnknownNotAssumed() {
         val f = JitRef.TtlSnapshotFlow()
         val op = f.begin(true, 1_000L)
-        f.applied(1_500L, "ok")
+        f.applied(op, 1_500L, "ok")
         assertEquals("pre_unknown", f.preLabel(op))
     }
 
@@ -324,8 +349,8 @@ class TtlSnapshotFlow43Test {
     fun postWithoutConfirmedApplyIsMarked() {
         val f = JitRef.TtlSnapshotFlow()
         val op = f.begin(true, 1_000L)
-        f.preStarted(1_100L); f.preFinished(1_200L)
-        f.postScheduled(1_300L)
+        f.preStarted(op, 1_100L); f.preFinished(op, 1_200L)
+        f.postScheduled(op, 1_300L)
         assertEquals("post_without_confirmed_apply", f.postLabel(op))
         val d = f.describe(op, JitRef.TtlSnapshotFlow.SnapPart.POST, "net=idle")
         assertTrue(d.contains("phase=post label=post_without_confirmed_apply"))

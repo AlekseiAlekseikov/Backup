@@ -73,6 +73,9 @@ object LogFiles {
      */
     internal const val MAX_LINE_BYTES = 256 * 1024
 
+    /** §2.4 iter44: ретеншн во время работы — не чаще раза в 10 минут на каталог/tier. */
+    internal const val RUNTIME_PRUNE_MS = 10 * 60_000L
+
     /** Уровни (tier): полезный журнал и шумные низкоуровневые трассы — раздельно. */
     enum class Tier(val prefix: String, val maxFileBytes: Long, val maxFiles: Int) {
         MAIN(PREFIX, MAX_FILE_BYTES, MAX_FILES_PER_DAY),
@@ -141,7 +144,10 @@ object LogFiles {
         if (parts.size != 3 && parts.size != 4) return null
         if (!DATE_RE.matches(parts.subList(0, 3).joinToString("."))) return null
         val n = if (parts.size == 4) {
-            if (!parts[3].matches(Regex("\\d{1,3}"))) return null
+            // §2.4 iter44: раньше принимались только 1–3 цифры, а генерация имён номер не
+            // ограничивала: `.1000` переставал распознаваться как СВОЯ часть (файл «исчезал» из
+            // учёта, а следующая запись могла открыть старую часть заново). Теперь до 9 цифр.
+            if (!parts[3].matches(Regex("\\d{1,9}"))) return null
             parts[3].toIntOrNull() ?: return null
         } else 0
         if (parts.size == 4 && n < 1) return null      // `…2026.0.log` — не наш формат
@@ -421,7 +427,18 @@ object LogFiles {
      * Запись с критической секцией: выбор активной части, проверка места, ротация, запись.
      */
     private fun writeAtLocked(dir: File, line: String, nowMs: Long, tier: Tier): Result {
-        if (!dir.isDirectory && !dir.mkdirs()) return Result.fail("no_dir:${dir.absolutePath}")
+        if (!dir.isDirectory) {
+            val made = runCatching { dir.mkdirs() }.getOrDefault(false) || dir.isDirectory
+            if (!made) {
+                // §2.4 iter44: отказ каталога обязан быть виден независимо, а не только в Result.
+                // Сам счётчик ошибок ведёт `appendTier` (иначе одно событие считалось бы дважды).
+                lastIoError = "no_dir:${dir.absolutePath}"
+                report("LOGFILES_WRITE_ERROR no_dir dir=«${dir.absolutePath}» " +
+                    "tier=${tier.name.lowercase()} written=false " +
+                    "(каталог не создан/не является каталогом: строка НЕ сохранена)")
+                return Result.fail("no_dir:${dir.absolutePath}")
+            }
+        }
         return critical(dir) { writeAt(dir, line, nowMs, tier) }
     }
 
@@ -443,11 +460,15 @@ object LogFiles {
         else File(dir, if (parts.last().first == 0) base else rotatedName(base, parts.last().first))
 
         var rotated = ""
+        var pendingPrune: Pair<Int, List<Pair<Int, File>>>? = null
         val need = (if (active.isFile) active.length() else 0L) + bytes.size + 1L
         if (active.isFile && need > tier.maxFileBytes) {
             // Закрываем текущую часть и открываем следующую по НЕПРЕРЫВНОЙ нумерации.
             val nextN = (parts.last().first) + 1
-            enforcePartsLimit(dir, tier, date, parts, nextN)
+            // §2.4 iter44: ПОРЯДОК ИЗМЕНЁН. Раньше старая часть удалялась ДО попытки записи в
+            // новую: при отказе записи терялись и старая часть, и строка. Теперь лимит частей
+            // применяется ПОСЛЕ успешной записи (pendingPrune).
+            pendingPrune = nextN to parts
             // Место: 0 — знаем, что места нет; null — «узнать нельзя» (НЕ «места достаточно»).
             val free = freeSpace(dir)
             if (free != null && free < FREE_SPACE_MARGIN) {
@@ -456,6 +477,8 @@ object LogFiles {
                 report("LOGFILES_WRITE_ERROR $why dir=«${dir.absolutePath}» tier=${tier.name.lowercase()} " +
                     (if (free <= 0L) "(свободного места нет — запись НЕ выполнена)"
                      else "(меньше запаса — запись НЕ выполнена)"))
+                report("LOG_ROTATE skipped=1 reason=$why dir=«${dir.absolutePath}» " +
+                    "(старая часть НЕ удалена: новая запись не выполнена)")
                 return Result.fail(why)
             }
             if (free == null) {
@@ -486,9 +509,37 @@ object LogFiles {
                 runCatching { out.fd.sync() }     // fsync: защита от смерти процесса, не от сбоя питания
             }
             if (pathRef != active.absolutePath) pathRef = active.absolutePath
+            // Новая часть записана — только ТЕПЕРЬ можно удалять самые старые закрытые части.
+            pendingPrune?.let { (nextN, parts0) -> enforcePartsLimit(dir, tier, date, parts0, nextN) }
+            // §2.4 iter44: ретеншн проверяется не только в `prepare`, но и ВО ВРЕМЯ работы.
+            maybeRuntimePrune(dir, nowMs, tier)
             Result.ok(active, rotated)
         } catch (t: Throwable) {
             Result.fail("io:${t.javaClass.simpleName}:${t.message?.take(60) ?: ""}")
+        }
+    }
+
+    /** Когда последний раз выполнялся ретеншн по каталогу — «во время работы». */
+    private val lastRuntimePrune = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /**
+     * §2.4 iter44: ретеншн ВО ВРЕМЯ РАБОТЫ, не чаще раза в [RUNTIME_PRUNE_MS] на каталог/tier.
+     * Долгоживущий процесс иначе держал бы просроченные части до следующего `prepare`.
+     * Частичные отказы `delete` не считаются удачей — см. `pruneTier`.
+     */
+    private fun maybeRuntimePrune(dir: File, nowMs: Long, tier: Tier) {
+        val key = dir.absolutePath + "#" + tier.name
+        val last = lastRuntimePrune[key]
+        if (last != null && nowMs - last < RUNTIME_PRUNE_MS) return
+        lastRuntimePrune[key] = nowMs
+        val date = Instant.ofEpochMilli(nowMs).atZone(ZoneId.systemDefault()).toLocalDate()
+        val active = activeName(dir, tier, date)
+        val removed = runCatching { pruneTier(dir, nowMs, tier, active) }.getOrDefault(emptyList())
+        if (removed.isNotEmpty()) {
+            deletedCount.addAndGet(removed.size.toLong())
+            report("LOG_RETENTION_RUNTIME tier=${tier.name.lowercase()} dir=«${dir.absolutePath}» " +
+                "removed=${removed.size} names=«${removed.take(6).joinToString(",")}» " +
+                "reason=retention_while_running active_kept=«$active»")
         }
     }
 
@@ -528,36 +579,58 @@ object LogFiles {
     /** Разбиение очень длинной строки: данные сохраняются целиком, факт виден маркером. */
     private fun writeSplit(dir: File, line: String, nowMs: Long, tier: Tier): Result {
         val bytes = line.toByteArray(Charsets.UTF_8)
-        // §1.2 iter43 (найдено тестом на реальных UTF-8 байтах): кусок должен быть СТРОГО меньше
-        // MAX_LINE_BYTES, иначе «кусок + маркер» снова превышает лимит и writeAt уходит в
-        // writeSplit по кругу. Раньше это не проявлялось, потому что строк > 256 КиБ не писали.
+        // Кусок СТРОГО меньше лимита: иначе «кусок + маркер» снова превышает MAX_LINE_BYTES и
+        // writeAt уходит в writeSplit по кругу (это дефект, найденный тестом в iter43).
         val chunkMax = MAX_LINE_BYTES - SPLIT_MARKER_RESERVE
         var offset = 0
-        var last: Result = Result.fail("split_empty")
         var n = 0
         val total = (bytes.size + chunkMax - 1) / chunkMax
+        var written = 0
+        val failedParts = ArrayList<Int>(2)
+        var firstFail: Result? = null
+        var lastOk: Result? = null
         while (offset < bytes.size) {
             val end = minOf(offset + chunkMax, bytes.size)
-            // Не режем многобайтовый символ: отступаем до границы символа.
-            //
-            // §1.2 iter43: проверять надо БАЙТ НА ПОЗИЦИИ `cut` (продолжение ли он), а не
-            // `cut-1`. Проверка `cut-1` пропускала разрез ровно посередине символа
-            // (`0xD1 | 0x8F`), и в файле появлялся U+FFFD — то есть потеря байтов.
+            // Не режем многобайтовый символ: проверяем БАЙТ НА ПОЗИЦИИ `cut` (продолжение ли он).
+            // Проверка `cut-1` пропускала разрез ровно посередине символа (0xD1 | 0x8F), и в файле
+            // появлялся U+FFFD — фактическая потеря байтов.
             var cut = end
             while (cut > offset && cut < bytes.size && (bytes[cut].toInt() and 0xC0) == 0x80) cut--
             if (cut == offset) cut = end
             val part = String(bytes, offset, cut - offset, Charsets.UTF_8)
             n++
-            last = writeAt(dir, "${part}LOG_LINE_SPLIT n=$n/$total", nowMs, tier)
+            // §2.3 iter44: результат КАЖДОЙ части. Раньше возвращался результат последней —
+            // строка считалась записанной, даже если первая/средняя часть не записалась.
+            val r = writeAt(dir, "${part}LOG_LINE_SPLIT n=$n/$total", nowMs, tier)
             splitCount.incrementAndGet()
-            if (last.written) report("LOG_LINE_SPLIT n=$n/$total bytes=${cut - offset} " +
-                "reason=line_too_long limit=$MAX_LINE_BYTES file=«${last.file}»")
+            if (r.written) {
+                written++
+                lastOk = r
+            } else {
+                failedParts += n
+                if (firstFail == null) firstFail = r
+                report("LOG_LINE_SPLIT n=$n/$total bytes=${cut - offset} written=false " +
+                    "reason=${r.reason} limit=$MAX_LINE_BYTES dir=«${dir.absolutePath}» " +
+                    "(часть строки НЕ сохранена; исходная строка не считается записанной)")
+            }
             offset = cut
         }
-        return last
+        return when {
+            failedParts.isEmpty() && lastOk != null -> lastOk!!
+            written == 0 -> Result.fail(
+                "split_all_failed:" + (firstFail?.reason ?: "unknown") + ":parts=${failedParts.size}/$total"
+            )
+            else -> Result(
+                false,
+                lastOk?.file ?: "",
+                "split_partial:parts=${failedParts.joinToString(",")}/$total:" +
+                    (firstFail?.reason ?: "unknown"),
+                lastOk?.rotated ?: ""
+            )
+        }
     }
 
-    /** Запас под маркер `LOG_LINE_SPLIT n=NN/NN` при разбиении слишком длинной строки. */
+/** Запас под маркер `LOG_LINE_SPLIT n=NN/NN` при разбиении слишком длинной строки. */
     private const val SPLIT_MARKER_RESERVE = 96
 
     /**

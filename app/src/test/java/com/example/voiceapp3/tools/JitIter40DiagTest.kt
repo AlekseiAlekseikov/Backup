@@ -50,20 +50,22 @@ class DiagTruncationPerBlockTest {
         sink.log("INTERNET_DIAG_END sections=1")
 
         val text = f.readText()
-        assertTrue("усечение монтирований объявлено", text.contains("JIT_MOUNT_DIAG_TRUNCATED"))
+        assertTrue("превышение ориентира видно", text.contains("JIT_MOUNT_DIAG_BUDGET_HIGH"))
         assertTrue(
             "у сетевого блока СВОЯ отметка, а не молчание",
-            text.contains("INTERNET_DIAG_TRUNCATED")
+            text.contains("INTERNET_DIAG_BUDGET_HIGH")
         )
         assertTrue("BEGIN сети сохранён", text.contains("INTERNET_DIAG_BEGIN"))
         assertTrue("END сети сохранён", text.contains("INTERNET_DIAG_END"))
-        assertTrue(budget.truncatedFor("JIT_MOUNT_DIAG"))
-        assertTrue(budget.truncatedFor("INTERNET_DIAG"))
-        assertTrue(budget.droppedFor("JIT_MOUNT_DIAG") > 0)
-        assertTrue(budget.droppedFor("INTERNET_DIAG") > 0)
+        assertEquals("§2.1 iter44: строки не отбрасываются", 0L, budget.droppedFor("JIT_MOUNT_DIAG"))
+        assertEquals("§2.1 iter44: строки не отбрасываются", 0L, budget.droppedFor("INTERNET_DIAG"))
+        assertTrue(budget.overBudgetFor("JIT_MOUNT_DIAG") > 0)
+        assertTrue(budget.overBudgetFor("INTERNET_DIAG") > 0)
+        assertEquals("все 10 частей монтирований сохранены", 10,
+            Regex("JIT_MOUNT_DIAG_DATA").findAll(text).count())
+        assertEquals("часть сети сохранена", 1, Regex("INTERNET_DIAG_DATA").findAll(text).count())
         // Уведомление больше не обещает сохранение разделов.
-        assertFalse("нет ложного обещания про SECTION", text.contains("разделы и сводка сохраняются"))
-        assertTrue(text.contains("SECTION/DATA ограничены"))
+        assertTrue("уведомление больше не пугает потерей", text.contains("dropped=0"))
     }
 
     @Test
@@ -79,12 +81,12 @@ class DiagTruncationPerBlockTest {
         sink.log("JIT_MOUNT_DIAG_END sections=3")
 
         val text = f.readText()
-        assertTrue(text.contains("INTERNET_DIAG_TRUNCATED"))
-        assertTrue(text.contains("JIT_MOUNT_DIAG_TRUNCATED"))
+        assertTrue(text.contains("INTERNET_DIAG_BUDGET_HIGH"))
+        assertTrue(text.contains("JIT_MOUNT_DIAG_BUDGET_HIGH"))
         assertTrue(text.contains("JIT_MOUNT_DIAG_BEGIN"))
         assertTrue(text.contains("JIT_MOUNT_DIAG_END"))
-        assertTrue(budget.truncatedFor("INTERNET_DIAG"))
-        assertTrue(budget.truncatedFor("JIT_MOUNT_DIAG"))
+        assertEquals(0L, budget.droppedFor("INTERNET_DIAG"))
+        assertEquals(0L, budget.droppedFor("JIT_MOUNT_DIAG"))
     }
 
     @Test
@@ -111,10 +113,10 @@ class DiagTruncationPerBlockTest {
         })
         threads.forEach { it.second.start() }
         threads.forEach { it.second.join(5000) }
-        assertTrue(budget.usedBytes() <= 4000 + 120)
+        assertTrue("байты учтены все", budget.usedBytes() <= 400 * 60 * 2L)
         assertTrue(
             "оба блока получили свою отметку",
-            budget.truncatedFor("INTERNET_DIAG") && budget.truncatedFor("JIT_MOUNT_DIAG")
+            budget.overBudgetFor("INTERNET_DIAG") > 0 && budget.overBudgetFor("JIT_MOUNT_DIAG") > 0
         )
     }
 

@@ -385,6 +385,17 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
             override fun onReceive(rcvCtx: Context, intent: Intent) {
                 BgWorker.post("NetworkTtl.netChange") {
                     val active = isTtl65Active(rcvCtx)
+                    // §3.3 iter44: снимок сети НЕ зависит от того, включён ли TTL. Раньше при
+                    // выключенном TTL функция выходила ДО снимка, и существенное изменение сети
+                    // (ассоциация/IP/маршрут/DNS/validated) вообще не попадало в журнал. Снимок
+                    // ограничен частотой и single-flight; при пропуске по частоте запрашивается
+                    // ОДИН trailing-снимок после затихания шторма (см. JitNet.scheduleTrailing).
+                    runCatching {
+                        JitNet.requestEventSnapshot(
+                            rcvCtx, "net_change:ttl=" + (if (active) "on" else "off"),
+                            NetInfoAndroid(rcvCtx)
+                        )
+                    }
                     if (!active) return@post
                     val cm = rcvCtx.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
                     val isWifi = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {

@@ -271,8 +271,9 @@ class JitStoreSetChanged42Test {
         assertTrue("лог называет причину", lines().contains("blocked=store_set_changed"))
         assertTrue(
             "лог объясняет, почему это не «нет данных»",
-            lines().contains("набор хранилищ CPS/DPS изменился")
+            lines().contains("состав/тождество хранилищ CPS/DPS")
         )
+        assertTrue("в логе видны конкретные appeared/absent", lines().contains("absent="))
     }
 
     @Test

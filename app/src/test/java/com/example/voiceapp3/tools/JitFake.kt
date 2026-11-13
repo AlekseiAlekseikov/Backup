@@ -196,10 +196,22 @@ object JitFake {
         /** Хранилища, которые «пропадают» после чтения прежних значений (проверка §2.5). */
         val vanishAfterRead = mutableSetOf<Int>()
 
+        /**
+         * §1.2 iter44: копия «заменена под тем же именем» — идентичность при записи отличается от
+         * прочитанной: имя то же, данные другой копии.
+         */
+        val replaceIdentityAfterRead = mutableSetOf<Int>()
+
+        /** §1.2 iter44: хранилище «появляется» только к моменту записи (при чтении недоступно). */
+        val appearAfterRead = mutableSetOf<Int>()
+
         override fun readSnapshotState(): List<JitRef.StorePrev> =
-            maps.mapIndexed { i, m ->
+            maps.mapIndexedNotNull { i, m ->
+                if (i in appearAfterRead) return@mapIndexedNotNull null
                 JitRef.StorePrev(
-                    name(i),
+                    name = name(i),
+                    identity = "mem$i@copy",
+                    keys =
                     listOf(JitRef.KEY_PEDIDO, JitRef.KEY_AUTO, JitRef.KEY_RESTORE, JitRef.KEY_MARK).map { k ->
                         if (i in readStateFails) JitRef.KeyPrev(k, null, null, null)
                         else JitRef.KeyPrev(k, m.containsKey(k), m[k] as? Boolean, m[k] as? String)
@@ -240,17 +252,23 @@ object JitFake {
             target: List<String>?
         ): JitRef.SnapshotWrite {
             val reports = mutableListOf<JitRef.StoreReport>()
+            // §1.2 iter44: копии, появившиеся к моменту записи (в `target` их нет).
+            val appeared = if (target == null) emptyList()
+            else appearAfterRead.map { name(it) }.filter { it !in target }
             for ((i, m) in maps.withIndex()) {
+                if (i in appearAfterRead) continue
                 if (target != null && name(i) !in target) continue
                 // iter42 §5(а): хранилище «исчезло» уже ПОСЛЕ чтения прежних значений
                 // (провайдер вернул null / хранилище недоступно) — в отчёте его нет.
                 if (i in vanishAfterRead) continue
                 if (i in throwOn) {
-                    reports += JitRef.StoreReport(name(i), "exception:IllegalStateException", false)
+                    reports += JitRef.StoreReport(
+                        name(i), "exception:IllegalStateException", false, null, "mem$i@copy"
+                    )
                     continue
                 }
                 if (i in commitFails && !writeDespiteFalse) {
-                    reports += JitRef.StoreReport(name(i), "false", false)
+                    reports += JitRef.StoreReport(name(i), "false", false, null, "mem$i@copy")
                     continue
                 }
                 m[JitRef.KEY_PEDIDO] = want
@@ -262,9 +280,12 @@ object JitFake {
                 val readback = m[JitRef.KEY_PEDIDO] == want && m[JitRef.KEY_AUTO] == want &&
                     m[JitRef.KEY_RESTORE] == snap.wire() && m[JitRef.KEY_MARK] == mark.wire()
                 val commit = if (i in commitFails) "false" else "ok"
-                reports += JitRef.StoreReport(name(i), commit, readback)
+                val id = if (i in replaceIdentityAfterRead) "mem$i@other" else "mem$i@copy"
+                reports += JitRef.StoreReport(name(i), commit, readback, null, id)
             }
-            return JitRef.SnapshotWrite(want, snap, reports)
+            val reported = reports.map { it.name }.toSet()
+            val absent = if (target == null) emptyList() else target.filter { it !in reported }
+            return JitRef.SnapshotWrite(want, snap, reports, appeared, absent)
         }
 
         override fun updateMark(mark: JitRef.OpMark): JitRef.WriteResult {

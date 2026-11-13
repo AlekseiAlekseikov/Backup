@@ -273,25 +273,22 @@ internal object LogBudget {
 
         @Synchronized
         fun droppedLines(): Long = dropped
+
     }
 
     /**
      * Бюджет диагностических блоков. Не зависит от [AppState]: строки диагностики не «съедают»
      * общий лимит и не подменяются его уведомлением.
      *
-     * §3.1 iter40: усечение считается ОТДЕЛЬНО ПО КАЖДОМУ БЛОКУ/СЕССИИ (`INTERNET_DIAG`,
-     * `JIT_MOUNT_DIAG`). Раньше один флаг на оба означал: если бюджет исчерпали монтирования
-     * (они идут первыми), отдельной `INTERNET_DIAG_TRUNCATED` не было и потеря сетевых строк была
-     * не видна.
-     *
-     * Гарантии и обещания:
-     *  • `*_BEGIN`, `*_END` и строка `*_TRUNCATED` для СВОЕГО блока пишутся всегда;
-     *  • строки `SECTION`/`DATA` ограничены — сохранять их при исчерпании бюджета НЕ обещаем,
-     *    и уведомление об этом больше не утверждает обратного;
-     *  • факт усечения по каждому блоку запрашивается отдельно ([truncated]) и используется
-     *    сборщиком в `END` (`written=full|truncated`), чтобы сводка отличала «прочитано» от
-     *    «записано в файл»;
-     *  • окно сбрасывается по времени, поэтому блоки не пропадают навсегда.
+     * **§2.1 iter44 — отбрасывания строк больше НЕТ.** Прежний `DiagState` при исчерпании
+     * `DIAG_BYTES`/`DIAG_LINES` ПЕРЕСТАВАЛ писать `SECTION`/`DATA`: физическая потеря данных
+     * диагностики, о которой лишь предупреждала строка `TRUNCATED`. Теперь:
+     *  • `decide()` всегда возвращает `write=true`;
+     *  • при выходе за прежние пороги один раз на блок за окно выдаётся ОТДЕЛЬНАЯ строка
+     *    `"<LABEL>_BUDGET_HIGH …"` — она не подменяет данные;
+     *  • объём ограничен файловым слоем ([LogFiles]: ротация целыми частями, лимит частей,
+     *    retention), то есть конечный объём вместо потери строк;
+     *  • `truncated()`/`truncatedFor()` всегда `false`, `droppedLines()` = 0.
      */
     class DiagState(
         private val bytes: Long = DIAG_BYTES,
@@ -301,10 +298,12 @@ internal object LogBudget {
         private var windowStart = 0L
         private var used = 0L
         private var dataLines = 0
+        /** §2.1 iter44: отброшенных строк нет — поле оставлено для совместимости отчётов. */
         private var dropped = 0L
-        /** Усечение по каждому блоку отдельно: `INTERNET_DIAG` / `JIT_MOUNT_DIAG`. */
+        /** Блоки, по которым в этом окне уже писалась строка `*_BUDGET_HIGH`. */
         private val announced = LinkedHashMap<String, Boolean>()
-        private val droppedPerBlock = LinkedHashMap<String, Long>()
+        /** Сколько раз за окно прежний ориентир блока был превышен (справочно). */
+        private val overCount = LinkedHashMap<String, Long>()
 
         @Synchronized
         fun decide(msg: String, lenBytes: Int, nowMs: Long): Verdict {
@@ -313,52 +312,49 @@ internal object LogBudget {
                 windowStart = nowMs
                 used = 0L
                 dataLines = 0
-                dropped = 0L
                 announced.clear()
-                droppedPerBlock.clear()
+                overCount.clear()
             }
             val label = diagLabel(msg)
-            // Начало и конец блока не теряются: без них блок в логе не читается.
-            if (isDiagAlways(msg)) return Verdict(true)
-            if (used + lenBytes > bytes || dataLines >= lines) {
-                dropped++
-                droppedPerBlock[label] = (droppedPerBlock[label] ?: 0L) + 1
-                if (announced[label] != true) {
-                    announced[label] = true
-                    return Verdict(
-                        false,
-                        label + "_TRUNCATED truncated=true dropped=" +
-                            (droppedPerBlock[label] ?: 1L) + " bytes=$used " +
-                            "limit_bytes=$bytes limit_lines=$lines block=$label " +
-                            "reason=diag_budget_exhausted " +
-                            "(дальнейшие строки ЭТОГО блока не пишутся: SECTION/DATA ограничены и " +
-                            "их сохранение не обещается; BEGIN/END и эта строка сохранены; " +
-                            "состояние канала/сети в сводке END помечено written=truncated; " +
-                            "общий бюджет приложения не отключался)"
-                    )
-                }
-                return Verdict(false)
-            }
             used += lenBytes
             dataLines++
+            if (used <= bytes && dataLines <= lines) return Verdict(true)
+            overCount[label] = (overCount[label] ?: 0L) + 1L
+            if (announced[label] != true) {
+                announced[label] = true
+                return Verdict(
+                    true,
+                    label + "_BUDGET_HIGH over_bytes=$used over_lines=$dataLines " +
+                        "soft_limit_bytes=$bytes soft_limit_lines=$lines block=$label " +
+                        "action=continue_writing dropped=0 " +
+                        "(прежний ориентир превышен; строки НЕ отбрасываются — объём ограничен " +
+                        "ротацией и retention файлового слоя, потери нет)"
+                )
+            }
             return Verdict(true)
         }
 
         @Synchronized
         fun usedBytes(): Long = used
 
+        /** §2.1 iter44: сколько строк отброшено — всегда 0 (строки не отбрасываются). */
         @Synchronized
         fun droppedLines(): Long = dropped
 
-        /** Общее «было ли хоть одно усечение в окне». */
+        /** §2.1 iter44: усечения больше НЕТ — оставлено для совместимости сборщиков. */
         @Synchronized
-        fun truncated(): Boolean = announced.values.any { it }
+        fun truncated(): Boolean = false
 
-        /** §3.1: усечение ИМЕННО этого блока (`INTERNET_DIAG` / `JIT_MOUNT_DIAG`). */
+        /** §2.1 iter44: усечения ИМЕННО этого блока нет (строки не отбрасываются). */
         @Synchronized
-        fun truncatedFor(label: String): Boolean = announced[label] == true
+        fun truncatedFor(label: String): Boolean = false
 
+        /** §2.1 iter44: сколько строк отброшено у блока — всегда 0. */
         @Synchronized
-        fun droppedFor(label: String): Long = droppedPerBlock[label] ?: 0L
+        fun droppedFor(label: String): Long = 0L
+
+        /** §2.1 iter44: сколько раз за окно прежний ориентир блока превышен (справочно). */
+        @Synchronized
+        fun overBudgetFor(label: String): Long = overCount[label] ?: 0L
     }
 }

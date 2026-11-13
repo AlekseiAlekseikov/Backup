@@ -165,7 +165,13 @@ object JitRef {
         val name: String,
         val commit: String,
         val readback: Boolean,
-        val error: String? = null
+        val error: String? = null,
+        /**
+         * §1.2 iter44: идентичность копии в момент записи (`имя@тождество`). Нужна, чтобы
+         * отличить «ту же копию» от «другой копии под тем же именем»: имя совпадает, данные —
+         * нет. `null` — идентичность недоступна (это тоже повод сказать об этом в логе).
+         */
+        val identity: String? = null
     ) {
         val committed: Boolean get() = commit == "ok"
         /** Запись надёжна по нашим данным: commit прошёл И значения читаются. */
@@ -214,6 +220,75 @@ object JitRef {
      * `svc wifi disable` в таком состоянии нельзя.
      */
     data class SnapshotRead(val value: String?, val conflicts: List<String>)
+
+    /**
+     * §1.2/§1.3 iter44 — ЧТО ИМЕННО МОЖНО ВОЗВРАЩАТЬ.
+     *
+     * Безусловный `restorePrevious` опасен: если между нашей записью и возвратом значение изменил
+     * кто-то другой (другая операция, плагин, ручная правка), «возврат прежнего» затрёт чужое.
+     * Поэтому план строится по ФАКТУ чтения пары «снимок + отметка» ([StoreOp]):
+     *  • [owned] — отметка принадлежит НАШЕЙ операции И снимок равен нашему значению;
+     *  • [foreign] — лежит ЧУЖАЯ отметка: не трогаем и «ни записи не было» не заявляем;
+     *  • [unknown] — опознать нельзя (ошибка чтения, нет отметки, снимок подменён).
+     */
+    data class RestorePlan(
+        val owned: List<StorePrev>,
+        val foreign: List<String>,
+        val unknown: List<String>
+    ) {
+        val complete: Boolean get() = foreign.isEmpty() && unknown.isEmpty()
+        fun brief(): String =
+            "owned=${owned.map { it.name }.ifEmpty { listOf("none") }} " +
+                "foreign=${foreign.ifEmpty { listOf("none") }} " +
+                "unknown=${unknown.ifEmpty { listOf("none") }}"
+    }
+
+    /** Построить план возврата. Без чтения ([ops] пуст) план пустой и `complete=false`. */
+    fun planRestore(
+        prev: List<StorePrev>,
+        ops: List<StoreOp>,
+        opId: String,
+        snap: WifiSnapshot
+    ): RestorePlan {
+        val owned = ArrayList<StorePrev>(prev.size)
+        val foreign = ArrayList<String>(2)
+        val unknown = ArrayList<String>(2)
+        for (p in prev) {
+            val o = ops.firstOrNull { it.name == p.name }
+            if (o == null || o.error != null) { unknown += p.name; continue }
+            val mark = OpMark.parse(o.mark)
+            if (mark == null) { unknown += p.name; continue }
+            if (mark.op != opId) { foreign += p.name; continue }
+            if (o.snapshot != snap.wire()) { unknown += p.name; continue }
+            owned += p
+        }
+        return RestorePlan(owned, foreign, unknown)
+    }
+
+    /**
+     * §1.2 iter44: копия под тем же именем, но ДРУГАЯ (доказанное расхождение идентичностей).
+     * Недоступную идентичность расхождением НЕ считаем — иначе клиент без такой возможности был
+     * бы заблокирован навсегда; но и молчать о ней нельзя ([identityUnprovable]).
+     */
+    fun identityChanged(prev: List<StorePrev>, write: SnapshotWrite): List<String> {
+        val out = ArrayList<String>(2)
+        for (p in prev) {
+            val w = write.stores.firstOrNull { it.name == p.name } ?: continue
+            if (p.identity == null || w.identity == null) continue
+            if (p.identity != w.identity) out += p.name
+        }
+        return out
+    }
+
+    /** §1.2 iter44: для каких хранилищ тождество копии ДОКАЗАТЬ нельзя. */
+    fun identityUnprovable(prev: List<StorePrev>, write: SnapshotWrite): List<String> {
+        val out = ArrayList<String>(2)
+        for (p in prev) {
+            val w = write.stores.firstOrNull { it.name == p.name } ?: continue
+            if (p.identity == null || w.identity == null) out += p.name
+        }
+        return out
+    }
 
     interface JitStore {
         fun getString(key: String): String?
@@ -370,7 +445,12 @@ object JitRef {
     }
 
     /** Прежнее состояние ключей операции в одном хранилище. */
-    data class StorePrev(val name: String, val keys: List<KeyPrev>) {
+    data class StorePrev(
+        val name: String,
+        val keys: List<KeyPrev>,
+        /** §1.2 iter44: идентичность копии, снятая при предварительном чтении. */
+        val identity: String? = null
+    ) {
         /** Все ключи прочитаны достоверно; иначе менять данные нельзя (§2.5). */
         val complete: Boolean get() = keys.all { it.known }
         fun has(key: String): Boolean = keys.any { it.key == key && it.present == true }
@@ -1085,7 +1165,18 @@ object JitRef {
                         note("DIAG_ORCH reason=$reason status=completed attempt=$attempts/$maxAttempts " +
                             "pending_cancelled=true")
                     }
-                    Outcome.PARTIAL, Outcome.CHANNEL_NOT_READY -> {
+                    /**
+                     * §4.2 iter44: `CHANNEL_NOT_READY` — это НЕ израсходованная попытка сбора:
+                     * сбора не было вовсе (канал не готов). Иначе при недоступном канале бюджет
+                     * выгорал холостыми заходами, и к моменту реальной готовности собирать было
+                     * уже нечем. Счётчик возвращается, исчерпание не объявляется.
+                     */
+                    Outcome.CHANNEL_NOT_READY -> {
+                        attempts = (attempts - 1).coerceAtLeast(0)
+                        note("DIAG_ORCH reason=$reason status=wait_channel " +
+                            "attempt=$attempts/$maxAttempts (попытка не израсходована: сбора не было)")
+                    }
+                    Outcome.PARTIAL -> {
                         if (attempts >= maxAttempts) {
                             exhausted = true
                             note("DIAG_ORCH reason=$reason status=exhausted " +
@@ -1108,7 +1199,8 @@ object JitRef {
                     }
                 }
             }
-            if (outcome != Outcome.COMPLETED && attempts < maxAttempts) {
+            if (outcome != Outcome.COMPLETED && outcome != Outcome.CHANNEL_NOT_READY &&
+                attempts < maxAttempts) {
                 val myGen = synchronized(lock) { generation }
                 post("JitNet.diagRetry", retryDelayMs) {
                     val go = synchronized(lock) {
@@ -1186,7 +1278,8 @@ object JitRef {
             var appliedResult: String = "unknown",
             var preStartedAt: Long? = null,
             var preFinishedAt: Long? = null,
-            var postScheduledAt: Long? = null
+            var postScheduledAt: Long? = null,
+            var postCollectedAt: Long? = null
         )
 
         private val lock = Any()
@@ -1200,19 +1293,41 @@ object JitRef {
             op
         }
 
-        fun preStarted(nowMs: Long) = synchronized(lock) { current?.preStartedAt = nowMs }
-        fun preFinished(nowMs: Long) = synchronized(lock) { current?.preFinishedAt = nowMs }
-        fun applied(nowMs: Long, result: String) = synchronized(lock) {
-            current?.appliedAt = nowMs; current?.appliedResult = result
+        /**
+         * §3.2 iter44: все отметки привязаны к КОНКРЕТНОЙ операции. При быстром ON/OFF поздний
+         * callback предыдущей операции не должен испортить следующую — проверяем `id` и
+         * игнорируем чужой op (возвращаем `false`, чтобы вызывающий мог это записать в лог).
+         */
+        fun preStarted(op: Op, nowMs: Long): Boolean = applyTo(op) { it.preStartedAt = nowMs }
+        fun preFinished(op: Op, nowMs: Long): Boolean = applyTo(op) { it.preFinishedAt = nowMs }
+        fun applied(op: Op, nowMs: Long, result: String): Boolean = applyTo(op) {
+            it.appliedAt = nowMs
+            it.appliedResult = result
         }
-        fun postScheduled(nowMs: Long) = synchronized(lock) { current?.postScheduledAt = nowMs }
+        fun postScheduled(op: Op, nowMs: Long): Boolean = applyTo(op) { it.postScheduledAt = nowMs }
+        fun postCollected(op: Op, nowMs: Long): Boolean = applyTo(op) { it.postCollectedAt = nowMs }
+
+        /** Применить изменение ТОЛЬКО к текущей операции с тем же id. */
+        private fun applyTo(op: Op, block: (Op) -> Unit): Boolean = synchronized(lock) {
+            val cur = current
+            if (cur == null || cur.id != op.id) return false
+            block(cur)
+            true
+        }
+
         fun currentOp(): Op? = synchronized(lock) { current }
 
         /**
-         * Метка фазы «до» — по ФАКТИЧЕСКИМ временам, а не по намерению.
+         * Метка фазы «до» — по ФАКТИЧЕСКИМ временам сбора, а не по времени заказа.
+         *
+         * §3.1 iter44: `pre_confirmed` НЕ выдаётся, пока сбор не завершён (`pre_unfinished`), и
+         * `appliedAt == null` при завершённом сборе означает именно «применение ещё не начиналось»,
+         * а не «мы уверены, что успели».
          */
         fun preLabel(op: Op): String {
-            val started = op.preStartedAt ?: return "pre_unknown"
+            val started = op.preStartedAt
+            if (started == null) return "pre_unknown"
+            if (op.preFinishedAt == null) return "pre_unfinished"
             val applied = op.appliedAt ?: return "pre_confirmed"
             return when {
                 started > applied -> "pre_late"
@@ -1221,8 +1336,18 @@ object JitRef {
             }
         }
 
-        fun postLabel(op: Op): String =
-            if (op.appliedAt == null) "post_without_confirmed_apply" else "post_after_apply"
+        /**
+         * Метка «после». §3.2 iter44: `post_after_apply` означает только «снимок сделан после
+         * применения», и НЕ выдаётся за успешное применение: результат применения виден отдельно
+         * (`applied_result`), а при неуспехе метка так и говорит.
+         */
+        fun postLabel(op: Op): String {
+            if (op.appliedAt == null) return "post_without_confirmed_apply"
+            return when (op.appliedResult) {
+                "ok" -> "post_after_apply"
+                else -> "post_after_apply_not_ok:" + op.appliedResult
+            }
+        }
 
         fun describe(op: Op, part: SnapPart, snapshotLabel: String): String = when (part) {
             SnapPart.PRE -> "op=${op.id} want=${op.want} phase=pre label=${preLabel(op)} " +
@@ -1499,7 +1624,22 @@ object JitOp {
             // прочитает продолжение. Теперь fail closed: набор обязан совпасть.
             val readNames = prev.map { it.name }.toSet()
             val writtenNames = write.stores.map { it.name }.toSet()
-            val storeSetChanged = readNames != writtenNames
+            // §1.2 iter44: `appeared`/`absent` — ПОЯВИВШАЯСЯ или ПРОПАВШАЯ копия. Раньше они лишь
+            // писались в лог, а решение строилось по именам `prev` и `write.stores`: появившаяся
+            // копия в `stores` не попадает (её прежнее состояние неизвестно), наборы «сходились»,
+            // и скрипт уходил. Теперь это блокирует.
+            val setDiff = readNames != writtenNames ||
+                write.appeared.isNotEmpty() || write.absent.isNotEmpty()
+            val idChanged = JitRef.identityChanged(prev, write)
+            val idUnprovable = JitRef.identityUnprovable(prev, write)
+            if (idUnprovable.isNotEmpty()) {
+                log(
+                    "JIT_CLICK want=$want op=$opId identity_unprovable=" +
+                        "${idUnprovable.joinToString(",")} (тождество копии доказать нельзя: " +
+                        "сравнение идентичностей недоступно)"
+                )
+            }
+            val storeSetChanged = setDiff || idChanged.isNotEmpty()
             val blocked = when {
                 storeSetChanged -> "store_set_changed"
                 write.attempted == 0 -> "snapshot_not_saved"
@@ -1512,9 +1652,12 @@ object JitOp {
             if (blocked != null) {
                 val why = when (blocked) {
                     "store_set_changed" ->
-                        "набор хранилищ CPS/DPS изменился между чтением прежних значений и записью " +
-                            "снимка (провайдер вернул null/хранилище стало недоступно): где снимок " +
-                            "прочитает продолжение — неизвестно, поэтому не отправляем (fail closed)"
+                        "состав/тождество хранилищ CPS/DPS изменились между чтением прежних " +
+                            "значений и записью снимка (appeared=" +
+                            "${write.appeared.ifEmpty { listOf("none") }}, absent=" +
+                            "${write.absent.ifEmpty { listOf("none") }}, identity_changed=" +
+                            "${idChanged.ifEmpty { listOf("none") }}): где снимок прочитает " +
+                            "продолжение — неизвестно, поэтому не отправляем (fail closed)"
                     "snapshot_not_saved" ->
                         "ни одно хранилище не подтвердило запись снимка чтением: продолжение " +
                             "прочитает прежнее состояние, значит отправлять нельзя"
@@ -1533,23 +1676,47 @@ object JitOp {
                             "порядку чтения — снимок неоднозначен, поэтому не отправляем)"
                     )
                 }
-                val rb = synchronized(INTENT_LOCK) {
-                    runCatching { store.restorePrevious(prev) }
-                        .getOrElse { t -> JitRef.WriteResult.none("exception:${t.javaClass.simpleName}") }
+                // §1.3 iter44: возврат ТОЛЬКО по доказанной принадлежности. Читаем пару
+                // «снимок + отметка» по каждому хранилищу и возвращаем прежние значения лишь там,
+                // где лежит НАША отметка И НАШ снимок. Чужое/нечитаемое не трогаем.
+                val ops = runCatching { store.readOperation() }.getOrDefault(emptyList())
+                val plan = JitRef.planRestore(prev, ops, opId, snap)
+                val rb = if (plan.owned.isEmpty()) {
+                    JitRef.WriteResult.none("nothing_proven_owned")
+                } else synchronized(INTENT_LOCK) {
+                    runCatching { store.restorePrevious(plan.owned) }
+                        .getOrElse { t -> JitRef.WriteResult.none("exception:" + t.javaClass.simpleName) }
                 }
                 val leftPedido = runCatching { store.contains(JitRef.KEY_PEDIDO) }.getOrDefault(false)
                 val leftRestore = runCatching { store.getString(JitRef.KEY_RESTORE) }.getOrNull()
+                // §1.3 iter44: если запись БЫЛА, писать «ни записи» нельзя — показываем факт.
+                // Запись считается состоявшейся, если её подтвердил commit/readback ИЛИ если
+                // значение реально читается из хранилища (left_pedido) — именно так выглядит
+                // `commit=false` при `writeDespiteFalse`: данные есть, гарантии записи нет.
+                // Запись считается состоявшейся, если её подтвердил commit/readback ИЛИ если
+                // ПОСЛЕ записи (до возврата) значение читалось как наше: именно так выглядит
+                // `commit=false` при фактической записи — данные есть, гарантии записи нет.
+                // Смотреть `left_pedido` ПОСЛЕ возврата нельзя: он уже снят возвратом.
+                val wroteAny = write.confirmed > 0 || write.committed > 0 ||
+                    read.value == snap.wire()
                 log(
                     "JIT_CLICK want=$want op=$opId blocked=$blocked confirmed=${write.confirmed} " +
                         "committed=${write.committed} read=${read.value ?: "none"} " +
-                        "prev_restore=${rb.ok}/${rb.attempted} prev_restore_detail=${rb.detail} " +
+                        "wrote_any=$wroteAny prev_restore=${rb.ok}/${rb.attempted} " +
+                        "restore_plan=«${plan.brief()}» prev_restore_detail=«${rb.detail}» " +
                         "left_pedido=$leftPedido left_restore=${leftRestore ?: "none"} " +
                         "action=none commands=0 " +
-                        "(ни записи, ни shell: $why. Сеть и системные свойства НЕ менялись; " +
-                        "commit=false сам по себе не " +
-                        "доказывает отсутствия значения в памяти. Прежние значения восстановлены " +
-                        "там, где хранилище приняло запись; если восстановление не прошло — это " +
-                        "видно здесь и в left_*, и клик остаётся заблокированным)"
+                        "(shell НЕ отправлен: $why. Сеть и системные свойства НЕ менялись. " +
+                        (if (wroteAny)
+                            "Настройки операции БЫЛИ записаны и возвращаются только там, где " +
+                                "принадлежность доказана — это не «ни записи», см. prev_restore=/left_*. "
+                         else
+                            "Ни одно хранилище не подтвердило запись настроек операции. ") +
+                        (if (!plan.complete)
+                            "ЧАСТИЧНЫЙ ВОЗВРАТ: «${plan.brief()}» не тронуты, и «прежние значения " +
+                                "восстановлены» не заявляется. "
+                         else "") +
+                        "commit=false сам по себе не доказывает отсутствия значения в памяти)"
                 )
                 return Click(want, snap, write, read, -1, "", blocked, previousUndefined)
             }
