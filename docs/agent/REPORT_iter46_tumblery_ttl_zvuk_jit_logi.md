@@ -1,8 +1,8 @@
 # iter46 — тумблеры, TTL, звук замка, JIT, журналы: причина и исправление
 
-**Ветка:** `fix/v2` · **коммит с кодом:** `3189577` (первый срез кода — `c818ffe`) · **handoff-коммит (`SOURCE_SHA`):** `3d2cf85`
-**Версия:** `versionCode=63` / `versionName=1.0.63` · **`SOURCE_SHA`** = `3189577` (в `app/buildinfo.properties`, `git rev-parse` в сборке не используется)
-**CI:** run `43473000159` по `3d2cf85` (содержит весь код iter46), предыдущий — `43472404451` по `0efe649`; статус в §12.3.
+**Ветка:** `fix/v2` · **коммит с кодом:** `fd0529e` (срезы: `c818ffe` → `3189577` → `fd0529e`) · **handoff-коммит (`SOURCE_SHA`):** `c56e4eb`
+**Версия:** `versionCode=63` / `versionName=1.0.63` · **`SOURCE_SHA`** = `fd0529e` (в `app/buildinfo.properties`, `git rev-parse` в сборке не используется)
+**CI:** run `43476301200` по `fd0529e` — **success** (полная компиляция Kotlin + debug APK). Предыдущий run `43473746255` — failure (моя ошибка скобки/экранирования в `ToolsBackend.kt`, исправлена в `fd0529e`).
 **Локально:** `bash runtests.sh` → **`OK (415 tests)`** (было 391 на базе `2893d5b`, +24 теста этой итерации).
 **База:** `2893d5b` (= HEAD `fix/v2` до этой итерации).
 
@@ -186,7 +186,7 @@
 - ⛔ «звучит в салоне» и «JIT скомпилировал» — только владелец на машине
 
 ### 12.2 Ветка/SHA/файлы/версия
-- ветка `fix/v2`, код `3189577`, handoff `3d2cf85`, `SOURCE_SHA=3189577`, `versionCode=63`/`1.0.63`.
+- ветка `fix/v2`, код `fd0529e`, handoff `c56e4eb`, `SOURCE_SHA=fd0529e`, `versionCode=63`/`1.0.63`.
 - новые: `tools/TtlReconcile.kt`, `tools/FileLogCore.kt`, `app/src/test/.../Iter46Test.kt`.
 - изменены: `ui/UiBridge.kt`, `ui/ToolsPanel.kt`, `tools/{ToolsBackend,Prefs2,Toggles45,NetworkTtl,LockSound,JitNetCore,LogFiles,AppFileLogger,WindowDoors}.kt` + 5 тестовых файлов.
 
@@ -195,7 +195,13 @@
 bash runtests.sh                     # JVM-стенд (kotlinc 1.9.24 + junit, Android-стабы)
 → OK (415 tests)                     # база 2893d5b: OK (391 tests)
 ```
-Реальные команды стенда: `java -Xmx1400m -cp toolchains/kotlinc/lib/kotlin-compiler.jar org.jetbrains.kotlin.cli.jvm.K2JVMCompiler …` (out `/home/user/kcout/out`, tmp `/home/user/tmp/jvm`). Полный Gradle в песочнице невозможен (~2 ГБ RAM, OOM) — **сборка APK и её успех не заявляются**.
+Реальные команды стенда: `java -Xmx1400m -cp toolchains/kotlinc/lib/kotlin-compiler.jar org.jetbrains.kotlin.cli.jvm.K2JVMCompiler …` (out `/home/user/kcout/out`, tmp `/home/user/tmp/jvm`). Полный Gradle в песочнице невозможен (~2 ГБ RAM, OOM) — **локальную сборку APK не заявляю**.
+CI (GitHub Actions, `Build APK`) на `fd0529e`: **success** (`43476301200`) — это компиляция всего
+проекта и debug-сборка; workflow не содержит `testDebugUnitTest`, поэтому **success сборки ≠ прогон тестов**:
+тесты — это `runtests.sh` (415 OK) локально.
+Что поймал CI, а локальный стенд нет: в `ToolsBackend.kt` незакрытый `apply` и `"$rev"` как
+интерполяция (run `43473746255` = failure). Исправлено в `fd0529e`, повторный run — success.
+Это ровно тот случай, о котором предупреждает мандат: JVM-стенд компилирует не все файлы.
 
 ### 12.4 Что показала 1.0.62 и что реально проверено в 1.0.63
 - 1.0.62 (владелец): интернет и CarPlay после JIT работали; TTL «по впечатлению» держался; AVAS вернулся, но в салоне не звучал.
