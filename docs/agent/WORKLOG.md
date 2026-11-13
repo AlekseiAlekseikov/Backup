@@ -1521,3 +1521,43 @@ CI `43464916714` (`15dd3b2`) — success (сборка; unit-тестов в wor
   в BgWorker.
 * **§10:** `AppFileLogger` пишет под файловым локом + fsync; хвост `0x00` (3296 байт в legacy-файле)
   детектируется строкой `LOG_TAIL_NUL_DETECTED`, файл не переписывается.
+
+## iter46 — 2026-11-13 (коммиты `c818ffe` … `3d2cf85`)
+
+Задача: довести до рабочего состояния тумблеры (§4), TTL (§5), звук замка (§6), JIT (§7.2),
+журналы (§8) и §9, не выдавая JVM-тесты за проверку на ГУ.
+
+### Причины (по коду и логу 13.11, заново лог не разбирался)
+- §4.1: `tools.state` слался только из обработчиков клика → холодное открытие подставляло `def`
+  (17 из 19 тумблеров = false); `seq` выдавался ПОСЛЕ формирования снимка → старый ответ получал
+  больший номер.
+- §4.2: `Prefs2.getBoolean = cps || dps` → старое `true` перебивало новый OFF
+  (`master_remember_brightness=reg:true/dps:false`).
+- §5: намерение писалось после отказов; debounce/in-flight теряли клик; `applied` прошлого сеанса
+  выдавался за текущий.
+- §6: `bindDisabledUntilBoot` без сброса + `ERR_ROOT_CHANNEL_UNAVAILABLE` как «детерминированный»
+  → звук не работал до ребута (лог `:5549`).
+- §8: `AppFileLogger.kt:117–132` ротация ДО лока, ошибки глотались, `fsync` не было; init-строка
+  писалась до проверки NUL. В хвосте файла — 3296 Б `0x00` на границе смерти процесса.
+
+### Сделано
+- `ui/UiBridge.kt` — номер снимка в момент запроса, доставка только через CAS
+  `markToolsStateDelivered`, отказ → `TOOLS_STATE_STALE`.
+- `tools/ToolsBackend.kt` — `revision()`, `$keys`/`$rev` в снимке (вместо зашитой константы 19).
+- `tools/Prefs2.kt` + `tools/Toggles45.kt` — ревизии `<key>#rev`, побеждает последняя запись,
+  миграция без потери настроек; `pickBoolean`/`pickString`.
+- `tools/TtlReconcile.kt` (новый) — «последнее намерение», добивание ≤3, `networkDirty`.
+- `tools/NetworkTtl.kt` — намерение первым, `applyForIntent`, boot-scoped факт, одноразовый recheck.
+- `tools/LockSound.kt` — `bindGen`, backoff 5/10/20/40 с, отмена по поколению, root-ошибки временные.
+- `tools/JitNetCore.kt` — `restoreMayEnableWifi`: поздний независимый старт НЕ включает Wi-Fi.
+- `tools/LogFiles.kt` — жертвы по возрасту, защита активной части дня, отказы delete/lock видны.
+- `tools/FileLogCore.kt` (новый) + `tools/AppFileLogger.kt` — лок+ротация+запись одной операцией,
+  NUL до записи, `LOG_WRITE_FAILED` вместо тишины.
+- `tools/WindowDoors.kt` — `VENT_CLOSE_UNCONFIRMED` + один поздний readback (не цикл).
+- Тесты: `Iter46Test` (16 методов) + правки существующих (реальные отметки времени вместо `ts=0`).
+
+### Проверено / не проверено
+- `bash runtests.sh` → **OK (415 tests)** (база `2893d5b`: 391).
+- CI на точном коммите — см. `REPORT_iter46_*` §12.3.
+- **1.0.63 на машине НЕ проверялась.** Слышимость звука, TTL на живой сети, JIT-компиляция,
+  `umount`/namespace — за владельцем; перезагрузка ГУ как лечение по-прежнему запрещена.
