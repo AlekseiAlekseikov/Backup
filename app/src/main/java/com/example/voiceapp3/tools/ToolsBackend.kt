@@ -168,7 +168,12 @@ enum class Choice(
         addProperty("hvacTemp", StatusIcons.getHvacDigital(appContext, StatusIcons.PREF_HVAC_TEMP))
         addProperty("hvacExtTemp", StatusIcons.getHvacDigital(appContext, StatusIcons.PREF_HVAC_EXT_TEMP))
         /* Срез №4: Звуки замка (открытие и закрытие) (§7 ТЗ) */
+        /* §6 iter45: `lockSound` — намерение владельца («звук включён, файл выбран»).
+           `lockSoundApplied` = applied|pending|off — факт монтирования/готовности файла.
+           Временный отказ root/копирования больше НЕ выключает намерение. */
         addProperty("lockSound", LockSound.isEnabled(appContext))
+        addProperty("lockSoundApplied", LockSound.appliedState(appContext))
+        addProperty("lockSoundPendingReason", LockSound.pendingReason(appContext))
         addProperty("lockSoundPath", LockSound.getSelectedPath(appContext))
         addProperty("lockSoundName", LockSound.getDisplayName(appContext))
         addProperty("lockSoundVol", LockSound.getVolume(appContext))
@@ -181,7 +186,12 @@ enum class Choice(
         add("availableSounds", soundsArray)
         addProperty("windowDriverOnDoor", WindowDoors.isWindowDriverOnDoor(appContext))
         addProperty("windowOppositeOnDoor", WindowDoors.isWindowOppositeOnDoor(appContext))
+        /* §5 iter45: `ttl65` — СОХРАНЁННОЕ НАМЕРЕНИЕ владельца (его и показывает тумблер).
+           Фактическое применение read-only: `applied` (правило подтверждено), `pending`
+           (намерение ON, но сейчас нет uplink/root — повтор по сетевому событию), `off`. */
         addProperty("ttl65", NetworkTtl.isTtl65Active(appContext))
+        addProperty("ttl65Applied", NetworkTtl.appliedState(appContext))
+        addProperty("ttl65PendingReason", NetworkTtl.pendingReason(appContext))
         addProperty("perfVideo", AppPerformance.isVideo60FpsEnabled(appContext))
         /* iter33p-review2 §0.1(3): `perfJit` — это ЗАПРОШЕННОЕ состояние (preference тумблера),
            а не подтверждение применения. Факт читается отдельно и честно: on / off / unknown. */

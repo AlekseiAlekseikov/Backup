@@ -46,6 +46,31 @@ object LockSound {
 
     const val OEM_CARLOCK_DEFAULT_WAV = "/vendor/etc/carlock/xingguangshanyao.wav"
 
+    /**
+     * §6 iter45: ФАКТ применения кастомного звука — отдельно от намерения владельца.
+     *   `applied` — файл на месте и собственный bind подтверждён;
+     *   `pending` — намерение ON, файл выбран, но применить сейчас нельзя
+     *               (нет root-канала, временно недоступен каталог, идёт копирование);
+     *   `off`     — владелец выключил/сбросил к заводскому.
+     */
+    const val PREF_LOCK_SOUND_APPLIED = "lock_sound_applied"
+    const val PREF_LOCK_SOUND_PENDING_REASON = "lock_sound_pending_reason"
+
+    fun appliedState(ctx: Context): String =
+        Prefs2.getString(ctx, PREF_LOCK_SOUND_APPLIED, if (isEnabled(ctx)) "pending" else "off")
+            ?: (if (isEnabled(ctx)) "pending" else "off")
+
+    fun pendingReason(ctx: Context): String =
+        Prefs2.getString(ctx, PREF_LOCK_SOUND_PENDING_REASON, "") ?: ""
+
+    private fun markApplied(ctx: Context, applied: Boolean, reason: String) {
+        Prefs2.putString(ctx, PREF_LOCK_SOUND_APPLIED,
+            Toggles45.appliedOutcome(isEnabled(ctx), applied))
+        Prefs2.putString(ctx, PREF_LOCK_SOUND_PENDING_REASON, if (applied) "" else reason)
+        AppLog.i(ctx, TAG, "LOCK_SOUND_STATE desired=${isEnabled(ctx)} applied=${appliedState(ctx)} " +
+            "reason=«${pendingReason(ctx)}» (намерение владельца автоматикой не меняется)")
+    }
+
     const val DEFAULT_VOLUME = 80
     const val DEFAULT_DELAY_MS = 0
     val DELAY_CHOICES = setOf("0", "150", "300")
@@ -151,6 +176,9 @@ object LockSound {
         // iter17: prefs via Prefs2
 
         Prefs2.putBoolean(ctx, PREF_LOCK_SOUND_ENABLED, enabled)
+        if (enabled) Prefs2.putString(ctx, PREF_LOCK_SOUND_APPLIED, "pending")
+        else Prefs2.putString(ctx, PREF_LOCK_SOUND_APPLIED, "off")
+        AppLog.i(ctx, TAG, "LOCK_SOUND_INTENT desired=$enabled source=user_click")
         val prefReadback = Prefs2.getBoolean(ctx, PREF_LOCK_SOUND_ENABLED, false)
         steps += ToolsStep(
             step = "persist_pref",
@@ -367,7 +395,12 @@ object LockSound {
         val summary = if (copiedCount > 0) {
             "Скопировано звуков: $copiedCount"
         } else {
-            restoreSystemLockSoundBind(ctx)
+            // §6 iter45: НЕ снимаем собственный bind, пока владелец не выключил функцию.
+            // Раньше неудачный поиск на USB («накопитель не найден») снимал уже работающий
+            // кастомный звук — при сохранённом намерении ON это выглядело как «звук отключился».
+            if (!isEnabled(ctx)) restoreSystemLockSoundBind(ctx)
+            else AppLog.i(ctx, TAG, "copyFromUsb: ничего не найдено, намерение ON — " +
+                "существующий кастомный звук НЕ снимаем (applied=${appliedState(ctx)})")
             "USB-накопитель не найден или на нём нет аудиофайлов (WAV/MP3/OGG)"
         }
 
@@ -916,6 +949,7 @@ object LockSound {
                         .filter { isOurLockPath(it) }
                         .toList()
                     writeOurMounts(ctx, mounted)
+                    markApplied(ctx, true, "")
                     AppLog.i(ctx, TAG, "VERIFY lockSound: SUCCESS (MOUNTED_OK_COUNT present) " +
                         "paths=${mounted.joinToString(",")} (звук применится сразу либо после перезагрузки ГУ)")
                 } else {
@@ -946,14 +980,15 @@ object LockSound {
                 return
             }
         }
-        // Детерминированная ошибка или кончились повторы — отключаем тумблер,
-        // пишем причину и больше не пытаемся до ребута.
+        // §6 iter45: РАНЬШЕ здесь писалось `PREF_LOCK_SOUND_ENABLED = false` — то есть ошибка
+        // монтирования ВЫКЛЮЧАЛА выбор владельца, и после обновления/стоянки звук «сам»
+        // отключался. Теперь намерение и выбранный файл сохраняются, а факт честно `pending`
+        // с причиной; штурмовать систему каждые 60 с по-прежнему нельзя — до следующего
+        // подходящего события (boot/включение функции/смена файла) попыток нет.
         bindDisabledUntilBoot = true
-        AppLog.e(ctx, TAG, "lockSound отключён до следующей загрузки: $reason")
-        try {
-            Prefs2.putBoolean(ctx, PREF_LOCK_SOUND_ENABLED, false)
-        } catch (_: Throwable) {}
-        // TODO: показать нотификацию/Toast пользователю с причиной (след. итерация)
+        markApplied(ctx, false, reason)
+        AppLog.e(ctx, TAG, "lockSound остаётся включённым у владельца, применение=pending: $reason " +
+            "(повтор — при следующем подходящем событии, без автоматического штурма)")
     }
 
     /**

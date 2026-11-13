@@ -52,6 +52,16 @@ object AppFileLogger {
             Log.w(TAG, "mirror init failed", t)
         }
         i("LOGGER", "=== Logger init, primary=${primaryFile?.absolutePath} mirror=${mirrorFile?.absolutePath} ===")
+        // §10 iter45: честно сообщаем о повреждённом хвосте, а не молча дописываем за ним.
+        // Файл НЕ переписываем и НЕ обрезаем: это данные владельца (доказательство дефекта).
+        listOfNotNull(primaryFile, mirrorFile).forEach { f ->
+            val nul = tailNulBytes(f)
+            if (nul > 0) {
+                i("LOGGER", "LOG_TAIL_NUL_DETECTED file=«${f.absolutePath}» bytes=$nul " +
+                    "action=append_after (не обрезаем: старые записи не переписываются, " +
+                    "новые строки пишутся с лока и с fsync)")
+            }
+        }
     }
 
     @JvmStatic
@@ -59,6 +69,35 @@ object AppFileLogger {
 
     @JvmStatic
     fun allFiles(): List<File> = listOfNotNull(primaryFile, mirrorFile)
+
+    /**
+     * §10 iter45 — межпроцессный лок на запись.
+     *
+     * Раньше каждый процесс открывал `FileWriter(f, true)`, ротация делала
+     * `renameTo(.1)` + `createNewFile()`, и `fsync` не вызывался вообще. В логе владельца
+     * 13.11 в ХВОСТЕ этого файла найден блок из 3296 байт `0x00` ровно на границе смерти
+     * процесса (последняя строка 08:05:56.398, следующий старт 08:06:17 после рестарта
+     * framework). Такой «дырчатый» хвост даёт запись по смещению без лока (второй писатель
+     * укорачивает/пересоздаёт файл, первый продолжает писать со своего offset) и отсутствие
+     * fsync на FUSE-хранилище `/storage/emulated`. Утверждать единственную причину нельзя —
+     * воспроизведения нет; ниже убраны оба механизма, а повреждение честно детектируется.
+     */
+    private val ioLock = Any()
+
+    /** Сколько `0x00` подряд в самом хвосте файла (0 — хвост чистый). */
+    internal fun tailNulBytes(f: File): Int {
+        return runCatching {
+            java.io.RandomAccessFile(f, "r").use { raf ->
+                val len = raf.length()
+                if (len <= 0) return 0
+                val probe = kotlin.math.min(len, 64 * 1024L).toInt()
+                val buf = ByteArray(probe)
+                raf.seek(len - probe)
+                raf.readFully(buf)
+                Toggles45.trailingNulBytes(buf)
+            }
+        }.getOrDefault(0)
+    }
 
     private fun rotateIfNeeded(f: File) {
         try {
@@ -70,11 +109,28 @@ object AppFileLogger {
         } catch (_: Throwable) {}
     }
 
+    /**
+     * Запись под файловым локом + fsync. `RandomAccessFile` открывается заново на каждую
+     * строку (как и прежний `FileWriter`), но смещение берётся под локом, поэтому «дыры»
+     * из-за конкурирующего писателя не появляются.
+     */
     private fun writeTo(f: File, line: String) {
-        try {
-            rotateIfNeeded(f)
-            FileWriter(f, true).use { it.append(line) }
-        } catch (_: Throwable) {}
+        synchronized(ioLock) {
+            try {
+                rotateIfNeeded(f)
+                java.io.RandomAccessFile(f, "rw").use { raf ->
+                    val ch = raf.channel
+                    val lock = runCatching { ch.lock() }.getOrNull()
+                    try {
+                        raf.seek(raf.length())
+                        raf.write(line.toByteArray(Charsets.UTF_8))
+                        raf.fd.sync()
+                    } finally {
+                        runCatching { lock?.release() }
+                    }
+                }
+            } catch (_: Throwable) {}
+        }
     }
 
     private fun write(level: String, tag: String, msg: String) {

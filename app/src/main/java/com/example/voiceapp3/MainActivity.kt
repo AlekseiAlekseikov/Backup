@@ -179,9 +179,12 @@ class MainActivity : AppCompatActivity() {
         }
         // Нативная вкладка «Инструменты», этап 5a (ui/ToolsPanel.kt): настройки уходят
         // в тот же мост, снимок tools.state приходит из UiBridge.pushToolsState.
-        bridge.toolsPanel = com.example.voiceapp3.ui.ToolsPanel(this) { name, json ->
+        // §4 iter45: панель сама просит свежий снимок при показе — иначе холодное открытие
+        // рисовало значения по умолчанию (тумблеры выглядели выключенными, хотя функции работали).
+        bridge.toolsPanel = com.example.voiceapp3.ui.ToolsPanel(this, { name, json ->
             bridge.onEvent(name, json)
-        }
+        }, { reason -> bridge.requestToolsState(reason) })
+        bridge.requestToolsState("startup")
         // Stage CPv2: рендер-мост строится сразу после UiBridge (аналог
         // configureFlutterEngine в capy), статусы уходят в WebView пушами
         // carplay.status / android_auto.status.
@@ -351,6 +354,9 @@ class MainActivity : AppCompatActivity() {
         // Stage B5: живой поток телеметрии возвращается вместе с приложением,
         // если вкладка телеметрии была открыта.
         bridge.onAppResumed()
+        // §4 iter45: после сна/возврата из фона/обновления APK показываем СОХРАНЁННОЕ состояние,
+        // а не то, что осталось в памяти панели (процесс мог быть перезапущен).
+        bridge.requestToolsState("resume")
         // CarPlay/AA, как onActivityResumed в мосте capy: рёбра подключения,
         // ушедшие пока приложение было в фоне, до нас не дошли — перечитываем
         // геттеры обоих стеков.

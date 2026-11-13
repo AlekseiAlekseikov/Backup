@@ -37,7 +37,52 @@ object NetworkTtl {
     // вызывается на каждом onStartCommand и в логе дубли "network receiver registered" x6.
     @Volatile private var networkReceiver: BroadcastReceiver? = null
 
+    /** §5 iter45: СОХРАНЁННОЕ НАМЕРЕНИЕ владельца. Только пользователь меняет его. */
     const val PREF_TTL_65_ACTIVE = "ttl_65_ativo"
+
+    /**
+     * §5 iter45: ФАКТИЧЕСКОЕ применение правил — отдельно от намерения.
+     *
+     * Раньше одно и то же значение означало и «владелец хочет», и «правило стоит»: при
+     * `no_uplink`, отсутствии root, ошибке iptables код писал `ttl_65_ativo=false`, и тумблер
+     * сам выключался. Владелец видел «TTL постоянно отключается». Теперь:
+     *   `applied` — правило подтверждено VERIFY;
+     *   `pending` — намерение ON, применения ЕЩЁ НЕТ (сеть/root/канал недоступны) — повтор
+     *               произойдёт по сетевому событию, ограниченно и идемпотентно;
+     *   `off`     — правил нет (выключено владельцем или подтверждённо снято).
+     */
+    const val PREF_TTL_65_APPLIED = "ttl_65_applied"
+    /** Причина `pending` — для подписи в интерфейсе (не для изменения намерения). */
+    const val PREF_TTL_65_PENDING_REASON = "ttl_65_pending_reason"
+    /** Время последней подтверждённой попытки применения (wall clock, мс). */
+    const val PREF_TTL_65_APPLIED_AT = "ttl_65_applied_at"
+
+    /**
+     * §5 iter45: поколение намерения. Пользовательский клик увеличивает его; результат старой
+     * попытки, посчитанный до клика, не имеет права ни включить, ни выключить правило.
+     */
+    private val intentGen = java.util.concurrent.atomic.AtomicLong(0)
+
+    /** Желание владельца (не меняется автоматикой). */
+    fun desired(context: Context): Boolean = isTtl65Active(context)
+
+    /** Подтверждено ли применение (`pending` ≠ выключено). */
+    fun appliedState(context: Context): String =
+        getPrefs(context).getString(PREF_TTL_65_APPLIED, if (isTtl65Active(context)) "pending" else "off")
+            ?: "off"
+
+    fun pendingReason(context: Context): String =
+        getPrefs(context).getString(PREF_TTL_65_PENDING_REASON, "") ?: ""
+
+    private fun markApplied(context: Context, applied: Boolean, reason: String) {
+        // §5 iter45: решение «applied|pending|off» — в чистых правилах Toggles45 (покрыты тестами).
+        Prefs2.putString(context, PREF_TTL_65_APPLIED,
+            Toggles45.appliedOutcome(isTtl65Active(context), applied))
+        Prefs2.putString(context, PREF_TTL_65_PENDING_REASON, if (applied) "" else reason)
+        if (applied) Prefs2.putLong(context, PREF_TTL_65_APPLIED_AT, System.currentTimeMillis())
+        AppLog.i(TAG, "TTL_STATE desired=${desired(context)} applied=${appliedState(context)} " +
+            "reason=«${pendingReason(context)}» (намерение владельца не меняется автоматикой)")
+    }
 
     private const val IPT  = "iptables"
     private const val IPT6 = "ip6tables"
@@ -202,9 +247,14 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
             }
             ttlInFlight = true
         }
+        // §5 iter45: поколение этой попытки берётся ПОСЛЕ отметки нового клика.
+        val myGen = intentGen.incrementAndGet()
         try {
             ttlLastRunAtMs = SystemClock.uptimeMillis()
+            // §5 iter45: TTL-настройка — это ЗАПРОС владельца; применяем и отдельно фиксируем факт.
             Prefs2.putBoolean(context, PREF_TTL_65_ACTIVE, enabled)
+            if (!enabled) Prefs2.putString(context, PREF_TTL_65_APPLIED, "pending")
+            AppLog.i(TAG, "TTL_INTENT desired=$enabled source=user_click gen=$myGen")
 
             val script = buildScript(enabled)
             // iter33o §2.2: первый клик 09.11 «съело» тем, что Wi-Fi ещё подключался
@@ -238,10 +288,16 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
         output.lineSequence().firstOrNull { it.startsWith("TTL_ADD") }?.let { AppLog.i(TAG, it.trim()) }
         val (status, reason) = parseVerifyResult(enabled, output)
 
-        // P8: toggle back OFF if failed and we were trying to turn ON (PARTIAL/BLOCKED оставляем как есть — пользователь должен видеть не-идеал)
-        if (enabled && status == ToolsStep.Status.FAILED) {
-            AppLog.w(TAG, "TTL: toggle FAILED ($reason) — turning pref OFF to reflect reality")
-            Prefs2.putBoolean(context, PREF_TTL_65_ACTIVE, false)
+        // §5 iter45: РАНЬШЕ здесь стояло `putBoolean(PREF_TTL_65_ACTIVE, false)` — один неудачный
+        // скрипт (нет uplink, нет root, занят xtables) ВЫКЛЮЧАЛ тумблер владельца. Именно это он и
+        // видел как «TTL постоянно отключается». Теперь намерение остаётся, а честно пишется факт
+        // `pending` с причиной; повтор — по сетевому событию (ограниченно, идемпотентно).
+        val applied = status == ToolsStep.Status.OK
+        if (myGen == intentGen.get()) {
+            markApplied(context, applied, reason.ifEmpty { status.wire })
+        } else {
+            AppLog.i(TAG, "TTL_STATE stale_result ignored reason=intent_changed " +
+                "gen=$myGen now=${intentGen.get()} (клик владельца был позже результата)")
         }
         if (status == ToolsStep.Status.BLOCKED) {
             AppLog.w(TAG, "TTL: toggle BLOCKED ($reason). rootChannel state=${AdbClient.currentState()} port=${AdbClient.currentPort()}")
@@ -436,9 +492,15 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
                             rcvCtx, "ttl_network_change", NetInfoAndroid(rcvCtx)
                         )
                     }
-                    if (status == ToolsStep.Status.FAILED) {
-                        AppLog.w(TAG, "TTL networkChange: failed to re-apply — turning toggle off")
-                        Prefs2.putBoolean(rcvCtx, PREF_TTL_65_ACTIVE, false)
+                    // §5 iter45: сетевое событие больше НЕ выключает намерение владельца.
+                    // Нет интернета/раздачи в этот момент — это доступность, а не желание.
+                    if (status == ToolsStep.Status.OK) {
+                        markApplied(rcvCtx, true, "")
+                    } else {
+                        markApplied(rcvCtx, false, reason.ifEmpty { "network_change_failed" })
+                        AppLog.i(TAG, "TTL_PENDING reason=«${reason.ifEmpty { "network_change_failed" }}» " +
+                            "desired=true applied=pending action=wait_network " +
+                            "(тумблер остаётся включённым; повтор — по следующему сетевому событию)")
                     }
                 }
             }

@@ -64,7 +64,11 @@ class JitUiStateTest {
         assertFalse("программное обновление не пишет настройку", fn.contains("addProperty(key"))
         assertFalse(fn.contains("send(\"settings.change\""))
         // Положение при построении — из подтверждённого факта.
-        assertTrue(panel.contains("JitRef.switchPosition(jitConfirmed ?: \"unknown\", boolState(key) ?: def)"))
+        // §4 iter45: значение берётся один раз в `raw` — и `null` («не прочитано») больше
+        // НЕ выдаётся за OFF (в заголовке появляется «состояние ещё не прочитано»).
+        assertTrue(panel.contains("JitRef.switchPosition(jitConfirmed ?: \"unknown\", raw ?: def)"))
+        assertTrue(panel.contains("val raw = boolState(key)"))
+        assertTrue(panel.contains("состояние ещё не прочитано"))
         assertTrue("подпись про неизвестное состояние есть",
             panel.contains("состояние неизвестно"))
     }

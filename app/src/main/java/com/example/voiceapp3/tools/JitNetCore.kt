@@ -1420,6 +1420,33 @@ object JitOp {
     private val CHAIN_UNDEFINED = java.util.concurrent.atomic.AtomicBoolean(false)
 
     /**
+     * §7.2 iter45: ГРАНИЦА ЖИЗНИ незавершённой операции.
+     *
+     * Проблема из лога 13.11: отметка `undefined` (её нормальный исход — наш процесс умирает
+     * вместе с `ctl.restart zygote`, ответа физически быть не может) оставалась на диске
+     * навсегда, и ВСЕ последующие клики блокировались (`blocked=chain_undefined`), а старый
+     * снимок Wi-Fi участвовал в поздних запусках.
+     *
+     * 15 минут — обоснованная граница: дольше команда `setprop ctl.restart zygote` в очереди
+     * транспорта не живёт (таймаут одной команды 8–40 с, максимум три попытки), и за это время
+     * владелец успевает сам изменить Wi-Fi, поэтому «восстанавливать» старый снимок уже нельзя.
+     * По истечении окна операция считается завершённой БЕЗ восстановления сети: блокировка
+     * снимается только для НОВОГО пользовательского клика, автоматических рестартов нет.
+     */
+    private const val STALE_MARK_MS = 15 * 60_000L
+
+    /** Возраст отметки операции (мс) или `null`, если её нет/время нечитаемо. */
+    private fun markAgeMs(mark: JitRef.OpMark?): Long? {
+        val ts = mark?.ts ?: return null
+        if (ts <= 0L) return null
+        return (System.currentTimeMillis() - ts).coerceAtLeast(0L)
+    }
+
+    /** §7.2: отметка операции пережила окно (правило — [Toggles45.isStale]). */
+    private fun opExpired(mark: JitRef.OpMark?): Boolean =
+        Toggles45.isStale(mark?.ts, System.currentTimeMillis(), STALE_MARK_MS)
+
+    /**
      * Одна конкретная запланированная задача возврата Wi-Fi (не «весь процесс»).
      * Читается и пишется ТОЛЬКО под [INTENT_LOCK] (§2.4).
      */
@@ -1529,9 +1556,25 @@ object JitOp {
                 }
                 stored = JitRef.assessStored(reads)
             }
+            // §7.2 iter45: за границей STALE_MARK_MS неопределённость больше не блокирует НОВЫЙ
+            // клик владельца: команда уже не может быть в очереди, а старый снимок не применяется
+            // (см. `staleOp` ниже). Автоматики нет — только пользовательский клик.
+            val age = markAgeMs(stored.mark)
+            val staleOp = stored.state == JitRef.StoredState.UNDEFINED && opExpired(stored.mark)
+            if (staleOp) {
+                CHAIN_UNDEFINED.set(false)
+                log(
+                    "JIT_OP_EXPIRED op=${stored.mark?.op} age_ms=$age limit_ms=$STALE_MARK_MS " +
+                        "wifi_restore=none clicks=allowed " +
+                        "(неопределённость пережила окно: команда не может оставаться в очереди, " +
+                        "старый снимок НЕ применяется — за это время владелец мог сам изменить Wi-Fi. " +
+                        "Это разблокировка по времени, а не доказательство успеха JIT)"
+                )
+            }
             val blockedReason = when {
                 // Неопределённость в RAM — то же состояние, что и в отметке; порядок важен.
-                CHAIN_UNDEFINED.get() || stored.state == JitRef.StoredState.UNDEFINED -> "chain_undefined"
+                (!staleOp && CHAIN_UNDEFINED.get()) ||
+                    (stored.state == JitRef.StoredState.UNDEFINED && !staleOp) -> "chain_undefined"
                 restoreBusy -> "restore_pending"
                 stored.state == JitRef.StoredState.PENDING -> "previous_unfinished"
                 stored.state == JitRef.StoredState.AMBIGUOUS -> "previous_ambiguous"
@@ -1945,6 +1988,22 @@ object JitOp {
                 listOf(JitRef.StoreOp("read", null, null, "exception:" + t.javaClass.simpleName))
             }
             val stored = JitRef.assessStored(reads)
+            // §7.2 iter45: снимок старше окна НЕ применяется. Иначе поздний запуск приложения
+            // (обновление, сон, обычный старт через час) «возвращал» Wi-Fi по устаревшему снимку и
+            // перебивал ручное состояние владельца — это и было видно в логе 13.11.
+            val startAge = markAgeMs(stored.mark)
+            if (opExpired(stored.mark) && stored.state != JitRef.StoredState.NONE) {
+                log(
+                    "JIT_START snapshot=${stored.snapshot?.snap?.wire() ?: "none"} stale=1 " +
+                        "age_ms=$startAge limit_ms=$STALE_MARK_MS action=none wifi_restore=none " +
+                        "stored=«${stored.brief()}» " +
+                        "(продолжение операции по устаревшему снимку не выполняется: за окно " +
+                        "владелец мог изменить сеть сам; данные не удаляем, блокировку клика снимает " +
+                        "только пользовательский клик по правилу STALE_MARK_MS)"
+                )
+                return StartOutcome(stored.snapshot?.snap, stored.snapshot?.snap?.wire(),
+                    stored.snapshot?.format, null, false, "stale_snapshot", stored.mark)
+            }
             val raw = stored.snapshot?.snap?.wire()?.takeIf { stored.state != JitRef.StoredState.NONE }
                 ?: reads.firstNotNullOfOrNull { it.snapshot }
             if (scheduledTask != null) {

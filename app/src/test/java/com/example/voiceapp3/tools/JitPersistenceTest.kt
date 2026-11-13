@@ -20,6 +20,9 @@ import org.junit.Test
  * `SharedPreferences` ГУ здесь не участвует.
  */
 class JitPersistenceTest {
+    /** Единое «сейчас» для отметок операции (см. §7.2 iter45). */
+    private val NOW = System.currentTimeMillis()
+
 
     private lateinit var cpsDisk: MutableMap<String, Any?>
     private lateinit var dpsDisk: MutableMap<String, Any?>
@@ -36,7 +39,8 @@ class JitPersistenceTest {
     private fun bothPrefs() = JitFake.Prefs(cpsDisk) to JitFake.Prefs(dpsDisk)
 
     private fun mk(want: Boolean = true, op: String = "op-test", state: String = JitRef.OpMark.SENDING) =
-        JitRef.OpMark.of(op, want, state, 1_700_000_000_000L)
+        // §7.2 iter45: ts — содержательное поле (окно жизни операции), поэтому «сейчас».
+            JitRef.OpMark.of(op, want, state, System.currentTimeMillis())
 
     private val snapTrue = JitRef.WifiSnapshot(true)
     private val snapFalse = JitRef.WifiSnapshot(false)

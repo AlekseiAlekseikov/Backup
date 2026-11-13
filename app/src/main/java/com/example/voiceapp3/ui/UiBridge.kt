@@ -476,6 +476,13 @@ class UiBridge(
             // (sync.now, charge.*, charges.merge, energy.window, history.series,
             // cycle.sessions, places.*, lab.*, tool.act) удалены вместе с
             // экранами — эти операции выполняет Flutter-приложение телеметрии.
+            // §4 iter45: страница/панель просит свежий снимок состояния (без действий и сети).
+            "tools.refresh" -> {
+                val why = runCatching {
+                    JsonParser.parseString(data).asJsonObject.get("reason")?.asString
+                }.getOrNull() ?: "ui"
+                requestToolsState(why)
+            }
             "settings.change" -> {
                 // P1: applyFromUi для TTL/perf/mount/brightness — тяжёлые adb/iptables/VHAL.
                 // Парсим JSON на UI-потоке (быстро), работу — в BgWorker, результат возвращаем на main.
@@ -819,8 +826,13 @@ class UiBridge(
      * он был). JS по этому снимку красит тумблеры, сегменты и статусы —
      * никаких локальных догадок на стороне интерфейса.
      */
+    /** §4 iter45: номер снимка — старый ответ не должен перетирать новый в панели. */
+    private val toolsStateSeq = java.util.concurrent.atomic.AtomicLong(0)
+
     private fun pushToolsState() {
         val state = tools.state()
+        state.addProperty("seq", toolsStateSeq.incrementAndGet())
+        state.addProperty("stateLoaded", true)
         lastToolsResult?.let { state.add("last", it.toJson()) }
         // W3: действующая палитра считается нативно (раньше — JS applyTheme).
         refreshShellTheme()
@@ -828,6 +840,30 @@ class UiBridge(
         // Нативная панель «Инструменты» (5a) получает тот же снимок в UI-потоке.
         val snapshot = state.toString()
         activity.runOnUiThread { toolsPanel?.onToolsState(snapshot) }
+    }
+
+    /**
+     * §4 iter45: снимок состояния ПО ЗАПРОСУ панели/страницы.
+     *
+     * Зачем: `pushToolsState` вызывался только после действий, поэтому холодное открытие
+     * «Инструментов» не имело ни одного снимка и рисовало значения по умолчанию — почти все
+     * тумблеры выглядели выключенными, а первый клик «включал» сразу несколько.
+     *
+     * Считается в фоновом потоке (чтение prefs/яркости/списка звуков — не работа для UI-потока),
+     * на UI-поток уходит только готовый результат. Сеть, shell и монтирования не трогаются.
+     */
+    fun requestToolsState(reason: String) {
+        com.example.voiceapp3.tools.BgWorker.run("UiBridge.toolsState/$reason", {
+            tools.state()
+        }) { res ->
+            val json = res.getOrNull() ?: return@run
+            json.addProperty("seq", toolsStateSeq.incrementAndGet())
+            json.addProperty("stateLoaded", true)
+            lastToolsResult?.let { json.add("last", it.toJson()) }
+            val snapshot = json.toString()
+            activity.runOnUiThread { toolsPanel?.onToolsState(snapshot) }
+            pushToUi("tools.state", snapshot)
+        }
     }
 
     /**

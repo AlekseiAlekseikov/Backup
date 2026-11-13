@@ -621,10 +621,16 @@ class VoiceAssistantService : Service() {
                            пробуждения — порт w0.m.w: применяется корзина
                            текущего режима (день/ночь). До включённого
                            «Запоминать яркость по фарам» — no-op. */
-                        runCatching { ScreenBrightness.restoreIfEnabled(this@VoiceAssistantService) }
-                        /* Срез №3: синхронизация статус-иконок (батарея/темп/wifi)
-                           при пробуждении — как watchdog-цикл APK (r2 case 10). */
-                        runCatching { StatusIcons.syncAll(this@VoiceAssistantService) }
+                        /* iter45 §9.4: `onReceive` — ГЛАВНЫЙ поток. Раньше отсюда синхронно
+                           вызывались яркость и синхронизация иконок, и в логе владельца 13.11
+                           появлялось `VERIFY THREAD: AdbClient.execute вызван с main` (17:13:52,
+                           18:03:43). Работа уходит в BgWorker: UI не блокируется, а результат
+                           по-прежнему не теряется — он пишется в лог из фонового потока. */
+                        val appCtx = this@VoiceAssistantService
+                        com.example.voiceapp3.tools.BgWorker.post("VoiceAssistant.wake") {
+                            runCatching { ScreenBrightness.restoreIfEnabled(appCtx) }
+                            runCatching { StatusIcons.syncAll(appCtx) }
+                        }
                     }
                     Intent.ACTION_SCREEN_OFF -> {
                         /* Порт w0.m.z: перед уходом экрана в сон снимаем

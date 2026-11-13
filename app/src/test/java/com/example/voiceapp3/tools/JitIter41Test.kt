@@ -22,6 +22,13 @@ import org.junit.Test
  * `AdbClient` умеет сообщать о позднем завершении (§3.2).
  */
 class JitIter41Test {
+    /**
+     * §7.2 iter45: `ts` отметки операции теперь СОДЕРЖАТЕЛЬНОЕ поле — по нему решается,
+     * истекло ли окно жизни незавершённой операции (15 минут). Тесты, изображающие
+     * «только что начатую» операцию, обязаны подставлять реальное время.
+     */
+    private val NOW = System.currentTimeMillis()
+
 
     private val logs = mutableListOf<String>()
 
@@ -106,7 +113,7 @@ class JitIter41Test {
             d[JitRef.KEY_PEDIDO] = want
             d[JitRef.KEY_AUTO] = want
             d[JitRef.KEY_RESTORE] = snap
-            d[JitRef.KEY_MARK] = JitRef.OpMark.of(op, want, state, 1234L).wire()
+            d[JitRef.KEY_MARK] = JitRef.OpMark.of(op, want, state, NOW).wire()
         }
         // «Данные записаны прошлым процессом»: память новых объектов = диск.
         t.newProcess()
@@ -302,8 +309,8 @@ class JitIter41Test {
     @Test
     fun markStateConflictIsUncertaintyNotPending() {
         val snap = "wifi=1"
-        val replied = JitRef.OpMark.of("op-1", true, JitRef.OpMark.REPLIED, 10L).wire()
-        val undefined = JitRef.OpMark.of("op-1", true, JitRef.OpMark.UNDEFINED, 10L).wire()
+        val replied = JitRef.OpMark.of("op-1", true, JitRef.OpMark.REPLIED, NOW).wire()
+        val undefined = JitRef.OpMark.of("op-1", true, JitRef.OpMark.UNDEFINED, NOW).wire()
         for (order in listOf(replied to undefined, undefined to replied)) {
             val assessed = JitRef.assessStored(
                 storeOps("cps" to (snap to order.first), "dps" to (snap to order.second))
@@ -324,16 +331,16 @@ class JitIter41Test {
     @Test
     fun markWantAndTimestampConflictsAreConflicts() {
         val snap = "wifi=1"
-        val a = JitRef.OpMark.of("op-1", true, JitRef.OpMark.REPLIED, 10L).wire()
-        val b = JitRef.OpMark.of("op-1", false, JitRef.OpMark.REPLIED, 10L).wire()
-        val c = JitRef.OpMark.of("op-1", true, JitRef.OpMark.REPLIED, 11L).wire()
+        val a = JitRef.OpMark.of("op-1", true, JitRef.OpMark.REPLIED, NOW).wire()
+        val b = JitRef.OpMark.of("op-1", false, JitRef.OpMark.REPLIED, NOW).wire()
+        val c = JitRef.OpMark.of("op-1", true, JitRef.OpMark.REPLIED, NOW + 1).wire()
         assertTrue(JitRef.assessStored(storeOps("cps" to (snap to a), "dps" to (snap to b)))
             .detail.contains("mark_want_conflict"))
         assertTrue(JitRef.assessStored(storeOps("cps" to (snap to a), "dps" to (snap to c)))
             .detail.contains("mark_ts_conflict"))
         // Одинаковые значения Wi-Fi при разном `state` — всё равно конфликт (§4.1).
-        val replied = JitRef.OpMark.of("op-1", true, JitRef.OpMark.REPLIED, 10L).wire()
-        val sending = JitRef.OpMark.of("op-1", true, JitRef.OpMark.SENDING, 10L).wire()
+        val replied = JitRef.OpMark.of("op-1", true, JitRef.OpMark.REPLIED, NOW).wire()
+        val sending = JitRef.OpMark.of("op-1", true, JitRef.OpMark.SENDING, NOW).wire()
         assertTrue(JitRef.assessStored(storeOps("cps" to (snap to replied), "dps" to (snap to sending)))
             .detail.contains("mark_state_conflict"))
     }
@@ -344,7 +351,7 @@ class JitIter41Test {
         seedUndefined(t, snap = "wifi=1", want = false, op = "op-c")
         // Частичный `updateMark`: CPS стал replied, DPS остался undefined.
         t.cpsDisk[JitRef.KEY_MARK] =
-            JitRef.OpMark.of("op-c", false, JitRef.OpMark.REPLIED, 1234L).wire()
+            JitRef.OpMark.of("op-c", false, JitRef.OpMark.REPLIED, NOW).wire()
         t.newProcess()
         JitOp.resetStateForTest()
         val shell = TimeoutShell()
@@ -366,7 +373,7 @@ class JitIter41Test {
     fun providerExceptionIsUnknownNotAbsent() {
         val cpsDisk = LinkedHashMap<String, Any?>()
         cpsDisk[JitRef.KEY_RESTORE] = "wifi=1"
-        cpsDisk[JitRef.KEY_MARK] = JitRef.OpMark.of("op-x", true, JitRef.OpMark.UNDEFINED, 5L).wire()
+        cpsDisk[JitRef.KEY_MARK] = JitRef.OpMark.of("op-x", true, JitRef.OpMark.UNDEFINED, NOW).wire()
         val cps = JitFake.Prefs(cpsDisk)
         val store = JitNet.AndroidStore(
             { cps },

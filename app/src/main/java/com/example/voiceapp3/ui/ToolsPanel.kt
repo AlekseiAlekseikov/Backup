@@ -55,6 +55,16 @@ class ToolsPanel(
     private val activity: Activity,
     /** Отправка события в JS-мост, как у остальных нативных вкладок. */
     private val send: (name: String, json: String) -> Unit,
+    /**
+     * §4 iter45: запросить у backend свежий снимок состояния.
+     *
+     * Раньше снимок приходил ТОЛЬКО после клика: холодное открытие вкладки рисовало
+     * значения по умолчанию (`def`), т.е. почти все тумблеры выглядели выключенными,
+     * хотя функции работали; первый же клик привозил настоящий снимок, и «внезапно»
+     * загорались соседние тумблеры. Теперь панель просит снимок при показе и не
+     * выдаёт «ещё не прочитано» за «выключено».
+     */
+    private val onNeedState: (String) -> Unit = {},
 ) {
     private val view: FrameLayout = activity.findViewById(R.id.toolsPanel)
     private val nav: LinearLayout = activity.findViewById(R.id.toolsNav)
@@ -73,6 +83,10 @@ class ToolsPanel(
     private val open = HashMap<String, Boolean>().apply { put("interface", true) }
     /** Снимок настроек (как TOOLS.state), без служебного поля `last`. */
     private val state = JsonObject()
+    /** §4 iter45: пришёл ли ХОТЬ ОДИН снимок (иначе значения считаются непрочитанными). */
+    private var stateLoaded = false
+    /** §4 iter45: номер снимка — старый ответ не должен перетирать новый. */
+    private var stateSeq: Long = -1
     /** Результат последнего действия (как TOOLS.last). */
     private var last: JsonObject? = null
     private val sliderPending = HashMap<String, Runnable>()
@@ -129,6 +143,14 @@ class ToolsPanel(
      */
     fun onToolsState(json: String) {
         val d = runCatching { JsonParser.parseString(json).asJsonObject }.getOrNull() ?: return
+        // §4 iter45: снимки нумеруются на стороне backend. Поздний ответ, посчитанный РАНЬШЕ
+        // уже применённого, не должен откатывать тумблеры назад (гонка async-ответов).
+        val seq = d.get("seq")?.takeIf { it.isJsonPrimitive }?.let {
+            runCatching { it.asLong }.getOrNull()
+        }
+        if (!com.example.voiceapp3.tools.Toggles45.acceptsSeq(seq, stateSeq)) return
+        if (seq != null) stateSeq = seq
+        stateLoaded = true
         for ((k, v) in d.entrySet()) {
             if (k == "last") {
                 last = if (v.isJsonObject) v.asJsonObject else last
@@ -142,6 +164,9 @@ class ToolsPanel(
 
     private fun show() {
         visible = true
+        // §4 iter45: холодное открытие обязано показать СОХРАНЁННОЕ намерение до любого клика.
+        if (!stateLoaded) onNeedState("panel_open")
+        else onNeedState("panel_open_refresh")
         ensureOpen(sel)
         rebuild()
         view.visibility = View.VISIBLE
@@ -337,6 +362,7 @@ class ToolsPanel(
         addHead("page.networkTtl", "networkTtl")
         addSect("page.sectionTtl")
         addToggle("ttl65", "Фиксация TTL 65 (обход раздачи)", "desc.ttl65", def = false)
+        addAppliedNote("ttl65Applied", "ttl65PendingReason", "Правила TTL")
         addDiv()
         addText(ToolsCatalog.TEXT["page.ttlHelpTitle"].orEmpty(), ToolsCatalog.TEXT["page.ttlHelpText"].orEmpty())
     }
@@ -545,6 +571,7 @@ class ToolsPanel(
         // Блок 2: закрытие замка
         addSect("page.sectionLockSoundClose")
         addToggle("lockSound", "Кастомный звук замка", "desc.lockSound", def = false)
+        addAppliedNote("lockSoundApplied", "lockSoundPendingReason", "Кастомный звук")
         addDiv()
         val lockName = soundName("lockSound", "Заводской (Geely OEM)")
         soundInfoRow("Выбранный звук", lockName)
@@ -978,16 +1005,23 @@ class ToolsPanel(
         // Положение тумблера JIT = ПОДТВЕРЖДЁННЫЙ факт getprop (`on`/`off`), как
         // `toggle.setActive(getprop)` в `w0/r7`; preference участвует только когда факта нет
         // (`unknown`) — и тогда это видно по подписи «состояние неизвестно».
-        val on = if (key != "perfJit") (boolState(key) ?: def)
-                 else JitRef.switchPosition(jitConfirmed ?: "unknown", boolState(key) ?: def)
+        // §4 iter45: `null` здесь означает «значение ещё не прочитано» (снимка не было или
+        // ключа нет), а НЕ «выключено». Раньше такое состояние рисовалось как OFF.
+        val raw = boolState(key)
+        val unknownToggle = raw == null && !stateLoaded
+        val on = if (key != "perfJit") (raw ?: def)
+                 else JitRef.switchPosition(jitConfirmed ?: "unknown", raw ?: def)
         val row = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(0, dp(10f), 0, dp(10f))
         }
         val info = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
-        val titleText = if (key == "perfJit" && jitConfirmed == "unknown") "$title · состояние неизвестно"
-                        else title
+        val titleText = when {
+            unknownToggle -> "$title · состояние ещё не прочитано"
+            key == "perfJit" && jitConfirmed == "unknown" -> "$title · состояние неизвестно"
+            else -> title
+        }
         val titleView = text(titleText, 14.5f, palette.ink, bold = true)
         info.addView(titleView)
         descKey?.let { ToolsCatalog.TEXT[it] }?.let { info.addView(text(it, 12f, palette.muted, bold = false)) }
@@ -1017,6 +1051,28 @@ class ToolsPanel(
         }
         row.addView(sw, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
         page.addView(row, matchWrap())
+    }
+
+    /**
+     * §5/§6 iter45: отдельная честная строка «намерение ≠ применение».
+     *
+     * Тумблер показывает СОХРАНЁННОЕ ЖЕЛАНИЕ владельца; ниже — факт: `applied` (подтверждено),
+     * `pending` (ждём сеть/root/канал; функция НЕ выключена) или `off`. Строка нейтральная
+     * (не красная), новых кнопок не создаёт.
+     */
+    private fun addAppliedNote(stateKey: String, reasonKey: String, what: String) {
+        val applied = strState(stateKey) ?: return
+        val reason = strState(reasonKey).orEmpty()
+        val text = when (applied) {
+            "applied" -> "$what: применено и подтверждено"
+            "pending" -> "$what: ждёт готовности" + (if (reason.isNotEmpty()) " · причина: $reason" else "") +
+                " · настройка остаётся включённой"
+            "off" -> "$what: выключено"
+            else -> return
+        }
+        page.addView(text(text, 11.5f, palette.muted, bold = false).apply {
+            setPadding(0, dp(2f), 0, dp(6f))
+        }, matchWrap())
     }
 
     private fun addSeg(key: String, title: String, def: String, width: Int, opts: List<Pair<String, String>>) {
@@ -1366,10 +1422,9 @@ class ToolsPanel(
         return when {
             p.isBoolean -> p.asBoolean
             p.isNumber -> p.asInt != 0
-            else -> {
-                val s = p.asString
-                s.isNotEmpty() && s != "0"
-            }
+            // §4 iter45: строка "false" раньше читалась как ВКЛ (`isNotEmpty && != "0"`).
+            // Непонятное значение — «не прочитано» (null), а не OFF. Правило — в Toggles45 (тесты).
+            else -> com.example.voiceapp3.tools.Toggles45.boolOrNull(p.asString)
         }
     }
 
