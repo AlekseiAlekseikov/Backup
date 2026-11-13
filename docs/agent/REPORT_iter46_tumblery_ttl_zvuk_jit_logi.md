@@ -196,6 +196,8 @@ bash runtests.sh                     # JVM-стенд (kotlinc 1.9.24 + junit, A
 → OK (415 tests)                     # база 2893d5b: OK (391 tests)
 ```
 Реальные команды стенда: `java -Xmx1400m -cp toolchains/kotlinc/lib/kotlin-compiler.jar org.jetbrains.kotlin.cli.jvm.K2JVMCompiler …` (out `/home/user/kcout/out`, tmp `/home/user/tmp/jvm`). Полный Gradle в песочнице невозможен (~2 ГБ RAM, OOM) — **локальную сборку APK не заявляю**.
+**CI на handoff-коммитах:** `43478754069` по `4e7de0b` — **success**; `43476301200` по `fd0529e`
+(коммит с кодом) — **success**. Оба прогона: полная компиляция + debug APK, без unit-тестов.
 CI (GitHub Actions, `Build APK`) на `fd0529e`: **success** (`43476301200`) — это компиляция всего
 проекта и debug-сборка; workflow не содержит `testDebugUnitTest`, поэтому **success сборки ≠ прогон тестов**:
 тесты — это `runtests.sh` (415 OK) локально.
