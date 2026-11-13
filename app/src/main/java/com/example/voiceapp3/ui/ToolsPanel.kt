@@ -83,8 +83,11 @@ class ToolsPanel(
     private val open = HashMap<String, Boolean>().apply { put("interface", true) }
     /** Снимок настроек (как TOOLS.state), без служебного поля `last`. */
     private val state = JsonObject()
-    /** §4 iter45: пришёл ли ХОТЬ ОДИН снимок (иначе значения считаются непрочитанными). */
+    /** §4 iter45: пришёл ли ХОТЬ ОДИН снимок (для подписи о частичном снимке). */
     private var stateLoaded = false
+    /** §4.1 iter46: сколько ключей реально пришло в последнем снимке / сколько ожидаем. */
+    private var stateRenderedKeys = 0
+    private var stateExpectedKeys = 0
     /** §4 iter45: номер снимка — старый ответ не должен перетирать новый. */
     private var stateSeq: Long = -1
     /** Результат последнего действия (как TOOLS.last). */
@@ -151,6 +154,10 @@ class ToolsPanel(
         if (!com.example.voiceapp3.tools.Toggles45.acceptsSeq(seq, stateSeq)) return
         if (seq != null) stateSeq = seq
         stateLoaded = true
+        // §4.1 iter46: честная граница частичного снимка — считаем, сколько ключей тумблеров
+        // реально пришло; отсутствующие остаются «не прочитано» (см. addToggle), а не OFF.
+        stateRenderedKeys = d.entrySet().count { !it.key.startsWith("$") && it.key != "last" && it.key != "seq" }
+        stateExpectedKeys = EXPECTED_STATE_KEYS
         for ((k, v) in d.entrySet()) {
             if (k == "last") {
                 last = if (v.isJsonObject) v.asJsonObject else last
@@ -243,6 +250,15 @@ class ToolsPanel(
 
     private fun buildPage() {
         page.removeAllViews()
+        // §4.1 iter46: частичный снимок честно называется частичным (нейтральным текстом,
+        // без красного и без новых кнопок). Отсутствующие ключи не выдаются за выключенные.
+        if (stateLoaded && stateRenderedKeys in 1 until stateExpectedKeys) {
+            page.addView(text(
+                "Снимок состояния неполный: получено $stateRenderedKeys из $stateExpectedKeys ключей. " +
+                    "Отсутствующие показаны как «состояние ещё не прочитано».",
+                11.5f, palette.muted, bold = false
+            ), matchWrap())
+        }
         val node = findNode(sel)
         val key = node?.page
         when {
@@ -259,6 +275,13 @@ class ToolsPanel(
             else -> addText("Раздел переносится", "Эта страница переносится в этапах 5b/5c.")
         }
     }
+
+    /**
+     * §4.1 iter46: ключи тумблеров, которые backend обязан отдавать в каждом снимке
+     * (`ToolsBackend.state()`). Если чего-то нет — снимок частичный, и такие тумблеры
+     * показываются «состояние ещё не прочитано», а не выключенными.
+     */
+    private val EXPECTED_STATE_KEYS: Int = 19
 
     private fun pageScreen() {
         addHead("page.screen", "screen")
@@ -1008,7 +1031,10 @@ class ToolsPanel(
         // §4 iter45: `null` здесь означает «значение ещё не прочитано» (снимка не было или
         // ключа нет), а НЕ «выключено». Раньше такое состояние рисовалось как OFF.
         val raw = boolState(key)
-        val unknownToggle = raw == null && !stateLoaded
+        // §4.1 iter46: «известность» теперь ПО КЛЮЧУ, а не по факту «хоть один снимок пришёл».
+        // Раньше при частичном/повреждённом снимке отсутствующий ключ считался прочитанным и
+        // подменялся дефолтом (у 17 из 19 тумблеров это false) — ложное «выключено».
+        val unknownToggle = raw == null
         val on = if (key != "perfJit") (raw ?: def)
                  else JitRef.switchPosition(jitConfirmed ?: "unknown", raw ?: def)
         val row = LinearLayout(activity).apply {

@@ -139,6 +139,17 @@ enum class Choice(
     private fun prefs() = Prefs2.cps(appContext)
 
     /**
+     * §4.1 iter46: РЕВИЗИЯ ИЗМЕНЕНИЙ — счётчик, который увеличивается при каждой записи
+     * настройки через backend. Нужен, чтобы отличить «снимок прочитан целиком в одном
+     * состоянии» от «во время чтения что-то записали»: тогда значения в снимке относятся к
+     * разным моментам, и его нельзя показывать как согласованный.
+     */
+    private val writeRevision = java.util.concurrent.atomic.AtomicLong(0)
+
+    /** Текущая ревизия изменений (растёт при каждой записи через backend). */
+    fun revision(): Long = writeRevision.get()
+
+    /**
      * Снимок состояния для инициализации страницы и для пуша после каждого
      * изменения. Ключи совпадают с `SET` шелла, поэтому у JS нет собственного
      * источника истины.
@@ -231,6 +242,9 @@ enum class Choice(
      * не собрал бы цепочку «клик → ADB → итог».
      */
     fun set(toggle: Toggle, value: Boolean): ToolsResult {
+        // §4.1 iter46: ревизия растёт ДО побочных эффектов — снимок, начатый раньше, будет
+        // перечитан (UiBridge.readToolsState), а не показан как согласованный.
+        writeRevision.incrementAndGet()
         val op = LogKit.newOpId()
         val cat = toggleCat(toggle)
         LogKit.opStart(op, cat, toggle.pref, "click")
@@ -474,6 +488,7 @@ enum class Choice(
 
     /** Запись строковой настройки (палитра приложения, тема ГУ, hvac_digital_*). */
     fun set(choice: Choice, value: String): ToolsResult {
+        writeRevision.incrementAndGet()   // §4.1 iter46: см. revision()
         if (value !in choice.allowed) {
             val now = SystemClock.elapsedRealtime()
             return ToolsResult(
@@ -558,6 +573,7 @@ enum class Choice(
      * здесь он сознательно не выполняется — см. ScreenBrightness).
      */
     fun setBrightness(percent: Int): ToolsResult {
+        writeRevision.incrementAndGet()   // §4.1 iter46: см. revision()
         val action = "settings.bright"
         val title = "Яркость"
         if (percent < ScreenBrightness.MIN_PERCENT || percent > ScreenBrightness.MAX_PERCENT) {
@@ -643,6 +659,7 @@ enum class Choice(
      * приложения не трогает системный таймаут).
      */
     fun setRest(seconds: Int): ToolsResult {
+        writeRevision.incrementAndGet()   // §4.1 iter46: см. revision()
         val action = "settings.rest"
         val title = "Время заставки"
         if (ScreenBrightness.REST_CHOICES.none { it == seconds }) {
@@ -718,6 +735,7 @@ enum class Choice(
     /** «Не гасить экран» — вызывает ScreenBrightness.setKeepAwake и возвращает
      *  ToolsResult с тремя шагами: pref persist, apply (3-путная запись), readback. */
     fun setKeepAwake(enabled: Boolean): ToolsResult {
+        writeRevision.incrementAndGet()   // §4.1 iter46: см. revision()
         val action = "settings.keepawake"
         val title = "Не гасить экран"
         val steps = ArrayList<ToolsStep>(3)

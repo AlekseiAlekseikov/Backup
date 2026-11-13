@@ -49,7 +49,9 @@ class JitOrchestratorTest {
     ) = apply {
         setIn(0, JitRef.KEY_RESTORE, snap)
         setIn(1, JitRef.KEY_RESTORE, snap)
-        val mark = JitRef.OpMark.of(op, want, state, 0L).wire()
+        // §7.2 iter46: отметка «продолжения клика» обязана нести реальное время —
+        // по нему возврат решает, вправе ли он ВКЛЮЧАТЬ Wi-Fi (поздний старт — нет).
+        val mark = JitRef.OpMark.of(op, want, state, System.currentTimeMillis()).wire()
         setIn(0, JitRef.KEY_MARK, mark)
         setIn(1, JitRef.KEY_MARK, mark)
     }
@@ -483,7 +485,8 @@ class JitOrchestratorTest {
         val sched = JitFake.Scheduler()
         JitOp.onProcessStart(store, net, sched, ::log)
 
-        val newMark = JitRef.OpMark.of("op-new", want = false, state = JitRef.OpMark.REPLIED).wire()
+        val newMark = JitRef.OpMark.of("op-new", want = false, state = JitRef.OpMark.REPLIED,
+            System.currentTimeMillis()).wire()
         store.setIn(0, JitRef.KEY_RESTORE, "wifi=0")
         store.setIn(1, JitRef.KEY_RESTORE, "wifi=0")
         store.setIn(0, JitRef.KEY_MARK, newMark)
@@ -605,7 +608,7 @@ class JitOrchestratorTest {
         val store = JitFake.Store().apply {
             setIn(0, JitRef.KEY_RESTORE, "wifi=1,ap=0,extra=1")
             setIn(0, JitRef.KEY_MARK,
-                JitRef.OpMark.of("op-broken", true, JitRef.OpMark.REPLIED).wire())
+                JitRef.OpMark.of("op-broken", true, JitRef.OpMark.REPLIED, System.currentTimeMillis()).wire())
         }
         val net = JitFake.Net(wifi = true)
         val sched = JitFake.Scheduler()
@@ -620,7 +623,8 @@ class JitOrchestratorTest {
     fun legacyFormatIsReadOnlyByWifiAndNeverTurnsWifiOnBlindly() {
         val store = JitFake.Store().apply {
             setIn(0, JitRef.KEY_RESTORE, "wifi=0,ap=1")
-            setIn(0, JitRef.KEY_MARK, JitRef.OpMark.of("op-legacy", want = false, state = JitRef.OpMark.REPLIED).wire())
+            setIn(0, JitRef.KEY_MARK, JitRef.OpMark.of("op-legacy", want = false, state = JitRef.OpMark.REPLIED,
+                System.currentTimeMillis()).wire())
         }
         val net = JitFake.Net(wifi = true)
         val sched = JitFake.Scheduler()

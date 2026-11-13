@@ -103,10 +103,16 @@ class Toggles45UiTest {
 
     @Test
     fun corruptedLogTailIsDetectedAndReported() {
+        // §8.1/§8.2 iter46: лок/rotate/fsync живут в FileLogCore (проверяется реальными
+        // файлами в Iter46Test), а AppFileLogger обязан СООБЩАТЬ о проблеме.
+        val core = code("src/main/java/com/example/voiceapp3/tools/FileLogCore.kt")
+        assertTrue("межпроцессный лок на стабильном файле", core.contains("tryLock()"))
+        assertTrue("fsync после записи", core.contains("fd.sync()"))
+        assertTrue("ошибка rotate не глотается", core.contains("rotate_rename_failed"))
         val f = code(fileLog)
-        assertTrue("запись под файловым локом", f.contains("ch.lock()"))
-        assertTrue("fsync после записи", f.contains("fd.sync()"))
-        assertTrue("повреждение сообщается строкой", f.contains("LOG_TAIL_NUL_DETECTED"))
-        assertTrue("правило подсчёта — в Toggles45", f.contains("Toggles45.trailingNulBytes"))
+        assertTrue("повреждение хвоста сообщается", f.contains("LOG_TAIL_NUL_DETECTED"))
+        assertTrue("провал записи не маскируется", f.contains("LOG_WRITE_FAILED"))
+        assertTrue("запись без лока не выдаётся за норму", f.contains("LOG_WRITE_UNLOCKED"))
+        assertTrue("правило подсчёта — в Toggles45", core.contains("Toggles45.trailingNulBytes"))
     }
 }

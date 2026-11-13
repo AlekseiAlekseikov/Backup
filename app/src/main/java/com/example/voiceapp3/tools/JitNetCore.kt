@@ -1442,6 +1442,38 @@ object JitOp {
         return (System.currentTimeMillis() - ts).coerceAtLeast(0L)
     }
 
+    /**
+     * §7.2 iter46 — до какого возраста операции возврат имеет право ВКЛЮЧАТЬ Wi-Fi.
+     *
+     * Разница принципиальна: продолжение конкретного клика (процесс перезапустил `zygote`,
+     * задача возврата стартует через [JitRef.RESTORE_DELAY_MS]) возвращает исходный Wi-Fi,
+     * включая `setWifiEnabled(true)`. Но если приложение стартовало САМО и поздно (владелец
+     * открыл его через полчаса, система подняла процесс из-за другого повода), то включать
+     * Wi-Fi по старому снимку нельзя: за это время владелец мог выключить его сам, и мы бы
+     * «вернули» сеть против его воли. Такой возврат выполняется в режиме «не включать».
+     */
+    internal const val WIFI_ENABLE_MAX_AGE_MS = 5 * 60_000L
+
+    /**
+     * §7.2: можно ли этому возврату включать Wi-Fi. Чистая функция (без Android) — проверяется
+     * JVM-тестом. Возвращает `allowed` и причину для журнала.
+     *
+     * Защиты: нет отметки; `ts` нечитаем/ноль; `ts` в будущем (коррекция часов назад) — такое
+     * время не доказательство свежести; возраст больше [WIFI_ENABLE_MAX_AGE_MS].
+     */
+    fun restoreMayEnableWifi(
+        mark: JitRef.OpMark?,
+        nowMs: Long,
+        limitMs: Long = WIFI_ENABLE_MAX_AGE_MS
+    ): Pair<Boolean, String> {
+        val ts = mark?.ts ?: return false to "mark_absent"
+        if (ts <= 0L) return false to "mark_ts_unreadable"
+        if (ts > nowMs) return false to "clock_shift_back"
+        val age = nowMs - ts
+        if (age > limitMs) return false to "late_start:${age}>${limitMs}"
+        return true to "click_continuation:${age}"
+    }
+
     /** §7.2: отметка операции пережила окно (правило — [Toggles45.isStale]). */
     private fun opExpired(mark: JitRef.OpMark?): Boolean =
         Toggles45.isStale(mark?.ts, System.currentTimeMillis(), STALE_MARK_MS)
@@ -2156,7 +2188,17 @@ object JitOp {
         }
         var report: WifiRestoreReport? = null
         try {
-            report = runCatching { restoreWifi(netState, snap, log) }.getOrElse { t ->
+            val (allowEnable, enableWhy) = restoreMayEnableWifi(
+                runCatching { JitRef.assessStored(store.readOperation()).mark }.getOrNull(),
+                System.currentTimeMillis()
+            )
+            if (!allowEnable) {
+                log(
+                    "JIT_NET_RESTORE op=$opId wifi_enable=denied reason=$enableWhy " +
+                        "(возврат выполняется без включения Wi-Fi; см. WIFI_ENABLE_MAX_AGE_MS)"
+                )
+            }
+            report = runCatching { restoreWifi(netState, snap, log, allowEnable, enableWhy) }.getOrElse { t ->
                 log(
                     "JIT_NET_RESTORE exception=${t.javaClass.simpleName} action=none op=$opId " +
                         "(как e2: возврат прерван; снимок оставлен, следующий запуск попробует снова)"
@@ -2271,7 +2313,9 @@ object JitOp {
     fun restoreWifi(
         netState: JitRef.JitNetState,
         snap: JitRef.WifiSnapshot,
-        log: (String) -> Unit = {}
+        log: (String) -> Unit = {},
+        allowEnable: Boolean = true,
+        enableWhy: String = "click_continuation"
     ): WifiRestoreReport {
         if (!snap.wifi) {
             val addr = runCatching { netState.wifiAddress() }.getOrNull()
@@ -2295,6 +2339,22 @@ object JitOp {
                 JitRef.RestoreCompletion.UNAVAILABLE
             )
             log(r.log + " (WifiManager недоступен: запрос не отправлен)")
+            return r
+        }
+        if (!allowEnable && !stateBefore) {
+            // §7.2 iter46: поздний независимый старт. Wi-Fi выключен, снимок говорит «был включён»,
+            // но включать его по старому снимку нельзя: это не восстановление, а новое действие
+            // против возможного выбора владельца. Данные операции НЕ удаляем и ничего не «лечим».
+            val r = WifiRestoreReport(
+                snap, false, null, false, null, "not_enabled:$enableWhy",
+                JitRef.RestoreCompletion.PENDING
+            )
+            log(
+                r.log + " (⛔ включать Wi-Fi по старому снимку нельзя: $enableWhy. " +
+                    "Это повторный/поздний запуск, а не продолжение клика: сеть остаётся как есть, " +
+                    "снимок сохранён, никаких авто-повторов не запускается. Выключить Wi-Fi, " +
+                    "который владелец включил сам, мы тоже не будем)"
+            )
             return r
         }
         if (stateBefore) {

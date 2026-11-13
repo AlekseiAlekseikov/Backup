@@ -826,12 +826,38 @@ class UiBridge(
      * он был). JS по этому снимку красит тумблеры, сегменты и статусы —
      * никаких локальных догадок на стороне интерфейса.
      */
-    /** §4 iter45: номер снимка — старый ответ не должен перетирать новый в панели. */
+    /**
+     * §4.1 iter46: НОМЕР ЗАПРОСА, а не номер готового снимка.
+     *
+     * Дефект iter45 (доказан по коду): `seq` присваивался ПОСЛЕ `tools.state()`. Медленный
+     * старый снимок мог завершиться позже нового, получить БОЛЬШИЙ номер и откатить интерфейс.
+     * Номер, выданный по завершении, порядок состояния не выражает.
+     *
+     * Теперь номер берётся в момент ЗАПРОСА (монотонный порядок «кто позже попросил»), а
+     * доставка разрешена только если номер больше уже доставленного (`markToolsStateDelivered`).
+     * Снимок, посчитанный из устаревшего запроса, отбрасывается с записью в лог.
+     */
     private val toolsStateSeq = java.util.concurrent.atomic.AtomicLong(0)
 
+    /** Наибольший доставленный номер запроса (монотонный сторож доставки). */
+    private val toolsStateDelivered = java.util.concurrent.atomic.AtomicLong(0)
+
+    /** Читает состояние с проверкой ревизии изменений (см. [ToolsBackend.revision]). */
+    private fun readToolsState(): com.google.gson.JsonObject {
+        // Составной снимок читается из нескольких источников; если во время чтения что-то
+        // записали, значения могут относиться к разным моментам. Перечитываем ОДИН раз.
+        val rev0 = tools.revision()
+        var st = tools.state()
+        if (tools.revision() != rev0) st = tools.state()
+        return st
+    }
+
     private fun pushToolsState() {
-        val state = tools.state()
-        state.addProperty("seq", toolsStateSeq.incrementAndGet())
+        // Номер — ДО чтения состояния (§4.1 iter46).
+        val seq = toolsStateSeq.incrementAndGet()
+        val state = readToolsState()
+        if (!markToolsStateDelivered(seq, "push")) return
+        state.addProperty("seq", seq)
         state.addProperty("stateLoaded", true)
         lastToolsResult?.let { state.add("last", it.toJson()) }
         // W3: действующая палитра считается нативно (раньше — JS applyTheme).
@@ -853,16 +879,39 @@ class UiBridge(
      * на UI-поток уходит только готовый результат. Сеть, shell и монтирования не трогаются.
      */
     fun requestToolsState(reason: String) {
+        // §4.1 iter46: номер выдаётся В МОМЕНТ ЗАПРОСА, до чтения состояния.
+        val seq = toolsStateSeq.incrementAndGet()
         com.example.voiceapp3.tools.BgWorker.run("UiBridge.toolsState/$reason", {
-            tools.state()
+            readToolsState()
         }) { res ->
             val json = res.getOrNull() ?: return@run
-            json.addProperty("seq", toolsStateSeq.incrementAndGet())
+            if (!markToolsStateDelivered(seq, reason)) return@run
+            json.addProperty("seq", seq)
             json.addProperty("stateLoaded", true)
             lastToolsResult?.let { json.add("last", it.toJson()) }
             val snapshot = json.toString()
             activity.runOnUiThread { toolsPanel?.onToolsState(snapshot) }
             pushToUi("tools.state", snapshot)
+        }
+    }
+
+    /**
+     * §4.1 iter46: разрешить доставку снимка с номером запроса [seq].
+     *
+     * Доставляется только снимок, чей номер больше всех уже доставленных: ответ на более
+     * поздний запрос не откатывается ответом на более ранний, даже если тот посчитался позже.
+     * Отказ пишется в лог — «тихо пропущено» запрещено.
+     */
+    private fun markToolsStateDelivered(seq: Long, reason: String): Boolean {
+        while (true) {
+            val cur = toolsStateDelivered.get()
+            if (seq <= cur) {
+                com.example.voiceapp3.tools.AppLog.i(TAG,
+                    "TOOLS_STATE_STALE seq=$seq delivered=$cur reason=$reason " +
+                        "(снимок посчитан из устаревшего запроса: интерфейс не откатываем)")
+                return false
+            }
+            if (toolsStateDelivered.compareAndSet(cur, seq)) return true
         }
     }
 

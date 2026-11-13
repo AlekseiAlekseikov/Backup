@@ -42,7 +42,7 @@ class JitIter40Test {
     ) = apply {
         for (i in stores) {
             setIn(i, JitRef.KEY_RESTORE, snap)
-            setIn(i, JitRef.KEY_MARK, JitRef.OpMark.of(op, want, state, 0L).wire())
+            setIn(i, JitRef.KEY_MARK, JitRef.OpMark.of(op, want, state, System.currentTimeMillis()).wire())
         }
     }
 

@@ -74,7 +74,7 @@ class JitLogsCancelTest {
         // Старый снимок с ap=1 читается, но ни одного вызова AP не делает (решение владельца).
         val store = JitFake.Store().apply {
             setIn(0, JitRef.KEY_RESTORE, "wifi=1,ap=1")
-            setIn(0, JitRef.KEY_MARK, JitRef.OpMark.of("op-legacy", true, JitRef.OpMark.REPLIED).wire())
+            setIn(0, JitRef.KEY_MARK, JitRef.OpMark.of("op-legacy", true, JitRef.OpMark.REPLIED, System.currentTimeMillis()).wire())
         }
         val net = JitFake.Net(wifi = false)
         JitOp.onProcessStart(store, net, JitFake.Scheduler().apply { runInline = true })

@@ -530,8 +530,36 @@ object WindowDoors {
                 set.addAll(before)   // вернуть как было до попытки
             }
             persistVentOwners(appCtx)
-            AppLog.w(appCtx, TAG, "VENT_CLOSE_FAIL win=${hex(windowAreaId)} door=${hex(doorAreaId)} " +
-                "pos=$pos pos_after=${posAfter ?: "?"} written=$written owners_after=${ownersHex(after)}")
+            // §9 iter46: `getIntProperty` возвращает ПОСЛЕДНЕЕ известное значение VHAL, а
+            // применение команды может прийти позже (асинхронный стек). Поэтому расхождение —
+            // это «ещё не подтверждено», а НЕ «окно физически не закрылось». Повторных
+            // воздействий не делаем (никаких «дожать», повторных setIntProperty и т.п.).
+            AppLog.w(appCtx, TAG, "VENT_CLOSE_UNCONFIRMED win=${hex(windowAreaId)} door=${hex(doorAreaId)} " +
+                "pos=$pos pos_after=${posAfter ?: "?"} written=$written owners_after=${ownersHex(after)} " +
+                "reason=${if (!written) "write_rejected" else "late_readback"} " +
+                "physical_failure=not_claimed action=none " +
+                "(значение VHAL могло не обновиться на момент чтения; один отложенный readback " +
+                "только уточнит факт в журнале и не трогает окно)")
+            // Разовый поздний readback (не цикл): если VHAL подтвердит закрытие — снимаем
+            // владельцев и фиксируем факт. Ничего не двигаем и не «лечим».
+            val retryWin = windowAreaId
+            com.example.voiceapp3.tools.BgWorker.postDelayed("ventLateReadback", 1_500L) {
+                runCatching {
+                    val late = readWindowPos(cpm, retryWin)
+                    if (late != null && kotlin.math.abs(late - WINDOW_CLOSED_POS) <= WINDOW_CLOSE_TOLERANCE) {
+                        synchronized(ventOwners) {
+                            if (ventOwners[retryWin]?.isEmpty() == true) ventOwners.remove(retryWin)
+                        }
+                        persistVentOwners(appCtx)
+                        AppLog.i(appCtx, TAG, "VENT_CLOSE_CONFIRMED_LATE win=${hex(retryWin)} " +
+                            "pos_after=$late (поздний readback подтвердил закрытие; это НЕ отменяет " +
+                            "того, что первый readback был устаревшим)")
+                    } else {
+                        AppLog.w(appCtx, TAG, "VENT_CLOSE_STILL_UNCONFIRMED win=${hex(retryWin)} " +
+                            "pos_after=${late ?: "?"} physical_failure=not_claimed action=none")
+                    }
+                }
+            }
         }
     }
 

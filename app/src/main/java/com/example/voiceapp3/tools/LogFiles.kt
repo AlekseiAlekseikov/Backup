@@ -249,10 +249,16 @@ object LogFiles {
         val today = Instant.ofEpochMilli(nowMs).atZone(ZoneId.systemDefault()).toLocalDate()
         val names = runCatching { dir.list() }.getOrNull()?.toList() ?: return emptyList()
         val removed = ArrayList<String>(4)
+        // §8.3 iter46: активная часть защищена ВСЕГДА, даже если вызывающий не передал имя.
+        // Раньше `activeName == null` означал «защиты нет» — ротация могла удалить ту часть,
+        // в которую прямо сейчас пишут.
+        val protectedNames = protectedSet(dir, tier, activeName, today)
 
         for (n in expired(names, today)) {
-            if (n == activeName) continue
+            if (n in protectedNames) continue
             if (runCatching { File(dir, n).delete() }.getOrDefault(false)) removed += n
+            else report("LOG_PRUNE removed=FAILED name=$n reason=expired_delete_failed " +
+                "tier=${tier.name.lowercase()} (часть НЕ удалена — отказ delete не считается успехом)")
         }
 
         // Суммарный лимит tier: удаляем самые старые ЗАКРЫТЫЕ части сверх лимита.
@@ -267,7 +273,7 @@ object LogFiles {
         while (total > cap && i < parts.size) {
             val f = parts[i]
             i++
-            if (f.name == activeName) continue
+            if (f.name in protectedNames) continue
             val len = runCatching { f.length() }.getOrDefault(0L)
             if (runCatching { f.delete() }.getOrDefault(false)) {
                 total -= len
@@ -278,15 +284,48 @@ object LogFiles {
         // Количество частей по всем датам: не даём «лавине» файлов съесть место.
         val after = partsOf(dir, tier)
         if (after.size > MAX_PARTS_TOTAL) {
-            val victims = after.drop(MAX_PARTS_TOTAL)
-                .filter { it.name != activeName }
-                .sortedWith(compareBy<File> { parseOwn(it.name)!!.second }
-                    .thenBy { parseOwn(it.name)!!.third })
+            // §8.3 iter46: сначала ЯВНАЯ сортировка «самые старые первыми», и только потом
+            // выбор жертв. Раньше `drop()` применялся к списку «новые первыми», т.е. жертвы
+            // определялись порядком листинга, а не возрастом.
+            val ordered = partsOf(dir, tier).sortedWith(
+                compareBy<File> { parseOwn(it.name)!!.second }
+                    .thenBy { parseOwn(it.name)!!.third }
+            )
+            val excess = ordered.size - MAX_PARTS_TOTAL
+            val victims = ordered.filter { it.name !in protectedNames }.take(maxOf(0, excess))
             for (f in victims) {
-                if (runCatching { f.delete() }.getOrDefault(false)) removed += f.name
+                if (runCatching { f.delete() }.getOrDefault(false)) {
+                    removed += f.name
+                } else {
+                    report("LOG_PRUNE removed=FAILED name=${f.name} reason=parts_total_delete_failed " +
+                        "tier=${tier.name.lowercase()} total=${ordered.size} cap=$MAX_PARTS_TOTAL")
+                }
             }
         }
         return removed
+    }
+
+    /**
+     * §8.3 iter46: набор имён, которые ротация/ретеншн НЕ трогают.
+     *
+     * Защищены: явно переданная активная часть и часть с максимальным номером самой свежей
+     * даты (по инварианту «активная = максимальный номер», см. шапку файла). Плюс для tier
+     * защищаем самую новую часть каждого tier-каталога — она может быть открыта писателем.
+     */
+    private fun protectedSet(
+        dir: File,
+        tier: Tier,
+        activeName: String?,
+        today: java.time.LocalDate
+    ): Set<String> {
+        val out = HashSet<String>(4)
+        activeName?.let { out += it }
+        // Защищаем активную часть ПИСАТЕЛЯ: это часть с максимальным номером СЕГОДНЯШНЕЙ даты.
+        // Старые даты активными быть не могут (ротация идёт по дате и номеру), поэтому
+        // просроченные части удалять по-прежнему можно — иначе ретеншн не работал бы.
+        val parts = runCatching { partsOf(dir, tier) }.getOrDefault(emptyList())
+        parts.firstOrNull { parseOwn(it.name)?.second == today }?.let { out += it.name }
+        return out
     }
 
     /** Старый API (число удалённых) — оставлен для существующих тестов/вызовов. */
@@ -375,8 +414,11 @@ object LogFiles {
                 lockChannel = java.io.RandomAccessFile(lf, "rw").channel
                 fileLock = lockChannel!!.lock()
             }.onFailure { e ->
-                // Не молчим: координация между процессами недоступна.
+                // §8.3: определённое поведение — работаем под JVM-локом, но факт публикуем.
                 lastIoError = "lock_unavailable:${e.javaClass.simpleName}"
+                report("LOGFILES_LOCK_UNAVAILABLE dir=«${dir.absolutePath}» " +
+                    "reason=${e.javaClass.simpleName} action=write_under_jvm_lock_only " +
+                    "(межпроцессная координация по каталогу недоступна — это не «норма», а отказ)")
             }
             block()
         } finally {

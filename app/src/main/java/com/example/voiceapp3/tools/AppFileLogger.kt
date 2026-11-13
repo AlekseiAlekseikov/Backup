@@ -51,17 +51,18 @@ object AppFileLogger {
         } catch (t: Throwable) {
             Log.w(TAG, "mirror init failed", t)
         }
-        i("LOGGER", "=== Logger init, primary=${primaryFile?.absolutePath} mirror=${mirrorFile?.absolutePath} ===")
-        // §10 iter45: честно сообщаем о повреждённом хвосте, а не молча дописываем за ним.
+        // §8.2 iter46: состояние хвоста проверяется ДО любой записи. Порядок iter45 был
+        // обратным (сначала init-строка, потом поиск NUL), поэтому собственная новая строка
+        // могла «замаскировать» уже существующий нулевой хвост.
         // Файл НЕ переписываем и НЕ обрезаем: это данные владельца (доказательство дефекта).
         listOfNotNull(primaryFile, mirrorFile).forEach { f ->
-            val nul = tailNulBytes(f)
+            val nul = FileLogCore.tailNulBytes(f)
             if (nul > 0) {
-                i("LOGGER", "LOG_TAIL_NUL_DETECTED file=«${f.absolutePath}» bytes=$nul " +
-                    "action=append_after (не обрезаем: старые записи не переписываются, " +
-                    "новые строки пишутся с лока и с fsync)")
+                Log.e(TAG, "LOG_TAIL_NUL_DETECTED file=«${f.name}» bytes=$nul pre_init=true " +
+                    "action=append_after (старые записи не переписываются; новые пишутся под локом и с fsync)")
             }
         }
+        i("LOGGER", "=== Logger init, primary=${primaryFile?.absolutePath} mirror=${mirrorFile?.absolutePath} ===")
     }
 
     @JvmStatic
@@ -99,37 +100,31 @@ object AppFileLogger {
         }.getOrDefault(0)
     }
 
-    private fun rotateIfNeeded(f: File) {
-        try {
-            if (f.length() < MAX_SIZE_BYTES) return
-            val bak = File(f.parentFile, "$NAME.1")
-            if (bak.exists()) bak.delete()
-            f.renameTo(bak)
-            f.createNewFile()
-        } catch (_: Throwable) {}
-    }
+    /**
+     * §8.1 iter46: ротация и запись — ОДНА операция под локом на стабильном файле
+     * (`<name>.lock`), с проверкой каждого шага. Реализация вынесена в [FileLogCore] и
+     * покрыта JVM-тестами на реальных файлах (в т.ч. конкурирующие писатели и отказ rename).
+     */
+    private fun rotateIfNeeded(f: File) = Unit   // оставлено ради совместимости: логика в FileLogCore
 
     /**
      * Запись под файловым локом + fsync. `RandomAccessFile` открывается заново на каждую
      * строку (как и прежний `FileWriter`), но смещение берётся под локом, поэтому «дыры»
      * из-за конкурирующего писателя не появляются.
      */
+    /** Ошибки больше не глотаются: провал сообщается независимым каналом (logcat) с причиной. */
     private fun writeTo(f: File, line: String) {
-        synchronized(ioLock) {
-            try {
-                rotateIfNeeded(f)
-                java.io.RandomAccessFile(f, "rw").use { raf ->
-                    val ch = raf.channel
-                    val lock = runCatching { ch.lock() }.getOrNull()
-                    try {
-                        raf.seek(raf.length())
-                        raf.write(line.toByteArray(Charsets.UTF_8))
-                        raf.fd.sync()
-                    } finally {
-                        runCatching { lock?.release() }
-                    }
-                }
-            } catch (_: Throwable) {}
+        // Короткое ожидание: занятый лок — не повод терять строку, но и не повод писать вслепую.
+        val r = FileLogCore.append(f.parentFile, f.name, line, MAX_SIZE_BYTES.toLong(), lockWaitMs = 25L)
+        if (!r.written) {
+            // Независимый канал: Log.e доступен даже когда файловая запись невозможна.
+            Log.e(TAG, "LOG_WRITE_FAILED file=«${f.name}» ${r.wire()}")
+        } else if (r.tailNulBefore > 0) {
+            Log.e(TAG, "LOG_TAIL_NUL_AT_APPEND file=«${f.name}» bytes=${r.tailNulBefore} " +
+                "(повреждение было ДО этой записи; файл не переписываем)")
+        } else if (!r.locked) {
+            Log.w(TAG, "LOG_WRITE_UNLOCKED file=«${f.name}» (межпроцессный лок недоступен: " +
+                "запись выполнена без него, это НЕ молчаливый успех)")
         }
     }
 

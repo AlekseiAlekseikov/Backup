@@ -45,7 +45,7 @@ class JitIter39Test {
     ) = apply {
         setIn(0, JitRef.KEY_RESTORE, snap)
         setIn(1, JitRef.KEY_RESTORE, snap)
-        val mark = JitRef.OpMark.of(op, want, state, 0L).wire()
+        val mark = JitRef.OpMark.of(op, want, state, System.currentTimeMillis()).wire()
         setIn(0, JitRef.KEY_MARK, mark)
         setIn(1, JitRef.KEY_MARK, mark)
     }
@@ -168,7 +168,7 @@ class JitIter39Test {
         val cps = JitFake.Prefs(cpsDisk)
         val dps = JitFake.Prefs(dpsDisk)
         val store = JitNet.AndroidStore({ cps }, { dps })
-        val mark = JitRef.OpMark.of("op-real", true, JitRef.OpMark.REPLIED, 0L)
+        val mark = JitRef.OpMark.of("op-real", true, JitRef.OpMark.REPLIED, System.currentTimeMillis())
         store.putSnapshot(true, JitRef.WifiSnapshot(true), mark)
         assertEquals("wifi=1", cpsDisk[JitRef.KEY_RESTORE])
 
@@ -201,11 +201,11 @@ class JitIter39Test {
         val store = JitNet.AndroidStore({ cps }, { dps })
         // В CPS — наша операция, в DPS уже лежит другая (новая).
         store.putSnapshot(true, JitRef.WifiSnapshot(true),
-            JitRef.OpMark.of("op-mine", true, JitRef.OpMark.REPLIED, 0L))
+            JitRef.OpMark.of("op-mine", true, JitRef.OpMark.REPLIED, System.currentTimeMillis()))
         dps.edit()
             .putString(JitRef.KEY_RESTORE, "wifi=0")
             .putString(JitRef.KEY_MARK,
-                JitRef.OpMark.of("op-new", false, JitRef.OpMark.REPLIED, 0L).wire())
+                JitRef.OpMark.of("op-new", false, JitRef.OpMark.REPLIED, System.currentTimeMillis()).wire())
             .commit()
 
         val rm = store.removeOwned("op-mine")
@@ -227,7 +227,7 @@ class JitIter39Test {
         val dps = JitFake.Prefs(dpsDisk)
         val store = JitNet.AndroidStore({ cps }, { dps })
         store.putSnapshot(true, JitRef.WifiSnapshot(true),
-            JitRef.OpMark.of("op-one", true, JitRef.OpMark.REPLIED, 0L))
+            JitRef.OpMark.of("op-one", true, JitRef.OpMark.REPLIED, System.currentTimeMillis()))
         val cpsBefore = cps.writes.get()
         val dpsBefore = dps.writes.get()
 
@@ -247,7 +247,7 @@ class JitIter39Test {
         val dps = JitFake.Prefs(dpsDisk)
         val store = JitNet.AndroidStore({ cps }, { dps })
         store.putSnapshot(true, JitRef.WifiSnapshot(true),
-            JitRef.OpMark.of("op-part", true, JitRef.OpMark.REPLIED, 0L))
+            JitRef.OpMark.of("op-part", true, JitRef.OpMark.REPLIED, System.currentTimeMillis()))
         dps.commitOk = false            // DPS отказывает: частичный успех
 
         val rm = store.removeOwned("op-part")
@@ -367,7 +367,7 @@ class JitIter39Test {
         JitOp.onProcessStart(store, net, sched, ::log)
 
         // Пока задача стояла, записалась другая операция.
-        val newMark = JitRef.OpMark.of("op-new", false, JitRef.OpMark.REPLIED, 0L).wire()
+        val newMark = JitRef.OpMark.of("op-new", false, JitRef.OpMark.REPLIED, System.currentTimeMillis()).wire()
         store.setIn(0, JitRef.KEY_RESTORE, "wifi=0")
         store.setIn(1, JitRef.KEY_RESTORE, "wifi=0")
         store.setIn(0, JitRef.KEY_MARK, newMark)

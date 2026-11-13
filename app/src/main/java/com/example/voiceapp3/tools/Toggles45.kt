@@ -19,6 +19,61 @@ object Toggles45 {
         if (applied) (if (want) "applied" else "off") else "pending"
 
     /**
+     * §4.2 iter46: какое из двух хранилищ (CPS/DPS) считать истиной для boolean.
+     *
+     * @param cpsValue значение в credential-protected storage (`null` — ключа нет).
+     * @param cpsRev   ревизия записи там же (`-1` — ревизии нет, старая установка).
+     * @param dpsValue значение в device-protected storage.
+     * @param dpsRev   ревизия там же.
+     * @param default  значение по умолчанию, если известно только «ключа нет».
+     *
+     * Правила (доказаны тестами):
+     *  1. Ревизий нет нигде (старая установка) → прежняя семантика `cps || dps`: сохранённые
+     *     настройки владельца при обновлении не теряются.
+     *  2. Ревизии есть → побеждает копия с БОЛЬШЕЙ ревизией (последняя запись). Это и есть
+     *     исправление «старое true перебивает новый OFF».
+     *  3. Ревизии равны → значения должны совпадать (одна запись в обе копии); если копия
+     *     без значения (ключ удалён) — берём значение из другой; если обе без значения —
+     *     `default`.
+     *  4. Нечитаемая копия (`null` значения при наличии ревизии) не считается «OFF».
+     */
+    fun pickBoolean(
+        cpsValue: Boolean?,
+        cpsRev: Long,
+        dpsValue: Boolean?,
+        dpsRev: Long,
+        default: Boolean
+    ): Boolean {
+        val hasRev = cpsRev >= 0L || dpsRev >= 0L
+        if (!hasRev) {
+            // Миграция: старое поведение (OR) — не теряем включённое владельцем.
+            return when {
+                cpsValue == true || dpsValue == true -> true
+                cpsValue == false || dpsValue == false -> false
+                else -> default
+            }
+        }
+        // Побеждает более новая запись.
+        val useCps = cpsRev > dpsRev || (cpsRev == dpsRev && cpsValue != null)
+        val winner = if (useCps) cpsValue else dpsValue
+        val other = if (useCps) dpsValue else cpsValue
+        return winner ?: other ?: default
+    }
+
+    /**
+     * §4.2 iter46: то же для строк (путь к выбранному WAV и подобное).
+     * `null` — значения нет ни в одной копии.
+     */
+    fun pickString(cpsValue: String?, cpsRev: Long, dpsValue: String?, dpsRev: Long): String? {
+        val hasRev = cpsRev >= 0L || dpsRev >= 0L
+        if (!hasRev) return cpsValue ?: dpsValue
+        val useCps = cpsRev > dpsRev || (cpsRev == dpsRev && cpsValue != null)
+        val winner = if (useCps) cpsValue else dpsValue
+        val other = if (useCps) dpsValue else cpsValue
+        return winner ?: other
+    }
+
+    /**
      * §7.2: истекло ли окно жизни незавершённой операции.
      *
      * @param markTs время отметки операции (wall clock, мс); `<= 0` — время неизвестно.

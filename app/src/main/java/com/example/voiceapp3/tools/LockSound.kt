@@ -83,6 +83,11 @@ object LockSound {
     private const val MAX_BIND_RETRIES = 3
     @Volatile private var bindFailCount = 0
     @Volatile private var bindDisabledUntilBoot = false
+    /**
+     * §6.3 iter46: поколение операций звука. OFF или смена файла увеличивают его, поэтому
+     * запланированный повтор/копирование старого поколения НЕ смонтирует звук после OFF.
+     */
+    @Volatile private var bindGen = 0L
     @Volatile private var lastBindFailReason: String? = null
     @Volatile
     private var mediaPlayer: MediaPlayer? = null
@@ -178,7 +183,12 @@ object LockSound {
         Prefs2.putBoolean(ctx, PREF_LOCK_SOUND_ENABLED, enabled)
         if (enabled) Prefs2.putString(ctx, PREF_LOCK_SOUND_APPLIED, "pending")
         else Prefs2.putString(ctx, PREF_LOCK_SOUND_APPLIED, "off")
-        AppLog.i(ctx, TAG, "LOCK_SOUND_INTENT desired=$enabled source=user_click")
+        // §6.3 iter46: любое решение владельца — новая генерация: старые отложенные задачи
+        // (копирование/bind/повтор) не имеют права применить звук после OFF.
+        bindGen++
+        bindFailCount = 0
+        bindDisabledUntilBoot = false
+        AppLog.i(ctx, TAG, "LOCK_SOUND_INTENT desired=$enabled source=user_click gen=$bindGen")
         val prefReadback = Prefs2.getBoolean(ctx, PREF_LOCK_SOUND_ENABLED, false)
         steps += ToolsStep(
             step = "persist_pref",
@@ -499,6 +509,13 @@ object LockSound {
         Prefs2.putString(ctx, pathKey, targetFile.absolutePath)
         Prefs2.putString(ctx, nameKey, fileName)
         Prefs2.putBoolean(ctx, enableKey, true)
+        // §6.3 iter46: смена файла — новая генерация: задача, начатая со СТАРЫМ файлом, не должна
+        // ни смонтировать старый звук, ни перезаписать новый выбор.
+        bindGen++
+        bindFailCount = 0
+        bindDisabledUntilBoot = false
+        markApplied(ctx, false, "selected_pending_apply")
+        AppLog.i(ctx, TAG, "LOCK_SOUND_SELECT file=$fileName gen=$bindGen action=apply_pending")
 
         if (isLock) {
             // Выбор кастомного файла → пишем путь и enable=1.
@@ -771,6 +788,10 @@ object LockSound {
     }
 
     fun onBootOrWatchdog(ctx: Context) {
+        // §6.2 iter46: boot — подходящее событие, сбрасываем «до boot»-блокировку и счётчик.
+        bindDisabledUntilBoot = false
+        bindFailCount = 0
+        bindGen++
         val lockEnabled = isEnabled(ctx)
         val unlockEnabled = isUnlockSoundEnabled(ctx)
         AppLog.i(ctx, TAG, "onBootOrWatchdog: проверка звуков замка (lock=$lockEnabled unlock=$unlockEnabled) vol=${getVolume(ctx)}% delay=${getDelayMs(ctx)}ms")
@@ -832,11 +853,18 @@ object LockSound {
      *  4. VERIFY по SRC_INODE/TGT_INODE и по /proc/mounts.
      */
     private fun applySystemLockSoundBind(ctx: Context, soundFile: File) {
-        // Если ранее тумблер был отключён из-за детерминированной ошибки — не штурмим
+        // §6.2 iter46: «до boot» больше не блокирует бессрочно — только до подходящего события;
+        // флаг оставлен для совместимости и снимается в onConditionsRestored/смене выбора.
         if (bindDisabledUntilBoot) {
-            AppLog.i(ctx, TAG, "VERIFY lockSound: skip (disabled until boot, reason=$lastBindFailReason)")
+            AppLog.i(ctx, TAG, "VERIFY lockSound: skip (ждёт подходящего события, reason=$lastBindFailReason)")
             return
         }
+        // §6.3: применение только для актуальной генерации и при сохранённом ON.
+        if (!isEnabled(ctx)) {
+            AppLog.i(ctx, TAG, "VERIFY lockSound: skip reason=desired_off (владелец выключил)")
+            return
+        }
+        val gen = bindGen
         val appCtx = ctx.applicationContext
         // P1: всё что ниже — ADB/mount, на BgWorker а не на main.
         BgWorker.post("LockSound.bind") {
@@ -929,14 +957,28 @@ object LockSound {
                     recordBindFailure("path_not_ours: ${notOurs.first()}", appCtx, deterministic = true)
                     return@post
                 }
+                // §6.3 iter46: пока шло копирование, владелец мог выключить звук или выбрать
+                // другой файл — тогда старый bind НЕ выполняется (иначе OFF «отменялся» бы
+                // сам собой, а новый выбор затирался старым).
+                if (gen != bindGen || !isEnabled(appCtx)) {
+                    AppLog.i(ctx, TAG, "LOCKSOUND_BIND_CANCELLED gen=$gen now=$bindGen " +
+                        "desired=${isEnabled(appCtx)} action=none " +
+                        "(решение владельца изменилось во время копирования)")
+                    return@post
+                }
                 val bindRes = AdbClient.execute(bindScript, 20000)
                 AppLog.i(ctx, TAG, "lockSound bind rc=${bindRes.first}: ${bindRes.second.replace('\n', ' ').take(500)}")
 
-                val failDeterm = bindRes.second.contains("ERR_ROOT_CHANNEL_UNAVAILABLE")
-                    || bindRes.second.contains("Permission denied")
-                    || bindRes.second.contains("avc: denied")
-                    || bindRes.second.contains("No such file")
-                    || bindRes.second.contains("MOUNT_VERIFY_FAIL") && bindRes.first == 0 && !bindRes.second.contains("MOUNTED_OK:")
+                // §6.2 iter46: `ERR_ROOT_CHANNEL_UNAVAILABLE` и `Permission denied` — ВРЕМЕННЫЕ
+                // (канал/права могут вернуться без перезагрузки: в логе владельца 13.11 это
+                // `copy failed rc=1 out=ERR_SCRIPT_UPLOAD_CLEA…`, а root позже снова работал).
+                // Неисправимыми считаем только отсутствие самого файла и провал проверки
+                // монтирования при успешном rc.
+                val tempRootGone = bindRes.second.contains("ERR_ROOT_CHANNEL_UNAVAILABLE") ||
+                    bindRes.second.contains("Permission denied") || bindRes.second.contains("avc: denied")
+                val failDeterm = (!tempRootGone && bindRes.second.contains("No such file"))
+                    || (bindRes.second.contains("MOUNT_VERIFY_FAIL") && bindRes.first == 0 &&
+                        !bindRes.second.contains("MOUNTED_OK:"))
                 val ok = bindRes.first == 0 && bindRes.second.contains("MOUNTED_OK:") && !failDeterm
 
                 if (ok) {
@@ -968,27 +1010,85 @@ object LockSound {
     private fun recordBindFailure(reason: String, ctx: Context, deterministic: Boolean) {
         lastBindFailReason = reason
         AppLog.e(ctx, TAG, "VERIFY lockSound: FAILED ($reason), deterministic=$deterministic")
-        if (!deterministic) {
-            // Временная ошибка (таймаут, рестарт adbd) — увеличиваем счётчик, но не отключаем.
-            bindFailCount += 1
-            if (bindFailCount < MAX_BIND_RETRIES) {
-                AppLog.i(ctx, TAG, "lockSound retry scheduled (attempt ${bindFailCount+1}/$MAX_BIND_RETRIES)")
-                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+        bindFailCount += 1
+        markApplied(ctx, false, reason)
+        // §6.2 iter46: ОГРАНИЧЕННЫЙ повтор с backoff. Раньше здесь ставился «замок до boot»,
+        // который никто не снимал: один временный отказ root-канала блокировал звук до
+        // перезагрузки (и в логе владельца именно так и выглядело). Теперь:
+        //  • каждая неудача планирует ОДИН повтор (не чаще, чем раз в [BACKOFF_MS][bindFailCount]);
+        //  • после [MAX_BIND_RETRIES] попыток остаётся честный `pending` с причиной — но НЕ
+        //    бессрочная блокировка: подходящее событие (включение функции, смена файла,
+        //    возврат канала, boot) сбрасывает счётчик и пробует снова;
+        //  • OFF владельца отменяет всё: [bindGen] меняется и запланированный повтор не сработает.
+        if (bindFailCount <= MAX_BIND_RETRIES) {
+            val attempt = bindFailCount
+            val delay = backoffMs(attempt)
+            val gen = bindGen
+            AppLog.i(ctx, TAG, "lockSound retry scheduled attempt=$attempt/$MAX_BIND_RETRIES delay_ms=$delay " +
+                "reason=«$reason» (намерение владельца сохраняется)")
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                // Повтор только если владелец всё ещё хочет звук и выбор не изменился.
+                if (gen != bindGen) {
+                    AppLog.i(ctx, TAG, "lockSound retry cancelled generation_changed " +
+                        "(OFF/смена файла были позже — старую задачу не выполняем)")
+                } else if (!isEnabled(ctx)) {
+                    AppLog.i(ctx, TAG, "lockSound retry cancelled desired=false")
+                } else {
                     val path = getSelectedPath(ctx)
                     if (path.isNotEmpty() && File(path).exists()) applySystemLockSoundBind(ctx, File(path))
-                }, (5000L * (1 shl (bindFailCount - 1).coerceAtMost(3)))) // exponential backoff 5/10/20s
-                return
-            }
+                    else AppLog.i(ctx, TAG, "lockSound retry skipped reason=no_file_selected")
+                }
+            }, delay)
+            // §6.2: подписка на возврат канала — без перезагрузки ГУ.
+            armRetryOnChannelReady(ctx)
+        } else {
+            armRetryOnChannelReady(ctx)
+            AppLog.e(ctx, TAG, "lockSound применение=pending после $MAX_BIND_RETRIES попыток: $reason " +
+                "(не блокируем до boot: повтор — по событию «канал готов»/включение/смена файла/boot; " +
+                "намерение владельца сохранено)")
         }
-        // §6 iter45: РАНЬШЕ здесь писалось `PREF_LOCK_SOUND_ENABLED = false` — то есть ошибка
-        // монтирования ВЫКЛЮЧАЛА выбор владельца, и после обновления/стоянки звук «сам»
-        // отключался. Теперь намерение и выбранный файл сохраняются, а факт честно `pending`
-        // с причиной; штурмовать систему каждые 60 с по-прежнему нельзя — до следующего
-        // подходящего события (boot/включение функции/смена файла) попыток нет.
-        bindDisabledUntilBoot = true
-        markApplied(ctx, false, reason)
-        AppLog.e(ctx, TAG, "lockSound остаётся включённым у владельца, применение=pending: $reason " +
-            "(повтор — при следующем подходящем событии, без автоматического штурма)")
+    }
+
+    /** Пауза перед повтором: 5/10/20/40 с, без бесконечного роста. */
+    internal fun backoffMs(attempt: Int): Long =
+        5_000L * (1 shl (attempt - 1).coerceIn(0, 3))
+
+    /**
+     * §6.2 iter46: подписка на ОДНО существующее событие «канал root готов».
+     *
+     * Это не новый сторож и не цикл: обработчик снимается при первом срабатывании. Нужен,
+     * чтобы временный отказ root-канала не превращался в ожидание до перезагрузки ГУ
+     * (в логе владельца 13.11 root позже снова работал без ребута).
+     */
+    fun armRetryOnChannelReady(ctx: Context) {
+        if (!isEnabled(ctx)) return
+        val app = ctx.applicationContext
+        runCatching {
+            AdbClient.onChannelReadyOnce {
+                BgWorker.post("LockSound.channelReady") {
+                    if (isEnabled(app) && appliedState(app) != "applied") {
+                        onConditionsRestored(app, "channel_ready")
+                    }
+                }
+            }
+            AppLog.i(app, TAG, "LOCKSOUND_RETRY armed on=channel_ready desired=true " +
+                "applied=${appliedState(app)}")
+        }
+    }
+
+    /**
+     * §6.2 iter46: «условия вернулись» — сбрасываем счётчик и блокировку и пробуем применить
+     * ещё раз (без нового штурма: одна попытка на событие).
+     */
+    fun onConditionsRestored(ctx: Context, source: String) {
+        if (!isEnabled(ctx)) return
+        bindFailCount = 0
+        bindDisabledUntilBoot = false
+        bindGen++
+        val path = getSelectedPath(ctx)
+        AppLog.i(ctx, TAG, "LOCKSOUND_RETRY source=$source desired=true applied=${appliedState(ctx)} " +
+            "file=${if (path.isEmpty()) "none" else "selected"}")
+        if (path.isNotEmpty() && File(path).exists()) applySystemLockSoundBind(ctx, File(path))
     }
 
     /**
