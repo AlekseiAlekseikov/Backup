@@ -156,12 +156,22 @@ class ToolsPanel(
         stateLoaded = true
         // §4.1 iter46: честная граница частичного снимка — считаем, сколько ключей тумблеров
         // реально пришло; отсутствующие остаются «не прочитано» (см. addToggle), а не OFF.
-        stateRenderedKeys = d.entrySet().count { !it.key.startsWith("$") && it.key != "last" && it.key != "seq" }
-        stateExpectedKeys = EXPECTED_STATE_KEYS
+        stateRenderedKeys = d.entrySet().count {
+            !it.key.startsWith("$") && it.key != "last" && it.key != "seq"
+        }
+        // §4.1 iter46: ожидаемое число ключей сообщает сам снимок (`$keys`). Зашитая константа
+        // (19) расходилась с составом `ToolsBackend.state()` и давала ложное «снимок неполный».
+        val declared = d.get("\$keys")?.takeIf { it.isJsonPrimitive }
+            ?.let { runCatching { it.asInt }.getOrNull() }
+        stateExpectedKeys = when {
+            declared != null && declared > 0 -> declared
+            stateRenderedKeys > 0 -> stateRenderedKeys
+            else -> 0
+        }
         for ((k, v) in d.entrySet()) {
             if (k == "last") {
                 last = if (v.isJsonObject) v.asJsonObject else last
-            } else {
+            } else if (!k.startsWith("\$")) {
                 state.add(k, v)
             }
         }
@@ -252,7 +262,7 @@ class ToolsPanel(
         page.removeAllViews()
         // §4.1 iter46: частичный снимок честно называется частичным (нейтральным текстом,
         // без красного и без новых кнопок). Отсутствующие ключи не выдаются за выключенные.
-        if (stateLoaded && stateRenderedKeys in 1 until stateExpectedKeys) {
+        if (stateLoaded && stateExpectedKeys > 0 && stateRenderedKeys in 1 until stateExpectedKeys) {
             page.addView(text(
                 "Снимок состояния неполный: получено $stateRenderedKeys из $stateExpectedKeys ключей. " +
                     "Отсутствующие показаны как «состояние ещё не прочитано».",
@@ -281,7 +291,7 @@ class ToolsPanel(
      * (`ToolsBackend.state()`). Если чего-то нет — снимок частичный, и такие тумблеры
      * показываются «состояние ещё не прочитано», а не выключенными.
      */
-    private val EXPECTED_STATE_KEYS: Int = 19
+    // Ожидаемое число ключей больше не константа: его сообщает сам снимок (`$keys`).
 
     private fun pageScreen() {
         addHead("page.screen", "screen")

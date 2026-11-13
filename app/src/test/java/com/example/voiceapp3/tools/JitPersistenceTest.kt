@@ -49,7 +49,10 @@ class JitPersistenceTest {
     fun successfulCommitIsConfirmedByReadbackOfAllThreeKeys() {
         val (cps, dps) = bothPrefs()
         val s = store(cps, dps)
-        val w = s.putSnapshot(true, snapTrue, mk())
+        // Одна и та же отметка: `mk()` берёт реальное время, поэтому два вызова могут
+        // разойтись на 1 мс и дать ложный провал (гонка самого теста, не кода).
+        val mark = mk()
+        val w = s.putSnapshot(true, snapTrue, mark)
         assertEquals(2, w.attempted)
         assertEquals(2, w.committed)
         assertEquals(2, w.confirmed)
@@ -59,7 +62,7 @@ class JitPersistenceTest {
             assertEquals(true, disk[JitRef.KEY_PEDIDO])
             assertEquals(true, disk[JitRef.KEY_AUTO])
             assertEquals("wifi=1", disk[JitRef.KEY_RESTORE])
-            assertEquals("отметка операции тоже durable", mk().wire(), disk[JitRef.KEY_MARK])
+            assertEquals("отметка операции тоже durable", mark.wire(), disk[JitRef.KEY_MARK])
         }
     }
 

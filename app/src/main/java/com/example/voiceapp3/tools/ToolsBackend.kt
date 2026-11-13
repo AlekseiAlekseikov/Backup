@@ -155,7 +155,7 @@ enum class Choice(
      * источника истины.
      */
     fun state(): JsonObject {
-        return JsonObject().apply {
+        val o = JsonObject().apply {
         Toggle.values().forEach { t ->
             addProperty(t.key, prefs().getBoolean(t.pref, t.default))
         }
@@ -226,6 +226,13 @@ enum class Choice(
         /* iter23 P0.6: состояние root-канала для баннера в «Инструментах». */
         addProperty("rootState", AdbClient.currentState().name)
         addProperty("rootPort", AdbClient.currentPort().toString())
+        }
+        // §4.1 iter46: снимок сам сообщает, сколько ключей он ОБЯЗАН содержать, и свою ревизию.
+        // Раньше панель сравнивала пришедшее с зашитой константой — она неизбежно расходилась
+        // с реальным составом и давала ложную «неполноту». Теперь счётчик вычисляется здесь.
+        o.addProperty("\$keys", o.entrySet().count { !it.key.startsWith("\$") })
+        o.addProperty("$rev", revision())
+        return o
     }
 }
 
