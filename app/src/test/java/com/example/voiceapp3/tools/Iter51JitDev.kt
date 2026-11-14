@@ -59,11 +59,23 @@ internal object JitDev {
             return 0 to line
         }
         // 2) Чтение claim + terminal одной командой.
-        if (command.startsWith("echo CLAIM=")) {
+        //
+        // iter53 §4.1: fake-устройство ОБЯЗАНО отвечать в том же протоколе, что и настоящий
+        // `readCmd` (`CS_BEGIN…CS_END`, `CLAIM_STATUS`/`CLAIM_VALUE`, `TERM_STATUS`/`TERM_VALUE`),
+        // иначе тест снова начнёт проверять формат, которого нет на устройстве.
+        if (command.contains("CLAIM_STATUS=") && command.contains("CS_BEGIN")) {
             val op = Regex("voiceapp3_jit_([A-Za-z0-9_.-]{1,64})\\.term")
                 .find(command)?.groupValues?.get(1) ?: ""
             val term = terms[op]?.joinToString("|") ?: ""
-            return 0 to "CLAIM=${claim ?: ""}\nTERM=$term"
+            val cur = claim
+            val b = StringBuilder()
+            b.append("CS_BEGIN\n")
+            if (cur.isNullOrBlank()) b.append("CLAIM_STATUS=absent\n")
+            else b.append("CLAIM_STATUS=present\nCLAIM_VALUE=").append(cur).append("\n")
+            if (term.isEmpty()) b.append("TERM_STATUS=absent\n")
+            else b.append("TERM_STATUS=present\nTERM_VALUE=").append(term).append("\n")
+            b.append("CS_END\n")
+            return 0 to b.toString()
         }
         return null
     }

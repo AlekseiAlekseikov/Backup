@@ -22,6 +22,17 @@ import org.junit.Test
  */
 class Iter51JitOwnershipTest {
 
+    /** iter53 §4.1: ответ устройства в РЕАЛЬНОМ протоколе чтения (без кавычек). */
+    private fun reply(claim: String?, term: String?): String {
+        val b = StringBuilder("CS_BEGIN\n")
+        if (claim.isNullOrBlank()) b.append("CLAIM_STATUS=absent\n")
+        else b.append("CLAIM_STATUS=present\nCLAIM_VALUE=").append(claim).append("\n")
+        if (term.isNullOrBlank()) b.append("TERM_STATUS=absent\n")
+        else b.append("TERM_STATUS=present\nTERM_VALUE=").append(term).append("\n")
+        b.append("CS_END")
+        return b.toString()
+    }
+
     private val logs = java.util.Collections.synchronizedList(mutableListOf<String>())
     private fun log(s: String) { logs += s }
     private fun lines(): String = synchronized(logs) { logs.joinToString("\n") }
@@ -74,19 +85,19 @@ class Iter51JitOwnershipTest {
         JitOwn.Op.parseClaim(other.claimLine())
         assertEquals(true, JitOwn.Op.parseClaim(other.claimLine())?.id == "op-b")
 
-        val startedOnly = JitOwn.parseTerminal("op-a", "CLAIM=op=op-b;ts=6;want=0\nTERM=START ts=1 op=op-a|")
+        val startedOnly = JitOwn.parseTerminal("op-a", reply("op=op-b;ts=6;want=0", "START ts=1 op=op-a|"))
         assertEquals("claim чужой — видно", true, startedOnly!!.claimOther)
         assertEquals(JitOwn.State.STARTED, JitOwn.classify(sentAck = false, term = startedOnly))
         assertEquals("начался и не закончился — это неопределённость",
             JitOwn.State.STARTED, JitOwn.classify(false, startedOnly))
 
         val finished = JitOwn.parseTerminal("op-a",
-            "CLAIM=op=op-a;ts=5;want=1\nTERM=START ts=1 op=op-a|END rc=0 op=op-a|")
+            reply("op=op-a;ts=5;want=1", "START ts=1 op=op-a|END rc=0 op=op-a|"))
         assertEquals(JitOwn.State.FINISHED, JitOwn.classify(sentAck = false, term = finished))
         assertEquals(0, finished!!.rc)
 
         val refused = JitOwn.parseTerminal("op-a",
-            "CLAIM=op=op-b;ts=6;want=0\nTERM=JIT_REFUSED op=op-a reason=superseded claim=op=op-b")
+            reply("op=op-b;ts=6;want=0", "JIT_REFUSED op=op-a reason=superseded claim=op=op-b"))
         assertEquals(JitOwn.State.REFUSED, JitOwn.classify(sentAck = false, term = refused))
 
         assertNull("нечитаемый ответ — не «не выполнено», а «неизвестно»",
@@ -105,7 +116,7 @@ class Iter51JitOwnershipTest {
         assertEquals("old_payload_maybe_queued", queued.risk)
 
         val running = JitOwn.clickDecision(prev,
-            JitOwn.parseTerminal("op-x", "CLAIM=op=op-x;ts=1;want=1\nTERM=START ts=1 op=op-x|"))
+            JitOwn.parseTerminal("op-x", reply("op=op-x;ts=1;want=1", "START ts=1 op=op-x|")))
         assertTrue(running.allow)
         assertEquals("old_payload_running", running.risk)
         assertTrue("честно: уже начавшийся рестарт не отменить", running.why.contains("не отменит"))
@@ -113,7 +124,7 @@ class Iter51JitOwnershipTest {
         val done = JitOwn.clickDecision(prev,
             // iter52 §7.2: строки terminal'а несут op=<id> — теперь это проверяется строго,
             // поэтому в тесте id указан так же, как его пишет production-payload.
-            JitOwn.parseTerminal("op-x", "CLAIM=op=op-x;ts=1;want=1\nTERM=START ts=1 op=op-x|END rc=1 op=op-x|"))
+            JitOwn.parseTerminal("op-x", reply("op=op-x;ts=1;want=1", "START ts=1 op=op-x|END rc=1 op=op-x|")))
         assertEquals("none", done.risk)
     }
 
@@ -187,7 +198,7 @@ class Iter51JitOwnershipTest {
                     JitDev.claimForTest(JitOwn.Op("someone-else", 9L, false, JitOwn.State.CLAIMED).claimLine())
                     return 0 to JitDev.claim!!       // команда «подтвердила» запись, но она не вступила
                 }
-                if (command.startsWith("echo CLAIM=")) return JitDev.handle(command)!!
+                if (command.contains("CLAIM_STATUS=")) return JitDev.handle(command)!!
                 if (command.contains("setprop ctl.restart zygote")) {
                     // Гвардия отказала бы: ничего не выполняем, но на устройстве остаётся след.
                     val opId = Regex("JIT_REFUSED op=([A-Za-z0-9_.-]+)").find(command)!!
@@ -220,7 +231,7 @@ class Iter51JitOwnershipTest {
                 if (command.startsWith("printf") && command.contains(JitOwn.CLAIM)) {
                     return 1 to "Permission denied"
                 }
-                if (command.startsWith("echo CLAIM=")) return 0 to "CLAIM=\nTERM="
+                if (command.contains("CLAIM_STATUS=")) return 0 to reply(null, null)
                 return 0 to "ok"
             }
             override fun mapsExcerpt(): String? = null

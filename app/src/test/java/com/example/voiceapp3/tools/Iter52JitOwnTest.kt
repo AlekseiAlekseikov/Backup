@@ -28,6 +28,17 @@ import org.junit.Test
  */
 class Iter52JitOwnTest {
 
+    /** iter53 §4.1: ответ устройства в РЕАЛЬНОМ протоколе чтения (без кавычек). */
+    private fun reply(claim: String?, term: String?): String {
+        val b = StringBuilder("CS_BEGIN\n")
+        if (claim.isNullOrBlank()) b.append("CLAIM_STATUS=absent\n")
+        else b.append("CLAIM_STATUS=present\nCLAIM_VALUE=").append(claim).append("\n")
+        if (term.isNullOrBlank()) b.append("TERM_STATUS=absent\n")
+        else b.append("TERM_STATUS=present\nTERM_VALUE=").append(term).append("\n")
+        b.append("CS_END")
+        return b.toString()
+    }
+
     private val base: File = File.createTempFile("jit52", "").let { it.delete(); it.mkdirs(); it }
 
     private val sh: String = listOf("/bin/sh", "/usr/bin/sh", "sh")
@@ -127,7 +138,7 @@ class Iter52JitOwnTest {
 
     @Test
     fun terminalLinesOfAnotherOpAreNotCountedAsOurs() {
-        val out = "CLAIM=\"op=a;ts=1700000000;want=1\"\nTERM=\"START ts=1 op=zzz|END rc=0 op=zzz|\""
+        val out = reply("op=a;ts=1700000000;want=1", "START ts=1 op=zzz|END rc=0 op=zzz|")
         val t = JitOwn.parseTerminal("a", out)
         assertTrue("terminal прочитан", t != null)
         assertFalse("чужой START не наш", t!!.started)
@@ -138,7 +149,7 @@ class Iter52JitOwnTest {
 
     @Test
     fun terminalEndWithoutRcIsNotFinished() {
-        val out = "CLAIM=\"op=a;ts=1700000000;want=1\"\nTERM=\"START ts=1 op=a|END op=a|\""
+        val out = reply("op=a;ts=1700000000;want=1", "START ts=1 op=a|END op=a|")
         val t = JitOwn.parseTerminal("a", out)!!
         assertTrue("START наш", t.started)
         assertFalse("END без rc — не доказательство завершения", t.finished)
@@ -158,9 +169,14 @@ class Iter52JitOwnTest {
         claim().writeText("op=a;ts=1700000000;want=1")
         // payload реально исполняется — START/END появляются на диске
         run(JitOwn.guard(op("a"), base.absolutePath) + "\nexit 3\n")
-        val out = "CLAIM=\"${claim().readText().trim()}\"\nTERM=\"${
-            term("a").readText().trim().replace("\n", "|")
-        }|\""
+        // iter53 §4.1: вывод берётся в РЕАЛЬНОМ протоколе чтения (без кавычек — их печатает
+        // только сам тест, а shell в stdout их не выводит). Прежний вариант теста «доказывал»
+        // разбор на выводе, которого устройство не производит.
+        val out = "CS_BEGIN\n" +
+            "CLAIM_STATUS=present\nCLAIM_VALUE=" + claim().readText().trim() + "\n" +
+            "TERM_STATUS=present\nTERM_VALUE=" +
+            term("a").readText().trim().replace("\n", "|") + "\n" +
+            "CS_END"
         val t = JitOwn.parseTerminal("a", out)!!
         assertTrue("END есть", t.finished)
         assertEquals("rc из END, а не из транспорта", 3, t.rc)
@@ -174,11 +190,14 @@ class Iter52JitOwnTest {
         assertEquals("claim нашей операции", true to "claim_ours",
             JitOwn.claimAllowsRestore("a", "op=a;ts=1;want=1"))
         assertEquals("claim другой операции — НЕЛЬЗЯ (затрём новое решение)",
-            false to "claim_foreign", JitOwn.claimAllowsRestore("a", "op=b;ts=1;want=0"))
-        assertEquals("claim отсутствует — конкурирующих нет", true to "claim_absent",
+            false to "claim_foreign:b", JitOwn.claimAllowsRestore("a", "op=b;ts=1;want=0"))
+        // iter53 §4.2: отсутствие claim НЕ разрешает возврат (гвардия payload в этом случае
+        // отказывается работать, значит наша цепочка Wi-Fi не выключала).
+        assertEquals("claim подтверждённо отсутствует — НЕЛЬЗЯ",
+            false to "claim_confirmed_absent_payload_refused",
             JitOwn.claimAllowsRestore("a", null))
         assertEquals("испорченный claim — неизвестность, а не «всё чисто»",
-            false to "claim_unparsable", JitOwn.claimAllowsRestore("a", "мусор"))
+            false to "claim_unknown:claim_value_invalid", JitOwn.claimAllowsRestore("a", "мусор"))
     }
 
     @Test

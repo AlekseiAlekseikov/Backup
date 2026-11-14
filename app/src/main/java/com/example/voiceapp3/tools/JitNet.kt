@@ -614,17 +614,15 @@ object JitNet {
             scheduler = AndroidScheduler,
             log = { log("source=$source $it") },
             claimGuardFor = { opId ->
-                // iter52 §7.4: реальный путь — читаем claim С УСТРОЙСТВА и спрашиваем JitOwn.
-                // Ошибка чтения = «не знаю» → включение Wi-Fi не выполняется (неизвестность
-                // нельзя превращать в «конкурирующих операций нет»).
-                val raw = runCatching { AdbClient.execute(JitOwn.readCmd(opId), 6_000).second }
-                    .getOrElse { t -> "ERR_${t.javaClass.simpleName}" }
-                if (raw.contains("ERR_")) {
-                    false to "claim_read_failed"
-                } else {
-                    val claim = Regex("CLAIM=\"?([^\"\\n]*)\"").find(raw)?.groupValues?.get(1)
-                    JitOwn.claimAllowsRestore(opId, claim)
-                }
+                // iter52 §7.4 / iter53 §4.1–§4.2: реальный путь — читаем claim С УСТРОЙСТВА и
+                // спрашиваем JitOwn. Прежний regex требовал закрывающую кавычку, которой в
+                // stdout нет (`echo`) → совпадений не было, `null` означал «claim отсутствует»
+                // и возврат Wi-Fi РАЗРЕШАЛСЯ при чужом claim. Теперь разбор строгий:
+                // rc + маркеры CS_BEGIN/CS_END + статусы, а неизвестность трактуется как отказ.
+                val (rc, raw) = runCatching { AdbClient.execute(JitOwn.readCmd(opId), 6_000) }
+                    .getOrElse { t -> -1 to "ERR_${t.javaClass.simpleName}" }
+                val read = JitOwn.parseReadReply(rc, raw).claim
+                JitOwn.restoreDecision(opId, read)
             }
         )
 

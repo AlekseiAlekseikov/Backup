@@ -137,12 +137,161 @@ internal object JitOwn {
     }
 
     /**
-     * Короткая команда чтения «claim + terminal» одной операцией. Печатает две секции:
-     * `CLAIM=<строка>` и `TERM=<строки через | >`.
+     * iter53 §4.1 — КОМАНДА ЧТЕНИЯ С ЯВНЫМ ПРОТОКОЛОМ, у которой нет двусмысленности.
+     *
+     * Дефект iter52: команда печатала `echo CLAIM="$(cat …)"`. Кавычки — синтаксис shell, в
+     * stdout они НЕ попадают, поэтому вывод выглядел как `CLAIM=op=abc;ts=123;want=1`, а парсер
+     * в `JitNet` требовал ЗАКРЫВАЮЩУЮ кавычку. Совпадения не было, `null` трактовался как
+     * «claim отсутствует» → возврат Wi-Fi разрешался при ЧУЖОМ claim.
+     *
+     * Теперь чтение отвечает тремя РАЗНЫМИ фактами и обрамлено маркерами:
+     * ```
+     * CS_BEGIN
+     * CLAIM_STATUS=present|absent|empty|unreadable
+     * CLAIM_VALUE=<строка без переводов строк, только при present>
+     * TERM_STATUS=present|absent|empty|unreadable
+     * TERM_VALUE=<строки через |, только при present>
+     * CS_END
+     * ```
+     *  • `absent` печатается только когда файла действительно НЕТ и каталог доступен
+     *    (`[ -e ]` + `[ -d ]`), а не когда `cat` вернул пустоту;
+     *  • отказ `cat` — `unreadable`, а не «пусто»: `rc` самого `cat` проверяется;
+     *  • маркеры позволяют отличить обрезанный/неполный вывод (нет `CS_END`) от нормального.
      */
-    fun readCmd(opId: String, base: String = BASE): String =
-        "echo CLAIM=\"\$(cat ${claimPath(base)} 2>/dev/null)\"; " +
-            "echo TERM=\"\$(cat ${termPath(opId, base)} 2>/dev/null | tr '\\n' '|')\""
+    fun readCmd(opId: String, base: String = BASE): String {
+        val claim = claimPath(base)
+        val term = termPath(opId, base)
+        val dir = java.io.File(claim).parent ?: BASE
+        return """
+set +e
+echo CS_BEGIN
+_cv=""; _cs=unreadable
+if [ -e $claim ]; then
+  _cv=${'$'}(cat $claim 2>/dev/null); _cr=${'$'}?
+  if [ "${'$'}_cr" != "0" ]; then _cs=unreadable
+  elif [ -z "${'$'}_cv" ]; then _cs=empty
+  else _cs=present; fi
+else
+  if [ -d $dir ]; then _cs=absent; else _cs=unreadable; fi
+fi
+_cv=${'$'}(printf '%s' "${'$'}_cv" | tr '\n' '|')
+echo "CLAIM_STATUS=${'$'}_cs"
+[ "${'$'}_cs" = "present" ] && echo "CLAIM_VALUE=${'$'}_cv"
+_tv=""; _ts=unreadable
+if [ -e $term ]; then
+  _tv=${'$'}(cat $term 2>/dev/null); _tr=${'$'}?
+  if [ "${'$'}_tr" != "0" ]; then _ts=unreadable
+  elif [ -z "${'$'}_tv" ]; then _ts=empty
+  else _ts=present; fi
+else
+  if [ -d $dir ]; then _ts=absent; else _ts=unreadable; fi
+fi
+_tv=${'$'}(printf '%s' "${'$'}_tv" | tr '\n' '|')
+echo "TERM_STATUS=${'$'}_ts"
+[ "${'$'}_ts" = "present" ] && echo "TERM_VALUE=${'$'}_tv"
+echo CS_END
+""".trimIndent()
+    }
+
+    // ─────────────────────────── iter53 §4.2: строгий разбор ответа ───────────────────────────
+
+    /**
+     * Результат чтения claim — ТРИ разных факта, а не «есть/нет».
+     *
+     *  • [Present] — файл прочитан и значение разобрано; владение знает только [Op.id];
+     *  • [ConfirmedAbsent] — доказано, что файла НЕТ (shell проверил `[ -e ]`, каталог доступен);
+     *  • [Unknown] — транспорт/формат/чтение: НЕЛЬЗЯ трактовать как «claim отсутствует».
+     */
+    sealed interface ClaimRead {
+        data class Present(val op: Op) : ClaimRead
+        data object ConfirmedAbsent : ClaimRead
+        data class Unknown(val why: String) : ClaimRead
+    }
+
+    /** Результат чтения terminal-файла операции (значение — строки через `|`). */
+    data class TermRead(val status: String, val lines: List<String>) {
+        val present: Boolean get() = status == "present"
+    }
+
+    /** Полный разбор ответа [readCmd]: владение + terminal одной командой. */
+    data class ReadReply(val claim: ClaimRead, val term: TermRead?)
+
+    private val CLAIM_VALUE_RE = Regex("^op=([A-Za-z0-9_.-]{1,64});ts=(\\d{1,19});want=([01])${'$'}")
+
+    /**
+     * Строгий разбор stdout [readCmd].
+     *
+     * Правила, каждое из которых закрывает конкретный способ «додумать успех»:
+     *  • `rc != 0`, `ERR_…` в выводе — транспорт отказал: [ClaimRead.Unknown];
+     *  • ровно один `CS_BEGIN` и ровно один `CS_END`, причём в этом порядке — иначе вывод
+     *    обрезан/склеен: [ClaimRead.Unknown];
+     *  • ровно одна строка `CLAIM_STATUS=…` — дубликаты считаются подменой;
+     *  • `present` требует ровно одного `CLAIM_VALUE=` с валидным форматом claim;
+     *  • `absent` — только явный статус от shell, не пустой вывод.
+     */
+    fun parseClaimReply(rc: Int, out: String): ClaimRead = parseReadReply(rc, out).claim
+
+    fun parseReadReply(rc: Int, out: String): ReadReply {
+        if (rc != 0) return ReadReply(ClaimRead.Unknown("transport_rc=$rc"), null)
+        if (out.contains("ERR_")) return ReadReply(ClaimRead.Unknown("transport"), null)
+        val lines = out.split('\n').map { it.trim() }
+        val begins = lines.count { it == "CS_BEGIN" }
+        val ends = lines.count { it == "CS_END" }
+        if (begins != 1 || ends != 1 || lines.indexOf("CS_BEGIN") > lines.indexOf("CS_END"))
+            return ReadReply(ClaimRead.Unknown("framing:begin=$begins end=$ends"), null)
+        val body = lines.subList(lines.indexOf("CS_BEGIN") + 1, lines.indexOf("CS_END"))
+        val claimStatuses = body.filter { it.startsWith("CLAIM_STATUS=") }.map { it.removePrefix("CLAIM_STATUS=") }
+        if (claimStatuses.size != 1) return ReadReply(ClaimRead.Unknown("claim_status_lines=${claimStatuses.size}"), null)
+        val termStatuses = body.filter { it.startsWith("TERM_STATUS=") }.map { it.removePrefix("TERM_STATUS=") }
+        val termValues = body.filter { it.startsWith("TERM_VALUE=") }.map { it.removePrefix("TERM_VALUE=") }
+        val term = when {
+            termStatuses.size == 1 -> TermRead(
+                termStatuses.first(),
+                termValues.firstOrNull()?.split('|')?.map { it.trim() }?.filter { it.isNotEmpty() } ?: emptyList()
+            )
+            else -> null
+        }
+        val status = claimStatuses.first()
+        val claim: ClaimRead = when (status) {
+            "present" -> {
+                val values = body.filter { it.startsWith("CLAIM_VALUE=") }.map { it.removePrefix("CLAIM_VALUE=") }
+                if (values.size != 1) return ReadReply(ClaimRead.Unknown("claim_value_lines=${values.size}"), term)
+                val raw = values.first().trim()
+                val m = CLAIM_VALUE_RE.matchEntire(raw) ?: return ReadReply(ClaimRead.Unknown("claim_value_invalid"), term)
+                ClaimRead.Present(
+                    Op(
+                        id = m.groupValues[1],
+                        ts = m.groupValues[2].toLongOrNull() ?: return ReadReply(ClaimRead.Unknown("claim_ts_invalid"), term),
+                        want = m.groupValues[3] == "1",
+                        state = State.CLAIMED
+                    )
+                )
+            }
+            "absent" -> ClaimRead.ConfirmedAbsent
+            "empty" -> ClaimRead.Unknown("claim_empty")
+            "unreadable" -> ClaimRead.Unknown("claim_unreadable")
+            else -> ClaimRead.Unknown("claim_status_unknown=$status")
+        }
+        return ReadReply(claim, term)
+    }
+
+    /**
+     * iter53 §4.2 — можно ли ВКЛЮЧАТЬ Wi-Fi по сохранённому снимку, по факту чтения claim.
+     *
+     * Правило одно и без исключений: включать можно только когда claim принадлежит НАШЕЙ
+     * операции. Почему так, а не «отсутствие = конкурирующих нет» (как было в iter52):
+     * гвардия payload (`guard`) отказывается работать, если claim не её. Значит, если claim
+     * отсутствует/чужой/нечитаем — наш payload НЕ выполнялся, Wi-Fi им не выключался, и
+     * включать его «по старому снимку» нельзя: это было бы новое действие против возможного
+     * более позднего решения владельца.
+     */
+    fun restoreDecision(opId: String, read: ClaimRead): Pair<Boolean, String> = when (read) {
+        is ClaimRead.Present ->
+            if (read.op.id == opId) true to "claim_ours"
+            else false to "claim_foreign:${read.op.id}"
+        ClaimRead.ConfirmedAbsent -> false to "claim_confirmed_absent_payload_refused"
+        is ClaimRead.Unknown -> false to "claim_unknown:${read.why}"
+    }
 
     /**
      * Гвардия payload: доказанная защита от позднего СТАРТА устаревшей операции.
@@ -230,12 +379,22 @@ internal object JitOwn {
      * @return `null` — прочитать НЕ УДАЛОСЬ (неизвестность не снимается).
      */
     fun parseTerminal(opId: String, out: String, rc: Int = 0): Terminal? {
-        if (rc != 0 || out.contains("ERR_")) return null
-        val claimLine = Regex("CLAIM=\"?([^\"\\n]*)\"?").find(out)?.groupValues?.get(1)?.trim()
-        val termRaw = Regex("TERM=\"?([^\"\\n]*)\"?").find(out)?.groupValues?.get(1) ?: ""
-        if (claimLine == null && termRaw.isEmpty()) return null
-        val claim = Op.parseClaim(claimLine)
-        val lines = termRaw.split('|').map { it.trim() }.filter { it.isNotEmpty() }
+        // iter53 §4.1: разбор идёт по протоколу `CLAIM_STATUS/CLAIM_VALUE/TERM_STATUS/TERM_VALUE`
+        // внутри маркеров CS_BEGIN…CS_END. Прежние regex искали `CLAIM=`/`TERM=` и требовали
+        // закрывающую кавычку, которой в stdout нет → terminal «не читался» даже когда читался.
+        val reply = parseReadReply(rc, out)
+        val claimRead = reply.claim
+        val termRead = reply.term
+        if (claimRead is ClaimRead.Unknown && termRead == null) return null
+        val claim = (claimRead as? ClaimRead.Present)?.op
+        val lines = termRead?.lines ?: emptyList()
+        val claimNote = when (claimRead) {
+            is ClaimRead.Present -> if (claimRead.op.id == opId) "claim_ours" else "claim_foreign"
+            ClaimRead.ConfirmedAbsent -> "claim_absent"
+            is ClaimRead.Unknown -> "claim_unknown:" + claimRead.why
+        }
+        val termRaw = lines.joinToString("|")
+        if (claim == null && lines.isEmpty() && claimRead !is ClaimRead.ConfirmedAbsent) return null
         // iter52 §7.2: строки terminal'а принимаются ТОЛЬКО со своим `op=<id>`. Файл назван по id,
         // но id мог быть переиспользован (перезапуск/повтор клика), а на устройстве мог остаться
         // файл прошлой операции: считать чужой `END rc=0` своим завершением нельзя.
@@ -257,12 +416,8 @@ internal object JitOwn {
             rc = rcEnd,
             refused = refused,
             claimOther = claim != null && claim.id != opId,
-            note = when {
-                claim == null && claimLine.isNullOrEmpty() -> "claim_absent"
-                claim == null -> "claim_unparsable"
-                claim.id == opId -> "claim_ours"
-                else -> "claim_foreign"
-            } + (if (foreignCount > 0) ";term_lines_other_op=$foreignCount" else "") +
+            note = claimNote +
+                (if (foreignCount > 0) ";term_lines_other_op=$foreignCount" else "") +
                 (if (lines.isNotEmpty() && mine.isEmpty()) ";term_only_foreign_op" else "")
         )
     }
@@ -353,16 +508,20 @@ internal object JitOwn {
      *  • claim принадлежит этой операции — да (`claim_ours`);
      *  • claim принадлежит ДРУГОЙ операции — нет (`claim_foreign`): владелец уже нажал тумблер
      *    снова, и включение Wi-Fi по старому снимку затирало бы его новое решение;
-     *  • claim отсутствует — да (`claim_absent`): конкурирующей операции нет (снимок всё равно
-     *    проверяется по своему opId выше);
+     *  • iter53 §4.2 — claim отсутствует/нечитаем — НЕТ (`claim_confirmed_absent_payload_refused`
+     *    / `claim_unknown:…`): отсутствие владения не доказывает, что наша цепочка выключала
+     *    Wi-Fi, а гвардия payload в этом случае отказывается работать;
      *  • claim испорчен — НЕТ (`claim_unparsable`): это неизвестность, а не «конкурирующих нет».
      *
      * Что это НЕ даёт: защиты от того, что владелец включил Wi-Fi сам после клика (это состояние
      * читается отдельно перед включением: «уже включён» → запрос не отправляется).
      */
     fun claimAllowsRestore(opId: String, claimRaw: String?): Pair<Boolean, String> {
-        if (claimRaw.isNullOrBlank()) return true to "claim_absent"
-        val claim = Op.parseClaim(claimRaw) ?: return false to "claim_unparsable"
-        return if (claim.id == opId) true to "claim_ours" else false to "claim_foreign"
+        // iter53 §4.2: отсутствие claim НЕ разрешает включение Wi-Fi. Если claim не наш,
+        // гвардия payload отказалась работать — значит наша цепочка Wi-Fi не выключала и
+        // возвращать «по снимку» нечего (см. [restoreDecision]).
+        if (claimRaw.isNullOrBlank()) return false to "claim_confirmed_absent_payload_refused"
+        val claim = Op.parseClaim(claimRaw) ?: return false to "claim_unknown:claim_value_invalid"
+        return if (claim.id == opId) true to "claim_ours" else false to "claim_foreign:${claim.id}"
     }
 }
