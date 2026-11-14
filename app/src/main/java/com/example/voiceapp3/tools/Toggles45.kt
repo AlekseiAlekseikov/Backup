@@ -74,6 +74,103 @@ object Toggles45 {
     }
 
     /**
+     * §6.1 iter47 — результат согласования копий CPS/DPS для одного ключа.
+     *
+     * Отличает ЧЕТЫРЕ разных состояния, которые раньше сливались в «bool»:
+     *  • [Value]    — подтверждённое значение (ревизия известна);
+     *  • [Deleted]  — последняя подтверждённая запись была УДАЛЕНИЕМ (tombstone): старое значение
+     *                 из второй копии воскресать не должно;
+     *  • [Conflict] — равные ревизии с РАЗНЫМИ значениями (два писателя одновременно): порядок
+     *                 неизвестен, выдумывать его нельзя;
+     *  • [Unknown]  — значения нет нигде / хранилище не прочитано.
+     */
+    sealed class Resolved<out T> {
+        data class Value<T>(val v: T) : Resolved<T>()
+        object Deleted : Resolved<Nothing>()
+        object Conflict : Resolved<Nothing>()
+        object Unknown : Resolved<Nothing>()
+    }
+
+    /**
+     * §6.1 iter47: согласование boolean с учётом tombstone и конфликта равных ревизий.
+     *
+     * @param cpsDeleted признак «последняя запись — удаление» (tombstone) в CPS.
+     * @param legacyOr  прежняя семантика `cps || dps` для установок БЕЗ ревизий (миграция).
+     */
+    fun resolveBoolean(
+        cpsValue: Boolean?,
+        cpsRev: Long,
+        cpsDeleted: Boolean,
+        dpsValue: Boolean?,
+        dpsRev: Long,
+        dpsDeleted: Boolean,
+        legacyOr: Boolean = true
+    ): Resolved<Boolean> {
+        val hasRev = cpsRev >= 0L || dpsRev >= 0L
+        if (!hasRev) {
+            // Миграция: ревизий нет. Если в копии есть значение — старое поведение.
+            if (cpsValue == null && dpsValue == null) return Resolved.Unknown
+            return if (legacyOr) Resolved.Value(cpsValue == true || dpsValue == true)
+            else Resolved.Value(cpsValue ?: dpsValue ?: false)
+        }
+        if (cpsRev == dpsRev) {
+            // Одна запись обычно пишет обе копии одинаково. Расхождение при равной ревизии —
+            // конфликт двух писателей, а НЕ повод выбрать «более удобное» значение.
+            val cv = if (cpsDeleted) null else cpsValue
+            val dv = if (dpsDeleted) null else dpsValue
+            return when {
+                cpsDeleted && dpsDeleted -> Resolved.Deleted
+                cv != null && dv != null && cv != dv -> Resolved.Conflict
+                cv != null -> Resolved.Value(cv)
+                dv != null -> Resolved.Value(dv)
+                cpsDeleted || dpsDeleted -> Resolved.Deleted
+                else -> Resolved.Unknown
+            }
+        }
+        val cpsWins = cpsRev > dpsRev
+        val winnerRevDeleted = if (cpsWins) cpsDeleted else dpsDeleted
+        val winnerValue = if (cpsWins) cpsValue else dpsValue
+        if (winnerRevDeleted) return Resolved.Deleted
+        winnerValue?.let { return Resolved.Value(it) }
+        // Победившая копия новее, но значения в ней нет и tombstone не выставлен — это
+        // частичная запись/сбой чтения, а НЕ «вторая копия права».
+        return Resolved.Unknown
+    }
+
+    /** §6.1 iter47: то же для строк (путь к WAV и подобное). */
+    fun resolveString(
+        cpsValue: String?,
+        cpsRev: Long,
+        cpsDeleted: Boolean,
+        dpsValue: String?,
+        dpsRev: Long,
+        dpsDeleted: Boolean
+    ): Resolved<String> {
+        val hasRev = cpsRev >= 0L || dpsRev >= 0L
+        if (!hasRev) {
+            val v = cpsValue ?: dpsValue
+            return if (v == null) Resolved.Unknown else Resolved.Value(v)
+        }
+        if (cpsRev == dpsRev) {
+            val cv = if (cpsDeleted) null else cpsValue
+            val dv = if (dpsDeleted) null else dpsValue
+            return when {
+                cpsDeleted && dpsDeleted -> Resolved.Deleted
+                cv != null && dv != null && cv != dv -> Resolved.Conflict
+                cv != null -> Resolved.Value(cv)
+                dv != null -> Resolved.Value(dv)
+                cpsDeleted || dpsDeleted -> Resolved.Deleted
+                else -> Resolved.Unknown
+            }
+        }
+        val cpsWins = cpsRev > dpsRev
+        if (cpsWins && cpsDeleted) return Resolved.Deleted
+        if (!cpsWins && dpsDeleted) return Resolved.Deleted
+        val v = if (cpsWins) cpsValue else dpsValue
+        return if (v == null) Resolved.Unknown else Resolved.Value(v)
+    }
+
+    /**
      * §7.2: истекло ли окно жизни незавершённой операции.
      *
      * @param markTs время отметки операции (wall clock, мс); `<= 0` — время неизвестно.

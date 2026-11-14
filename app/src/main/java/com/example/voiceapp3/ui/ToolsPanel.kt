@@ -85,6 +85,15 @@ class ToolsPanel(
     private val state = JsonObject()
     /** §4 iter45: пришёл ли ХОТЬ ОДИН снимок (для подписи о частичном снимке). */
     private var stateLoaded = false
+    /**
+     * §6.2 iter47: ключи, реально пришедшие в ПОСЛЕДНЕМ принятом снимке.
+     *
+     * `state` по-прежнему сливается (нужно для `last` и для неизменившихся полей), но значение
+     * из старого снимка больше не выдаётся за текущее: если ключа в последнем снимке нет, для UI
+     * это «не прочитано», а не «старое значение» и не `def`.
+     */
+    private val snapshotKeys = HashSet<String>()
+
     /** §4.1 iter46: сколько ключей реально пришло в последнем снимке / сколько ожидаем. */
     private var stateRenderedKeys = 0
     private var stateExpectedKeys = 0
@@ -161,6 +170,8 @@ class ToolsPanel(
         }
         // §4.1 iter46: ожидаемое число ключей сообщает сам снимок (`$keys`). Зашитая константа
         // (19) расходилась с составом `ToolsBackend.state()` и давала ложное «снимок неполный».
+        snapshotKeys.clear()
+        d.entrySet().forEach { e -> if (!e.key.startsWith("\$") && e.key != "last") snapshotKeys.add(e.key) }
         val declared = d.get("\$keys")?.takeIf { it.isJsonPrimitive }
             ?.let { runCatching { it.asInt }.getOrNull() }
         stateExpectedKeys = when {
@@ -1453,6 +1464,9 @@ class ToolsPanel(
 
     /** Как JS: '0' и 0 — выключено; прочие примитивы — по truthiness. */
     private fun boolState(key: String): Boolean? {
+        // §6.2 iter47: ключа нет в ПОСЛЕДНЕМ снимке → «не прочитано» (даже если старое значение
+        // ещё лежит в слитом `state`). Раньше слитый снимок показывал устаревшее значение.
+        if (stateLoaded && key !in snapshotKeys) return null
         val el = state.get(key)?.takeIf { it.isJsonPrimitive } ?: return null
         val p = el.asJsonPrimitive
         return when {
@@ -1464,8 +1478,10 @@ class ToolsPanel(
         }
     }
 
-    private fun strState(key: String): String? =
-        state.get(key)?.takeIf { it.isJsonPrimitive }?.asString
+    private fun strState(key: String): String? {
+        if (stateLoaded && key !in snapshotKeys) return null
+        return state.get(key)?.takeIf { it.isJsonPrimitive }?.asString
+    }
 
     private fun intState(key: String): Int? =
         state.get(key)?.takeIf { it.isJsonPrimitive }?.let { runCatching { it.asInt }.getOrNull() }

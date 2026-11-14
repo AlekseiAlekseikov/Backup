@@ -112,19 +112,35 @@ object AppFileLogger {
      * строку (как и прежний `FileWriter`), но смещение берётся под локом, поэтому «дыры»
      * из-за конкурирующего писателя не появляются.
      */
-    /** Ошибки больше не глотаются: провал сообщается независимым каналом (logcat) с причиной. */
+    /**
+     * Ошибки больше не глотаются: провал сообщается независимым каналом (logcat) с причиной.
+     *
+     * §8.1 iter47: при занятом межпроцессном локе строка НЕ теряется и НЕ пишется вслепую в
+     * общий файл — она уходит в spill-файл процесса; после успешной записи накопленный spill
+     * вливается в журнал под локом. «Сохранено» для spill не заявляется.
+     */
     private fun writeTo(f: File, line: String) {
         // Короткое ожидание: занятый лок — не повод терять строку, но и не повод писать вслепую.
         val r = FileLogCore.append(f.parentFile, f.name, line, MAX_SIZE_BYTES.toLong(), lockWaitMs = 25L)
         if (!r.written) {
             // Независимый канал: Log.e доступен даже когда файловая запись невозможна.
             Log.e(TAG, "LOG_WRITE_FAILED file=«${f.name}» ${r.wire()}")
-        } else if (r.tailNulBefore > 0) {
-            Log.e(TAG, "LOG_TAIL_NUL_AT_APPEND file=«${f.name}» bytes=${r.tailNulBefore} " +
-                "(повреждение было ДО этой записи; файл не переписываем)")
-        } else if (!r.locked) {
-            Log.w(TAG, "LOG_WRITE_UNLOCKED file=«${f.name}» (межпроцессный лок недоступен: " +
-                "запись выполнена без него, это НЕ молчаливый успех)")
+        } else if (r.spilled) {
+            Log.w(TAG, "LOG_SPILLED file=«${f.name}» to=«${r.spillFile?.name}» " +
+                "reason=process_lock_busy (строка сохранена в spill-файл процесса и будет влита " +
+                "в журнал при следующей успешной записи; это НЕ запись в основной журнал)")
+        } else {
+            if (r.tailNulBefore > 0) {
+                Log.e(TAG, "LOG_TAIL_NUL_AT_APPEND file=«${f.name}» bytes=${r.tailNulBefore} " +
+                    "(повреждение было ДО этой записи; файл не переписываем)")
+            }
+            if (!r.locked) {
+                Log.w(TAG, "LOG_WRITE_UNLOCKED file=«${f.name}» (межпроцессный лок недоступен: " +
+                    "запись выполнена без него, это НЕ молчаливый успех)")
+            }
+            // §8.1: лок был свободен — самое время влить накопленный spill.
+            val drained = runCatching { FileLogCore.drainSpill(f.parentFile, f.name) }.getOrDefault(0)
+            if (drained > 0) Log.i(TAG, "LOG_SPILL_DRAINED file=«${f.name}» lines=$drained")
         }
     }
 

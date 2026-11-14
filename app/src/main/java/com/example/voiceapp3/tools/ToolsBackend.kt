@@ -157,10 +157,12 @@ enum class Choice(
     fun state(): JsonObject {
         val o = JsonObject().apply {
         Toggle.values().forEach { t ->
-            addProperty(t.key, prefs().getBoolean(t.pref, t.default))
+            // §6.1 iter47: снимок читает ЧЕРЕЗ согласование CPS/DPS, а не прямо из CPS.
+            // Прямое чтение отдавало устаревшее значение, если новее была вторая копия.
+            addProperty(t.key, Prefs2.getBoolean(appContext, t.pref, t.default))
         }
         Choice.values().forEach { c ->
-            addProperty(c.key, prefs().getString(c.pref, c.default) ?: c.default)
+            addProperty(c.key, Prefs2.getString(appContext, c.pref, c.default) ?: c.default)
         }
         /* «Яркость»: снимок отдаёт ФАКТИЧЕСКИЙ процент (Settings.System, при
            отказе — sysfs), поэтому при FAILED интерфейс сам откатывает
@@ -316,8 +318,14 @@ enum class Choice(
         ) {
             // commit(), а не apply(): readback должен видеть уже записанное
             // значение — иначе «успех» мог бы опираться на кэш редактора.
-            Prefs2.putBoolean(appContext, toggle.pref, value)
-            val actual = prefs().getBoolean(toggle.pref, !value).toString()
+            // §6.1 iter47: запись возвращает ФАКТ (подтверждено/частично/не записано), а не Unit.
+            val save = Prefs2.putBooleanEx(appContext, toggle.pref, value)
+            if (!save.confirmed) {
+                AppLog.w("ToolsBackend", "PREF_SAVE_NOT_CONFIRMED key=${toggle.pref} ${save.wire()}")
+            } else if (save.partial) {
+                AppLog.i("ToolsBackend", "PREF_SAVE_PARTIAL key=${toggle.pref} ${save.wire()}")
+            }
+            val actual = Prefs2.getBoolean(appContext, toggle.pref, !value).toString()
             // Итерация 8: трассировка чтения/записи префа toggle=off/on
             // (диагностика спама 12 раз за 65 сек в логе).
             if (toggle.pref == StatusIcons.PREF_EXT_TEMP) {
@@ -524,7 +532,10 @@ enum class Choice(
             command = "SharedPreferences[${Prefs.FILE}].putString(${choice.pref})",
             expected = value
         ) {
-            Prefs2.putString(appContext, choice.pref, value)
+            // §6.1 iter47: удаление значения = tombstone (иначе старое значение из второй
+            // копии «воскресало»); результат записи проверяется и сообщается.
+            val save = Prefs2.putStringEx(appContext, choice.pref, value)
+            if (!save.confirmed) AppLog.w("ToolsBackend", "PREF_SAVE_NOT_CONFIRMED key=${choice.pref} ${save.wire()}")
             val actual = prefs().getString(choice.pref, "") ?: ""
             (actual == value) to actual
         }

@@ -62,8 +62,45 @@ object Prefs2 {
      */
     private fun revKey(key: String) = key + "#rev"
 
+    /** §6.1 iter47: tombstone-отметка «ключ удалён намеренно» (ревизия удаления). */
+    private fun delKey(key: String) = key + "#del"
+
+    /** §6.1 iter47: кто записал ревизию — чтобы отличить конфликт двух писателей от одной записи. */
+    private fun ownerKey(key: String) = key + "#who"
+
     private fun readRev(p: SharedPreferences?, key: String): Long =
         runCatching { p?.getLong(revKey(key), -1L) ?: -1L }.getOrDefault(-1L)
+
+    private fun readDel(p: SharedPreferences?, key: String): Boolean =
+        runCatching { p?.getBoolean(delKey(key), false) ?: false }.getOrDefault(false)
+
+    /**
+     * §6.1 iter47 — факт сохранения. Раньше `putBoolean` возвращал `Unit`, а результат `commit()`
+     * игнорировался: «сохранено» заявлялось даже когда ни одна копия не записалась.
+     */
+    data class Save(
+        /** Подтверждено чтением хотя бы в одной копии с ожидаемой ревизией. */
+        val confirmed: Boolean,
+        /** Сколько копий фактически записалось. */
+        val stores: Int,
+        /** Ревизия записи (`-1` — запись не удалась/неизвестна). */
+        val rev: Long,
+        /** В другой копии обнаружена РАВНАЯ ревизия с другим значением. */
+        val conflict: Boolean,
+        /** Причина отказа/частичности (пусто — всё подтверждено). */
+        val reason: String
+    ) {
+        val partial: Boolean get() = confirmed && stores < 2
+        fun wire(): String =
+            "confirmed=$confirmed stores=$stores rev=$rev conflict=$conflict" +
+                (if (reason.isEmpty()) "" else " reason=«$reason»")
+    }
+
+    /** Идентификатор писателя: pid+время старта процесса. Служит только для диагностики конфликта. */
+    private val who: String by lazy {
+        val pid = runCatching { android.os.Process.myPid() }.getOrDefault(-1)
+        "$pid@${System.currentTimeMillis()}"
+    }
 
     /** Следующая ревизия = max(ревизий обеих копий) + 1 (без опоры на часы). */
     private fun nextRev(app: Context, key: String): Long {
@@ -72,50 +109,132 @@ object Prefs2 {
         return maxOf(c, d, 0L) + 1
     }
 
-    /** Записать boolean в ОБА хранилища. Возвращает фактическую ревизию записи. */
-    fun putBoolean(c: Context, key: String, value: Boolean) {
-        val app = c.applicationContext
-        val rev = nextRev(app, key)
-        try {
-            cps(app).edit().putBoolean(key, value).putLong(revKey(key), rev).commit()
-        } catch (_: Throwable) {}
-        try {
-            dps(app).edit().putBoolean(key, value).putLong(revKey(key), rev).commit()
-        } catch (_: Throwable) {}
+    private fun writeBoth(
+        app: Context,
+        key: String,
+        rev: Long,
+        put: (SharedPreferences.Editor) -> Unit
+    ): Int {
+        var ok = 0
+        for (p in listOf(runCatching { cps(app) }.getOrNull(), runCatching { dps(app) }.getOrNull())) {
+            if (p == null) continue
+            val committed = try {
+                val ed = p.edit()
+                put(ed)
+                ed.putLong(revKey(key), rev)
+                ed.putString(ownerKey(key), who)
+                ed.commit()
+            } catch (_: Throwable) {
+                false
+            }
+            if (committed) ok++
+        }
+        return ok
     }
 
     /**
-     * Читать boolean: значение из копии с большей ревизией; при отсутствии ревизий —
-     * прежняя семантика «true в любой копии» (миграция без потери настроек).
+     * §6.1 iter47: записать boolean и вернуться с ФАКТОМ сохранения.
+     *
+     * Значение, ревизия, владелец и снятие tombstone пишутся ОДНОЙ транзакцией в каждую копию.
+     * Если ни одна копия не записалась — `confirmed=false` (а не тихий «успех»).
      */
-    fun getBoolean(c: Context, key: String, default: Boolean = false): Boolean {
+    fun putBooleanEx(c: Context, key: String, value: Boolean): Save {
+        val app = c.applicationContext
+        val rev = nextRev(app, key)
+        val stores = writeBoth(app, key, rev) { ed ->
+            ed.putBoolean(key, value)
+            ed.putBoolean(delKey(key), false)
+        }
+        val pc = runCatching { cps(app) }.getOrNull()
+        val pd = runCatching { dps(app) }.getOrNull()
+        val rc = readRev(pc, key)
+        val rd = readRev(pd, key)
+        val cv = runCatching { pc?.let { if (it.contains(key)) it.getBoolean(key, value) else null } }.getOrNull()
+        val dv = runCatching { pd?.let { if (it.contains(key)) it.getBoolean(key, value) else null } }.getOrNull()
+        val conflict = rc == rd && rc >= 0L && cv != null && dv != null && cv != dv
+        val confirmed = (rc == rev && cv == value) || (rd == rev && dv == value)
+        val why = when {
+            confirmed && stores == 2 -> ""
+            confirmed -> "partial_stores:$stores"
+            else -> "not_persisted"
+        }
+        return Save(confirmed, stores, if (confirmed) rev else -1L, conflict, why)
+    }
+
+    /**
+     * §6.1 iter47: удаление ключа как ЯВНОЕ действие (tombstone), чтобы старое значение из второй
+     * копии не воскресло. `value=null` в старом `putString` именно это и ломало.
+     */
+    fun removeEx(c: Context, key: String): Save {
+        val app = c.applicationContext
+        val rev = nextRev(app, key)
+        val stores = writeBoth(app, key, rev) { ed ->
+            ed.remove(key)
+            ed.putBoolean(delKey(key), true)
+        }
+        val rc = readRev(runCatching { cps(app) }.getOrNull(), key)
+        val rd = readRev(runCatching { dps(app) }.getOrNull(), key)
+        val confirmed = rc == rev || rd == rev
+        return Save(confirmed, stores, if (confirmed) rev else -1L, false,
+            if (confirmed) (if (stores == 2) "" else "partial_stores:$stores") else "not_persisted")
+    }
+
+    fun putStringEx(c: Context, key: String, value: String?): Save =
+        if (value == null) removeEx(c, key) else {
+            val app = c.applicationContext
+            val rev = nextRev(app, key)
+            val stores = writeBoth(app, key, rev) { ed ->
+                ed.putString(key, value)
+                ed.putBoolean(delKey(key), false)
+            }
+            val pc = runCatching { cps(app) }.getOrNull()
+            val pd = runCatching { dps(app) }.getOrNull()
+            val rc = readRev(pc, key)
+            val rd = readRev(pd, key)
+            val cv = runCatching { pc?.getString(key, null) }.getOrNull()
+            val dv = runCatching { pd?.getString(key, null) }.getOrNull()
+            val conflict = rc == rd && rc >= 0L && cv != null && dv != null && cv != dv
+            val confirmed = (rc == rev && cv == value) || (rd == rev && dv == value)
+            Save(confirmed, stores, if (confirmed) rev else -1L, conflict,
+                when {
+                    confirmed && stores == 2 -> ""
+                    confirmed -> "partial_stores:$stores"
+                    else -> "not_persisted"
+                })
+        }
+
+    /** Оставить для совместимости: `true`, если запись подтверждена хотя бы в одной копии. */
+    fun putBoolean(c: Context, key: String, value: Boolean): Boolean =
+        putBooleanEx(c, key, value).confirmed
+
+    /** Записать строку; `null` = удаление (tombstone). Возвращает `true` при подтверждении. */
+    fun putString(c: Context, key: String, value: String?): Boolean =
+        putStringEx(c, key, value).confirmed
+
+    /** Полное чтение ключа с состоянием (значение/удалён/конфликт/неизвестно). */
+    fun readBoolean(c: Context, key: String): Toggles45.Resolved<Boolean> {
         val app = c.applicationContext
         val pc = runCatching { cps(app) }.getOrNull()
         val pd = runCatching { dps(app) }.getOrNull()
-        val cv = runCatching { pc?.let { if (it.contains(key)) it.getBoolean(key, default) else null } }
+        val cv = runCatching { pc?.let { if (it.contains(key)) it.getBoolean(key, false) else null } }
             .getOrNull()
-        val dv = runCatching { pd?.let { if (it.contains(key)) it.getBoolean(key, default) else null } }
+        val dv = runCatching { pd?.let { if (it.contains(key)) it.getBoolean(key, false) else null } }
             .getOrNull()
-        return Toggles45.pickBoolean(cv, readRev(pc, key), dv, readRev(pd, key), default)
+        return Toggles45.resolveBoolean(
+            cv, readRev(pc, key), readDel(pc, key),
+            dv, readRev(pd, key), readDel(pd, key)
+        )
     }
 
-    fun putString(c: Context, key: String, value: String?) {
-        val app = c.applicationContext
-        // §4.2 iter46: значение и ревизия пишутся одной транзакцией в каждую копию.
-        val rev = nextRev(app, key)
-        try {
-            val ed = cps(app).edit()
-            if (value == null) ed.remove(key) else ed.putString(key, value)
-            ed.putLong(revKey(key), rev)
-            ed.commit()
-        } catch (_: Throwable) {}
-        try {
-            val ed = dps(app).edit()
-            if (value == null) ed.remove(key) else ed.putString(key, value)
-            ed.putLong(revKey(key), rev)
-            ed.commit()
-        } catch (_: Throwable) {}
-    }
+    fun getBoolean(c: Context, key: String, default: Boolean = false): Boolean =
+        when (val r = readBoolean(c, key)) {
+            is Toggles45.Resolved.Value -> r.v
+            // Конфликт равных ревизий: порядок неизвестен. Отдаём сохранённое значение только
+            // если копии СОВПАЛИ (тогда конфликта нет); иначе — default и запись в журнал
+            // делает вызывающий через readBoolean. Молча выбирать «удобное» нельзя.
+            Toggles45.Resolved.Deleted -> false
+            Toggles45.Resolved.Conflict, Toggles45.Resolved.Unknown -> default
+        }
 
     fun getString(c: Context, key: String, default: String? = null): String? {
         val app = c.applicationContext
@@ -123,8 +242,14 @@ object Prefs2 {
         val pd = runCatching { dps(app) }.getOrNull()
         val cv = runCatching { pc?.getString(key, null) }.getOrNull()
         val dv = runCatching { pd?.getString(key, null) }.getOrNull()
-        // Итог: значение из копии с большей ревизией; без ревизий — как раньше (CPS, затем DPS).
-        return Toggles45.pickString(cv, readRev(pc, key), dv, readRev(pd, key)) ?: default
+        return when (val r = Toggles45.resolveString(
+            cv, readRev(pc, key), readDel(pc, key),
+            dv, readRev(pd, key), readDel(pd, key)
+        )) {
+            is Toggles45.Resolved.Value -> r.v
+            Toggles45.Resolved.Deleted, Toggles45.Resolved.Conflict,
+            Toggles45.Resolved.Unknown -> default
+        }
     }
 
     fun putInt(c: Context, key: String, value: Int) {

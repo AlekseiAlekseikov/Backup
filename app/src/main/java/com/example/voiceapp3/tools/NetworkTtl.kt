@@ -69,7 +69,6 @@ object NetworkTtl {
      * §5.1/§5.2 iter46: политика «применять по последнему сохранённому намерению».
      * Реализация — чистый класс [TtlReconcile] (покрыт JVM-тестами), здесь только вызовы.
      */
-    private val reconcile = TtlReconcile(maxChain = 3)
 
     /** Желание владельца (не меняется автоматикой). */
     fun desired(context: Context): Boolean = isTtl65Active(context)
@@ -91,12 +90,17 @@ object NetworkTtl {
      * осталось `applied`. Ложное «применено и подтверждено» по прошлому сеансу исключено.
      */
     fun appliedState(context: Context): String {
-        val raw = getPrefs(context).getString(PREF_TTL_65_APPLIED,
+        val raw = Prefs2.getString(context, PREF_TTL_65_APPLIED,
             if (isTtl65Active(context)) "pending" else "off") ?: "off"
         if (raw != "applied") return raw
-        val stored = getPrefs(context).getLong(PREF_TTL_65_APPLIED_BOOT, -1L)
+        val stored = Prefs2.getLong(context, PREF_TTL_65_APPLIED_BOOT, -1L)
         val now = bootCount(context).toLong()
         if (stored < 0L || now < 0L || stored != now) return "pending"
+        // §4.2 п.4 iter47: факт принадлежит ПОКОЛЕНИЮ намерения. Если намерение успели
+        // изменить (новый клик), старый «applied» относится к другому желанию — не заявляем.
+        val factGen = Prefs2.getLong(context, PREF_TTL_65_APPLIED_GEN, -1L)
+        val nowGen = Prefs2.getLong(context, PREF_TTL_65_INTENT_GEN, 0L)
+        if (factGen >= 0L && nowGen > 0L && factGen != nowGen) return "pending"
         return raw
     }
 
@@ -136,10 +140,24 @@ object NetworkTtl {
  */
 private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
 
-    private fun getPrefs(context: Context): SharedPreferences = Prefs2.cps(context)
-
+    /**
+     * §4.6 iter47: намерение читается ТОЛЬКО через согласование копий (`Prefs2.readBoolean`),
+     * а не напрямую из CPS — иначе дефект §6 «старое true из второй копии» возвращался бы в
+     * production-путь TTL. Конфликт равных ревизий = «неизвестно» → OFF не выдумываем, но и
+     * ON не подтверждаем: `false` здесь означает лишь «достоверного ON нет».
+     */
     fun isTtl65Active(context: Context): Boolean =
-        getPrefs(context).getBoolean(PREF_TTL_65_ACTIVE, false)
+        when (val r = Prefs2.readBoolean(context, PREF_TTL_65_ACTIVE)) {
+            is Toggles45.Resolved.Value -> r.v
+            Toggles45.Resolved.Deleted -> false
+            Toggles45.Resolved.Conflict -> {
+                AppLog.w(TAG, "TTL_ACTIVE_CONFLICT key=$PREF_TTL_65_ACTIVE " +
+                    "(CPS и DPS имеют равные ревизии с разными значениями: применяем как «не ON», " +
+                    "ничего не перезаписывая автоматически)")
+                false
+            }
+            Toggles45.Resolved.Unknown -> false
+        }
 
     /** Парсит echo-style `KEY=value` строки из вывода. */
     private fun parseKv(output: String): Map<String, String> =
@@ -229,7 +247,6 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
         return status to detail
     }
 
-    @Volatile private var ttlInFlight = false
     @Volatile private var ttlLastRunAtMs: Long = 0L
 
     /** iter33o §2.2 — повторы детекта uplink (только для ON), пауза 3 с. */
@@ -242,103 +259,111 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
 
     /**
      * iter33n-fix1 §3.1 — окно debounce для ПОВТОРНОГО ON: 3 с (было 30 с).
-     * Приёмник сети (`TTL_RECEIVER`) продолжает жить со своим окном 30 с: там шторм
-     * переподключений, а не клик владельца. OFF не блокируется никогда (`debounceMs = 0`).
+     * §4.2 iter47: клики это окно больше НЕ использует — оно ТЕРЯЛО нажатие. Окно осталось
+     * только для сетевого шторма (в receiver), и даже там событие не теряется: оно помечается
+     * и добирается одним отложенным проходом.
      */
     internal const val TTL_ON_DEBOUNCE_MS = 3_000L
 
-    fun setTtl65Active(context: Context, enabled: Boolean): ToolsResult {
-        BgWorker.assertNotMain("NetworkTtl.setTtl65Active")
-        val t0 = SystemClock.uptimeMillis()
-        // ── §5.1 iter46: НАМЕРЕНИЕ СОХРАНЯЕТСЯ ПЕРВЫМ ──────────────────────────────────────
-        // Раньше отказ по `ttlInFlight`/debounce стоял ВЫШЕ сохранения, и быстрый OFF во время
-        // ON/retry терялся. Теперь запрос владельца фиксируется всегда, а применение либо
-        // выполняется сразу, либо добирается после текущей операции (ограниченное добивание).
-        Prefs2.putBoolean(context, PREF_TTL_65_ACTIVE, enabled)
-        Prefs2.putString(context, PREF_TTL_65_APPLIED,
-            if (enabled) "pending" else Prefs2.getString(context, PREF_TTL_65_APPLIED, "off") ?: "off")
-        AppLog.i(TAG, "TTL_INTENT desired=$enabled source=user_click in_flight=${ttlInFlight}")
-        val decision = reconcile.onIntent(enabled)
-        if (decision == TtlReconcile.Decision.MARKED_AND_RUNNING) {
-            AppLog.i(TAG, "TTL_RECONCILE desired=$enabled action=after_current " +
-                "(применение уже идёт: намерение сохранено и будет догнано после него; " +
-                "мгновенная отмена уже запущенного скрипта не заявляется)")
-            val st = ToolsStep(step="settings.ttl65", command="iptables ttl-set", startedAtMs=t0,
-                finishedAtMs=SystemClock.uptimeMillis(), exitCode=0, stdout="",
-                stderr="", expected=enabled.toString(), actual="queued_after_current",
-                status=ToolsStep.Status.PARTIAL)
-            return ToolsResult("settings.ttl65", "Фиксация TTL 65", listOf(st))
-        }
-        // iter21 §7: debounce 30s + single-flight — не давать шторму вызовов (в iter19 логе было 22 запуска за 7 с).
-        if (ttlInFlight) {
-            AppLog.w(TAG, "TTL: setTtl65Active SKIPPED (in-flight enabled=$enabled)")
-            val skipStep = ToolsStep(step="settings.ttl65", command="iptables ttl-set", startedAtMs=t0,
-                finishedAtMs=SystemClock.uptimeMillis(), exitCode=1, stdout="",
-                stderr="skipped: single-flight in-flight", expected="", actual="", status=ToolsStep.Status.BLOCKED)
-            return ToolsResult("settings.ttl65", "Фиксация TTL 65", listOf(skipStep))
-        }
-        // iter33n-fix1 §3.1: окно debounce — только для ПОВТОРНОГО включения и ≤ 3 с.
-        // Лог 08.11: второй клик через 13 с съедался окном 30 с (`skipped: debounce 13424ms`),
-        // §5.1 iter46: отдельного «debounce» больше нет — он ТЕРЯЛ нажатие. Шторм ограничен
-        // иначе: single-flight + ограниченная цепочка добиваний ([TtlReconcile.maxChain]).
-        synchronized(this) { ttlInFlight = true }
-        val myGen = intentGen.incrementAndGet()
-        try {
-            ttlLastRunAtMs = SystemClock.uptimeMillis()
-            AppLog.i(TAG, "TTL_APPLY desired=$enabled gen=$myGen (запуск применения)")
-            // §5.1 iter46: единый путь применения (клик, добивание, сеть) — [applyForIntent].
-            val ok = applyForIntent(context, enabled, "click")
-            val (status, reason) = if (ok) {
-                ToolsStep.Status.OK to null
-            } else {
-                ToolsStep.Status.FAILED to (pendingReason(context).ifEmpty { "not_confirmed" })
-            }
-            val (out4, out6) = ttlRuleCounts()
-            val expectedStr = if (enabled) "TTL_V4=1 TTL_V6=1 VERIFY=OK/OK rules=scoped"
-            else "TTL_V4=0 TTL_V6=0 rules=none"
-            val actualStr = if (enabled) "TTL_V4=$out4 TTL_V6=$out6 scoped=uplink_only"
-            else "TTL_V4=$out4 TTL_V6=$out6"
-            val step = ToolsStep(
-                step = "settings.ttl65",
-                command = if (enabled) "iptables -w 5 -t mangle -A TTL --ttl-set 65"
-                else "iptables -w 5 -t mangle -D (только свои правила)",
-                startedAtMs = t0,
-                finishedAtMs = SystemClock.uptimeMillis(),
-                exitCode = if (ok) 0 else 1,
-                stdout = "",
-                stderr = if (ok) "" else (reason ?: "не подтверждено"),
-                expected = expectedStr,
-                actual = actualStr,
-                status = status
-            )
-            return ToolsResult("settings.ttl65", "Фиксация TTL 65", listOf(step))
-        } finally {
-            synchronized(this) { ttlInFlight = false }
-            // §5.1 iter46: применение завершилось — если последнее сохранённое намерение ещё не
-            // достигнуто (например, во время ON пришёл OFF), ВЫПОЛНЯЕМ ровно одно добивание.
-            // Цепочка ограничена внутри TtlReconcile: бесконечных повторов и лавины команд нет.
-            val followUp = reconcile.onRunFinished(lastApplyOk)
-            if (followUp != null) {
-                AppLog.i(TAG, "TTL_RECONCILE follow_up desired=$followUp action=run_after_current " +
-                    "(догоняем последнее намерение владельца; уже запущенный скрипт не отменяем)")
-                runCatching { applyForIntent(context, followUp, "reconcile") }
-            } else {
-                AppLog.i(TAG, "TTL_RECONCILE done desired=${reconcile.desired()} applied=${reconcile.applied()} " +
-                    "action=none")
-            }
-        }
+    // ───────────────────────── §4.2 iter47: единственный путь применения ─────────────────────
+
+    /** Поколение намерения: растёт при каждой ПОДТВЕРЖДЁННОЙ записи намерения. */
+    private const val PREF_TTL_65_INTENT_GEN = "ttl_65_intent_gen"
+
+    /** Поколение, к которому относится подтверждённый факт `applied`. */
+    private const val PREF_TTL_65_APPLIED_GEN = "ttl_65_applied_gen"
+
+    private val runner: TtlRunner by lazy {
+        TtlRunner(
+            transport = object : TtlRunner.Transport {
+                override fun apply(want: Boolean): TtlRunner.Outcome = runTransport(want, "runner")
+            },
+            store = object : TtlRunner.Store {
+                override fun desired(): Boolean? {
+                    val r = Prefs2.readBoolean(appCtxRef ?: return null, PREF_TTL_65_ACTIVE)
+                    return when (r) {
+                        is Toggles45.Resolved.Value -> r.v
+                        Toggles45.Resolved.Deleted -> false
+                        // Конфликт/неизвестность: НЕ выдумываем ни ON, ни OFF.
+                        Toggles45.Resolved.Conflict, Toggles45.Resolved.Unknown -> null
+                    }
+                }
+
+                override fun intentGen(): Long =
+                    appCtxRef?.let { Prefs2.getLong(it, PREF_TTL_65_INTENT_GEN, 0L) } ?: 0L
+
+                override fun beginIntent(want: Boolean): Long {
+                    val c = appCtxRef ?: return -1L
+                    // §4.2 п.1: сначала НАМЕРЕНИЕ, с фактическим результатом записи.
+                    val save = Prefs2.putBooleanEx(c, PREF_TTL_65_ACTIVE, want)
+                    if (!save.confirmed) {
+                        AppLog.w(TAG, "TTL_INTENT_WRITE_FAILED want=$want ${save.wire()} " +
+                            "(намерение НЕ подтверждено: «применено» заявлять нельзя)")
+                        return -1L
+                    }
+                    if (save.partial) {
+                        AppLog.i(TAG, "TTL_INTENT_PARTIAL want=$want ${save.wire()} " +
+                            "(записалась только одна копия — вторая будет согласована следующей записью)")
+                    }
+                    val gen = Prefs2.getLong(c, PREF_TTL_65_INTENT_GEN, 0L) + 1L
+                    Prefs2.putLong(c, PREF_TTL_65_INTENT_GEN, gen)
+                    Prefs2.putString(c, PREF_TTL_65_APPLIED,
+                        if (want) "pending" else Prefs2.getString(c, PREF_TTL_65_APPLIED, "off") ?: "off")
+                    if (want) Prefs2.putString(c, PREF_TTL_65_PENDING_REASON, "applying")
+                    return gen
+                }
+
+                override fun markApplied(
+                    ok: Boolean,
+                    want: Boolean,
+                    gen: Long,
+                    current: Boolean,
+                    reason: String
+                ) {
+                    val c = appCtxRef ?: return
+                    // §4.2 п.4: факт принадлежит ПОКОЛЕНИЮ намерения. Результат прохода, во
+                    // время которого намерение сменилось, не переименовывается в новый факт.
+                    if (!current) {
+                        Prefs2.putString(c, PREF_TTL_65_APPLIED, "pending")
+                        Prefs2.putString(c, PREF_TTL_65_PENDING_REASON, "superseded")
+                        AppLog.i(TAG, "TTL_APPLIED_PENDING gen=$gen reason=superseded " +
+                            "(намерение сменилось во время прохода: результат относится к старому " +
+                            "желанию и фактом нового не становится)")
+                        return
+                    }
+                    markAppliedInternal(c, ok, reason, gen)
+                }
+
+                override fun conflict(): Boolean =
+                    appCtxRef?.let {
+                        Prefs2.readBoolean(it, PREF_TTL_65_ACTIVE) == Toggles45.Resolved.Conflict
+                    } ?: false
+
+                override fun desiredProblem(): String = "unreadable_or_conflict"
+            },
+            log = { line -> AppLog.i(TAG, line) }
+        )
     }
 
-    /** Результат последнего применения (для добивания): подтверждено ли состояние. */
-    @Volatile private var lastApplyOk = false
+    /** Контекст приложения для лямбд раннера (ставится при первом обращении/инициализации). */
+    @Volatile private var appCtxRef: Context? = null
+
+    private fun ensureCtx(context: Context): Context {
+        val app = context.applicationContext
+        appCtxRef = app
+        return app
+    }
 
     /**
-     * Применение по явному намерению (используется кликом, добиванием и сетевым событием).
-     * Возвращает подтверждённый результат; намерение владельца не меняет.
+     * Исполнение ОДНОГО применения (единственное место, где TTL вызывает shell).
+     *
+     * Результат — только подтверждённая проверка: ON требует `TTL_V4>=1 && VERIFY_V4=OK &&
+     * uplink_only=yes`, OFF — отсутствия СВОИХ правил. Ответ транспорта/успешный rc сам по
+     * себе применением не считается.
      */
-    internal fun applyForIntent(context: Context, want: Boolean, source: String): Boolean {
-        val script = buildScript(want)
+    private fun runTransport(want: Boolean, source: String): TtlRunner.Outcome {
         val t0 = SystemClock.uptimeMillis()
+        val script = buildScript(want)
         var (exitCode, output) = AdbClient.executeScript("ttl_script", script, 40000)
         if (want) {
             var attempt = 1
@@ -354,67 +379,91 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
         }
         val (status, reason) = parseVerifyResult(want, output)
         val ok = status == ToolsStep.Status.OK
-        lastApplyOk = ok
-        ttlLastRunAtMs = android.os.SystemClock.uptimeMillis()
-        // Факт привязывается к текущей подтверждённой конфигурации (см. §5.3): успешный readback
-        // ставит `applied`, провал — `pending` с причиной; намерение НЕ меняется.
-        markApplied(context, ok, if (ok) "" else reason.ifEmpty { status.wire })
+        ttlLastRunAtMs = SystemClock.uptimeMillis()
         AppLog.i(TAG, "TTL_APPLY_RESULT source=$source want=$want rc=$exitCode ok=$ok " +
-            "desired=${desired(context)} applied=${appliedState(context)}")
-        return ok
+            "ms=${ttlLastRunAtMs - t0} reason=«${reason ?: ""}»")
+        return TtlRunner.Outcome(ok, reason ?: if (ok) "" else status.wire)
+    }
+
+    /** Факт применения: значение + поколение + загрузка (все три проверяются при чтении). */
+    private fun markAppliedInternal(context: Context, applied: Boolean, reason: String, gen: Long) {
+        val save = Prefs2.putStringEx(context, PREF_TTL_65_APPLIED,
+            Toggles45.appliedOutcome(isTtl65Active(context), applied))
+        Prefs2.putString(context, PREF_TTL_65_PENDING_REASON, if (applied) "" else reason)
+        if (applied) {
+            Prefs2.putLong(context, PREF_TTL_65_APPLIED_AT, System.currentTimeMillis())
+            Prefs2.putLong(context, PREF_TTL_65_APPLIED_BOOT, bootCount(context).toLong())
+            Prefs2.putLong(context, PREF_TTL_65_APPLIED_GEN, gen)
+        }
+        AppLog.i(TAG, "TTL_STATE desired=${desired(context)} applied=${appliedState(context)} " +
+            "gen=$gen reason=«${pendingReason(context)}» save=«${save.wire()}» " +
+            "(намерение владельца не меняется автоматикой)")
+    }
+
+    /**
+     * Пользовательский клик. §4.2 iter47: сохранение намерения и применение — один путь
+     * ([TtlRunner.request]); отдельный `ttlInFlight` удалён, параллельных shell-операций нет.
+     */
+    fun setTtl65Active(context: Context, enabled: Boolean): ToolsResult {
+        BgWorker.assertNotMain("NetworkTtl.setTtl65Active")
+        val app = ensureCtx(context)
+        val t0 = SystemClock.uptimeMillis()
+        val res = runner.request(enabled, "click")
+        val (status, detail) = when (res.request) {
+            TtlRunner.Request.CONFLICT -> ToolsStep.Status.BLOCKED to "storage_conflict"
+            TtlRunner.Request.INTENT_NOT_SAVED -> ToolsStep.Status.FAILED to "intent_not_saved"
+            TtlRunner.Request.QUEUED -> ToolsStep.Status.PARTIAL to "queued_after_current"
+            TtlRunner.Request.STARTED ->
+                if (res.confirmed) ToolsStep.Status.OK to null
+                else ToolsStep.Status.FAILED to res.reason.ifEmpty { "not_confirmed" }
+        }
+        val (out4, out6) = ttlRuleCounts()
+        val step = ToolsStep(
+            step = "settings.ttl65",
+            command = if (enabled) "iptables -w 5 -t mangle -A TTL --ttl-set 65"
+            else "iptables -w 5 -t mangle -D (только свои правила)",
+            startedAtMs = t0,
+            finishedAtMs = SystemClock.uptimeMillis(),
+            exitCode = if (status == ToolsStep.Status.OK) 0 else 1,
+            stdout = "",
+            stderr = detail ?: "",
+            expected = if (enabled) "TTL_V4=1 TTL_V6=1 VERIFY=OK/OK rules=scoped"
+            else "TTL_V4=0 TTL_V6=0 rules=none",
+            actual = "TTL_V4=$out4 TTL_V6=$out6 gen=${res.gen} passes=${res.passes} " +
+                "desired=${desired(app)} applied=${appliedState(app)}",
+            status = status
+        )
+        return ToolsResult("settings.ttl65", "Фиксация TTL 65", listOf(step))
     }
 
     fun bootRestore(context: Context) {
         BgWorker.assertNotMain("NetworkTtl.bootRestore")
-        val active = isTtl65Active(context)
+        val app = ensureCtx(context)
+        val active = isTtl65Active(app)
         LogKit.stateTtl(active)
-        // §5.3 iter46: на старте/упоминании факт не подтверждён текущей проверкой — до readback
-        // состояние честно `pending` (никаких «применено» по прошлому сеансу).
-        if (active) markApplied(context, false, "boot_unverified")
-        // iter33 B4: сначала ОДНА короткая read-only проверка. Если правило уже стоит —
-        // ноль записи (раньше каждый тик заливался скрипт чанками: `rm -f` + `cat >>`×7 + chmod + sh).
+        // §5.3 iter46/§4.2 iter47: до проверки факт не подтверждён — честный `pending`.
+        if (active) markAppliedInternal(app, false, "boot_unverified", -1L)
         val (cnt4, cnt6) = ttlRuleCounts()
-        // iter33b C2: (-1,-1) — «канал не ответил», а НЕ «правила нет». Раньше при включённом
-        // тумблере это уходило в полную заливку скрипта чанками на каждом тике. Теперь — SKIP.
         if (cnt4 < 0 || cnt6 < 0) {
             AppLog.i(TAG, "TTL: SKIP (unknown, channel down) v4=$cnt4 v6=$cnt6")
-            // iter33k §3.4: строка загрузки печатается и здесь — честно «не восстановлено».
             AppLog.i(TAG, TtlRules.bootLine(0, 0) + " reason=channel_down")
             return
         }
-        if (!active) {
-            if (cnt4 == 0 && cnt6 == 0) {
-                // iter33m §1.2: стартовая санация — нечего снимать, фиксируем факт строкой.
-                AppLog.i(TAG, "TTL_SANITIZED removed=0 v4_removed=0 v6_removed=0 reason=start_nothing_to_remove")
-                AppLog.i(TAG, "TTL: SKIP (rule absent, toggle off) v4=$cnt4 v6=$cnt6")
-                return
-            }
-            AppLog.i(TAG, "TTL bootRestore: active=false, но правило есть (v4=$cnt4 v6=$cnt6) — снимаю (санация)")
-        } else if (cnt4 > 0 && cnt6 > 0) {
-            // §5.3 iter46: правило реально прочитано в этой загрузке — вот ТЕПЕРЬ факт `applied`.
-            markApplied(context, true, "")
-            AppLog.i(TAG, "TTL: SKIP (rule present) v4=$cnt4 v6=$cnt6")
-            // iter33k §3.4: правило уже стоит (напр. после перезапуска приложения) — фиксируем факт.
-            AppLog.i(TAG, TtlRules.bootLine(cnt4, cnt6) + " reason=already_present")
+        if (!active && cnt4 == 0 && cnt6 == 0) {
+            AppLog.i(TAG, "TTL_SANITIZED removed=0 v4_removed=0 v6_removed=0 reason=start_nothing_to_remove")
+            AppLog.i(TAG, "TTL: SKIP (rule absent, toggle off) v4=$cnt4 v6=$cnt6")
+            markAppliedInternal(app, true, "", -1L)
             return
         }
-        // iter33m §1.2: boot-ветка ставит правило ТОЛЬКО если тумблер включён; иначе это санация.
-        val script = buildScript(active)
-        val (rc, out) = AdbClient.executeScript("ttl_script", script, 40000)
-        out.lineSequence().firstOrNull { it.startsWith("TTL_SANITIZED") }?.let { AppLog.i(TAG, it.trim()) }
-        out.lineSequence().filter { it.startsWith("TTL_DEL") || it.startsWith("TTL_FOREIGN") }
-            .forEach { AppLog.i(TAG, it.trim()) }
-        out.lineSequence().firstOrNull { it.startsWith("TTL_TRY") }?.let { AppLog.i(TAG, it.trim()) }
-        val (status, reason) = parseVerifyResult(active, out)
-        // iter33k §3.4: одна строка восстановления при загрузке (правила — со скоупом).
+        // §4.2: boot идёт ТЕМ ЖЕ путём, что клик/сеть (проход раннера + проверка правил).
+        val res = runner.onBackgroundTrigger("boot")
         val after = ttlRuleCounts()
-        AppLog.i(TAG, TtlRules.bootLine(after.first, after.second))
-        AppLog.i(TAG, "VERIFY TTL bootRestore: rc=$rc → $status ($reason)")
-        // §5.3 iter46: факт выводится из ФАКТИЧЕСКОГО чтения после применения, а не из вызова.
-        val ok = status == ToolsStep.Status.OK &&
-            (!active || after.first > 0) && (active || (after.first == 0 && after.second == 0))
-        if (!active && after.first <= 0 && after.second <= 0) markApplied(context, true, "")
-        else markApplied(context, ok, if (ok) "" else (reason ?: "boot_not_confirmed"))
+        AppLog.i(TAG, TtlRules.bootLine(after.first, after.second) + " reason=boot_pass " +
+            "active=$active result=${res?.request} confirmed=${res?.confirmed}")
+        if (res == null) {
+            // Намерение прочитать нельзя — ничего не заявляем и ничего не снимаем вслепую.
+            AppLog.i(TAG, "TTL_BOOT action=none desired=unknown (правила не тронуты)")
+        }
     }
 
     /**
@@ -474,52 +523,31 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
                     // окне оно просто отбрасывалось, и «пропущено» означало «потеряно»: правила
                     // оставались снятыми до следующего broadcast. Теперь пропуск ставит флаг
                     // «догнать», а добивание выполняется после текущего применения.
-                    if (!reconcile.onNetworkEvent()) {
-                        AppLog.i(TAG, "TTL_RECEIVER skipped reason=in_flight action=mark_dirty " +
-                            "wifi=$isWifi (событие запомнено: будет один добивочный проход, " +
-                            "а не потеря)")
+                    // §4.2 iter47: сетевое событие идёт ТЕМ ЖЕ путём, что клик — через
+                    // сериализованный раннер. Отдельного `ttlInFlight` больше нет, поэтому
+                    // сетевой ON не может пересечься с ручным OFF: проходы не параллельны.
+                    val now = SystemClock.uptimeMillis()
+                    val since = now - ttlLastRunAtMs
+                    if (since in 0 until 30_000L) {
+                        // Шторм переподключений: проход не запускаем, но событие НЕ теряем —
+                        // один отложенный проход по последнему намерению.
+                        AppLog.i(TAG, "TTL_RECEIVER deferred reason=window sinceMs=$since " +
+                            "action=schedule_once delay_ms=${30_000L - since} wifi=$isWifi")
+                        networkRecheckOnce(rcvCtx, 30_000L - since)
                         return@post
                     }
-                    val now = SystemClock.uptimeMillis()
-                    synchronized(this@NetworkTtl) {
-                        val since = now - ttlLastRunAtMs
-                        if (since in 0 until 30_000L) {
-                            // Не теряем: помечаем, что нужен проход, и планируем ОДИН отложенный
-                            // (без цикла и без лавины команд).
-                            val delay = 30_000L - since
-                            AppLog.i(TAG, "TTL_RECEIVER skipped reason=window sinceMs=$since " +
-                                "action=schedule_once delay_ms=$delay wifi=$isWifi")
-                            networkRecheckOnce(rcvCtx, delay)
-                            return@post
-                        }
-                        ttlInFlight = true
-                        ttlLastRunAtMs = now
+                    val res = runner.onBackgroundTrigger("network:ttl=on")
+                    AppLog.i(TAG, "TTL_RECEIVER ran result=${res?.request} confirmed=${res?.confirmed} " +
+                        "desired=${desired(rcvCtx)} applied=${appliedState(rcvCtx)} wifi=$isWifi")
+                    if (res != null && !res.confirmed) {
+                        AppLog.i(TAG, "TTL_PENDING reason=«${res.reason}» desired=true applied=pending " +
+                            "action=wait_network (тумблер остаётся включённым; повтор — по следующему " +
+                            "событию сети, не по таймеру)")
                     }
-                    val res = try {
-                        AdbClient.executeScript("ttl_script", buildScript(true), 40000)
-                    } finally {
-                        synchronized(this@NetworkTtl) { ttlInFlight = false }
-                    }
-                    val rc = res.first
-                    val out = res.second
-                    val (status, reason) = parseVerifyResult(true, out)
-                    AppLog.i(TAG, "VERIFY TTL networkChange: rc=$rc → $status ($reason)")
-                    // iter42 §3: снимок устойчивого состояния после переприменения правил по
-                    // событию сети (одно событие шторма = один снимок, с ограничением частоты).
                     runCatching {
                         JitNet.requestEventSnapshot(
                             rcvCtx, "ttl_network_change", NetInfoAndroid(rcvCtx)
                         )
-                    }
-                    // §5 iter45: сетевое событие больше НЕ выключает намерение владельца.
-                    // Нет интернета/раздачи в этот момент — это доступность, а не желание.
-                    if (status == ToolsStep.Status.OK) {
-                        markApplied(rcvCtx, true, "")
-                    } else {
-                        markApplied(rcvCtx, false, reason.ifEmpty { "network_change_failed" })
-                        AppLog.i(TAG, "TTL_PENDING reason=«${reason.ifEmpty { "network_change_failed" }}» " +
-                            "desired=true applied=pending action=wait_network " +
-                            "(тумблер остаётся включённым; повтор — по следующему сетевому событию)")
                     }
                 }
             }
@@ -550,13 +578,11 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
      * Факт привязывается к текущей проверке: до неё состояние не объявляется «применено».
      */
     private fun reapplyForNetwork(ctx: Context) {
-        if (!isTtl65Active(ctx)) {
-            AppLog.i(TAG, "TTL_NET_REAPPLY desired=false action=none (владелец выключил — не включаем)")
-            return
-        }
-        markApplied(ctx, false, "network_change_unverified")
-        val ok = applyForIntent(ctx, true, "network")
-        AppLog.i(TAG, "TTL_NET_REAPPLY ok=$ok desired=true applied=${appliedState(ctx)}")
+        // §4.2: отложенный повтор — тот же путь. При OFF проход снимает только свои правила
+        // (санация) и НИКОГДА не включает Wi-Fi; включать TTL «на всякий случай» нечего.
+        val res = runner.onBackgroundTrigger("network_recheck")
+        AppLog.i(TAG, "TTL_NET_REAPPLY result=${res?.request} confirmed=${res?.confirmed} " +
+            "desired=${desired(ctx)} applied=${appliedState(ctx)}")
     }
 
     @JvmStatic fun unregisterNetworkReceiver(context: Context) {

@@ -840,8 +840,10 @@ class JitOrchestratorTest {
         val net = JitFake.Net(wifi = false)
         val shell = JitFake.QueueShell(stand())
         JitOp.click(store, net, shell, want = true, log = ::log)
+        // §7.3 iter47: добавлен read-only `zygoteStartMs` (признак доставки команды
+        // перезапуска). Ни одного метода управления точкой доступа/плагином по-прежнему нет.
         assertEquals(
-            setOf("wifiOn", "setWifi", "wifiAddress"),
+            setOf("wifiOn", "setWifi", "wifiAddress", "zygoteStartMs"),
             JitRef.JitNetState::class.java.methods.map { it.name }
                 .filterNot { it.contains("equals") || it.contains("hashCode") || it.contains("Default") }
                 .toSet()

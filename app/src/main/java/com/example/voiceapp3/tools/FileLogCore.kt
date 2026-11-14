@@ -35,10 +35,18 @@ object FileLogCore {
         /** Сколько `0x00` было в хвосте ПЕРЕД записью (диагностика повреждения). */
         val tailNulBefore: Int,
         /** Удалось ли взять межпроцессный лок (`false` — писали без него, это сообщается). */
-        val locked: Boolean
+        val locked: Boolean,
+        /**
+         * §8.1 iter47: строка сохранена в spill-файл процесса (лок был занят другим процессом),
+         * а не в основной журнал. Это НЕ «записано в журнал» — и не должно так называться.
+         */
+        val spilled: Boolean = false,
+        /** Файл, куда строка фактически попала (`null` — никуда). */
+        val spillFile: File? = null
     ) {
         fun wire(): String =
             "written=$written rotated=$rotated locked=$locked tail_nul_before=$tailNulBefore" +
+                (if (spilled) " spilled_to=«${spillFile?.name}»" else "") +
                 (if (reason.isEmpty()) "" else " reason=«$reason»")
     }
 
@@ -83,9 +91,23 @@ object FileLogCore {
                 }
                 lock = runCatching { acquire(raf, lockWaitMs) }.getOrNull()
                 if (lock == null) {
-                    // Файл лока занят другим процессом: не пишем в общий offset вне лока —
-                    // именно так появлялись «дыры» (3296 Б `0x00` в логе владельца).
-                    return Result(false, active, "process_lock_busy", false, 0, false)
+                    // §8.1 iter47: файл лока занят другим процессом. В общий offset вне лока не
+                    // пишем (именно так появлялись «дыры» — блок `0x00` в логе владельца), но и
+                    // НЕ теряем строку: кладём её в spill-файл ЭТОГО процесса. Spill безопасен без
+                    // лока, потому что у каждого процесса он свой, а слияние делает владелец лока.
+                    val spill = spillFor(active)
+                    val saved = runCatching {
+                        RandomAccessFile(spill, "rw").use { out ->
+                            out.seek(out.length())
+                            out.write(line.toByteArray(Charsets.UTF_8))
+                            runCatching { out.fd.sync() }.isSuccess
+                        }
+                    }.getOrDefault(false)
+                    return if (saved)
+                        Result(true, active, "process_lock_busy", false, 0, false,
+                            spilled = true, spillFile = spill)
+                    else
+                        Result(false, active, "process_lock_busy_spill_failed", false, 0, false)
                 }
                 return writeUnderLock(dir, active, name, line, maxBytes, false, locked = true)
             } catch (t: Throwable) {
@@ -133,18 +155,39 @@ object FileLogCore {
 
         if (active.isFile && active.length() >= maxBytes) {
             val bak = File(dir, "$name.1")
-            // Новая часть создаётся/переименовывается ДО того, как трогаем старую: при отказе
-            // rename старая часть остаётся нетронутой (раньше bak удалялся сразу).
+            val fresh = File(dir, "$name.new")
+            // §8.2 iter47 — ТРАНЗАКЦИОННЫЙ порядок ротации.
+            // Было: удалить `.1` → переименовать активный → создать новый. Отказ на любом шаге
+            // после первого удаления терял ПРЕЖНЮЮ часть, а строка уже была потеряна при отказе
+            // записи в новый файл.
+            // Стало: 1) новая часть с этой же строкой пишется в `.new` и fsync; 2) только после
+            // успеха активный файл заменяет `.1` (rename поверх существующего атомарен); 3) `.new`
+            // становится активным. Любой отказ оставляет данные: либо в `.new`, либо в активном.
+            val wroteNew = runCatching {
+                RandomAccessFile(fresh, "rw").use { out ->
+                    out.setLength(0)
+                    out.write(line.toByteArray(Charsets.UTF_8))
+                    runCatching { out.fd.sync() }.isSuccess
+                }
+            }.getOrDefault(false)
+            if (!wroteNew) {
+                // Новая часть не создана — старую НЕ трогаем вообще.
+                val nul = tailNulBytes(active)
+                return appendDirect(active, line, nulBefore = nul, locked = locked)
+            }
             if (bak.exists() && !bak.delete()) {
-                return Result(false, active, "rotate_bak_delete_failed", false, 0, locked)
+                val nul = tailNulBytes(active)
+                return appendDirect(active, line, nulBefore = nul, locked = locked)
             }
             if (!active.renameTo(bak)) {
+                // Прежняя часть осталась на месте, новая — в `.new` (данные не потеряны).
                 return Result(false, active, "rotate_rename_failed", false, 0, locked)
             }
-            if (!active.createNewFile() && !active.isFile) {
-                return Result(false, active, "rotate_create_failed", false, 0, locked)
+            if (!fresh.renameTo(active)) {
+                // Активного файла нет, но содержимое цело в `.new` — честно сообщаем.
+                return Result(false, fresh, "rotate_promote_failed", true, 0, locked)
             }
-            didRotate = true
+            return Result(true, active, "", true, 0, locked)
         }
 
         // §8.2: состояние проверяется ДО записи, иначе наш же новый хвост маскирует повреждение.
@@ -165,6 +208,51 @@ object FileLogCore {
             Result(false, active, "write_failed:${t.javaClass.simpleName}:${t.message?.take(60) ?: ""}",
                 didRotate, nulBefore, locked)
         }
+    }
+
+    /** §8.2: обычная дозапись в уже существующий/созданный активный файл. */
+    private fun appendDirect(f: File, line: String, nulBefore: Int, locked: Boolean): Result {
+        return try {
+            RandomAccessFile(f, "rw").use { out ->
+                out.seek(out.length())
+                out.write(line.toByteArray(Charsets.UTF_8))
+                runCatching { out.fd.sync() }.onFailure {
+                    return Result(false, f, "fsync_failed:${it.javaClass.simpleName}", false, nulBefore, locked)
+                }
+            }
+            Result(true, f, "", false, nulBefore, locked)
+        } catch (t: Throwable) {
+            Result(false, f, "write_failed:${t.javaClass.simpleName}", false, nulBefore, locked)
+        }
+    }
+
+    /**
+     * §8.1: spill-файл ЭТОГО процесса. Отдельный на процесс — поэтому его запись не требует
+     * межпроцессного лока (общий файл без лока как раз и давал «дыры»).
+     */
+    fun spillFor(active: File): File {
+        val pid = runCatching { java.lang.management.ManagementFactory.getRuntimeMXBean().name }
+            .getOrDefault("p")
+        return File(active.parentFile, active.name + "." + pid + ".spill")
+    }
+
+    /**
+     * §8.1: перенести накопленный spill в основной журнал под локом. Вызывается при следующей
+     * успешной записи. Возвращает число перенесённых строк (`-1` — не удалось, spill оставлен).
+     */
+    fun drainSpill(dir: File, name: String): Int {
+        val active = File(dir, name)
+        val spill = spillFor(active)
+        if (!spill.isFile) return 0
+        val text = runCatching { spill.readText() }.getOrNull() ?: return -1
+        if (text.isEmpty()) {
+            runCatching { spill.delete() }
+            return 0
+        }
+        val r = append(dir, name, text, maxBytes = Long.MAX_VALUE)
+        if (!r.written || r.spilled) return -1
+        runCatching { spill.delete() }
+        return text.count { it == '\n' }
     }
 
     /** Сколько `0x00` подряд в самом хвосте файла (0 — хвост чистый). */

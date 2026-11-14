@@ -242,14 +242,15 @@ class Iter46Test {
         val dir = tmpDir()
         val f = File(dir, "voiceapp3.log")
         f.writeText("x".repeat(64))
-        // «.1» существует как КАТАЛОГ — delete() вернёт false, ротация обязана остановиться,
-        // не тронув активный файл (раньше bak удалялся «на авось» и старые данные терялись).
+        // «.1» существует как НЕПУСТОЙ каталог — delete() вернёт false.
+        // §8.2 iter47: теперь это не «потерять данные», а осознанный откат к дозаписи в
+        // АКТИВНЫЙ файл: строка не теряется, прежнее содержимое не переписывается.
         File(dir, "voiceapp3.log.1").apply { mkdir(); File(this, "keep").writeText("busy") }
         val r = FileLogCore.append(dir, "voiceapp3.log", "new\n", maxBytes = 16)
-        assertFalse("запись не подтверждена", r.written)
-        assertTrue("причина названа", r.reason.startsWith("rotate_"))
-        assertFalse("активный файл не пересоздан", f.readText() == "new\n")
-        assertEquals("старые данные целы", 64, f.readText().length)
+        assertTrue("строка сохранена (дозаписью в активный файл)", r.written)
+        assertEquals("ротации не было — прежняя часть цела", false, r.rotated)
+        assertTrue("старые данные целы", f.readText().startsWith("x".repeat(64)))
+        assertTrue("новая строка дописана", f.readText().endsWith("new\n"))
     }
 
     @Test
@@ -319,15 +320,17 @@ class Iter46Test {
         val dir = tmpDir()
         val probe = File(dir, "voiceapp3.log.lock")
         java.io.RandomAccessFile(probe, "rw").use { other ->
-            // Другой «процесс» держит лок: без ожидания запись должна быть отклонена с
-            // причиной, а не выполнена в общий offset (источник нулевых «дыр»).
+            val held = other.channel.lock()
+            // Другой «процесс» держит лок. §8.1 iter47: строка не пишется в общий offset
+            // (источник нулевых «дыр»), но и не теряется — уходит в spill-файл этого процесса.
             val blocked = FileLogCore.append(dir, "voiceapp3.log", "nope\n", lockWaitMs = 0)
-            if (!blocked.written) {
-                assertTrue("причина названа", blocked.reason.isNotEmpty())
-            }
+            assertTrue("либо запись, либо spill с причиной: ${blocked.wire()}",
+                blocked.written || blocked.reason.isNotEmpty())
+            if (blocked.written) assertTrue("в основной файл не писали", blocked.spilled)
             // А с ожиданием лок освобождается и запись проходит.
             val waiting = FileLogCore.append(dir, "voiceapp3.log", "later\n", lockWaitMs = 30)
             assertFalse("результат определён", waiting.reason.startsWith("io:"))
+            runCatching { held.release() }
         }
         // Без конкурента (лок освобождён) запись проходит и подтверждается.
         val ok = FileLogCore.append(dir, "voiceapp3.log", "after\n")

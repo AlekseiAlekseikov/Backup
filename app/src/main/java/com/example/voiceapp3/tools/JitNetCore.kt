@@ -356,6 +356,15 @@ object JitRef {
 
         /** Read-only признак подключения: у `wlan0` есть не-loopback адрес. НЕ интернет. */
         fun wifiAddress(): Boolean?
+
+        /**
+         * §7.3 iter47 — когда СТАРТОВАЛ текущий `zygote` (wall clock, мс), `null` — прочитать
+         * нельзя. Это ЕДИНСТВЕННЫЙ доступный проверяемый факт о судьбе команды
+         * `setprop ctl.restart zygote`: если процесс zygote стартовал ПОСЛЕ отметки операции,
+         * значит команда была доставлена и выполнена, и «висит в очереди транспорта» она уже
+         * быть не может. Чего это НЕ доказывает: что JIT-компиляция произошла.
+         */
+        fun zygoteStartMs(): Long? = null
     }
 
     /** Отложенный запуск — как `Handler.postDelayed` в референсе. */
@@ -1474,6 +1483,33 @@ object JitOp {
         return true to "click_continuation:${age}"
     }
 
+    /**
+     * §7.3 iter47 — ПРОВЕРЯЕМЫЙ выход из `chain_undefined` вместо одного таймера.
+     *
+     * Если zygote стартовал позже отметки операции (с допуском [tolMs] на грубую сетку часов
+     * `starttime`), команда `ctl.restart zygote` была доставлена и выполнена: её невозможно
+     * «выполнить позже» — процесс, который она перезапускает, уже перезапущен. Это снимает
+     * блокировку НОВОГО пользовательского клика.
+     *
+     * Ограничения (честно): нечитаемое время отметки/zygote, коррекция часов назад, zygote,
+     * стартовавший ДО отметки (в т.ч. по другой причине) — доказательством не считаются.
+     * Автоматического повтора JIT это не включает: решает только владелец кликом.
+     */
+    fun zygoteRestartEvidence(
+        mark: JitRef.OpMark?,
+        zygoteStartMs: Long?,
+        nowMs: Long,
+        tolMs: Long = 60_000L
+    ): Boolean {
+        val ts = mark?.ts ?: return false
+        val zs = zygoteStartMs ?: return false
+        if (ts <= 0L || zs <= 0L) return false
+        // Отметка «из будущего» — часы сдвинуты, порядок не доказан.
+        if (ts > nowMs + tolMs) return false
+        if (zs > nowMs + tolMs) return false
+        return zs >= ts - tolMs
+    }
+
     /** §7.2: отметка операции пережила окно (правило — [Toggles45.isStale]). */
     private fun opExpired(mark: JitRef.OpMark?): Boolean =
         Toggles45.isStale(mark?.ts, System.currentTimeMillis(), STALE_MARK_MS)
@@ -1592,7 +1628,25 @@ object JitOp {
             // клик владельца: команда уже не может быть в очереди, а старый снимок не применяется
             // (см. `staleOp` ниже). Автоматики нет — только пользовательский клик.
             val age = markAgeMs(stored.mark)
-            val staleOp = stored.state == JitRef.StoredState.UNDEFINED && opExpired(stored.mark)
+            // §7.3 iter47: сначала ПРОВЕРЯЕМЫЙ признак (перезапуск zygote после отметки),
+            // и только потом — временное окно как резервная граница.
+            val zygoteStart = runCatching { netState.zygoteStartMs() }.getOrNull()
+            val evidenceOp = stored.state == JitRef.StoredState.UNDEFINED &&
+                zygoteRestartEvidence(stored.mark, zygoteStart, System.currentTimeMillis())
+            if (evidenceOp) {
+                log(
+                    "JIT_UNDEFINED_RESOLVED op=${stored.mark?.op} evidence=zygote_restarted " +
+                        "mark_ts=${stored.mark?.ts} zygote_start=$zygoteStart age_ms=$age " +
+                        "wifi_restore=none clicks=allowed " +
+                        "(zygote стартовал ПОСЛЕ отметки операции: команда перезапуска доставлена и " +
+                        "выполнена, «выполниться позже» она уже не может. Это доказательство " +
+                        "доставки команды, а НЕ того, что JIT-компиляция произошла; нового запуска " +
+                        "нет — решает только клик владельца)"
+                )
+            }
+            // Разблокировка: либо проверяемый признак, либо (резерв) истечение окна.
+            val staleOp = stored.state == JitRef.StoredState.UNDEFINED &&
+                (evidenceOp || opExpired(stored.mark))
             if (staleOp) {
                 CHAIN_UNDEFINED.set(false)
                 log(

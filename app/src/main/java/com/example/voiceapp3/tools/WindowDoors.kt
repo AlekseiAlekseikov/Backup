@@ -543,12 +543,28 @@ object WindowDoors {
             // Разовый поздний readback (не цикл): если VHAL подтвердит закрытие — снимаем
             // владельцев и фиксируем факт. Ничего не двигаем и не «лечим».
             val retryWin = windowAreaId
+            // §9 iter47: снимаем запись владельцев только если набор НЕ ИЗМЕНИЛСЯ с момента
+            // попытки. Иначе повторное открытие (или новая дверь) уже добавило владельца, и
+            // поздний readback «прошлого» закрытия выкинул бы живую запись — окно осталось бы
+            // без владельца и его больше никто не закрыл бы.
+            val ownersAtAttempt = synchronized(ventOwners) {
+                ventOwners[retryWin]?.toSortedSet()?.toList() ?: emptyList()
+            }
             com.example.voiceapp3.tools.BgWorker.postDelayed("ventLateReadback", 1_500L) {
                 runCatching {
                     val late = readWindowPos(cpm, retryWin)
                     if (late != null && kotlin.math.abs(late - WINDOW_CLOSED_POS) <= WINDOW_CLOSE_TOLERANCE) {
-                        synchronized(ventOwners) {
-                            if (ventOwners[retryWin]?.isEmpty() == true) ventOwners.remove(retryWin)
+                        val unchanged = synchronized(ventOwners) {
+                            val now = ventOwners[retryWin]?.toSortedSet()?.toList() ?: emptyList()
+                            if (now == ownersAtAttempt && now.isEmpty()) {
+                                ventOwners.remove(retryWin)
+                                true
+                            } else false
+                        }
+                        if (!unchanged) {
+                            AppLog.i(appCtx, TAG, "VENT_CLOSE_LATE_KEPT win=${hex(retryWin)} " +
+                                "pos_after=$late reason=owners_changed_since_attempt " +
+                                "(запись владельцев изменена позже — поздний readback её не трогает)")
                         }
                         persistVentOwners(appCtx)
                         AppLog.i(appCtx, TAG, "VENT_CLOSE_CONFIRMED_LATE win=${hex(retryWin)} " +

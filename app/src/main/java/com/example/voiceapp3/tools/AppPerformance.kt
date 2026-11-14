@@ -62,11 +62,12 @@ object AppPerformance {
     }
 
     fun isAutoOptimizeEnabled(context: Context): Boolean {
-        return getPrefs(context).getBoolean(PREF_PERF_AUTO_OPTIMIZE, false)
+        // §6.1 iter47: намерение читается через согласование копий (не напрямую из CPS).
+        return Prefs2.getBoolean(context, PREF_PERF_AUTO_OPTIMIZE, false)
     }
 
     fun isVideo60FpsEnabled(context: Context): Boolean {
-        return getPrefs(context).getBoolean(PREF_PERF_VIDEO, false)
+        return Prefs2.getBoolean(context, PREF_PERF_VIDEO, false)
     }
 
     /**

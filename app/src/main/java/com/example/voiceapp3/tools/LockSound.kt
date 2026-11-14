@@ -818,7 +818,7 @@ object LockSound {
             // Единственное исключение — снять СВОИ маунты, список которых оно само записало
             // в files/locksound_mounts.txt, и только в /vendor/etc/carlock/.
             AppLog.i(ctx, TAG, "LOCKSOUND_BOOT enabled=false action=none")
-            if (readOurMounts(ctx).isNotEmpty()) runCatching { restoreSystemLockSoundBind(ctx) }
+            if (readOwnMounts(ctx).isNotEmpty()) runCatching { restoreSystemLockSoundBind(ctx) }
         }
         if (unlockEnabled) {
             // Звук открытия — наш проигрыватель (не OEM-механизм), просто пишем путь
@@ -869,7 +869,18 @@ object LockSound {
         // P1: всё что ниже — ADB/mount, на BgWorker а не на main.
         BgWorker.post("LockSound.bind") {
             try {
-                val stagePath = "/data/local/tmp/carlock_custom.wav"
+                // §5.2 iter47: staging-файл УНИКАЛЕН для (поколение + содержимое). Раньше все
+                // задачи писали в один и тот же путь: параллельная задача могла подменить файл
+                // между копированием и bind, и на цель монтировался ЧУЖОЙ звук.
+                val ourMountsBefore = readOwnMounts(ctx)
+                val bytes0 = runCatching { soundFile.readBytes() }.getOrNull()
+                if (bytes0 == null) {
+                    recordBindFailure("source file unreadable: ${soundFile.name}", appCtx, deterministic = true)
+                    return@post
+                }
+                val contentHash = String.format("%08x",
+                    java.util.zip.CRC32().apply { update(bytes0) }.value)
+                val stagePath = "/data/local/tmp/carlock_custom_g${gen}_$contentHash.wav"
                 if (!soundFile.exists() || !soundFile.canRead()) {
                     recordBindFailure("source file unreadable: ${soundFile.absolutePath}", appCtx, deterministic = true)
                     return@post
@@ -922,14 +933,28 @@ object LockSound {
                         # подсистема машины (задний ход/скорость), приложение её не трогает.
                         for f in /vendor/etc/carlock/*.wav; do
                             if [ -f "${"$"}f" ]; then
+                                # §5.3 iter47: снимаем слой на цели ТОЛЬКО если ЕГО ИСТОЧНИК —
+                                # наш staging (_g<N>_<hash>.wav). Чужой bind на том же пути
+                                # (другое приложение/плагин) не трогаем: раньше цикл снимал всё,
+                                # что оказалось на пути, без проверки принадлежности слоя.
                                 for _i in 1 2 3 4; do
-                                    grep -F " ${"$"}f " /proc/mounts >/dev/null 2>&1 || break
+                                    CUR_SRC=$(awk -v t="${"$"}f" '$2==t {print $1; exit}' /proc/mounts 2>/dev/null)
+                                    [ -z "${'$'}CUR_SRC" ] && break
+                                    case "${'$'}CUR_SRC" in
+                                        /data/local/tmp/carlock_custom*) : ;;
+                                        *) echo "FOREIGN_MOUNT:${"$"}f src=${'$'}CUR_SRC"; break ;;
+                                    esac
                                     umount "${"$"}f" 2>/dev/null || umount -l "${"$"}f" 2>/dev/null || true
                                 done
+                                CUR_SRC=$(awk -v t="${"$"}f" '$2==t {print $1; exit}' /proc/mounts 2>/dev/null)
+                                if [ -n "${'$'}CUR_SRC" ] && [ "${'$'}CUR_SRC" != "$stagePath" ]; then
+                                    echo "TARGET_BUSY:${"$"}f src=${'$'}CUR_SRC"
+                                    continue
+                                fi
                                 mount -o bind '$stagePath' "${"$"}f" 2>&1 || echo MOUNT_FAIL:${"$"}f
                                 TGT_INODE=${'$'}(stat -c '%i' "${"$"}f" 2>/dev/null)
                                 if [ "${'$'}STAGE_INODE" = "${'$'}TGT_INODE" ] && grep -qF " ${"$"}f " /proc/mounts; then
-                                    echo MOUNTED_OK:${"$"}f
+                                    echo "MOUNTED_OK:${"$"}f|$stagePath"
                                     MOUNTED_COUNT=${'$'}((MOUNTED_COUNT+1))
                                 else
                                     echo MOUNT_VERIFY_FAIL:${"$"}f inode=${'$'}TGT_INODE
@@ -981,31 +1006,113 @@ object LockSound {
                         !bindRes.second.contains("MOUNTED_OK:"))
                 val ok = bindRes.first == 0 && bindRes.second.contains("MOUNTED_OK:") && !failDeterm
 
+                // §5.1 iter47: скрипт уже УШЁЛ, и во время его выполнения владелец мог выключить
+                // звук или выбрать другой WAV. Проверка флага ДО вызова такой случай не ловит,
+                // а «отменить отправленную команду» невозможно. Поэтому после ответа
+                // перепроверяем намерение и поколение, и доводим систему до АКТУАЛЬНОГО
+                // состояния: OFF → снимаем только свои слои, другой файл → новый проход.
+                val genChanged = bindGen != gen
+                val desiredOff = !isEnabled(appCtx)
+                if (ok && (genChanged || desiredOff)) {
+                    // Факт для ЭТОГО поколения не публикуем: он относится к устаревшему выбору.
+                    markApplied(appCtx, false, if (desiredOff) "desired_off_after_bind" else "superseded")
+                    AppLog.i(ctx, TAG, "LOCKSOUND_BIND_STALE gen=$gen now=$bindGen desired=${!desiredOff} " +
+                        "result=converge (намерение изменилось, пока скрипт выполнялся; applied для " +
+                        "устаревшего выбора не заявляется)")
+                    cleanupStage(ctx, stagePath)
+                    convergeAfterBind(appCtx, desiredOff)
+                    return@post
+                }
                 if (ok) {
                     bindFailCount = 0
                     lastBindFailReason = null
-                    // iter33h A1.4: запоминаем СВОИ пути, чтобы уметь снять только их.
+                    // §5.3 iter47: в реестр пишем ПАРУ «цель|источник|поколение», а не только путь:
+                    // без источника нельзя доказать принадлежность слоя при снятии.
                     val mounted = bindRes.second.lineSequence().map { it.trim() }
                         .filter { it.startsWith("MOUNTED_OK:") }
                         .map { it.removePrefix("MOUNTED_OK:") }
-                        .filter { isOurLockPath(it) }
+                        .mapNotNull { line ->
+                            val target = line.substringBefore('|').trim()
+                            val src = line.substringAfter('|', "").trim()
+                            if (!isOurLockPath(target)) null
+                            else OwnMount(target, src.ifEmpty { stagePath }, gen)
+                        }
                         .toList()
-                    writeOurMounts(ctx, mounted)
-                    markApplied(ctx, true, "")
-                    AppLog.i(ctx, TAG, "VERIFY lockSound: SUCCESS (MOUNTED_OK_COUNT present) " +
-                        "paths=${mounted.joinToString(",")} (звук применится сразу либо после перезагрузки ГУ)")
+                    val expectedTargets = glideTargets.size
+                    writeOwnMounts(ctx, mounted)
+                    // §5.4 iter47: `applied` — только когда смонтированы ВСЕ цели, которые есть
+                    // на устройстве, и каждая проверена readback (inode источника = цель).
+                    val complete = mounted.isNotEmpty() && mounted.size == expectedTargets
+                    markApplied(ctx, complete, if (complete) "" else "partial_mounts:${mounted.size}/$expectedTargets")
+                    AppLog.i(ctx, TAG, "VERIFY lockSound: ${if (complete) "SUCCESS" else "PARTIAL"} " +
+                        "mounted=${mounted.size} expected=$expectedTargets " +
+                        "paths=${mounted.joinToString(",") { it.target }} " +
+                        "(наличие файла, Settings и mount readback — разные факты; слышимость " +
+                        "подтверждает только владелец)")
                 } else {
                     val reason = if (bindRes.second.contains("ERR_ROOT_CHANNEL_UNAVAILABLE")) "root unavailable"
                                  else if (bindRes.second.contains("Permission denied")) "Permission denied"
                                  else "rc=${bindRes.first}: ${bindRes.second.take(200)}"
                     recordBindFailure(reason, appCtx, deterministic = failDeterm)
                 }
+                cleanupStage(ctx, stagePath)
             } catch (t: Throwable) {
                 AppLog.w(ctx, TAG, "applySystemLockSoundBind error: ${t.message}", t)
                 recordBindFailure("exception: ${t.message}", appCtx, deterministic = false)
             }
         }
     }
+
+    /**
+     * §5.2 iter47: staging-файл этого поколения удаляется после использования — иначе
+     * `/data/local/tmp` копил бы копии WAV, а «старый» файл мог быть смонтирован вместо нового.
+     */
+    private fun cleanupStage(ctx: Context, stagePath: String) {
+        runCatching {
+            BgWorker.post("LockSound.cleanupStage") {
+                runCatching { AdbClient.execute("rm -f '$stagePath' 2>/dev/null || true", 8000) }
+            }
+        }
+    }
+
+    /**
+     * §5.1 iter47: привести систему к АКТУАЛЬНОМУ намерению после того, как уже отправленный
+     * bind завершился. Ровно один проход: OFF → снять свои слои; другой файл → новый bind
+     * (у него будет своё поколение). Рекурсии нет — второй проход видит стабильное поколение.
+     */
+    private fun convergeAfterBind(ctx: Context, desiredOff: Boolean) {
+        if (convergePending) {
+            AppLog.i(ctx, TAG, "LOCKSOUND_CONVERGE skip reason=already_pending " +
+                "(сходимость уже запланирована: без лавины задач)")
+            return
+        }
+        convergePending = true
+        BgWorker.post("LockSound.converge") {
+            try {
+                if (desiredOff || !isEnabled(ctx)) {
+                    AppLog.i(ctx, TAG, "LOCKSOUND_CONVERGE action=restore_stock " +
+                        "(звук выключен владельцем: снимаем ТОЛЬКО свои слои)")
+                    restoreSystemLockSoundBind(ctx)
+                    markApplied(ctx, false, "off")
+                } else {
+                    val path = getSelectedPath(ctx)
+                    if (path.isNotEmpty() && File(path).exists()) {
+                        AppLog.i(ctx, TAG, "LOCKSOUND_CONVERGE action=apply_new_selection file=${File(path).name}")
+                        applySystemLockSoundBind(ctx, File(path))
+                    } else {
+                        AppLog.i(ctx, TAG, "LOCKSOUND_CONVERGE action=none reason=no_file_selected")
+                        markApplied(ctx, false, "no_file_selected")
+                    }
+                }
+            } catch (t: Throwable) {
+                AppLog.w(ctx, TAG, "LOCKSOUND_CONVERGE error: ${t.message}", t)
+            } finally {
+                convergePending = false
+            }
+        }
+    }
+
+    @Volatile private var convergePending = false
 
     private fun recordBindFailure(reason: String, ctx: Context, deterministic: Boolean) {
         lastBindFailReason = reason
@@ -1102,28 +1209,43 @@ object LockSound {
     private fun restoreSystemLockSoundBind(ctx: Context) {
         soundExecutor.execute {
             try {
-                val ours = readOurMounts(ctx)
-                val checked = ours.filter { isOurLockPath(it) }
-                val skipped = ours - checked.toSet()
+                val ours = readOwnMounts(ctx)
+                val entries = ours.filter { isOurLockPath(it.target) }
+                val skipped = ours.filterNot { isOurLockPath(it.target) }.map { it.target }
                 if (skipped.isNotEmpty()) {
                     AppLog.i(ctx, TAG, "LOCKSOUND_UNMOUNT SKIP reason=path_not_ours paths=" + skipped.joinToString(","))
                 }
-                if (checked.isEmpty()) {
-                    writeOurMounts(ctx, emptyList())
+                if (entries.isEmpty()) {
+                    writeOwnMounts(ctx, emptyList())
                     AppLog.i(ctx, TAG, "LOCKSOUND_BOOT enabled=false action=none (своих маунтов нет)")
                     return@execute
                 }
                 val sb = StringBuilder("UNMOUNTED=0\n")
-                for (p in checked) {
-                    sb.append("if grep -qF ' ").append(p).append(" ' /proc/mounts; then ")
-                    sb.append("umount ").append(p).append(" 2>/dev/null || umount -l ").append(p)
-                    sb.append(" 2>/dev/null || true; UNMOUNTED=\$((UNMOUNTED+1)); echo UNMOUNTED_OK:")
-                    sb.append(p).append("; fi\n")
+                for (o in entries) {
+                    val target = o.target
+                    val expected = o.source
+                    // §5.3 iter47: перед снятием смотрим ФАКТИЧЕСКИЙ источник слоя в /proc/mounts.
+                    // Снимаем, только если это НАШ staging (или совпадает с записанным источником):
+                    // иначе на цели мог оказаться чужой bind, и снимать его нельзя.
+                    val oursPattern = "/data/local/tmp/carlock_custom*" +
+                        if (expected.isNotEmpty() && isOurStageSource(expected)) "|" + expected else ""
+                    sb.append("CUR=$(awk -v t='").append(target)
+                        .append("' '$2==t {print $1; exit}' /proc/mounts 2>/dev/null)\n")
+                    sb.append("if [ -n \"\$CUR\" ]; then\n")
+                    sb.append("  case \"\$CUR\" in\n")
+                    sb.append("    ").append(oursPattern).append(") umount ").append(target)
+                    sb.append(" 2>/dev/null || umount -l ").append(target)
+                    sb.append(" 2>/dev/null || true; UNMOUNTED=$((UNMOUNTED+1))")
+                    sb.append("; echo UNMOUNTED_OK:").append(target).append(" ;;\n")
+                    sb.append("    *) echo \"UNMOUNT_SKIP:").append(target)
+                    sb.append(":foreign:\$CUR\" ;;\n")
+                    sb.append("  esac\n")
+                    sb.append("fi\n")
                 }
-                sb.append("echo \"MOUNTS_LEFT=\$(grep carlock /proc/mounts | wc -l) UNMOUNTED=\$UNMOUNTED\"\n")
+                sb.append("rm -f /data/local/tmp/carlock_custom*.wav 2>/dev/null || true\n")
                 val res = AdbClient.execute(sb.toString(), 20000)
                 AppLog.i(ctx, TAG, "LOCKSOUND_UNMOUNT [exitCode=${res.first}]: " + res.second.trim())
-                if (res.first == 0) writeOurMounts(ctx, emptyList())
+                if (res.first == 0) writeOwnMounts(ctx, emptyList())
             } catch (t: Throwable) {
                 AppLog.w(ctx, TAG, "restoreSystemLockSoundBind error: ${t.message}")
             }
@@ -1144,12 +1266,40 @@ object LockSound {
 
     private fun mountsFile(ctx: Context): File = File(ctx.applicationContext.filesDir, "locksound_mounts.txt")
 
-    private fun readOurMounts(ctx: Context): List<String> =
-        runCatching { mountsFile(ctx).readLines().map { it.trim() }.filter { it.isNotEmpty() } }
-            .getOrDefault(emptyList())
+    /**
+     * §5.3 iter47 — слой владения: ЦЕЛЬ + ИСТОЧНИК + поколение, которым он смонтирован.
+     *
+     * Одного пути недостаточно: на той же цели мог оказаться чужой bind, и снимать его нельзя.
+     * Формат строки реестра: `target|source|gen`. Старые записи (только путь) читаются как
+     * `target||gen=-1` и снимаются лишь при совпадении источника с нашим staging-префиксом.
+     */
+    internal data class OwnMount(val target: String, val source: String, val gen: Long)
 
-    private fun writeOurMounts(ctx: Context, paths: List<String>) {
-        runCatching { mountsFile(ctx).writeText(paths.joinToString("\n")) }
+    /** Наш staging-префикс — единственный источник, который мы вправе снимать. */
+    internal fun isOurStageSource(src: String): Boolean =
+        src.startsWith("/data/local/tmp/carlock_custom")
+
+    internal fun parseOwnMount(line: String): OwnMount? {
+        val t = line.trim()
+        if (t.isEmpty()) return null
+        val parts = t.split('|')
+        val target = parts[0].trim()
+        if (target.isEmpty()) return null
+        val source = parts.getOrElse(1) { "" }.trim()
+        val gen = parts.getOrElse(2) { "-1" }.trim().toLongOrNull() ?: -1L
+        return OwnMount(target, source, gen)
+    }
+
+    private fun readOwnMounts(ctx: Context): List<OwnMount> =
+        runCatching { mountsFile(ctx).readLines() }.getOrDefault(emptyList())
+            .mapNotNull { parseOwnMount(it) }
+
+    private fun writeOwnMounts(ctx: Context, mounts: List<OwnMount>) {
+        runCatching {
+            mountsFile(ctx).writeText(
+                mounts.joinToString("\n") { o -> o.target + "|" + o.source + "|" + o.gen }
+            )
+        }
     }
 
     fun discoverWavFiles(): List<File> {
