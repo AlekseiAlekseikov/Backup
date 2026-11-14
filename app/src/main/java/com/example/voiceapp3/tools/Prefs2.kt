@@ -463,8 +463,18 @@ object Prefs2 {
 
     /** Факт транзакционной записи: значение настройки + новое поколение. */
     data class Save2(val save: Save, val genSave: Save, val gen: Long) {
-        /** Подтверждено только если записались ОБЕ части одной транзакции. */
-        val confirmed: Boolean get() = save.confirmed && genSave.confirmed
+        /**
+         * §5.1(1) iter51: ЕДИНЫЙ результат транзакции.
+         *
+         * Дефект: `confirmed` складывался из `save.confirmed && genSave.confirmed`, а `gen`
+         * отдельно требовал обе части В ОДНОЙ копии. При «разных частях в разных копиях»
+         * получалось `confirmed=true, gen=-1`: вызывающий считал намерение подтверждённым и при
+         * этом не имел настоящего поколения (`NetworkTtl` в этом случае не публиковал `applied`,
+         * но статус оставался противоречивым).
+         * Теперь `confirmed` истинно ровно тогда, когда есть реальное поколение — то есть обе
+         * части подтверждены в ОДНОЙ копии.
+         */
+        val confirmed: Boolean get() = gen > 0L && save.confirmed && genSave.confirmed
         fun wire(): String = "intent{${save.wire()}} gen{${genSave.wire()}} gen_value=$gen"
     }
 

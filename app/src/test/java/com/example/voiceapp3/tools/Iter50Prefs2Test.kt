@@ -40,7 +40,9 @@ class Iter50Prefs2Test {
         var commitResult: Boolean = true,
         var throwOnCommit: Boolean = false,
         /** Сколько операций редактора реально применить при commit (null — все). */
-        var applyFirst: Int? = null
+        var applyFirst: Int? = null,
+        /** Ключи, операции которых НЕ применяются (модель «часть транзакции потерялась»). */
+        var skipKeys: Set<String> = emptySet()
     ) : SharedPreferences {
         val map = LinkedHashMap<String, Any?>()
         private val listeners = mutableListOf<SharedPreferences.OnSharedPreferenceChangeListener>()
@@ -104,6 +106,7 @@ class Iter50Prefs2Test {
                     if (i >= n) break
                     val (k, v) = op
                     when {
+                        k in skipKeys -> continue
                         k == "*" -> map.clear()
                         v === removed -> map.remove(k)
                         else -> map[k] = v
@@ -282,5 +285,36 @@ class Iter50Prefs2Test {
         assertEquals(1L, Prefs2.nextGen(-5L))
         assertEquals(6L, Prefs2.nextGen(5L))
         assertEquals("переполнение не переходит в отрицательное", 1L, Prefs2.nextGen(Long.MAX_VALUE))
+    }
+
+    // ── iter51 §5.1(1): единый результат транзакции ──────────────────────────────────────
+
+    @Test
+    fun transactionConfirmedImpliesRealGeneration() {
+        // «Разные части выглядят верными в РАЗНЫХ копиях»: cps применил intent (поколение
+        // потерялось), dps — поколение (intent потерялся).
+        val a = FakePrefs("cps", commitResult = true, skipKeys = setOf(GEN, "$GEN#rev"))
+        val b = FakePrefs("dps", commitResult = true, skipKeys = setOf(K, "$K#del", "$K#rev", "$K#who"))
+        val tx = Prefs2.putBoolAndBumpCore(
+            copies(a, b), K, true, GEN, genNew = 9L, revB = 2L, revL = 3L, whoTag = "test"
+        )
+        assertTrue("поколение найдено в одной копии", tx.genSave.confirmed)
+        assertTrue("intent найден в другой", tx.save.confirmed)
+        assertEquals("но настоящего поколения НЕТ", -1L, tx.gen)
+        assertFalse(
+            "подтверждённая транзакция без реального поколения — противоречие: ${tx.wire()}",
+            tx.confirmed
+        )
+    }
+
+    @Test
+    fun confirmedTransactionAlwaysHasPositiveGeneration() {
+        val a = FakePrefs("cps", commitResult = true)
+        val b = FakePrefs("dps", commitResult = false)
+        val tx = Prefs2.putBoolAndBumpCore(
+            copies(a, b), K, true, GEN, genNew = 5L, revB = 1L, revL = 1L, whoTag = "test"
+        )
+        assertTrue(tx.confirmed)
+        assertTrue("gen > 0", tx.gen > 0L)
     }
 }

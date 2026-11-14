@@ -115,6 +115,25 @@ internal object TtlVerify {
         // iter50 §5.1(3): своё правило снять не удалось — повторное включение остановлено.
         // В таблице могло остаться КОРРЕКТНОЕ правило от прошлого раза; это не «включилось сейчас».
         val ownLeftStop = ttlVerdict == "OWN_LEFT_STOP"
+        // iter51 §4.3(1): состояние IPv6 проверяется ОТДЕЛЬНО от IPv4. Раньше при ON
+        // достаточно было `VERIFY_V4=OK` + `uplink_only=yes`: `VERIFY_V6=FAIL` (правило v6 не
+        // встало/не прочиталось) давал ПОЛНЫЙ OK, хотя половина семейства не применена.
+        // Различаем:
+        //  • `SKIPPED`/`none` — IPv6 в этой системе НЕТ (не поддержан/выключен): это не ошибка,
+        //    но и не «всё проверено» — статус остаётся `SCOPED_V4_ONLY`;
+        //  • `FAIL`/`NOT_APPLIED`/`COLLISION`/`UNKNOWN` — IPv6 ЕСТЬ, но применение/чтение не
+        //    удалось: полного подтверждения быть не может.
+        val v6PresentButFailed = v6Verify != null && v6Verify != "OK" &&
+            v6Verify != "SKIPPED" && v6Verify != "none"
+        val v6Unsupported = v6Verify == "SKIPPED" || v6Verify == "none" || v6Verify == null
+        // §4.3(1): ЧАСТИЧНЫЙ случай — ровно «v4 применён и проверен, а v6 присутствует, но не
+        // применён/не прочитан». Любая другая проблема (коллизия, откат, нечитаемая таблица,
+        // нет uplink, не встал v4) остаётся FAILED с прежней причиной.
+        val v6OnlyIssue = expected && v6PresentButFailed && v4Verify == "OK" && v4Count >= 1 &&
+            !collision && !rolledBack && !readFailed && uplinkOnly
+        val v6Reason = "IPv6 присутствует, но применение или чтение не удалось " +
+            "(VERIFY_V6=$v6Verify): v4=$v4Verify — полного подтверждения обоих семейств нет, " +
+            "состояние ЧАСТИЧНОЕ. Правило v4 при этом стоит; смотрите TTL_V4/TTL_CHECK."
         val foreignN = foreign4?.toIntOrNull() ?: 0
         val foreignN6 = foreign6?.toIntOrNull() ?: 0
 
@@ -129,6 +148,7 @@ internal object TtlVerify {
             rolledBack ->
                 "включение откатано целиком: половинчатое состояние (только v4 или только v6) не " +
                     "оставлено. Смотрите TTL_ADD/TTL_ROLLBACK — iptables не принял правило."
+            v6OnlyIssue -> v6Reason
             notApplied ->
                 "не применялось: состояние одной из семей не наше (или не прочитано) — " +
                     "включать половину нельзя."
@@ -165,11 +185,18 @@ internal object TtlVerify {
             reason == null && offPartialForeign -> Verdict.PARTIAL
             reason == null -> Verdict.OK
             hasNoRoot -> Verdict.BLOCKED
+            // iter51 §4.3(1): ON с присутствующим, но неработающим IPv6 — ЧАСТИЧНО (v4 применён,
+            // v6 нет). Не FAILED: половина действительно применена и это надо показать как есть.
+            v6OnlyIssue -> Verdict.PARTIAL
             else -> Verdict.FAILED
         }
 
         val detail = when {
             reason != null -> reason
+            expected && v6Unsupported && v4Verify == "OK" ->
+                "применено ТОЛЬКО IPv4 (IPv6 в системе нет/не поддержан: VERIFY_V6=$v6Verify): " +
+                    "это не ошибка, но и не полная проверка обоих семейств. TTL_V4=$v4 " +
+                    "scoped=uplink_only wire=not_measured"
             expected -> "своё правило стоит: TTL_V4=$v4 TTL_V6=$v6 OWN_J4=$ownJ4 OWN_J6=$ownJ6 " +
                 "VERIFY=$v4Verify/$v6Verify scoped=uplink_only verdict=$ttlVerdict " +
                 "foreign_v4=${foreignN} foreign_v6=${foreignN6} wire=not_measured"
