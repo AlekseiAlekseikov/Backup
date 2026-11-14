@@ -65,7 +65,19 @@ if [ -r "${'$'}MI" ]; then echo "MOUNT_TABLE path=ok"; else echo "MOUNT_TABLE pa
 # ЕДИНЫЙ формат: <mount_id>|<major:minor>|<root> — ровно три поля (см. KDoc).
 mi_layers() { awk -v t="${'$'}1" '${'$'}5==t {print ${'$'}1"|"${'$'}3"|"${'$'}4}' "${'$'}MI" 2>/dev/null; }
 mi_count() { mi_layers "${'$'}1" | wc -l | tr -d ' '; }
-mi_top() { mi_layers "${'$'}1" | tail -1; }
+# iter52 §5.2: верхний слой = МАКСИМАЛЬНЫЙ mount_id среди слоёв цели, а не последняя строка
+# файла. Порядок строк mountinfo не гарантирует порядок вложения: в реальных таблицах (и в
+# тестах) строка с большим id может стоять ВЫШЕ по файлу, и «последняя строка» отдавала не тот слой —
+# тогда проверка root/umount работала не с фактическим верхом. Если id нечисловой,
+# возвращается AMBIGUOUS||, и вызывающая сторона обязана считать это «не доказано»,
+# а не «слоя нет». Пустой вывод означает ЛИБО «слоёв нет», ЛИБО «таблица не прочиталась» —
+# различать обязан барьер на читаемость таблицы (см. MOUNT_TABLE выше).
+mi_top() {
+  mi_layers "${'$'}1" | awk -F'|' '
+    BEGIN { best = -1; line = ""; bad = 0 }
+    { if (${'$'}1 ~ /^[0-9]+${'$'}/) { if (${'$'}1 + 0 > best) { best = ${'$'}1 + 0; line = ${'$'}0 } } else { bad = 1 } }
+    END { if (bad) { print "AMBIGUOUS||"; exit } if (line != "") print line }'
+}
 
 # Разбор строки mi_layers в MID/MMIN/ROOT. 2 = повреждённая строка (не догадываемся).
 # ROOT может содержать '|' (в mountinfo он не экранируется), поэтому отрезается только
@@ -150,7 +162,7 @@ expected_root_for() {
         sb.append("echo \"STAGE_IDENT inode=\${STAGE_DEV_INO:-unknown} path_len=\${#STAGE_PATH}\"\n")
         sb.append("EXPECTED_ROOT=\$(expected_root_for \"\$STAGE_PATH\" 2>/dev/null)\n")
         sb.append("echo \"EXPECTED_ROOT value=\${EXPECTED_ROOT:-unknown} method=longest_mount_prefix\"\n")
-        sb.append("echo \"MOUNT_ORDER method=mountinfo_order top_guaranteed=no\"\n")
+        sb.append("echo \"MOUNT_ORDER method=max_mount_id top_guaranteed=yes_within_table\"\n")
         sb.append(
             """
 # Снять ТОЛЬКО свои слои на цели. Возврат: 0 — своих не осталось; 3 — сверху чужой/неопознанный
@@ -273,7 +285,7 @@ echo "OWN_LAYERS_TOTAL=${'$'}(awk '${'$'}4 ~ /^\// && ${'$'}5 ~ /^\/vendor\/etc\
         val sb = StringBuilder()
         sb.append(commonPrologue())
         sb.append("\n")
-        sb.append("echo \"MOUNT_ORDER method=mountinfo_order top_guaranteed=no\"\n")
+        sb.append("echo \"MOUNT_ORDER method=max_mount_id top_guaranteed=yes_within_table\"\n")
         sb.append("STAGE_PREFIX=${shQuote(STAGE_PREFIX)}\n")
         // iter51 §3.4(1): строгий барьер namespace В ЭТОЙ ЖЕ shell-операции и ДО любого side
         // effect. Отдельная предварительная команда (`NS_PRE` в LockSound) доказывает namespace

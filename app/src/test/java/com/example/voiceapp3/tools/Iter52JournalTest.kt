@@ -225,4 +225,58 @@ class Iter52JournalTest {
         assertEquals("нет слоя — это STOCK_OK, а не отказ: $out", LockOp.Reconcile.STOCK_RESTORED,
             LockOp.reconcileVerdict(rc, out))
     }
+
+    // ─────────── §5.2: верхний слой определяется по mount_id, а не по порядку строк ───────────
+
+    @Test
+    fun topLayerIsChosenByMountIdNotByFileOrder() {
+        val (st, targets, env) = stand()
+        val stage = env.getValue("STAGE")
+        val t = wav(targets)
+        st.exec(LockMountScripts.bindScript(stage), "bind.sh", env)
+
+        // Наш слой в таблице, но строка с МЕНЬШИМ id (чужой слой) стоит ПОСЛЕ неё.
+        val ours = st.mountinfo.readLines().first { it.contains(" ${t.absolutePath} ") }
+        val rest = st.mountinfo.readLines().filter { it != ours }
+        st.mountinfo.writeText(
+            (listOf(ours) + rest + "3 1 8:1 /other/place ${t.absolutePath} rw - ext4 /dev/block/sda1 rw").joinToString("\n") + "\n"
+        )
+        val before = st.mountinfo.readText()
+        assertTrue("наша строка выше чужой", before.indexOf(ours) < before.indexOf("/other/place"))
+
+        val (rc, out) = st.exec(
+            LockMountScripts.restoreScript(listOf(t.absolutePath to stage)), "restore.sh", env
+        )
+
+        // Доказательство выбора: снят слой с mid=1002 (наша строка, больший mount_id), а не
+        // нижний с id=3, который стоит последним в файле. Со «последней строкой» скрипт
+        // увидел бы чужой root и не снял ничего.
+        assertTrue("снят именно наш (больший mount_id): $out", out.contains("UMOUNTED_OK:${t.absolutePath}") && out.contains("mid=1002"))
+        assertFalse("нижний слой не принят за наш по порядку строк: $out", out.contains("FOREIGN_MOUNT:${t.absolutePath}"))
+        assertEquals("снятие ровно одно: ${st.mountCalls()}", 1, st.mountCalls().count { it.startsWith("umount") })
+        assertFalse("нашей строки в таблице больше нет", st.mountinfo.readText().contains(ours))
+        assertEquals("исход назван по факту", LockOp.Reconcile.STOCK_RESTORED, LockOp.reconcileVerdict(rc, out))
+    }
+
+    @Test
+    fun nonNumericMountIdIsAmbiguousNotEmpty() {
+        val (st, targets, env) = stand()
+        val stage = env.getValue("STAGE")
+        val t = wav(targets)
+        st.exec(LockMountScripts.bindScript(stage), "bind.sh", env)
+        // id испорчен: нельзя решать, что слоя нет, и нельзя угадывать верх.
+        val lines = st.mountinfo.readLines().map {
+            if (it.contains(" ${t.absolutePath} ")) it.replaceFirst(Regex("^[0-9]+"), "x") else it
+        }
+        st.mountinfo.writeText(lines.joinToString("\n") + "\n")
+        val before = st.mountinfo.readText()
+
+        val (rc, out) = st.exec(
+            LockMountScripts.restoreScript(listOf(t.absolutePath to stage)), "restore.sh", env
+        )
+        assertTrue("недоказанность названа: $out", out.contains("RESTORE_BAD_LAYER") || out.contains("STOCK_UNPROVEN"))
+        assertFalse("сток не заявляется", out.contains("STOCK_OK:"))
+        assertEquals("ничего не снято", before, st.mountinfo.readText())
+        assertEquals("вердикт — не успех", LockOp.Reconcile.UNPROVEN, LockOp.reconcileVerdict(rc, out))
+    }
 }
