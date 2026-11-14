@@ -108,8 +108,33 @@ object WindowDoors {
     /** Текущее поколение набора владельцев (для сверки поздних ответов). */
     internal fun ventOwnersGeneration(): Long = ventGen.get()
 
-    /** Набор дверей-владельцев окна (создаётся по требованию). */
+    /** Набор дверей-владельцев окна (создаётся по требованию). ТОЛЬКО для чтения под lock. */
     private fun ownersOf(w: Int): MutableSet<Int> = synchronized(ventOwners) { ventOwners.getOrPut(w) { HashSet() } }
+
+    /**
+     * §9.1 iter50 — ЕДИНАЯ точка мутации набора владельцев.
+     *
+     * Дефект: поколение увеличивалось только в `closeVentWindow`, а `owners.add(...)` при
+     * ОТКРЫТИИ и восстановление из prefs меняли набор БЕЗ нового поколения. Тогда поздний
+     * readback закрытия видел «содержимое и поколение те же» и снимал живую запись (ABA).
+     * Теперь любая мутация идёт через этот метод и всегда двигает поколение.
+     */
+    private fun mutateOwners(block: (MutableMap<Int, MutableSet<Int>>) -> Unit) {
+        synchronized(ventOwners) {
+            block(ventOwners)
+            ventGen.incrementAndGet()
+        }
+    }
+
+    /**
+     * §9.1 iter50 — АТОМАРНЫЙ снимок «набор владельцев + поколение» одним lock.
+     *
+     * Раньше набор и `ventGen` читались двумя разными синхронизациями: между ними могла
+     * пройти мутация, и решение позднего readback принималось по несогласованным данным.
+     */
+    private fun ownersSnapshotWithGen(): Pair<Map<Int, Set<Int>>, Long> = synchronized(ventOwners) {
+        ventOwners.mapValues { it.value.toSet() } to ventGen.get()
+    }
 
     /** Окно вообще наше (есть запись владельцев — возможно пустая, это legacy-окно). */
     private fun isOurs(w: Int): Boolean = synchronized(ventOwners) { ventOwners.containsKey(w) }
@@ -162,11 +187,17 @@ object WindowDoors {
                 val winHex = p.substringBefore('=').trim()
                 val doors = p.substringAfter('=')
                 val w = runCatching { winHex.toInt(16) }.getOrNull() ?: continue
-                val set = ownersOf(w)
-                for (d in doors.split(',')) {
-                    val dv = d.trim().takeIf { it.isNotEmpty() }?.let { runCatching { it.toInt(16) }.getOrNull() } ?: continue
-                    set.add(dv)
+                // §9.1 iter50: восстановление — тоже МУТАЦИЯ набора: идёт через единую точку,
+                // иначе поколение не двигалось и поздний readback считал набор «неизменным».
+                mutateOwners { map ->
+                    val set = map.getOrPut(w) { HashSet() }
+                    for (d in doors.split(',')) {
+                        val dv = d.trim().takeIf { it.isNotEmpty() }
+                            ?.let { runCatching { it.toInt(16) }.getOrNull() } ?: continue
+                        set.add(dv)
+                    }
                 }
+                val set = synchronized(ventOwners) { ventOwners[w]?.toSortedSet()?.toList() ?: emptyList() }
                 AppLog.i(ctx, TAG, "VENT_RESEED win=0x${Integer.toHexString(w)} owners=${set.joinToString(",") { Integer.toHexString(it) }}")
             }
             AppLog.i(ctx, TAG, "VENT_RESEED: восстановлено окон=${ventOwners.size}")
@@ -180,7 +211,7 @@ object WindowDoors {
         }
         for (part in legacy.split(',')) {
             val a = part.trim().takeIf { it.isNotEmpty() }?.let { runCatching { it.toInt(16) }.getOrNull() } ?: continue
-            ownersOf(a)   // ключ без владельцев = «наше окно, дверь неизвестна»
+            mutateOwners { map -> map.getOrPut(a) { HashSet() } }   // ключ без владельцев = «наше окно, дверь неизвестна»
             AppLog.i(ctx, TAG, "VENT_LEGACY_MIGRATE win=0x${Integer.toHexString(a)} (owners неизвестны)")
         }
         AppLog.i(ctx, TAG, "VENT_RESEED: миграция со старого ключа, окон=${ventOwners.size}")
@@ -442,10 +473,10 @@ object WindowDoors {
             if (ok) {
                 // iter32 §3.2: владельцем окна становится ИМЕННО эта дверь (и для «своего» окна,
                 // и для «противоположного» — это требование §3.3 п.2).
-                val owners = ownersOf(windowAreaId)
-                owners.add(doorAreaId)
+                mutateOwners { map -> map.getOrPut(windowAreaId) { HashSet() }.add(doorAreaId) }
                 persistVentOwners(appCtx)
-                AppLog.i(appCtx, TAG, "VENT_OPEN door=0x${Integer.toHexString(doorAreaId)} win=0x${Integer.toHexString(windowAreaId)} pos=$curPos owners=${owners.sorted().joinToString(",") { Integer.toHexString(it) }}")
+                val owners = synchronized(ventOwners) { ventOwners[windowAreaId]?.toSortedSet()?.toList() ?: emptyList() }
+                AppLog.i(appCtx, TAG, "VENT_OPEN door=0x${Integer.toHexString(doorAreaId)} win=0x${Integer.toHexString(windowAreaId)} pos=$curPos owners=${owners.joinToString(",") { Integer.toHexString(it) }} gen=${ventGen.get()}")
                 AppLog.i(appCtx, TAG, "janela ${tag}0x${Integer.toHexString(windowAreaId)} → POS $WINDOW_OPEN_POS (дверь 0x${Integer.toHexString(doorAreaId)} открыта)")
             } else {
                 AppLog.w(appCtx, TAG, "windowDriver set ${tag}0x${Integer.toHexString(windowAreaId)} не удался")
@@ -497,13 +528,11 @@ object WindowDoors {
             doorStates = states, doorToWindow = DOOR_TO_WINDOW, legacy = legacy,
         )
         val added = ownersAfter - (before - doorAreaId)
-        synchronized(ventOwners) {
-            val set = ownersOf(windowAreaId)
+        mutateOwners { map ->
+            val set = map.getOrPut(windowAreaId) { HashSet() }
             set.clear()
             set.addAll(ownersAfter)
-            if (set.isEmpty() && legacy) ventOwners.remove(windowAreaId)
-            // iter49 §9: любое изменение набора — новое поколение (ABA-защита позднего readback).
-            ventGen.incrementAndGet()
+            if (set.isEmpty() && legacy) map.remove(windowAreaId)
         }
         val after = synchronized(ventOwners) { ventOwners[windowAreaId]?.toSet() ?: emptySet() }
         val pos = posBefore ?: -1
@@ -530,7 +559,11 @@ object WindowDoors {
         val written = writeWindowPos(cpm, windowAreaId, WINDOW_CLOSED_POS)
         // ── C1.3: POS 0 подтверждается ЧТЕНИЕМ; закрытым без подтверждения не считаем ──
         val posAfter = if (written) readWindowPos(cpm, windowAreaId) else null
-        val closed = written && (posAfter == null || kotlin.math.abs(posAfter - WINDOW_CLOSED_POS) <= WINDOW_CLOSE_TOLERANCE)
+        // §9.1 iter50: `posAfter == null` больше НЕ считается закрытием. Отсутствие readback —
+        // это «команда принята, факт неизвестен», а не «VHAL подтвердил»: прежнее выражение
+        // попадало в ветку `closed` именно тогда, когда подтверждения не было вовсе.
+        val outcome = ventCloseOutcome(written, posAfter, WINDOW_CLOSED_POS, WINDOW_CLOSE_TOLERANCE)
+        val closed = outcome == "closed"
         if (closed) {
             synchronized(ventOwners) { if (ventOwners[windowAreaId]?.isEmpty() == true) ventOwners.remove(windowAreaId) }
             persistVentOwners(appCtx)
@@ -552,7 +585,7 @@ object WindowDoors {
             // воздействий не делаем (никаких «дожать», повторных setIntProperty и т.п.).
             AppLog.w(appCtx, TAG, "VENT_CLOSE_UNCONFIRMED win=${hex(windowAreaId)} door=${hex(doorAreaId)} " +
                 "pos=$pos pos_after=${posAfter ?: "?"} written=$written owners_after=${ownersHex(after)} " +
-                "reason=${if (!written) "write_rejected" else "late_readback"} " +
+                "reason=$outcome " +
                 "physical_failure=not_claimed action=none " +
                 "(значение VHAL могло не обновиться на момент чтения; один отложенный readback " +
                 "только уточнит факт в журнале и не трогает окно)")
@@ -563,24 +596,30 @@ object WindowDoors {
             // попытки. Иначе повторное открытие (или новая дверь) уже добавило владельца, и
             // поздний readback «прошлого» закрытия выкинул бы живую запись — окно осталось бы
             // без владельца и его больше никто не закрыл бы.
-            val ownersAtAttempt = synchronized(ventOwners) {
-                ventOwners[retryWin]?.toSortedSet()?.toList() ?: emptyList()
-            }
-            val genAtAttempt = ventGen.get()
+            // §9.1 iter50: снимок «набор + поколение» берётся ОДНИМ lock (раньше две отдельные
+            // синхронизации могли увидеть набор до мутации, а поколение — после).
+            val (snapAtAttempt, genAtAttempt) = ownersSnapshotWithGen()
+            val ownersAtAttempt = snapAtAttempt[retryWin]?.toSortedSet()?.toList() ?: emptyList()
             com.example.voiceapp3.tools.BgWorker.postDelayed("ventLateReadback", 1_500L) {
                 runCatching {
                     val late = readWindowPos(cpm, retryWin)
                     if (late != null && kotlin.math.abs(late - WINDOW_CLOSED_POS) <= WINDOW_CLOSE_TOLERANCE) {
-                        val unchanged = synchronized(ventOwners) {
-                            val now = ventOwners[retryWin]?.toSortedSet()?.toList() ?: emptyList()
+                        // §9.1 iter50: сверка и снятие — в ОДНОМ lock через единую точку мутации:
+                        // проверка «не изменилось» и удаление больше не разнесены по времени.
+                        var removed = false
+                        mutateOwners { map ->
+                            val now = map[retryWin]?.toSortedSet()?.toList() ?: emptyList()
                             // Сверяются ОБА факта: содержимое И поколение. A→B→A даёт равное
                             // содержимое, но другое поколение — значит запись живёт, её не трогаем.
-                            if (now == ownersAtAttempt && now.isEmpty() && ventGen.get() == genAtAttempt) {
-                                ventOwners.remove(retryWin)
-                                ventGen.incrementAndGet()
-                                true
-                            } else false
+                            if (ventLateReadbackMayDropOwners(
+                                    now, ownersAtAttempt, ventGen.get(), genAtAttempt
+                                )
+                            ) {
+                                map.remove(retryWin)
+                                removed = true
+                            }
                         }
+                        val unchanged = removed
                         if (!unchanged) {
                             AppLog.i(appCtx, TAG, "VENT_CLOSE_LATE_KEPT win=${hex(retryWin)} " +
                                 "pos_after=$late reason=owners_changed_since_attempt " +
@@ -715,6 +754,37 @@ internal fun ventOwnersAfterClose(
     }
     result.remove(door)
     return result
+}
+
+/**
+ * §9.1 iter50 — можно ли позднему readback снимать запись владельцев (чистая функция).
+ *
+ * Условия ОДНОВРЕМЕННО: набор не изменился с момента попытки (содержимое), владельцев не
+ * осталось, и ПОКОЛЕНИЕ то же (иначе A→B→A дал бы равное содержимое при живой записи).
+ */
+internal fun ventLateReadbackMayDropOwners(
+    now: List<Int>,
+    atAttempt: List<Int>,
+    genNow: Long,
+    genAtAttempt: Long,
+): Boolean = now == atAttempt && now.isEmpty() && genNow == genAtAttempt
+
+/**
+ * §9.1 iter50 — исход попытки закрытия по фактам: команда записана, что прочиталось.
+ *
+ * Возвращает `closed` ТОЛЬКО при подтверждённом чтении. Отсутствие readback — `readback_missing`
+ * (два разных факта: «команда принята» и «VHAL подтвердил», их нельзя смешивать).
+ */
+internal fun ventCloseOutcome(
+    written: Boolean,
+    posAfter: Int?,
+    closedPos: Int,
+    tolerance: Int,
+): String = when {
+    !written -> "write_rejected"
+    posAfter == null -> "readback_missing"
+    kotlin.math.abs(posAfter - closedPos) <= tolerance -> "closed"
+    else -> "late_readback"
 }
 
 /**
