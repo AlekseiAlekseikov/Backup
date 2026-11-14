@@ -88,6 +88,29 @@ object LockSound {
      * запланированный повтор/копирование старого поколения НЕ смонтирует звук после OFF.
      */
     @Volatile private var bindGen = 0L
+
+    /**
+     * iter52 §5.3 — ОДИН шлюз на все операции со слоями.
+     *
+     * bind идёт на `BgWorker`, снятие — на `soundExecutor`, сверка — на обоих. Это РАЗНЫЕ
+     * потоки: без общей блокировки bind мог ставиться одновременно со снятием, и тогда
+     * «снято» и «установлено» описывали бы один и тот же момент, а реестр — уже нет.
+     * Блокировка честная: ждём столько, сколько нужно (без таймаута-догадки), но пишем в лог,
+     * если ждали долго.
+     */
+    private val ioGate = java.util.concurrent.locks.ReentrantLock()
+
+    private fun gateEnter(what: String) {
+        val t0 = SystemClock.elapsedRealtime()
+        ioGate.lock()
+        val waited = SystemClock.elapsedRealtime() - t0
+        if (waited > 500) AppLog.i(TAG, "LOCKSOUND_SERIALIZE what=$what waited_ms=$waited " +
+            "(bind/restore/reconcile идут строго по одному)")
+    }
+
+    private fun gateExit() {
+        if (ioGate.isHeldByCurrentThread) ioGate.unlock()
+    }
     @Volatile private var lastBindFailReason: String? = null
     @Volatile
     private var mediaPlayer: MediaPlayer? = null
@@ -194,6 +217,15 @@ object LockSound {
         // до выбранного файла. Сверка идёт до применения, в фоне (ADB внутри).
         BgWorker.post("LockSound.reconcileIntent") {
             runCatching { reconcilePendingOps(ctx.applicationContext, "intent_desired=$enabled") }
+        }
+        // iter52 §5.3: OFF — это НЕ только «запись preferences». Раньше снятие своего слоя
+        // происходило лишь после следующей удачной операции или на boot: владелец выключал
+        // звук, а система продолжала играть наш файл. Теперь OFF снимает ТОЛЬКО свои слои
+        // (чужое не трогается) и делает это сразу, под тем же шлюзом, что bind.
+        if (!enabled) {
+            AppLog.i(ctx, TAG, "LOCK_SOUND_OFF action=restore_own_layers " +
+                "(снимаем только свои слои по реестру; чужие/стоковые не трогаем)")
+            convergeAfterBind(ctx, true)
         }
         val prefReadback = Prefs2.getBoolean(ctx, PREF_LOCK_SOUND_ENABLED, false)
         steps += ToolsStep(
@@ -882,8 +914,9 @@ object LockSound {
             // он останется в журнале как UNDEFINED, и мы это увидим в логе, а не потеряем.
             // reconcileFirst=false — это вызов ИЗ сверки: иначе сверка → применение → сверка
             // зацикливается на записи, которую снять нельзя (чужой слой).
-            if (reconcileFirst) runCatching { reconcilePendingOps(appCtx, "before_bind") }
+            gateEnter("bind")
             try {
+                if (reconcileFirst) runCatching { reconcilePendingOps(appCtx, "before_bind") }
                 // §5.2 iter47: staging-файл УНИКАЛЕН для (поколение + содержимое). Раньше все
                 // задачи писали в один и тот же путь: параллельная задача могла подменить файл
                 // между копированием и bind, и на цель монтировался ЧУЖОЙ звук.
@@ -1122,6 +1155,8 @@ object LockSound {
             } catch (t: Throwable) {
                 AppLog.w(ctx, TAG, "applySystemLockSoundBind error: ${t.message}", t)
                 recordBindFailure("exception: ${t.message}", appCtx, deterministic = false)
+            } finally {
+                gateExit()
             }
         }
     }
@@ -1273,6 +1308,7 @@ object LockSound {
      */
     private fun restoreSystemLockSoundBind(ctx: Context) {
         soundExecutor.execute {
+            gateEnter("restore")
             try {
                 val ours = readOwnMounts(ctx)
                 val entries = ours.filter { isOurLockPath(it.target) }
@@ -1377,6 +1413,8 @@ object LockSound {
             } catch (t: Throwable) {
                 AppLog.w(ctx, TAG, "restoreSystemLockSoundBind error: ${t.message}")
                 markApplied(ctx, false, "unmount_exception:${t.javaClass.simpleName}")
+            } finally {
+                gateExit()
             }
         }
     }
@@ -1466,6 +1504,16 @@ object LockSound {
      * @return true — была хотя бы одна незавершённая операция (значит, нужна сходимость).
      */
     internal fun reconcilePendingOps(ctx: Context, source: String): Boolean {
+        gateEnter("reconcile")
+        try {
+            return reconcileLocked(ctx, source)
+        } finally {
+            gateExit()
+        }
+    }
+
+    /** Тело сверки — выполняется под [ioGate] (см. [reconcilePendingOps]). */
+    private fun reconcileLocked(ctx: Context, source: String): Boolean {
         val journal = readOpJournal(ctx)
         val pending = journal.unresolved()
         if (pending.isEmpty()) {
