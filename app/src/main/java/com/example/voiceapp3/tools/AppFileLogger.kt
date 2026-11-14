@@ -149,9 +149,17 @@ object AppFileLogger {
                 Log.w(TAG, "LOG_WRITE_UNLOCKED file=«${f.name}» (межпроцессный лок недоступен: " +
                     "запись выполнена без него, это НЕ молчаливый успех)")
             }
-            // §8.1: лок был свободен — самое время влить накопленный spill.
+            // §8.1: лок был свободен — самое время влить накопленный spill и восстановить
+            // оставшиеся work-файлы (`.drain`) от умерших процессов.
             val drained = runCatching { FileLogCore.drainSpill(f.parentFile, f.name) }.getOrDefault(0)
-            if (drained > 0) Log.i(TAG, "LOG_SPILL_DRAINED file=«${f.name}» lines=$drained")
+            val note = FileLogCore.lastDrainNote()
+            if (drained > 0) Log.i(TAG, "LOG_SPILL_DRAINED file=«${f.name}» lines=$drained" +
+                (if (note.isEmpty()) "" else " note=«$note»"))
+            // §8.1 iter50: неудача слияния — независимый (не рекурсивный) канал: пишем только в
+            // logcat, а НЕ в тот же файл, иначе сигнал сам станет источником тех же строк.
+            if (drained < 0) Log.e(TAG, "LOG_SPILL_DRAIN_FAILED file=«${f.name}» " +
+                "reason=merge_not_confirmed note=«${note.ifEmpty { "kept" }}» " +
+                "(строки НЕ потеряны: spill/work-файл оставлен на месте)")
         }
     }
 

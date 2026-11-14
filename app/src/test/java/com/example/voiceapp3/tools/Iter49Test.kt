@@ -343,12 +343,8 @@ class Iter49Test {
         f.delete()
     }
 
-    @Test
-    fun drainFileIsNotDeletedWhenSpillRestoreFails() {
-        val core = src("FileLogCore.kt")
-        assertTrue("отказ возврата данных не скрывается",
-            core.contains("if (restored) runCatching { work.delete() }"))
-    }
+    // iter50 §8.1: текстовая проверка «в коде есть эта строка» заменена ИСПОЛНЕНИЕМ —
+    // см. Iter50DrainTest (отказ слияния, восстановление `.drain` без spill, отсутствие затирания).
 
     // ───────────────── §9: ABA у владельцев окна ─────────────────
 

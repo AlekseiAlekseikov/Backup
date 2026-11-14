@@ -177,13 +177,26 @@ object FileLogCore {
             // следующем успешном повышении `.new` строка попала бы в журнал дважды.
             val freshHadData = runCatching { fresh.isFile && fresh.length() > 0L }
                 .getOrDefault(false)
-            val wroteNew = runCatching {
+            // §8.2 iter50: РАЗДЕЛЯЕМ «записано» и «синхронизировано». Раньше результат
+            // `fsync` был ВСЕМ результатом записи в `.new`: при отказе fsync (сама запись уже
+            // сделана) код уходил в `appendDirect(active, …)` и та же строка оказывалась и в
+            // `.new`, и в активном файле — дубль после следующего повышения `.new`.
+            var newWritten = false
+            var newSynced = false
+            runCatching {
                 RandomAccessFile(fresh, "rw").use { out ->
                     out.seek(out.length())
                     out.write(line.toByteArray(Charsets.UTF_8))
-                    runCatching { out.fd.sync() }.isSuccess
+                    newWritten = true
+                    newSynced = runCatching { out.fd.sync() }.isSuccess
                 }
-            }.getOrDefault(false)
+            }
+            val wroteNew = newWritten
+            if (wroteNew && !newSynced) {
+                // Строка лежит в `.new`; в активный файл её НЕ дублируем — честно сообщаем,
+                // что подтверждения записи на носитель нет.
+                return Result(true, fresh, "new_fsync_failed:kept_in_new", false, 0, locked)
+            }
             if (!wroteNew) {
                 // Новая часть не создана — старую НЕ трогаем вообще.
                 val nul = tailNulBytes(active)
@@ -221,14 +234,17 @@ object FileLogCore {
                     return Result(true, fresh, "rotate_rename_failed:kept_in_new", false, 0,
                         locked)
                 }
-                runCatching { fresh.delete() }
+                // §8.2 iter50: результат удаления `.new` больше не игнорируется. Если удалить
+                // не удалось, а строка дописана в активный файл, при следующем повышении `.new`
+                // она может появиться дважды — это сказано в причине, а не скрыто.
+                val freshRemoved = runCatching { fresh.delete() }.getOrDefault(false)
                 val nul = tailNulBytes(active)
                 val direct = appendDirect(active, line, nulBefore = nul, locked = locked)
-                return direct.copy(
-                    rotated = false,
-                    reason = if (direct.reason.isEmpty()) "rotate_rename_failed:appended_to_active"
-                    else direct.reason
-                )
+                val base = when {
+                    freshRemoved -> "rotate_rename_failed:appended_to_active"
+                    else -> "rotate_rename_failed:new_not_removed_dup_possible"
+                }
+                return direct.copy(rotated = false, reason = if (direct.reason.isEmpty()) base else direct.reason)
             }
             val promoted = runCatching {
                 java.nio.file.Files.move(
@@ -243,6 +259,27 @@ object FileLogCore {
                 return Result(false, fresh, "rotate_promote_failed", true, 0, locked)
             }
             return Result(true, active, "", true, 0, locked)
+        }
+
+        // §8.2 iter50 — ВОССТАНОВЛЕНИЕ после падения между `move(active→.1)` и повышением `.new`.
+        // Тогда активного файла нет, а новая часть лежит в `.new`. Раньше `.new` повышался только
+        // при следующей ротации (а она требует непустой активный файл), поэтому часть журнала
+        // могла остаться в `.new` навсегда. Повышаем только когда терять нечего (active нет).
+        if (!active.isFile) {
+            val pending = File(dir, "$name.new")
+            if (pending.isFile && pending.length() > 0L) {
+                val promoted = runCatching {
+                    java.nio.file.Files.move(
+                        pending.toPath(), active.toPath(),
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                        java.nio.file.StandardCopyOption.ATOMIC_MOVE
+                    )
+                    true
+                }.getOrElse { pending.renameTo(active) }
+                if (!promoted) {
+                    return Result(false, pending, "recover_new_promote_failed", false, 0, locked)
+                }
+            }
         }
 
         // §8.2: состояние проверяется ДО записи, иначе наш же новый хвост маскирует повреждение.
@@ -324,58 +361,165 @@ object FileLogCore {
             ?: ("p" + Integer.toHexString(System.identityHashCode(Any())))
     }
 
+    /** §8.1 iter50: честная заметка о последнем слиянии (пусто — всё прошло штатно). */
+    @Volatile
+    private var drainNote: String = ""
+
+    /** Заметка о последнем [drainSpill]: почему не всё снялось/что могло задвоиться. */
+    fun lastDrainNote(): String = drainNote
+
+    /** Счётчик уникальных имён work-файлов в пределах процесса. */
+    private val drainSeq = java.util.concurrent.atomic.AtomicInteger(0)
+
+    /** Является ли файл work-файлом слияния spill (`.drain`, `.drain.<...>`, без `.lock`). */
+    private fun isDrainOf(f: File, spillName: String): Boolean =
+        f.isFile && f.name.startsWith("$spillName.drain") && !f.name.endsWith(".lock")
+
     /**
-     * §8.1: перенести накопленный spill в основной журнал под локом. Вызывается при следующей
-     * успешной записи. Возвращает число перенесённых строк (`-1` — не удалось, spill оставлен).
+     * §8.1 iter50: УНИКАЛЬНОЕ имя work-файла.
+     *
+     * Раньше work всегда был `<spill>.drain`, а `spill.renameTo(work)` на файловых системах,
+     * разрешающих замену, МОЛЧА заменял уже сохранённый work-файл (например, оставшийся от
+     * процесса, умершего между rename и слиянием) — сохранённые строки исчезали вместе с ним.
+     */
+    private fun uniqueWork(spill: File): File =
+        File(spill.parentFile, "${spill.name}.drain.${processTag}-${drainSeq.incrementAndGet()}")
+
+    /**
+     * §8.1: перенести накопленный spill в основной журнал под локом. Возвращает число
+     * перенесённых строк (`-1` — не удалось целиком, данные не удалены).
+     *
+     * Порядок iter50:
+     *  1. Сначала восстанавливаются ВСЕ оставшиеся work-файлы (`.drain*`) — независимо от того,
+     *     есть ли новый spill. Раньше `drainSpill` выходил по `if (!spill.isFile) return 0`, и
+     *     `.drain`, оставшийся после смерти процесса, не восстанавливался уже никогда.
+     *  2. Слияние каждого work-файла идёт под МЕЖПРОЦЕССНЫМ lock-файлом `<work>.lock`: если
+     *     владелец жив и уже сливает — мы не вмешиваемся (`skipped_locked`), а не дублируем.
+     *  3. Свой spill переименовывается в УНИКАЛЬНОЕ имя (чужие/старые work-файлы не затираются).
+     *  4. Исходник удаляется только после подтверждённой дозаписи; неудача `delete` не скрывается,
+     *     а попадает в [lastDrainNote] (возможные дубли честно обозначены).
      */
     fun drainSpill(dir: File, name: String): Int {
         val active = File(dir, name)
         val spill = spillFor(active)
-        if (!spill.isFile) return 0
-        // §Е iter48: слияние и удаление spill — одна операция под локом spill. Раньше чтение,
-        // запись и удаление шли врозь: строка, дописанная другим потоком МЕЖДУ чтением и
-        // удалением, терялась; а при отказе записи spill всё равно мог быть удалён вызывающим.
-        val gate = spillLocks.computeIfAbsent(spill.absolutePath) { Any() }
-        return synchronized(gate) {
-            // Сначала переименовываем spill в «свой» файл слияния: новые записи пойдут в
-            // свежий spill и не потеряются, даже если слияние не удастся.
-            val work = File(spill.parentFile, spill.name + ".drain")
-            if (!runCatching { spill.renameTo(work) }.getOrDefault(false) && !work.isFile) {
-                // Переименовать нельзя (чужой процесс/ФС) — читаем как есть, но НЕ удаляем при
-                // неудачной записи.
-                val text = runCatching { spill.readText() }.getOrNull() ?: return@synchronized -1
-                if (text.isEmpty()) {
-                    runCatching { spill.delete() }
-                    return@synchronized 0
-                }
-                val r = append(dir, name, text, maxBytes = Long.MAX_VALUE)
-                if (!r.written || r.spilled) return@synchronized -1
-                runCatching { spill.delete() }
-                return@synchronized text.count { it == '\n' }
+        drainNote = ""
+        var merged = 0
+        var failed = false
+        var skipped = 0
+        val notes = mutableListOf<String>()
+
+        // 1) Восстановление оставшихся work-файлов — всегда, даже если нового spill нет.
+        val leftovers = runCatching {
+            dir.listFiles()?.filter { isDrainOf(it, spill.name) } ?: emptyList()
+        }.getOrDefault(emptyList())
+        for (w in leftovers.sortedBy { it.name }) {
+            val n = mergeWork(active, dir, name, w, notes)
+            when {
+                // Порядок важен: Int.MIN_VALUE — это «занято живым владельцем», а НЕ отказ.
+                n == Int.MIN_VALUE -> skipped++
+                n < 0 -> failed = true
+                else -> merged += n
             }
+        }
+
+        if (spill.isFile) {
+            val gate = spillLocks.computeIfAbsent(spill.absolutePath) { Any() }
+            synchronized(gate) {
+                val work = uniqueWork(spill)
+                val renamed = runCatching { spill.renameTo(work) }.getOrDefault(false)
+                val n = if (renamed) {
+                    val r = mergeWork(active, dir, name, work, notes)
+                    if (r == Int.MIN_VALUE) {
+                        // Переименовали, но слияние занято живым владельцем: вернуть данные
+                        // обратно в spill, чтобы строки не остались «нигде».
+                        val text = runCatching { work.readText() }.getOrNull()
+                        val back = if (text.isNullOrEmpty()) true else runCatching {
+                            RandomAccessFile(spill, "rw").use { out ->
+                                out.seek(out.length())
+                                out.write(text.toByteArray(Charsets.UTF_8))
+                                runCatching { out.fd.sync() }.isSuccess
+                            }
+                        }.getOrDefault(false)
+                        if (back) {
+                            if (!runCatching { work.delete() }.isSuccess) {
+                                notes += "work_dup_possible:«${work.name}»"
+                            }
+                            0
+                        } else {
+                            notes += "work_not_merged_and_not_restored:«${work.name}»"
+                            -1
+                        }
+                    } else r
+                } else {
+                    // Переименовать нельзя (чужой процесс/ФС) — читаем на месте, НЕ удаляя при
+                    // неудачной записи.
+                    val text = runCatching { spill.readText() }.getOrNull()
+                    if (text.isNullOrEmpty()) {
+                        runCatching { spill.delete() }
+                        0
+                    } else {
+                        val r = append(dir, name, text, maxBytes = Long.MAX_VALUE)
+                        if (!r.written || r.spilled) -1 else {
+                            val del = runCatching { spill.delete() }.isSuccess
+                            if (!del) notes += "spill_delete_failed:«${spill.name}»"
+                            text.count { it == '\n' }
+                        }
+                    }
+                }
+                when {
+                    n < 0 -> failed = true
+                    else -> merged += n
+                }
+            }
+        }
+
+        if (skipped > 0) notes += "skipped_locked:$skipped"
+        drainNote = notes.joinToString(",")
+        return when {
+            failed -> -1
+            merged > 0 -> merged
+            skipped > 0 -> 0
+            merged == 0 && notes.isEmpty() -> 0
+            else -> merged
+        }
+    }
+
+    /**
+     * Слить ОДИН work-файл в основной журнал.
+     *
+     * @return число строк; `-1` — запись не удалась (work-файл сохранён);
+     *   [Int.MIN_VALUE] — файл занят живым владельцем (не влезаем).
+     */
+    private fun mergeWork(
+        active: File,
+        dir: File,
+        name: String,
+        work: File,
+        notes: MutableList<String>
+    ): Int {
+        if (!work.isFile) return 0
+        val lockFile = File(work.parentFile, work.name + ".lock")
+        val outcome = ProcLock.withLock(lockFile, timeoutMs = 500L) {
             val text = runCatching { work.readText() }.getOrNull()
             if (text.isNullOrEmpty()) {
-                runCatching { work.delete() }
-                return@synchronized 0
+                if (!runCatching { work.delete() }.isSuccess) notes += "empty_work_kept:«${work.name}»"
+                return@withLock 0
             }
             val r = append(dir, name, text, maxBytes = Long.MAX_VALUE)
             if (!r.written || r.spilled) {
-                // Не удалось — возвращаем данные обратно в spill, ничего не теряем.
-                val restored = runCatching {
-                    RandomAccessFile(spill, "rw").use { out ->
-                        out.seek(out.length())
-                        out.write(text.toByteArray(Charsets.UTF_8))
-                        runCatching { out.fd.sync() }.isSuccess
-                    }
-                }.getOrDefault(false)
-                // iter49 §8: если вернуть данные не удалось, `.drain` НЕ удаляем — иначе строки
-                // журнала исчезают вместе с файлом при скрытом отказе переноса.
-                if (restored) runCatching { work.delete() }
-                return@synchronized -1
+                // Не удалось — work остаётся как есть (данные не теряются).
+                return@withLock -1
             }
-            runCatching { work.delete() }
+            // §8.1(2): исходник удаляется только после подтверждённой дозаписи; неудача не
+            // скрывается — при повторе возможны дубли, и это сказано прямо.
+            if (!runCatching { work.delete() }.isSuccess) {
+                notes += "work_delete_failed:«${work.name}»( возможны дубли при повторе )"
+            }
+            runCatching { lockFile.delete() }
             text.count { it == '\n' }
         }
+        if (!outcome.executed) return Int.MIN_VALUE
+        return outcome.value ?: -1
     }
 
     /**
