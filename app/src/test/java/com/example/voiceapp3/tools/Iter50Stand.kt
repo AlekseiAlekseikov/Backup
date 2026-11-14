@@ -59,8 +59,19 @@ class Iter50Stand {
         rest=${'$'}*
         case "${'$'}cmd" in
           -S)
+            # iter52 §6.1: без имени цепи реальный iptables печатает ВСЕ цепи таблицы
+            # (пользовательские через -N и их правила). Стенд раньше показывал только
+            # POSTROUTING, из-за чего ссылки на нашу цепочку из других цепей (`-j`/`-g`)
+            # было невозможно проверить в принципе.
             echo "-P POSTROUTING ACCEPT"
-            if [ -z "${'$'}chain" ] || [ "${'$'}chain" = "POSTROUTING" ]; then
+            if [ -z "${'$'}chain" ]; then
+              grep '^POSTROUTING ' "${'$'}RULES" 2>/dev/null | sed 's/^POSTROUTING /-A POSTROUTING /'
+              while IFS= read -r c; do
+                [ -n "${'$'}c" ] || continue
+                echo "-N ${'$'}c"
+                grep "^${'$'}c " "${'$'}RULES" 2>/dev/null | sed "s/^${'$'}c /-A ${'$'}c /"
+              done < "${'$'}CHAINS"
+            elif [ "${'$'}chain" = "POSTROUTING" ]; then
               grep '^POSTROUTING ' "${'$'}RULES" 2>/dev/null | sed 's/^POSTROUTING /-A POSTROUTING /'
             elif grep -qx "${'$'}chain" "${'$'}CHAINS" 2>/dev/null; then
               echo "-N ${'$'}chain"; grep "^${'$'}chain " "${'$'}RULES" 2>/dev/null | sed "s/^${'$'}chain /-A ${'$'}chain /"
@@ -228,6 +239,9 @@ class Iter50Stand {
 
     /** Смоделировать отказ удаления правила (`-D`). */
     fun failDelete(family: String) { File(stateDir, "fail_del.$family").writeText("1") }
+
+    /** Смоделировать отказ ЧТЕНИЯ таблицы (`-S`): «правил нет» ≠ «прочитать нельзя». */
+    fun failRead(family: String) { File(stateDir, "fail_read.$family").writeText("1") }
 
     /** Текущий набор правил family — для сравнения «до/после». */
     fun rules(family: String): List<String> =

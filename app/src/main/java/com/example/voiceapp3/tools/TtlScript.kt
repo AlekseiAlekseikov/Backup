@@ -92,6 +92,42 @@ jump_count() {
   jump_specs ${D}1 | wc -l | tr -d ' '
 }
 
+# iter52 §6.1: ССЫЛКИ НА НАШУ ЦЕПОЧКУ ИЗ ЛЮБОЙ ЦЕПИ таблицы mangle — и `-j`, и `-g`.
+# Раньше смотрели только POSTROUTING и только `-j`: переход из другой цепи (OUTPUT/FORWARD/
+# пользовательской) или goto (`-g`) не учитывался, и получалось «наших ссылок нет» — после чего
+# `-F/-X` рвал чужое поведение, а TTL мог оставаться применимым уже без нашей цепочки.
+# Формат строки: <цепь>\t<target>\t<спецификация ЦЕЛИКОМ>.
+# `__READ_FAILED__` — прочитать таблицу не удалось (это НЕ «ссылок нет»).
+ref_specs() {
+  r_tool=${D}1
+  if ! r_out=${D}(${D}r_tool -t mangle -S 2>/dev/null); then echo "__READ_FAILED__"; return 0; fi
+  printf '%s\n' "${D}r_out" | awk -v our="${D}OUR" '
+    /^-A / {
+      chain = ${D}2
+      spec = substr(${D}0, index(${D}0, ${D}3))
+      n = split(spec, a, " ")
+      for (i = 1; i < n; i++)
+        if ((a[i] == "-j" || a[i] == "-g") && a[i+1] == our) { print chain "\t" a[i] "\t" spec; next }
+    }'
+}
+# Все ссылки на нашу цепочку. -1 — прочитать нельзя.
+ref_count() {
+  r_all=${D}(ref_specs ${D}1)
+  [ "${D}r_all" = "__READ_FAILED__" ] && { echo -1; return; }
+  printf '%s\n' "${D}r_all" | grep -c . | tr -d ' '
+}
+# Ссылки, КРОМЕ ровно ожидаемого перехода POSTROUTING "-o <uplink> -j <OUR>". -1 — не прочитать.
+ref_other_count() {
+  r_all=${D}(ref_specs ${D}1)
+  [ "${D}r_all" = "__READ_FAILED__" ] && { echo -1; return; }
+  # ВНИМАНИЕ: имя переменной НЕ `exp` — это встроенная функция awk, и `-v exp=…` падает с
+  # "cannot command line assign to exp" (проверено на настоящем awk). Поэтому `want_spec`.
+  printf '%s\n' "${D}r_all" | awk -F'\t' -v want_spec="${D}EXPECTED_JUMP" '
+    ${D}0 == "" { next }
+    { if (${D}1 == "POSTROUTING" && ${D}3 == want_spec) next; c++ }
+    END { print c + 0 }'
+}
+
 # iter50 §5.1: `-D` требует ОТДЕЛЬНЫЕ argv. Цикл по строкам с IFS=<newline> давал
 # спецификацию ОДНИМ аргументом ("<-o wlan0 -j VAPP_TTL>"), iptables такой вызов отвергает,
 # и наши правила оставались на месте. Разбираем строку на токены сами и передаём их как
@@ -219,6 +255,24 @@ EOF_SPECS
     # НЕ удаляем: иначе получится «висячая» цепочка без правила, а TTL останется применённым
     # через оставшийся переход — лучше честное partial, чем полуснятое состояние.
     echo "TTL_OWN family=${D}fam state=partial removed=partial jumps_failed=${D}del_fail reason=jumps_not_removed"
+    echo "${D}fam:partial"; return 0
+  fi
+  # iter52 §6.1: цепочку нельзя чистить/удалять, пока на неё ссылаются ОТКУДА-ТО ЕЩЁ
+  # (другая цепь, goto из POSTROUTING, чужой пользовательский переход). Иначе чужое поведение
+  # ломается, а TTL может остаться применённым мимо нашей цепочки. Такое состояние НЕ снимаем:
+  # отчёт честный, семья — partial.
+  refs_all=${D}(ref_specs "${D}tool")
+  if [ "${D}refs_all" = "__READ_FAILED__" ]; then
+    echo "TTL_OWN family=${D}fam state=unknown removed=unproven reason=refs_read_failed"
+    echo "${D}fam:unproven"; return 0
+  fi
+  refs_n=${D}(printf '%s\n' "${D}refs_all" | grep -c . | tr -d ' ')
+  if [ "${D}refs_n" != "0" ]; then
+    # Печать первых трёх ссылок: префикс собирается в shell (внутри sed имя семьи не раскрылось бы).
+    printf '%s\n' "${D}refs_all" | head -3 | sed 's/\t/ /g' | while IFS= read -r ref_line; do
+      [ -n "${D}ref_line" ] && echo "TTL_REF_KEEP family=${D}fam ref=\"${D}ref_line\""
+    done
+    echo "TTL_OWN family=${D}fam state=referenced action=keep refs=${D}refs_n reason=referenced_elsewhere note=\"цепочка очищена не полностью: на неё ссылаются из других мест\""
     echo "${D}fam:partial"; return 0
   fi
   ${D}tool -w 5 -t mangle -F "${D}OUR" 2>/dev/null; fl_rc=${D}?
@@ -368,6 +422,19 @@ report_foreign
 CS2_V4=${D}(chain_state iptables "${D}RULE4")
 CS2_V6=none; [ "${D}V6_SUPPORTED" = "1" ] && CS2_V6=${D}(chain_state ip6tables "${D}RULE6")
 J4=${D}(jump_count iptables); J6=0; [ "${D}V6_SUPPORTED" = "1" ] && J6=${D}(jump_count ip6tables)
+# iter52 §6.1: ссылки на нашу цепочку из ЛЮБОЙ цепи/через goto — часть доказательства владения.
+REFS_OUT4=${D}(ref_other_count iptables); REFS_ANY4=${D}(ref_count iptables)
+REFS_OUT6=0; REFS_ANY6=0
+if [ "${D}V6_SUPPORTED" = "1" ]; then
+  REFS_OUT6=${D}(ref_other_count ip6tables); REFS_ANY6=${D}(ref_count ip6tables)
+fi
+# -1 — таблицу прочитать не удалось: это не «ссылок нет».
+if [ "${D}REFS_OUT4" = "-1" ] || [ "${D}REFS_ANY4" = "-1" ] || [ "${D}REFS_OUT6" = "-1" ] || [ "${D}REFS_ANY6" = "-1" ]; then
+  echo "TTL_REF_READ result=failed refs_out4=${D}REFS_OUT4 refs_any4=${D}REFS_ANY4 refs_out6=${D}REFS_OUT6 refs_any6=${D}REFS_ANY6 action=none"
+fi
+if [ "${D}REFS_OUT4" != "0" ] || [ "${D}REFS_OUT6" != "0" ]; then
+  echo "TTL_REF_FOREIGN refs_out4=${D}REFS_OUT4 refs_out6=${D}REFS_OUT6 note=\"на ${D}OUR ссылаются из других мест/через -g: правило работает не только на нашем переходе\""
+fi
 JS4_RAW=${D}(jump_specs iptables | head -1)
 JS6_RAW=${D}(jump_specs ip6tables | head -1)
 ALL_V4=${D}(count_ttl_rules iptables 'ttl-set')
@@ -388,9 +455,10 @@ elif [ "${D}CS2_V4" = "empty" ]; then
   if [ "${D}TOUCHED_v4" = "yes" ]; then VERIFY_V4=FAIL; else VERIFY_V4=COLLISION; fi
 elif [ "${D}ENABLE" = "1" ] && [ "${D}CS2_V4" = "absent" ] && [ "${D}TOUCHED_v4" != "yes" ]; then VERIFY_V4=NOT_APPLIED
 elif [ "${D}ENABLE" = "1" ]; then
-  if [ "${D}CS2_V4" = "ours" ] && [ "${D}J4" = "1" ] && [ "${D}JS4_RAW" = "${D}EXPECTED_JUMP" ]; then VERIFY_V4=OK; fi
+  if [ "${D}CS2_V4" = "ours" ] && [ "${D}J4" = "1" ] && [ "${D}JS4_RAW" = "${D}EXPECTED_JUMP" ] && \
+     [ "${D}REFS_OUT4" = "0" ]; then VERIFY_V4=OK; fi
 else
-  if [ "${D}CS2_V4" = "absent" ] && [ "${D}J4" = "0" ]; then VERIFY_V4=OFF_OK; fi
+  if [ "${D}CS2_V4" = "absent" ] && [ "${D}J4" = "0" ] && [ "${D}REFS_ANY4" = "0" ]; then VERIFY_V4=OFF_OK; fi
 fi
 VERIFY_V6=SKIPPED
 if [ "${D}V6_SUPPORTED" = "1" ]; then
@@ -401,16 +469,17 @@ if [ "${D}V6_SUPPORTED" = "1" ]; then
     if [ "${D}TOUCHED_v6" = "yes" ]; then VERIFY_V6=FAIL; else VERIFY_V6=COLLISION; fi
   elif [ "${D}ENABLE" = "1" ] && [ "${D}CS2_V6" = "absent" ] && [ "${D}TOUCHED_v6" != "yes" ]; then VERIFY_V6=NOT_APPLIED
   elif [ "${D}ENABLE" = "1" ]; then
-    if [ "${D}CS2_V6" = "ours" ] && [ "${D}J6" = "1" ] && [ "${D}JS6_RAW" = "${D}EXPECTED_JUMP" ]; then VERIFY_V6=OK; fi
+    if [ "${D}CS2_V6" = "ours" ] && [ "${D}J6" = "1" ] && [ "${D}JS6_RAW" = "${D}EXPECTED_JUMP" ] && \
+       [ "${D}REFS_OUT6" = "0" ]; then VERIFY_V6=OK; fi
   else
-    if [ "${D}CS2_V6" = "absent" ] && [ "${D}J6" = "0" ]; then VERIFY_V6=OFF_OK; fi
+    if [ "${D}CS2_V6" = "absent" ] && [ "${D}J6" = "0" ] && [ "${D}REFS_ANY6" = "0" ]; then VERIFY_V6=OFF_OK; fi
   fi
 fi
 
 if [ "${D}ENABLE" = "0" ]; then
   if [ "${D}VERIFY_V4" = "UNKNOWN" ] || [ "${D}VERIFY_V6" = "UNKNOWN" ]; then
     # Отказ чтения ≠ «правил нет»: снятие НЕ подтверждено.
-    echo "TTL_OFF own_v4=${D}OWN_V4 own_v6=${D}OWN_V6 result=UNKNOWN reason=read_failed read_v4=${D}READ_V4 read_v6=${D}{READ_V6}"
+    echo "TTL_OFF own_v4=${D}OWN_V4 own_v6=${D}OWN_V6 result=UNKNOWN reason=read_failed read_v4=${D}READ_V4 read_v6=${D}{READ_V6} refs_out4=${D}REFS_OUT4 refs_any4=${D}REFS_ANY4 refs_out6=${D}REFS_OUT6 refs_any6=${D}REFS_ANY6"
   elif [ "${D}VERIFY_V4" = "OFF_OK" ] && { [ "${D}VERIFY_V6" = "OFF_OK" ] || [ "${D}VERIFY_V6" = "SKIPPED" ]; }; then
     if [ "${D}FOREIGN_V4" = "0" ] && [ "${D}FOREIGN_V6" = "0" ]; then
       echo "TTL_OFF own_v4=0 own_v6=0 foreign_v4=${D}FOREIGN_V4 foreign_v6=${D}FOREIGN_V6 result=OK v6=${D}{VERIFY_V6}"
@@ -442,6 +511,7 @@ if [ "${D}ENABLE" = "1" ]; then
   # iter50 §5.1(3): остановка из-за неснятого своего правила — НЕ успех, даже если в таблице
   # стоит корректное правило (оно осталось от прошлого раза, а не выставлено сейчас).
   elif [ "${D}TTL_STOP" = "1" ]; then VERDICT=OWN_LEFT_STOP
+  elif [ "${D}REFS_OUT4" != "0" ] || [ "${D}REFS_OUT6" != "0" ]; then VERDICT=REF_ELSEWHERE
   elif [ "${D}VERIFY_V4" = "OK" ] && [ "${D}VERIFY_V6" = "OK" ] && [ "${D}SCOPE_UPLINK_ONLY" = "yes" ]; then VERDICT=SCOPED_OK
   elif [ "${D}VERIFY_V4" = "OK" ] && [ "${D}VERIFY_V6" = "SKIPPED" ] && [ "${D}SCOPE_UPLINK_ONLY" = "yes" ]; then VERDICT=SCOPED_V4_ONLY
   elif [ "${D}ROLLED_BACK" = "yes" ]; then VERDICT=APPLY_FAILED
@@ -456,7 +526,7 @@ else
 fi
 
 echo "TTL_CHECK: rule_v4=${D}{RULE_TTL:-none} rule_v6=${D}{RULE_HL:-none} real=UNKNOWN expected=65 src=${D}{SRC_IP:-unknown} dst=1.1.1.1 iface=${D}{UPLINK:-none} method=rules_not_wire reason=wire_not_measured jumps_v4=${D}J4 jumps_v6=${D}J6 chain_v4=${D}CS2_V4 chain_v6=${D}CS2_V6 ARROW ${D}VERDICT"
-echo "TTL_RESULT rule_v4=${D}{RULE_TTL:-none} rule_v6=${D}{RULE_HL:-none} verify_v4=${D}VERIFY_V4 verify_v6=${D}VERIFY_V6 wire_v4=not_measured enable=${D}ENABLE scoped=${D}SCOPED uplink=${D}{UPLINK:-none} variant=${D}VARIANT own_chain=${D}OUR foreign_v4=${D}FOREIGN_V4 foreign_v6=${D}FOREIGN_V6 chain_v4=${D}CS2_V4 chain_v6=${D}CS2_V6 read_v4=${D}READ_V4 read_v6=${D}{READ_V6}"
+echo "TTL_RESULT rule_v4=${D}{RULE_TTL:-none} rule_v6=${D}{RULE_HL:-none} verify_v4=${D}VERIFY_V4 verify_v6=${D}VERIFY_V6 wire_v4=not_measured enable=${D}ENABLE scoped=${D}SCOPED uplink=${D}{UPLINK:-none} variant=${D}VARIANT own_chain=${D}OUR foreign_v4=${D}FOREIGN_V4 foreign_v6=${D}FOREIGN_V6 chain_v4=${D}CS2_V4 chain_v6=${D}CS2_V6 read_v4=${D}READ_V4 read_v6=${D}{READ_V6} refs_out4=${D}REFS_OUT4 refs_any4=${D}REFS_ANY4 refs_out6=${D}REFS_OUT6 refs_any6=${D}REFS_ANY6"
 echo '=== TTL_SCRIPT end ==='
 """.trimIndent()
             .replace("ARROW", "\u2192")

@@ -40,6 +40,14 @@ internal object TtlVerify {
     private fun num(out: String, key: String): String? =
         Regex(NUM.pattern + Regex.escape("$key=") + "(\\d+)").find(out)?.groupValues?.get(1)
 
+    /**
+     * iter52 §6.1: число СО ЗНАКОМ. `refs_out4=-1` означает «прочитать нельзя», и это
+     * НЕ то же, что «ссылок нет» (0). Прежний `num` (только `\d+`) отбрасывал `-1` в `null`,
+     * после чего неизвестность выглядела как нормальный успех.
+     */
+    private fun signed(out: String, key: String): String? =
+        Regex(NUM.pattern + Regex.escape("$key=") + "(-?\\d+)").find(out)?.groupValues?.get(1)
+
     private fun flag(out: String, key: String): String? =
         Regex(FLAG.pattern + Regex.escape("$key=") + "([A-Za-z0-9_-]+)").find(out)
             ?.groupValues?.get(1)
@@ -67,6 +75,11 @@ internal object TtlVerify {
         val chain6 = flag(out, "CHAIN6")
         val foreign4 = num(out, "FOREIGN_V4")
         val foreign6 = num(out, "FOREIGN_V6")
+        // iter52 §6.1: ссылки на нашу цепочку из других мест (включая `-g`) — часть владения.
+        val refsOut4 = signed(out, "refs_out4")
+        val refsOut6 = signed(out, "refs_out6")
+        val refsAny4 = signed(out, "refs_any4")
+        val refsAny6 = signed(out, "refs_any6")
         val v4Verify = flag(out, "VERIFY_V4")
         val v6Verify = flag(out, "VERIFY_V6")
         val ttlCheckLine = line(out, "TTL_CHECK:")
@@ -81,6 +94,7 @@ internal object TtlVerify {
             "OWN_LEFT_STOP" in ttlCheckLine -> "OWN_LEFT_STOP"
             "APPLY_FAILED" in ttlCheckLine -> "APPLY_FAILED"
             "NOT_APPLIED" in ttlCheckLine -> "NOT_APPLIED"
+            "REF_ELSEWHERE" in ttlCheckLine -> "REF_ELSEWHERE"
             "\u2192 VERIFIED" in ttlCheckLine -> "VERIFIED"
             "\u2192 MISMATCH" in ttlCheckLine -> "MISMATCH"
             "\u2192 INDIRECT" in ttlCheckLine -> "INDIRECT"
@@ -125,15 +139,30 @@ internal object TtlVerify {
         //    удалось: полного подтверждения быть не может.
         val v6PresentButFailed = v6Verify != null && v6Verify != "OK" &&
             v6Verify != "SKIPPED" && v6Verify != "none"
-        val v6Unsupported = v6Verify == "SKIPPED" || v6Verify == "none" || v6Verify == null
+        // iter52 §6.1: «IPv6 нет в системе» доказывается ФЛАГОМ `v6_supported=0`, а не
+        // ОТСУТСТВИЕМ строки. Раньше `VERIFY_V6` не разобран (null) трактовался как
+        // «IPv6 не поддержан», и обрезанный/потерянный вывод давал заявление «IPv6 в системе
+        // нет» и спокойный OK по одному семейству — то есть догадку вместо факта.
+        val v6Supported = flag(out, "v6_supported")
+        val v6Unsupported = v6Supported == "0" || v6Verify == "none" ||
+            (v6Verify == "SKIPPED" && v6Supported != "1")
+        // Нет ни строки VERIFY_V6, ни явного `v6_supported=0` — состояние IPv6 НЕИЗВЕСТНО.
+        val v6NotParsed = !v6Unsupported && v6Verify == null
         // §4.3(1): ЧАСТИЧНЫЙ случай — ровно «v4 применён и проверен, а v6 присутствует, но не
         // применён/не прочитан». Любая другая проблема (коллизия, откат, нечитаемая таблица,
         // нет uplink, не встал v4) остаётся FAILED с прежней причиной.
         val v6OnlyIssue = expected && v6PresentButFailed && v4Verify == "OK" && v4Count >= 1 &&
             !collision && !rolledBack && !readFailed && uplinkOnly
+        val v6UnknownPartial = expected && v6NotParsed && v4Verify == "OK" && v4Count >= 1 &&
+            !collision && !rolledBack && !readFailed && uplinkOnly
         val v6Reason = "IPv6 присутствует, но применение или чтение не удалось " +
             "(VERIFY_V6=$v6Verify): v4=$v4Verify — полного подтверждения обоих семейств нет, " +
             "состояние ЧАСТИЧНОЕ. Правило v4 при этом стоит; смотрите TTL_V4/TTL_CHECK."
+        // Ссылка из другой цепи/через `-g` = правило действует шире, чем мы ставили.
+        // `-1` — таблицу прочитать не удалось: это не «ссылок нет», а неизвестность.
+        val refProblem = listOf(refsOut4, refsOut6, refsAny4, refsAny6).any { it == "-1" } ||
+            (refsOut4?.toIntOrNull() ?: 0) > 0 || (refsOut6?.toIntOrNull() ?: 0) > 0
+        val refUnknown = listOf(refsOut4, refsOut6).any { it == "-1" }
         val foreignN = foreign4?.toIntOrNull() ?: 0
         val foreignN6 = foreign6?.toIntOrNull() ?: 0
 
@@ -149,6 +178,17 @@ internal object TtlVerify {
                 "включение откатано целиком: половинчатое состояние (только v4 или только v6) не " +
                     "оставлено. Смотрите TTL_ADD/TTL_ROLLBACK — iptables не принял правило."
             v6OnlyIssue -> v6Reason
+            refUnknown ->
+                "ссылки на ${TtlScript.OUR_CHAIN} прочитать не удалось (refs_out4=${refsOut4 ?: "?"} " +
+                    "refs_out6=${refsOut6 ?: "?"}): владение цепочкой НЕ доказано — состояние неизвестно"
+            refProblem ->
+                "на ${TtlScript.OUR_CHAIN} ссылаются НЕ только наш переход -o <uplink>: " +
+                    "refs_out4=$refsOut4 refs_out6=$refsOut6 (в том числе через -g). Правило " +
+                    "действует шире, чем мы ставили; чужое не удаляем, но и полного успеха нет."
+            v6UnknownPartial || (v6NotParsed && expected) ->
+                "результат по IPv6 НЕ РАЗОБРАН: в выводе нет ни VERIFY_V6, ни `v6_supported=0` — " +
+                    "состояние второго семейства НЕИЗВЕСТНО (обрезанный/потерянный вывод). Это не " +
+                    "«IPv6 в системе нет»: полного подтверждения нет, смотрите TTL_RESULT целиком."
             notApplied ->
                 "не применялось: состояние одной из семей не наше (или не прочитано) — " +
                     "включать половину нельзя."
@@ -188,6 +228,9 @@ internal object TtlVerify {
             // iter51 §4.3(1): ON с присутствующим, но неработающим IPv6 — ЧАСТИЧНО (v4 применён,
             // v6 нет). Не FAILED: половина действительно применена и это надо показать как есть.
             v6OnlyIssue -> Verdict.PARTIAL
+            v6UnknownPartial -> Verdict.PARTIAL
+            // Правило стоит и подтверждено по цели, но ссылки шире нашей: это ЧАСТИЧНО.
+            refProblem && !refUnknown && v4Verify == "OK" -> Verdict.PARTIAL
             else -> Verdict.FAILED
         }
 
@@ -225,6 +268,8 @@ internal object TtlVerify {
                 "verdict" to ttlVerdict.ifEmpty { "?" },
                 "chain_v4" to (chain4 ?: "?"),
                 "chain_v6" to (chain6 ?: "?"),
+                "refs_out4" to (refsOut4 ?: "?"),
+                "refs_out6" to (refsOut6 ?: "?"),
                 "read_v4" to (read4 ?: "?"),
                 "read_v6" to (read6 ?: "?"),
                 "ttl_off" to offLine.ifEmpty { "-" },
