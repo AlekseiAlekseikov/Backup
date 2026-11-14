@@ -84,7 +84,14 @@ object ScriptDelivery {
         /** Файл остался на устройстве после попытки удаления (честный факт). */
         val leftoverPath: String,
         /** Запуск МОГ произойти (ответ потерян) — повтор запрещён. */
-        val mayHaveRun: Boolean
+        val mayHaveRun: Boolean,
+        /** Каким инструментом сверено содержимое: `cksum`/`md5`/`odsum`/`none`. */
+        val contentKind: String = "none",
+        /**
+         * iter53 §6.2: файлы-свидетельства (`<path>`, `<path>.started`, `<path>.done`),
+         * ОСТАВЛЕННЫЕ на устройстве, когда исход неизвестен. Пусто — свидетельств не осталось.
+         */
+        val evidencePath: String = ""
     ) {
         val delivered: Boolean get() = state == State.RUN_SENT || state == State.RUN_CONFIRMED
         fun wire(): String =
@@ -92,7 +99,9 @@ object ScriptDelivery {
                 "size_checked=${if (sizeChecked) 1 else 0} " +
                 "content_checked=${if (contentChecked) 1 else 0} " +
                 "may_have_run=${if (mayHaveRun) 1 else 0} " +
-                "leftover=${leftoverPath.ifEmpty { "none" }}"
+                "content_kind=$contentKind " +
+                "leftover=${leftoverPath.ifEmpty { "none" }} " +
+                "evidence=${evidencePath.ifEmpty { "none" }}"
     }
 
     // ─────────────────────────── имена и содержимое ───────────────────────────
@@ -141,6 +150,31 @@ object ScriptDelivery {
         return crc.inv() and 0xFFFFFFFFL
     }
 
+    /**
+     * MD5 в hex — второй по доступности инструмент (`md5sum` есть в toybox большинства прошивок).
+     *
+     * Нужен как fallback, когда `cksum` в системе отсутствует: молча запускать непроверенный
+     * файл нельзя (iter53 §6.2.4), но и «проверки нет» — плохой ответ для звука замка.
+     */
+    fun md5Hex(bytes: ByteArray): String =
+        java.security.MessageDigest.getInstance("MD5").digest(bytes)
+            .joinToString("") { "%02x".format(it) }
+
+    /**
+     * Универсальный fallback без внешних утилит: `od -An -tu1 -v < файл | awk …`.
+     *
+     * Считается 32-битная полиномиальная сумма по байтам с умножением на 131 и модулем 2^32.
+     * `od` и `awk` есть в toybox практически всегда. Это НЕ криптография: цель — обнаружить
+     * обрезанную/подменённую заливку, а не защититься от противника.
+     */
+    fun odsum(bytes: ByteArray): Long {
+        var s = 0L
+        for (b in bytes) {
+            s = (s * 131L + (b.toLong() and 0xffL)) % 4294967296L
+        }
+        return s
+    }
+
     /** Выбор транспорта по ФАКТИЧЕСКОЙ длине UTF-8. */
     fun plan(name: String, script: String, nonce: String = newNonce()): Plan {
         val bytes = script.toByteArray(StandardCharsets.UTF_8)
@@ -169,27 +203,81 @@ object ScriptDelivery {
     fun createCommand(path: String): String =
         "if (set -C; : > " + path + ") 2>/dev/null; then echo CREATED; else echo EXISTS; fi"
 
-    /** Полная команда запуска: сверка размера И содержимого, затем terminal-файл и запуск. */
-    fun runCommand(path: String, expectedBytes: Int, expectedCksum: Long): String =
-        "chmod 700 $path; " +
+    /**
+     * Полная команда запуска: сверка размера И содержимого, затем terminal-файл и запуск.
+     *
+     * iter53 §6.2.4: раньше при отсутствии `cksum` (`CS` пустой) скрипт ВСЁ РАВНО запускался с
+     * `checked=0`, то есть «сверено» означало «не сверяли». Теперь:
+     *  • содержимое сверяется первым доступным инструментом: `cksum` → `md5sum` → `od|awk`;
+     *  • если ни одного нет — скрипт НЕ запускается (`exit 97`), а не «запускается без проверки»;
+     *  • перед `sh` пишется `<path>.started`, чтобы поздняя сверка отличала «начал» от «не начал»;
+     *  • `rm` файла до запуска выполняется только там, где запуск ДОКАЗАННО не состоялся, и
+     *    `rm`+`echo` больше не маскируют код возврата (rc берётся от `rm`).
+     */
+    fun runCommand(
+        path: String,
+        expectedBytes: Int,
+        expectedCksum: Long,
+        expectedMd5: String = "",
+        expectedOdsum: Long = -1L
+    ): String {
+        val odExpr = "{for(i=1;i<=NF;i++){s=(s*131+${'$'}i)%4294967296}} END{printf \"%d\\n\", s}"
+        return "chmod 700 $path 2>/dev/null; " +
             "SZ=\$(wc -c < $path 2>/dev/null); " +
-            "CS=\$(cksum < $path 2>/dev/null | awk '{print \$1}'); " +
-            "echo \"SCRIPT_BYTES=\$SZ EXPECTED=$expectedBytes CS=\$CS EXPECT_CS=$expectedCksum\"; " +
+            "echo \"SCRIPT_BYTES=\$SZ EXPECTED=$expectedBytes\"; " +
             "if [ \"\$SZ\" != \"$expectedBytes\" ]; then " +
             "echo \"ERR_SCRIPT_UPLOAD size expected=$expectedBytes actual=\$SZ\"; " +
-            "rm -f $path 2>/dev/null; exit 99; fi; " +
-            "if [ -n \"\$CS\" ] && [ \"\$CS\" != \"$expectedCksum\" ]; then " +
-            "echo \"ERR_SCRIPT_UPLOAD content cksum=\$CS expected=$expectedCksum\"; " +
-            "rm -f $path 2>/dev/null; exit 98; fi; " +
-            "echo \"SCRIPT_CONTENT_OK checked=\$([ -n \"\$CS\" ] && echo 1 || echo 0)\"; " +
+            "rm -f $path 2>/dev/null; _rmc=\$?; [ \"\$_rmc\" = 0 ] && [ ! -e $path ] && RM=1 || RM=0; " +
+            "echo \"CLEANUP_PROVEN not_started=1 removed=\$RM rc=\$_rmc\"; exit 99; fi; " +
+            "KIND=none; GOT=none; " +
+            "if command -v cksum >/dev/null 2>&1; then " +
+            "  GOT=\$(cksum < $path 2>/dev/null | awk '{print \$1}'); [ -n \"\$GOT\" ] && KIND=cksum; fi; " +
+            "if [ \"\$KIND\" = none ] && command -v md5sum >/dev/null 2>&1; then " +
+            "  GOT=\$(md5sum < $path 2>/dev/null | awk '{print \$1}'); [ -n \"\$GOT\" ] && KIND=md5; fi; " +
+            (if (expectedOdsum >= 0L) "if [ \"\$KIND\" = none ]; then " +
+                "  GOT=\$(od -An -tu1 -v < $path 2>/dev/null | awk '" + odExpr + "'); " +
+                "  [ -n \"\$GOT\" ] && KIND=odsum; fi; " else "") +
+            "echo \"SCRIPT_CONTENT_KIND=\$KIND GOT=\$GOT EXPECT_CS=$expectedCksum " +
+            "EXPECT_MD5=$expectedMd5 EXPECT_OD=${if (expectedOdsum >= 0L) expectedOdsum else -1}\"; " +
+            "BAD=0; " +
+            "case \"\$KIND\" in " +
+            "  cksum) [ \"\$GOT\" != \"$expectedCksum\" ] && BAD=1 ;; " +
+            (if (expectedMd5.isNotEmpty()) "  md5) [ \"\$GOT\" != \"$expectedMd5\" ] && BAD=1 ;; " else "") +
+            (if (expectedOdsum >= 0L) "  odsum) [ \"\$GOT\" != \"$expectedOdsum\" ] && BAD=1 ;; " else "") +
+            "  *) BAD=2 ;; " +
+            "esac; " +
+            "if [ \"\$BAD\" != 0 ]; then " +
+            "  echo \"ERR_SCRIPT_UPLOAD content kind=\$KIND got=\$GOT expect=$expectedCksum/$expectedMd5/" +
+            "${if (expectedOdsum >= 0L) expectedOdsum else -1} \"; " +
+            "  rm -f $path 2>/dev/null; _rmc=\$?; [ \"\$_rmc\" = 0 ] && [ ! -e $path ] && RM=1 || RM=0; " +
+            "  echo \"CLEANUP_PROVEN not_started=1 removed=\$RM rc=\$_rmc\"; " +
+            "  if [ \"\$BAD\" = 2 ]; then exit 97; else exit 98; fi; fi; " +
+            "echo \"SCRIPT_CONTENT_OK checked=1 kind=\$KIND\"; " +
+            "echo \"started=1\" > $path.started 2>/dev/null; " +
             "sh $path; RC=\$?; echo \"rc=\$RC\" > $path.done 2>/dev/null; " +
             "echo \"SCRIPT_RUN_DONE rc=\$RC\"; rm -f $path 2>/dev/null; exit \$RC"
+    }
 
-    /** Удаление с ДОКАЗАТЕЛЬСТВОМ: код возврата `rm` и фактическая проверка существования. */
-    fun cleanCommand(path: String): String =
-        "rm -f $path $path.done $path.started 2>/dev/null; RMC=\$?; " +
-            "if [ -e $path ] || [ -e $path.done ]; then " +
-            "echo \"RM_FAIL rc=\$RMC exists=1\"; else echo \"RM_OK rc=\$RMC exists=0\"; fi"
+    /**
+     * Удаление с ДОКАЗАТЕЛЬСТВОМ: код возврата `rm` и фактическая проверка существования.
+     *
+     * `withTerminal=false` удаляет ТОЛЬКО скрипт и его служебные файлы, но не `<path>.done`:
+     * terminal — свидетельство исхода, и уничтожать его можно лишь там, где исход уже прочитан
+     * и учтён (iter53 §6.2.3).
+     */
+    fun cleanCommand(path: String, withTerminal: Boolean = true): String {
+        val targets = if (withTerminal) "$path $path.done $path.started" else "$path $path.started"
+        val check = if (withTerminal) "[ -e $path ] || [ -e $path.done ]" else "[ -e $path ]"
+        return "rm -f $targets 2>/dev/null; RMC=\$?; " +
+            "if $check; then echo \"RM_FAIL rc=\$RMC exists=1\"; else echo \"RM_OK rc=\$RMC exists=0\"; fi"
+    }
+
+    /** Read-only: что реально осталось на устройстве по этому пути (для поздней сверки). */
+    fun evidenceCommand(path: String): String =
+        "echo \"SH=\$([ -e $path ] && echo 1 || echo 0)\"; " +
+            "echo \"STARTED=\$([ -e $path.started ] && echo 1 || echo 0)\"; " +
+            "echo \"DONE=\$(cat $path.done 2>/dev/null)\"; " +
+            "echo \"PRESENT=\$([ -e $path ] && echo 1 || echo 0)\""
 
     /** Чтение terminal-файла операции (короткая read-only команда). */
     fun doneCommand(path: String): String =
@@ -271,8 +359,10 @@ object ScriptDelivery {
             }
 
             // 3) Сверка + запуск. Ответ мог потеряться ПОСЛЕ запуска — это отдельная фаза.
+            val bytes = script.toByteArray(StandardCharsets.UTF_8)
             val (rcRun, outRun) = exec(
-                runCommand(path, plan.bytes, plan.cksum), timeoutMs + 15000, expectRoot
+                runCommand(path, plan.bytes, plan.cksum, md5Hex(bytes), odsum(bytes)),
+                timeoutMs + 15000, expectRoot
             )
             lastRc = rcRun
             lastOut = outRun
@@ -280,48 +370,85 @@ object ScriptDelivery {
             val sizeMarker = Regex("SCRIPT_BYTES=(\\d+) EXPECTED=(\\d+)").find(outRun)
             val sizeOk = sizeMarker != null &&
                 sizeMarker.groupValues[1] == sizeMarker.groupValues[2]
+            val contentKind = Regex("SCRIPT_CONTENT_KIND=(\\w+)").find(outRun)
+                ?.groupValues?.get(1) ?: "none"
             val contentOk = outRun.contains("SCRIPT_CONTENT_OK checked=1")
 
             if (explicitNoRun) {
-                // Маркер печатается ДО `sh`: запуска не было, повторять безопасно.
-                cleanup(path, exec, expectRoot)
+                // Маркер печатается ДО `sh`, а `CLEANUP_PROVEN not_started=1` означает, что удаление
+                // тоже проверено. Только здесь `rm` безопасен: запуска ДОКАЗАННО не было.
+                val cleaned = cleanup(path, exec, expectRoot)
+                if (!outRun.contains("CLEANUP_PROVEN") || cleaned.isNotEmpty()) {
+                    // Удаление не доказано (или маркера нет): файл остаётся свидетельством.
+                    return Result(
+                        rc = rcRun, out = outRun, plan = plan.copy(path = path), attempts = attempt,
+                        state = State.UPLOAD_INCOMPLETE, sizeChecked = sizeOk,
+                        contentChecked = false, leftoverPath = cleaned, mayHaveRun = false,
+                        contentKind = contentKind, evidencePath = if (cleaned.isEmpty()) "" else path
+                    )
+                }
                 continue
             }
-            if (outRun.contains("SCRIPT_CONTENT_OK") || sizeOk) {
+            if (outRun.contains("SCRIPT_CONTENT_OK") && sizeOk) {
                 val finished = Regex("SCRIPT_RUN_DONE rc=(-?\\d+)").find(outRun)
-                val leftover = cleanup(path, exec, expectRoot)
+                if (finished != null) {
+                    // Исход известен и прочитан → свидетельства можно убрать (и это проверяется).
+                    val leftover = cleanup(path, exec, expectRoot)
+                    return Result(
+                        rc = finished.groupValues[1].toIntOrNull() ?: rcRun,
+                        out = outRun, plan = plan.copy(path = path), attempts = attempt,
+                        state = State.RUN_CONFIRMED, sizeChecked = true, contentChecked = contentOk,
+                        leftoverPath = leftover, mayHaveRun = false,
+                        contentKind = contentKind, evidencePath = if (leftover.isEmpty()) "" else path
+                    )
+                }
+                // Запуск начался, но `SCRIPT_RUN_DONE` не доехал: сначала read-only сверка.
+                val rec = reconcile(path, exec, expectRoot)
+                if (rec != null) {
+                    val leftover = cleanup(path, exec, expectRoot)
+                    return Result(
+                        rc = rec, out = outRun, plan = plan.copy(path = path), attempts = attempt,
+                        state = State.RUN_CONFIRMED, sizeChecked = true, contentChecked = contentOk,
+                        leftoverPath = leftover, mayHaveRun = false,
+                        contentKind = contentKind, evidencePath = if (leftover.isEmpty()) "" else path
+                    )
+                }
+                // iter53 §6.2.2: исход НЕИЗВЕСТЕН — свидетельства НЕ удаляются.
                 return Result(
-                    rc = finished?.groupValues?.get(1)?.toIntOrNull() ?: rcRun,
-                    out = outRun,
-                    plan = plan.copy(path = path),
-                    attempts = attempt,
-                    state = if (finished != null) State.RUN_CONFIRMED else State.RUN_UNKNOWN,
-                    sizeChecked = sizeOk,
-                    contentChecked = contentOk,
-                    leftoverPath = leftover,
-                    mayHaveRun = finished == null
+                    rc = rcRun, out = outRun, plan = plan.copy(path = path), attempts = attempt,
+                    state = State.RUN_UNKNOWN, sizeChecked = true, contentChecked = contentOk,
+                    leftoverPath = "", mayHaveRun = true,
+                    contentKind = contentKind, evidencePath = path
                 )
             }
-            // Ни маркера, ни явного отказа: ответ потерян. Запуск МОГ произойти — не повторяем,
-            // пробуем прочитать terminal-файл (read-only) и вернуть честную фазу.
+            // Ни маркера содержимого, ни явного отказа: ответ потерян. Запуск МОГ произойти.
             val reconciled = reconcile(path, exec, expectRoot)
-            val leftover = cleanup(path, exec, expectRoot)
+            if (reconciled != null) {
+                // Исход доказан terminal-файлом — теперь свидетельства можно убрать.
+                val leftover = cleanup(path, exec, expectRoot)
+                return Result(
+                    rc = reconciled, out = outRun, plan = plan.copy(path = path), attempts = attempt,
+                    state = State.RUN_CONFIRMED, sizeChecked = sizeOk, contentChecked = false,
+                    leftoverPath = leftover, mayHaveRun = false,
+                    contentKind = contentKind, evidencePath = if (leftover.isEmpty()) "" else path
+                )
+            }
+            // iter53 §6.2.2: `cleanup` здесь БОЛЬШЕ НЕ ВЫЗЫВАЕТСЯ. Скрипт и terminal остаются на
+            // устройстве: удалённый shell мог стартовать позже, а `.done` мог появиться уже после
+            // нашей попытки. Поздняя сверка ([evidenceCommand]) разрешит исход без повторного
+            // side effect.
             return Result(
-                rc = reconciled ?: rcRun,
-                out = outRun,
-                plan = plan.copy(path = path),
-                attempts = attempt,
-                state = if (reconciled != null) State.RUN_CONFIRMED else State.RUN_UNKNOWN,
-                sizeChecked = false,
-                contentChecked = false,
-                leftoverPath = leftover,
-                mayHaveRun = reconciled == null
+                rc = rcRun, out = outRun, plan = plan.copy(path = path), attempts = attempt,
+                state = State.RUN_UNKNOWN, sizeChecked = sizeOk, contentChecked = contentOk,
+                leftoverPath = "", mayHaveRun = true,
+                contentKind = contentKind, evidencePath = path
             )
         }
         // Ни одна попытка не дошла до запуска: это ДОКАЗАННЫЙ «не отправлено/не запущено».
         val leftover = cleanup(path, exec, expectRoot)
         return Result(lastRc, lastOut, plan.copy(path = path), attempts,
-            State.UPLOAD_INCOMPLETE, false, false, leftover, false)
+            State.UPLOAD_INCOMPLETE, false, false, leftover, false,
+            evidencePath = if (leftover.isEmpty()) "" else path)
     }
 
     /**
@@ -342,9 +469,10 @@ object ScriptDelivery {
     private fun cleanup(
         path: String,
         exec: (String, Int, Boolean) -> Pair<Int, String>,
-        expectRoot: Boolean
+        expectRoot: Boolean,
+        withTerminal: Boolean = true
     ): String {
-        val r = runCatching { exec(cleanCommand(path), 8000, expectRoot) }.getOrNull()
+        val r = runCatching { exec(cleanCommand(path, withTerminal), 8000, expectRoot) }.getOrNull()
             ?: return path
         if (r.first != 0) return path
         return if (r.second.contains("RM_OK")) "" else path
