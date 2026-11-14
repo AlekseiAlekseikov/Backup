@@ -328,6 +328,60 @@ object LogFiles {
         return out
     }
 
+    /**
+     * §8 iter47 — обнаружение блоков `0x00` ГДЕ УГОДНО в частях, а не только в хвосте.
+     *
+     * В логе владельца блок NUL лежал ВНУТРИ датированного файла (между записями), поэтому
+     * проверка последних байтов его не находила. Здесь файл только ЧИТАЕТСЯ: ничего не
+     * обрезается и не переписывается (это данные владельца). Возвращает найденные блоки
+     * `имя@смещение:длина` — по ним видно и наличие повреждения, и его место.
+     *
+     * Ограничения (честно): находка НЕ доказывает, кто её создал, и не говорит, потеряны ли
+     * строки — она лишь фиксирует факт и место. Скан ограничен [MAX_SCAN_BYTES] на файл.
+     */
+    internal fun scanNulBlocks(
+        dir: File,
+        tier: Tier = Tier.MAIN,
+        maxScanBytes: Long = 4L * 1024 * 1024
+    ): List<String> {
+        val out = ArrayList<String>(2)
+        for (f in runCatching { partsOf(dir, tier) }.getOrDefault(emptyList())) {
+            val len = runCatching { f.length() }.getOrDefault(0L)
+            if (len <= 0L) continue
+            val from = (len - maxScanBytes).coerceAtLeast(0L)
+            val buf = ByteArray((len - from).toInt().coerceAtLeast(1))
+            val read = runCatching {
+                java.io.RandomAccessFile(f, "r").use { raf ->
+                    raf.seek(from)
+                    raf.read(buf)
+                }
+            }.getOrDefault(-1)
+            if (read <= 0) continue
+            var i = 0
+            while (i < read) {
+                if (buf[i].toInt() == 0) {
+                    val start = i
+                    while (i < read && buf[i].toInt() == 0) i++
+                    out += "${f.name}@${from + start}:${i - start}"
+                } else i++
+            }
+        }
+        return out
+    }
+
+    /** §8: сообщить о найденных блоках NUL отдельным фактом (пишется на старте). */
+    internal fun reportNulBlocks(dirs: List<File>, tier: Tier = Tier.MAIN) {
+        for (d in dirs) {
+            val blocks = runCatching { scanNulBlocks(d, tier) }.getOrDefault(emptyList())
+            if (blocks.isNotEmpty()) {
+                report("LOGFILES_NUL_DETECTED dir=«${d.absolutePath}» tier=${tier.name.lowercase()} " +
+                    "blocks=${blocks.size} where=${blocks.take(6).joinToString(",")} " +
+                    "action=report_only (файл НЕ переписывается и НЕ обрезается; происхождение " +
+                    "блока по этим данным не устанавливается)")
+            }
+        }
+    }
+
     /** Старый API (число удалённых) — оставлен для существующих тестов/вызовов. */
     internal fun pruneCount(dir: File, nowMs: Long, tier: Tier = Tier.MAIN): Int =
         pruneTier(dir, nowMs, tier).size
@@ -335,6 +389,8 @@ object LogFiles {
     /** Инициализация при старте: каталог + retention. Возвращает путь каталога. */
     fun prepare(context: Context): String {
         val d = dirFor(context)
+        // §8 iter47: проверить повреждения ВНУТРИ частей (не только хвост) — только отчёт.
+        runCatching { reportNulBlocks(listOf(d, internalDir(context))) }
         dirRef = d
         val now = System.currentTimeMillis()
         val today = Instant.ofEpochMilli(now).atZone(ZoneId.systemDefault()).toLocalDate()

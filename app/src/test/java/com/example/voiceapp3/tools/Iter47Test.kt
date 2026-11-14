@@ -409,6 +409,35 @@ class Iter47Test {
         assertTrue("spill не совпадает с основным файлом", a.name != "voiceapp3.log")
     }
 
+    // ───────────────────────── §8: NUL ВНУТРИ части, а не в хвосте ─────────────────────────
+
+    @Test
+    fun interiorNulBlockIsFoundAndFileIsNotRewritten() {
+        val dir = tmpDir()
+        val today = java.time.LocalDate.now()
+        val fmt = java.time.format.DateTimeFormatter.ofPattern("dd.MM.yyyy")
+        val f = File(dir, "voiceapp3-" + today.format(fmt) + ".1.log")
+        val content = "line-before\n" + "\u0000".repeat(100) + "line-after\n"
+        f.writeBytes(content.toByteArray(Charsets.UTF_8))
+        val before = f.readBytes()
+
+        val blocks = LogFiles.scanNulBlocks(dir)
+        assertTrue("внутренний блок найден: $blocks", blocks.isNotEmpty())
+        assertTrue("указано смещение и длина: $blocks", blocks.first().contains("@12:100"))
+        assertTrue("файл НЕ переписан", f.readBytes().contentEquals(before))
+        // Хвостовая проверка такой блок не видит — именно поэтому она была недостаточной.
+        assertEquals(0, FileLogCore.tailNulBytes(f))
+    }
+
+    @Test
+    fun cleanLogHasNoNulBlocks() {
+        val dir = tmpDir()
+        val today = java.time.LocalDate.now()
+        val fmt = java.time.format.DateTimeFormatter.ofPattern("dd.MM.yyyy")
+        File(dir, "voiceapp3-" + today.format(fmt) + ".1.log").writeText("normal line\nanother\n")
+        assertTrue(LogFiles.scanNulBlocks(dir).isEmpty())
+    }
+
     // ───────────────────────── §9: окна и §7: JIT-признак ─────────────────────────
 
     @Test
