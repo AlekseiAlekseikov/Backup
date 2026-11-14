@@ -156,11 +156,33 @@ enum class Choice(
      */
     fun state(): JsonObject {
         val o = JsonObject().apply {
+        // §Г iter48: неизвестность доходит до UI. Раньше конфликт/нечитаемое значение молча
+        // превращались в `default`, и тумблер показывал выдуманное состояние владельца.
+        // Теперь для каждого тумблера есть трёхзначный `*State` (on|off|unknown) и список
+        // `prefsUnknown`; значение `t.key` остаётся для совместимости, но не выдаётся за факт.
+        val unknownPrefs = com.google.gson.JsonArray()
         Toggle.values().forEach { t ->
             // §6.1 iter47: снимок читает ЧЕРЕЗ согласование CPS/DPS, а не прямо из CPS.
             // Прямое чтение отдавало устаревшее значение, если новее была вторая копия.
-            addProperty(t.key, Prefs2.getBoolean(appContext, t.pref, t.default))
+            val resolved = Prefs2.readBoolean(appContext, t.pref)
+            val tri: Boolean? = when (resolved) {
+                is Toggles45.Resolved.Value -> resolved.v
+                Toggles45.Resolved.Deleted -> false
+                Toggles45.Resolved.Conflict, Toggles45.Resolved.Unknown -> null
+            }
+            addProperty(t.key, tri ?: t.default)
+            addProperty(t.key + "State", when (tri) {
+                true -> "on"
+                false -> "off"
+                null -> "unknown"
+            })
+            if (tri == null) {
+                unknownPrefs.add(t.key)
+                AppLog.w(TAG, "PREFS_UNKNOWN key=${t.key} pref=${t.pref} " +
+                    "(значение не подтверждено: показываем unknown, а не выдуманный default)")
+            }
         }
+        add("prefsUnknown", unknownPrefs)
         Choice.values().forEach { c ->
             addProperty(c.key, Prefs2.getString(appContext, c.pref, c.default) ?: c.default)
         }

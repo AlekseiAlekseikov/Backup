@@ -924,53 +924,11 @@ object LockSound {
                     return@post
                 }
 
-                val bindScript = """
-                    SELINUX_BEFORE=${'$'}(getenforce 2>/dev/null)
-                    MOUNTED_COUNT=0
-                    if [ -s '$stagePath' ]; then
-                        STAGE_INODE=${'$'}(stat -c '%i' '$stagePath' 2>/dev/null)
-                        # iter33h A1: ТОЛЬКО /vendor/etc/carlock. /system/etc/avas/** — звуковая
-                        # подсистема машины (задний ход/скорость), приложение её не трогает.
-                        for f in /vendor/etc/carlock/*.wav; do
-                            if [ -f "${"$"}f" ]; then
-                                # §5.3 iter47: снимаем слой на цели ТОЛЬКО если ЕГО ИСТОЧНИК —
-                                # наш staging (_g<N>_<hash>.wav). Чужой bind на том же пути
-                                # (другое приложение/плагин) не трогаем: раньше цикл снимал всё,
-                                # что оказалось на пути, без проверки принадлежности слоя.
-                                for _i in 1 2 3 4; do
-                                    CUR_SRC=$(awk -v t="${"$"}f" '$2==t {print $1; exit}' /proc/mounts 2>/dev/null)
-                                    [ -z "${'$'}CUR_SRC" ] && break
-                                    case "${'$'}CUR_SRC" in
-                                        /data/local/tmp/carlock_custom*) : ;;
-                                        *) echo "FOREIGN_MOUNT:${"$"}f src=${'$'}CUR_SRC"; break ;;
-                                    esac
-                                    umount "${"$"}f" 2>/dev/null || umount -l "${"$"}f" 2>/dev/null || true
-                                done
-                                CUR_SRC=$(awk -v t="${"$"}f" '$2==t {print $1; exit}' /proc/mounts 2>/dev/null)
-                                if [ -n "${'$'}CUR_SRC" ] && [ "${'$'}CUR_SRC" != "$stagePath" ]; then
-                                    echo "TARGET_BUSY:${"$"}f src=${'$'}CUR_SRC"
-                                    continue
-                                fi
-                                mount -o bind '$stagePath' "${"$"}f" 2>&1 || echo MOUNT_FAIL:${"$"}f
-                                TGT_INODE=${'$'}(stat -c '%i' "${"$"}f" 2>/dev/null)
-                                if [ "${'$'}STAGE_INODE" = "${'$'}TGT_INODE" ] && grep -qF " ${"$"}f " /proc/mounts; then
-                                    echo "MOUNTED_OK:${"$"}f|$stagePath"
-                                    MOUNTED_COUNT=${'$'}((MOUNTED_COUNT+1))
-                                else
-                                    echo MOUNT_VERIFY_FAIL:${"$"}f inode=${'$'}TGT_INODE
-                                fi
-                                restorecon -v "${"$"}f" 2>/dev/null || true
-                            fi
-                        done
-                    fi
-                    # iter33h A1.2/A1.3: killall -9 audioserver и pkill -9 -f avas УДАЛЕНЫ
-                    # навсегда. Подмена файла в /vendor/etc/carlock/ не требует перезапуска
-                    # аудиоподсистемы; если звук не подхватился — применится после перезагрузки ГУ.
-                    SELINUX_AFTER=${'$'}(getenforce 2>/dev/null)
-                    echo SELINUX_BEFORE=${'$'}SELINUX_BEFORE SELINUX_AFTER=${'$'}SELINUX_AFTER
-                    echo MOUNTS_COUNT=${'$'}(grep carlock /proc/mounts | wc -l)
-                    echo MOUNTED_OK_COUNT=${'$'}MOUNTED_COUNT
-                """.trimIndent()
+                // iter48 §В: скрипт вынесен в чистый [LockMountScripts] — владение слоем
+                // доказывается по /proc/self/mountinfo (mount ID + root), а не по первому полю
+                // /proc/mounts (там устройство ФС). `umount … || true` внутри больше нет:
+                // rc фиксируется, результат перечитывается, «снято» заявляется только по факту.
+                val bindScript = LockMountScripts.bindScript(stagePath)
                 // iter33h A1.5: перед любой записью маунта — проверка пути. Скрипт трогает только
                 // /vendor/etc/carlock/*.wav; если глоб вдруг вернёт что-то другое, это отсекается здесь.
                 val glideTargets = runCatching {
@@ -1001,10 +959,20 @@ object LockSound {
                 // монтирования при успешном rc.
                 val tempRootGone = bindRes.second.contains("ERR_ROOT_CHANNEL_UNAVAILABLE") ||
                     bindRes.second.contains("Permission denied") || bindRes.second.contains("avc: denied")
+                val mountNsMismatch = bindRes.second.contains("MOUNT_NS_MISMATCH")
                 val failDeterm = (!tempRootGone && bindRes.second.contains("No such file"))
                     || (bindRes.second.contains("MOUNT_VERIFY_FAIL") && bindRes.first == 0 &&
                         !bindRes.second.contains("MOUNTED_OK:"))
-                val ok = bindRes.first == 0 && bindRes.second.contains("MOUNTED_OK:") && !failDeterm
+                // §В iter48: «MOUNTED_OK» печатается ТОЛЬКО когда mountinfo подтвердил корень
+                // нашего staging-файла и inode цели; само наличие строки успехом не является.
+                // Несовпадение namespace монтирования означает, что система нашего bind не
+                // увидит — «применено» в этом случае не заявляется.
+                val ok = bindRes.first == 0 && bindRes.second.contains("MOUNTED_OK:") &&
+                    !failDeterm && !mountNsMismatch
+                if (mountNsMismatch) {
+                    AppLog.w(ctx, TAG, "LOCKSOUND_BIND namespace init ≠ namespace shell: " +
+                        "bind не виден системе — applied не заявляется")
+                }
 
                 // §5.1 iter47: скрипт уже УШЁЛ, и во время его выполнения владелец мог выключить
                 // звук или выбрать другой WAV. Проверка флага ДО вызова такой случай не ловит,
@@ -1013,12 +981,28 @@ object LockSound {
                 // состояния: OFF → снимаем только свои слои, другой файл → новый проход.
                 val genChanged = bindGen != gen
                 val desiredOff = !isEnabled(appCtx)
+                // §В iter48: ФАКТЫ созданных слоёв пишутся в реестр ДО любой сходимости.
+                // Раньше реестр заполнялся только в «счастливой» ветке: если во время bind
+                // владелец выключил звук, слои уже стояли, а реестр о них не знал — снять их
+                // потом было нечем (и «своё» оставалось висеть до перезагрузки).
+                val mountedFacts = MountInfo.parseMountedOk(bindRes.second)
+                    .mapNotNull { (target, src) ->
+                        if (!isOurLockPath(target)) null
+                        else OwnMount(target, src.ifEmpty { stagePath }, gen)
+                    }
+                if (mountedFacts.isNotEmpty()) {
+                    val merged = mergeOwnMounts(readOwnMounts(ctx), mountedFacts)
+                    writeOwnMounts(ctx, merged)
+                    AppLog.i(ctx, TAG, "LOCKSOUND_REGISTRY write_before_converge gen=$gen " +
+                        "layers=${mountedFacts.size} total=${merged.size} " +
+                        "(факт слоя записан до любых дальнейших действий)")
+                }
                 if (ok && (genChanged || desiredOff)) {
                     // Факт для ЭТОГО поколения не публикуем: он относится к устаревшему выбору.
                     markApplied(appCtx, false, if (desiredOff) "desired_off_after_bind" else "superseded")
                     AppLog.i(ctx, TAG, "LOCKSOUND_BIND_STALE gen=$gen now=$bindGen desired=${!desiredOff} " +
                         "result=converge (намерение изменилось, пока скрипт выполнялся; applied для " +
-                        "устаревшего выбора не заявляется)")
+                        "устаревшего выбора не заявляется; реестр пополнен фактами)")
                     cleanupStage(ctx, stagePath)
                     convergeAfterBind(appCtx, desiredOff)
                     return@post
@@ -1026,20 +1010,9 @@ object LockSound {
                 if (ok) {
                     bindFailCount = 0
                     lastBindFailReason = null
-                    // §5.3 iter47: в реестр пишем ПАРУ «цель|источник|поколение», а не только путь:
-                    // без источника нельзя доказать принадлежность слоя при снятии.
-                    val mounted = bindRes.second.lineSequence().map { it.trim() }
-                        .filter { it.startsWith("MOUNTED_OK:") }
-                        .map { it.removePrefix("MOUNTED_OK:") }
-                        .mapNotNull { line ->
-                            val target = line.substringBefore('|').trim()
-                            val src = line.substringAfter('|', "").trim()
-                            if (!isOurLockPath(target)) null
-                            else OwnMount(target, src.ifEmpty { stagePath }, gen)
-                        }
-                        .toList()
+                    val mounted = mountedFacts
                     val expectedTargets = glideTargets.size
-                    writeOwnMounts(ctx, mounted)
+                    writeOwnMounts(ctx, mergeOwnMounts(readOwnMounts(ctx), mounted))
                     // §5.4 iter47: `applied` — только когда смонтированы ВСЕ цели, которые есть
                     // на устройстве, и каждая проверена readback (inode источника = цель).
                     val complete = mounted.isNotEmpty() && mounted.size == expectedTargets
@@ -1216,38 +1189,69 @@ object LockSound {
                     AppLog.i(ctx, TAG, "LOCKSOUND_UNMOUNT SKIP reason=path_not_ours paths=" + skipped.joinToString(","))
                 }
                 if (entries.isEmpty()) {
-                    writeOwnMounts(ctx, emptyList())
-                    AppLog.i(ctx, TAG, "LOCKSOUND_BOOT enabled=false action=none (своих маунтов нет)")
+                    AppLog.i(ctx, TAG, "LOCKSOUND_UNMOUNT action=none reason=registry_empty " +
+                        "(своих слоёв в реестре нет; чужие не трогаем)")
                     return@execute
                 }
-                val sb = StringBuilder("UNMOUNTED=0\n")
-                for (o in entries) {
-                    val target = o.target
-                    val expected = o.source
-                    // §5.3 iter47: перед снятием смотрим ФАКТИЧЕСКИЙ источник слоя в /proc/mounts.
-                    // Снимаем, только если это НАШ staging (или совпадает с записанным источником):
-                    // иначе на цели мог оказаться чужой bind, и снимать его нельзя.
-                    val oursPattern = "/data/local/tmp/carlock_custom*" +
-                        if (expected.isNotEmpty() && isOurStageSource(expected)) "|" + expected else ""
-                    sb.append("CUR=$(awk -v t='").append(target)
-                        .append("' '$2==t {print $1; exit}' /proc/mounts 2>/dev/null)\n")
-                    sb.append("if [ -n \"\$CUR\" ]; then\n")
-                    sb.append("  case \"\$CUR\" in\n")
-                    sb.append("    ").append(oursPattern).append(") umount ").append(target)
-                    sb.append(" 2>/dev/null || umount -l ").append(target)
-                    sb.append(" 2>/dev/null || true; UNMOUNTED=$((UNMOUNTED+1))")
-                    sb.append("; echo UNMOUNTED_OK:").append(target).append(" ;;\n")
-                    sb.append("    *) echo \"UNMOUNT_SKIP:").append(target)
-                    sb.append(":foreign:\$CUR\" ;;\n")
-                    sb.append("  esac\n")
-                    sb.append("fi\n")
+                // §В iter48: скрипт снятия вынесен и проверяется тестами. Внутри:
+                //  • владение слоем доказывается по mountinfo (root = наш staging), не по /proc/mounts;
+                //  • чужой верхний слой не снимается;
+                //  • каждый umount проверяется перечитыванием mountinfo; `|| true` больше нет.
+                val script = LockMountScripts.restoreScript(entries.map { it.target })
+                val res = AdbClient.execute(script, 20000)
+                AppLog.i(ctx, TAG, "LOCKSOUND_UNMOUNT [exitCode=${res.first}]: " + res.second.trim().take(800))
+                val parsed = MountInfo.parseRestore(res.second)
+                val nsMismatch = res.second.contains("MOUNT_NS_MISMATCH") ||
+                    run {
+                        val m = Regex("MOUNT_NS self=(\\S+) init=(\\S+)").find(res.second)
+                        m != null && m.groupValues[1] != m.groupValues[2]
+                    }
+                if (nsMismatch) {
+                    // Наш umount произошёл в другом пространстве имён: система слой не потеряла.
+                    // Реестр НЕ очищаем и «к стоку» не заявляем.
+                    markApplied(ctx, false, "unmount_namespace_differs")
+                    AppLog.w(ctx, TAG, "LOCKSOUND_UNMOUNT namespace differs: снятие не подтверждено, " +
+                        "реестр сохранён (${entries.size} записей)")
+                    return@execute
                 }
-                sb.append("rm -f /data/local/tmp/carlock_custom*.wav 2>/dev/null || true\n")
-                val res = AdbClient.execute(sb.toString(), 20000)
-                AppLog.i(ctx, TAG, "LOCKSOUND_UNMOUNT [exitCode=${res.first}]: " + res.second.trim())
-                if (res.first == 0) writeOwnMounts(ctx, emptyList())
+                val provenTargets = parsed.proven.toSet()
+                val foreignLeft = parsed.foreignLeft.toSet()
+                val unproven = entries.filter { it.target !in provenTargets && it.target !in foreignLeft }
+                val kept = unproven
+                // Реестр чистим ТОЛЬКО по доказанным записям. Недоказанные остаются — иначе
+                // приложение «забыло» бы свои слои и снять их потом было бы нечем.
+                if (kept.isEmpty()) writeOwnMounts(ctx, emptyList())
+                else writeOwnMounts(ctx, kept)
+                val allProven = unproven.isEmpty()
+                val ownLayersLeft = Regex("OWN_LAYERS_TOTAL=(\\d+)").find(res.second)
+                    ?.groupValues?.get(1)?.toIntOrNull() ?: -1
+                val clean = allProven && ownLayersLeft == 0
+                markApplied(
+                    ctx, false,
+                    when {
+                        clean -> "off"
+                        !allProven -> "unmount_unproven:${unproven.joinToString(",") { it.target }}"
+                        else -> "own_layers_left:$ownLayersLeft"
+                    }
+                )
+                AppLog.i(ctx, TAG, "LOCKSOUND_UNMOUNT_RESULT proven=${parsed.proven.size} " +
+                    "foreign_left=${parsed.foreignLeft.size} unproven=${unproven.size} " +
+                    "own_layers_total=$ownLayersLeft registry_kept=${kept.size} " +
+                    "(к стоку не заявляем, если остались чужие слои: ${foreignLeft.size})")
+                if (parsed.foreignLeft.isNotEmpty()) {
+                    AppLog.i(ctx, TAG, "LOCKSOUND_UNMOUNT FOREIGN_LAYER_LEFT paths=" +
+                        parsed.foreignLeft.joinToString(",") +
+                        " action=keep (чужой слой — не наш, не снимаем)")
+                }
+                // staging-файлы удаляем только когда наших слоёв не осталось вовсе.
+                if (ownLayersLeft == 0) {
+                    AdbClient.execute("rm -f /data/local/tmp/carlock_custom*.wav 2>/dev/null", 8000)
+                } else {
+                    AppLog.i(ctx, TAG, "LOCKSOUND_UNMOUNT stage kept reason=own_layers_left=$ownLayersLeft")
+                }
             } catch (t: Throwable) {
                 AppLog.w(ctx, TAG, "restoreSystemLockSoundBind error: ${t.message}")
+                markApplied(ctx, false, "unmount_exception:${t.javaClass.simpleName}")
             }
         }
     }
@@ -1293,6 +1297,18 @@ object LockSound {
     private fun readOwnMounts(ctx: Context): List<OwnMount> =
         runCatching { mountsFile(ctx).readLines() }.getOrDefault(emptyList())
             .mapNotNull { parseOwnMount(it) }
+
+    /**
+     * Слияние реестра: новые факты заменяют запись по той же цели, остальные сохраняются.
+     * Реестр не «перезаписывается с нуля» — иначе один частичный проход стирал бы знание о
+     * слоях, которые остались смонтированными.
+     */
+    private fun mergeOwnMounts(old: List<OwnMount>, facts: List<OwnMount>): List<OwnMount> {
+        val byTarget = LinkedHashMap<String, OwnMount>()
+        for (o in old) byTarget[o.target] = o
+        for (f in facts) byTarget[f.target] = f
+        return byTarget.values.toList()
+    }
 
     private fun writeOwnMounts(ctx: Context, mounts: List<OwnMount>) {
         runCatching {

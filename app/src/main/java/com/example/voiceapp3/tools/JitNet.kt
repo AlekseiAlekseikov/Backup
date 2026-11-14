@@ -567,6 +567,16 @@ object JitNet {
             val ni = java.net.NetworkInterface.getByName("wlan0") ?: return@runCatching false
             ni.isUp && ni.inetAddresses.toList().any { !it.isLoopbackAddress }
         }.getOrNull()
+
+        /**
+         * §Д iter48 — РЕАЛЬНОЕ чтение времени старта zygote (в iter47 переопределения не было,
+         * и признак всегда был `null`: в отчёте это было завышено, здесь исправлено и кодом).
+         *
+         * Читаются только `/proc/<pid>/cmdline`, `/proc/<pid>/stat` и `/proc/uptime`. Ничего не
+         * пишется, ничего не перезапускается. `null` — прочитать нельзя (тогда признак не
+         * используется, остаётся только временная граница, и это честно пишется в журнал).
+         */
+        override fun zygoteStartMs(): Long? = runCatching { ZygoteStart.readCurrent() }.getOrNull()
     }
 
     // ─────────────────────────── публичный вход для AppPerformance ───────────────────────────

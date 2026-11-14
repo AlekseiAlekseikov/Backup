@@ -336,4 +336,205 @@ class Iter48Test {
             synchronized(s.facts) { s.facts.any { it.contains("reason=foreign_rules_remain") } }
         )
     }
+    // ─────────────── §В: владение слоем монтирования по mountinfo ───────────────
+
+    private fun mountinfo(): String = listOf(
+        // базовая ФС /vendor — корень "/", это НЕ слой приложения
+        "35 1 253:4 / /vendor rw,relatime - ext4 /dev/block/dm-4 rw",
+        // наш bind: корень = staging-файл, цель = файл в /vendor/etc/carlock
+        "412 35 253:4 /data/local/tmp/carlock_custom_g7_ab12.wav " +
+            "/vendor/etc/carlock/xingguangshanyao.wav rw,relatime - ext4 /dev/block/dm-4 rw",
+        // чужой bind на другом файле той же папки
+        "413 35 253:4 /data/local/tmp/other_app_lock.wav " +
+            "/vendor/etc/carlock/other.wav rw,relatime - ext4 /dev/block/dm-4 rw"
+    ).joinToString("\n")
+
+    @Test
+    fun mountinfoProvesOwnershipByRootNotByDevice() {
+        val mi = mountinfo()
+        val ours = "/vendor/etc/carlock/xingguangshanyao.wav"
+        val foreign = "/vendor/etc/carlock/other.wav"
+        val base = "/vendor"
+        assertEquals(
+            "наш слой узнаётся по КОРНЮ монтирования",
+            MountInfo.Owner.OURS, MountInfo.topLayer(mi, ours)!!.let { MountInfo.ownerOf(it) }
+        )
+        assertEquals(
+            "чужой слой не может считаться нашим",
+            MountInfo.Owner.FOREIGN, MountInfo.topLayer(mi, foreign)!!.let { MountInfo.ownerOf(it) }
+        )
+        assertEquals(
+            "базовое монтирование ФС — не слой приложения",
+            MountInfo.Owner.BASE, MountInfo.parse(mi).first { it.target == base }.let { MountInfo.ownerOf(it) }
+        )
+        assertTrue("наш слой доказан", MountInfo.ownLayerProven(mi, ours, "/data/local/tmp/carlock_custom_g7_ab12.wav"))
+        assertFalse("чужой слой не доказан как наш", MountInfo.ownLayerProven(mi, foreign))
+        assertTrue("чужой слой на цели виден", MountInfo.foreignOnTarget(mi, foreign))
+        assertFalse("на нашей цели чужого нет", MountInfo.foreignOnTarget(mi, ours))
+        assertNull("на пути без слоя верхнего слоя нет",
+            MountInfo.topLayer(mi, "/vendor/etc/carlock/no_such.wav"))
+    }
+
+    @Test
+    fun mountinfoFieldsAreParsedIncludingOctalEscapes() {
+        val line = "78 35 0:45 /data/local/tmp/my\\040file.wav /vendor/etc/carlock/a\\040b.wav " +
+            "rw,nosuid - tmpfs tmpfs rw"
+        val l = MountInfo.parseLine(line)
+        assertNotNull(l)
+        assertEquals("78", l!!.id)
+        assertEquals("35", l.parentId)
+        assertEquals("0:45", l.majMin)
+        assertEquals("/data/local/tmp/my file.wav", l.root)
+        assertEquals("/vendor/etc/carlock/a b.wav", l.target)
+        assertEquals("tmpfs", l.fstype)
+    }
+
+    @Test
+    fun restoreMarkersDistinguishProvenForeignAndUnproven() {
+        val out = listOf(
+            "MOUNT_NS self=mnt:[4026531856] init=mnt:[4026531856]",
+            "UMOUNTED_OK:/vendor/etc/carlock/x.wav mid=412",
+            "STOCK_OK:/vendor/etc/carlock/x.wav",
+            "FOREIGN_MOUNT:/vendor/etc/carlock/y.wav mid=500 root=/tmp/other",
+            "STOCK_FOREIGN_LEFT:/vendor/etc/carlock/y.wav layers=1 reason=foreign_layer_above",
+            "UMOUNT_FAILED:/vendor/etc/carlock/z.wav mid=600 rc=1 lazy_rc=1",
+            "STOCK_UNPROVEN:/vendor/etc/carlock/z.wav reason=umount_not_confirmed rc=4"
+        ).joinToString("\n")
+        val r = MountInfo.parseRestore(out)
+        assertEquals(listOf("/vendor/etc/carlock/x.wav"), r.proven)
+        assertEquals(listOf("/vendor/etc/carlock/y.wav"), r.foreignLeft)
+        assertEquals(listOf("/vendor/etc/carlock/z.wav"), r.unproven)
+    }
+
+    @Test
+    fun bindScriptUsesMountinfoAndNeverClaimsSuccessAfterFailedUmount() {
+        val s = LockMountScripts.bindScript("/data/local/tmp/carlock_custom_g1_aa.wav")
+        assertFalse("первое поле /proc/mounts — устройство, а не путь: так нельзя",
+            s.contains("/proc/mounts"))
+        assertTrue("владение — по mountinfo", s.contains("/proc/self/mountinfo"))
+        assertTrue("проверяется пространство монтирования", s.contains("/proc/self/ns/mnt") &&
+            s.contains("/proc/1/ns/mnt"))
+        assertTrue("несовпадение namespace не выдаётся за успех", s.contains("MOUNT_NS_MISMATCH"))
+        assertTrue("чужой слой только диагностируется", s.contains("FOREIGN_MOUNT"))
+        val umountLines = s.lines().filter { l -> l.trim().startsWith("umount") || l.contains(" umount ") }
+        assertTrue("umount в скрипте есть", umountLines.isNotEmpty())
+        for (l in umountLines) {
+            assertFalse("после umount не должно быть || true: это скрывает провал", l.contains("|| true"))
+        }
+        assertTrue("снятие проверяется перечитыванием mountinfo", s.contains("after=\$(mi_count"))
+        assertTrue("на чужой слой не монтируем", s.contains("reason=foreign_layer_present"))
+        assertTrue("успех — только по readback корня и inode",
+            s.contains("MOUNT_VERIFY_FAIL") && s.contains("MOUNTED_OK:"))
+    }
+
+    @Test
+    fun restoreScriptReportsPerTargetAndKeepsStageWhileLayersLeft() {
+        val s = LockMountScripts.restoreScript(
+            listOf("/vendor/etc/carlock/a.wav", "/vendor/etc/carlock/b.wav")
+        )
+        assertTrue(s.contains("STOCK_OK:/vendor/etc/carlock/a.wav"))
+        assertTrue(s.contains("STOCK_UNPROVEN:/vendor/etc/carlock/b.wav"))
+        assertTrue(s.contains("STOCK_FOREIGN_LEFT:/vendor/etc/carlock/b.wav"))
+        assertTrue("реестр/стейдж не чистится без доказательства", s.contains("OWN_LAYERS_TOTAL="))
+        assertFalse("никакого /proc/mounts", s.contains("/proc/mounts"))
+        assertFalse("никакого || true после umount",
+            s.lines().any { it.contains("umount ") && it.contains("|| true") })
+    }
+    // ─────────────── §Д: время старта zygote читается и доказывает только факт ───────────────
+
+    @Test
+    fun zygoteStartIsParsedFromProcFields() {
+        // /proc/<pid>/stat: имя в скобках может содержать пробелы, starttime — 22-е поле.
+        val stat = "1234 (zygote) S 1 1234 1234 0 -1 4194560 100 0 0 0 5 3 0 0 20 0 1 0 98765 1234 56"
+        assertEquals(98765L, ZygoteStart.parseStarttimeTicks(stat))
+        assertEquals(1234.5, ZygoteStart.parseUptimeSec("1234.50 5000.10")!!, 0.001)
+        assertTrue(ZygoteStart.isZygoteCmdline("zygote64"))
+        assertTrue(ZygoteStart.isZygoteCmdline("/system/bin/zygote"))
+        assertFalse(ZygoteStart.isZygoteCmdline("zygote_helper"))
+        assertFalse(ZygoteStart.isZygoteCmdline(""))
+        // btime = now - uptime; старт = btime + ticks/hz
+        val now = 1_800_000_000_000L
+        val started = ZygoteStart.startMsFrom(1000L, 100.0, now, hz = 100L)
+        assertEquals(now - 100_000L + 10_000L, started)
+        assertNull("без uptime не догадываемся", ZygoteStart.startMsFrom(1000L, null, now))
+        assertNull("без ticks не догадываемся", ZygoteStart.startMsFrom(null, 100.0, now))
+    }
+
+    @Test
+    fun zygoteEvidenceRequiresStrictlyLaterStartWithoutTolerance() {
+        val now = 1_800_000_000_000L
+        val mark = JitRef.OpMark.of("op", true, JitRef.OpMark.UNDEFINED, now - 120_000L)
+        // iter47 засчитывал старт «за 60 с ДО отметки» как доказательство — это и убрано.
+        assertFalse(
+            "старт zygote ДО отметки не доказывает нашу команду (перенос/очередь/pid reuse)",
+            JitOp.zygoteRestartEvidence(mark, now - 180_000L, now)
+        )
+        assertFalse(
+            "равенство времени тоже не доказательство",
+            JitOp.zygoteRestartEvidence(mark, mark.ts, now)
+        )
+        assertTrue(
+            "строго позже — признак есть (но только для снятия блокировки нового клика)",
+            JitOp.zygoteRestartEvidence(mark, now - 60_000L, now)
+        )
+        val old = JitRef.OpMark.of("op2", true, JitRef.OpMark.UNDEFINED, now - 60 * 60_000L)
+        assertFalse(
+            "отметка старше окна: поздний старт zygote мог быть чем угодно",
+            JitOp.zygoteRestartEvidence(old, now - 1_000L, now)
+        )
+    }
+
+    // ─────────────── §Е: ротация лога не теряет .1 и не теряет строку ───────────────
+
+    private fun tmpLogDir(): java.io.File =
+        java.io.File.createTempFile("iter48log", "").let { it.delete(); it.mkdirs(); it }
+
+    @Test
+    fun rotationKeepsPreviousPartAndAppendsNewLine() {
+        val dir = tmpLogDir()
+        val name = "app.log"
+        val active = java.io.File(dir, name)
+        active.writeText("OLD-PART-1\nOLD-PART-2\n")
+        java.io.File(dir, "$name.1").writeText("ARCHIVE-OLDER\n")
+        val r = FileLogCore.append(dir, name, "NEW-LINE\n", maxBytes = 4L)
+        assertTrue("запись должна пройти: ${r.reason}", r.written)
+        assertTrue("ротация заявлена", r.rotated)
+        assertEquals("активный файл содержит новую строку", "NEW-LINE\n", active.readText())
+        val bak = java.io.File(dir, "$name.1")
+        assertTrue("прежняя активная часть сохранена в .1", bak.readText().contains("OLD-PART-1"))
+        assertFalse("ротация не обнуляет .new", java.io.File(dir, "$name.new").exists())
+        dir.deleteRecursively()
+    }
+
+    @Test
+    fun existingNewFileIsNotTruncated() {
+        val dir = tmpLogDir()
+        val name = "app.log"
+        java.io.File(dir, name).writeText("X".repeat(64))
+        // `.new` остался от прошлой неудачной ротации: данные в нём НЕ обнуляются.
+        java.io.File(dir, "$name.new").writeText("PRESERVED-FROM-EARLIER\n")
+        val r = FileLogCore.append(dir, name, "TAIL\n", maxBytes = 8L)
+        assertTrue(r.written)
+        val merged = java.io.File(dir, name).readText()
+        assertTrue("старый .new сохранён, а не затёрт: «$merged»",
+            merged.contains("PRESERVED-FROM-EARLIER") && merged.contains("TAIL"))
+        dir.deleteRecursively()
+    }
+
+    @Test
+    fun busyJvmLockDoesNotLoseTheLine() {
+        val dir = tmpLogDir()
+        val name = "app.log"
+        val active = java.io.File(dir, name)
+        // Путь «JVM-лок занят» больше не теряет строку: она уходит в spill этого процесса.
+        // Проверяем именно этот вспомогательный путь (взять JVM-лок снаружи API нельзя).
+        assertTrue("spill этого процесса пишется", FileLogCore.spillAppend(active, "LINE-A\n"))
+        val spill = FileLogCore.spillFor(active)
+        assertTrue("spill содержит строку", spill.readText().contains("LINE-A"))
+        val drained = FileLogCore.drainSpill(dir, name)
+        assertTrue("слияние выполнено (перенесено строк: $drained)", drained >= 0)
+        assertTrue("строка в основном журнале", active.readText().contains("LINE-A"))
+        assertFalse("spill убран после успешного слияния", spill.exists())
+        dir.deleteRecursively()
+    }
 }

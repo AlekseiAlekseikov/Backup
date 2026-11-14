@@ -109,6 +109,21 @@ object Prefs2 {
         return maxOf(c, d, 0L) + 1
     }
 
+    /**
+     * iter48 §Г — межпроцессный lock на ключ.
+     *
+     * Раньше «прочитать ревизию → записать ревизию+1» держалась только JVM-замком (его здесь и
+     * не было), поэтому два процесса могли прочитать одну ревизию и записать РАЗНЫЕ значения
+     * с одинаковым номером — тот самый «конфликт равных ревизий», порядок которого восстановить
+     * нельзя. Теперь read-modify-write целиком идёт под [ProcLock] (lock-файл ОС, не JVM).
+     *
+     * Ограничения (записаны честно): убийство процесса между записью копии №1 и №2 остаётся
+     * возможным — для этого есть ревизии и согласование при чтении; lock-файл не мешает другим
+     * приложениям писать в свои prefs.
+     */
+    private fun lockFile(app: Context, key: String): java.io.File =
+        java.io.File(java.io.File(app.filesDir, "locks"), "prefs_" + key.replace('/', '_') + ".lock")
+
     private fun writeBoth(
         app: Context,
         key: String,
@@ -140,25 +155,36 @@ object Prefs2 {
      */
     fun putBooleanEx(c: Context, key: String, value: Boolean): Save {
         val app = c.applicationContext
-        val rev = nextRev(app, key)
-        val stores = writeBoth(app, key, rev) { ed ->
-            ed.putBoolean(key, value)
-            ed.putBoolean(delKey(key), false)
+        val locked = ProcLock.withLock(lockFile(app, key)) {
+            val rev = nextRev(app, key)
+            val stores = writeBoth(app, key, rev) { ed ->
+                ed.putBoolean(key, value)
+                ed.putBoolean(delKey(key), false)
+            }
+            val pc = runCatching { cps(app) }.getOrNull()
+            val pd = runCatching { dps(app) }.getOrNull()
+            val rc = readRev(pc, key)
+            val rd = readRev(pd, key)
+            val cv = runCatching { pc?.let { if (it.contains(key)) it.getBoolean(key, value) else null } }.getOrNull()
+            val dv = runCatching { pd?.let { if (it.contains(key)) it.getBoolean(key, value) else null } }.getOrNull()
+            val conflict = rc == rd && rc >= 0L && cv != null && dv != null && cv != dv
+            // §Г iter48: при конфликте равных ревизий запись НЕ подтверждена, даже если наша
+            // копия содержит наше значение: во второй копии лежит другое, и порядок неизвестен.
+            val storeConfirmed = (rc == rev && cv == value) || (rd == rev && dv == value)
+            val confirmed = storeConfirmed && !conflict
+            val why = when {
+                conflict -> "conflict_same_rev"
+                confirmed && stores == 2 -> ""
+                confirmed -> "partial_stores:$stores"
+                else -> "not_persisted"
+            }
+            Save(confirmed, stores, if (confirmed) rev else -1L, conflict, why)
         }
-        val pc = runCatching { cps(app) }.getOrNull()
-        val pd = runCatching { dps(app) }.getOrNull()
-        val rc = readRev(pc, key)
-        val rd = readRev(pd, key)
-        val cv = runCatching { pc?.let { if (it.contains(key)) it.getBoolean(key, value) else null } }.getOrNull()
-        val dv = runCatching { pd?.let { if (it.contains(key)) it.getBoolean(key, value) else null } }.getOrNull()
-        val conflict = rc == rd && rc >= 0L && cv != null && dv != null && cv != dv
-        val confirmed = (rc == rev && cv == value) || (rd == rev && dv == value)
-        val why = when {
-            confirmed && stores == 2 -> ""
-            confirmed -> "partial_stores:$stores"
-            else -> "not_persisted"
+        if (!locked.executed) {
+            return Save(false, 0, -1L, false,
+                "lock_${locked.reason} (межпроцессный lock не взят: запись не заявляется подтверждённой)")
         }
-        return Save(confirmed, stores, if (confirmed) rev else -1L, conflict, why)
+        return locked.value!!
     }
 
     /**
@@ -167,21 +193,48 @@ object Prefs2 {
      */
     fun removeEx(c: Context, key: String): Save {
         val app = c.applicationContext
-        val rev = nextRev(app, key)
-        val stores = writeBoth(app, key, rev) { ed ->
-            ed.remove(key)
-            ed.putBoolean(delKey(key), true)
+        val locked = ProcLock.withLock(lockFile(app, key)) {
+            val rev = nextRev(app, key)
+            val stores = writeBoth(app, key, rev) { ed ->
+                ed.remove(key)
+                ed.putBoolean(delKey(key), true)
+            }
+            val pc = runCatching { cps(app) }.getOrNull()
+            val pd = runCatching { dps(app) }.getOrNull()
+            val rc = readRev(pc, key)
+            val rd = readRev(pd, key)
+            // §Г iter48: удаление подтверждено не «ревизией», а ФАКТОМ: в копии нет значения,
+            // tombstone стоит, и ревизия — наша. Иначе «удалено» могло означать лишь то, что
+            // запись дошла до одной копии, а во второй значение живо.
+            val goneC = pc == null || !pc.contains(key)
+            val goneD = pd == null || !pd.contains(key)
+            val delC = readDel(pc, key)
+            val delD = readDel(pd, key)
+            val okC = rc == rev && goneC && delC
+            val okD = rd == rev && goneD && delD
+            val confirmed = okC || okD
+            val why = when {
+                confirmed && stores == 2 && okC && okD -> ""
+                confirmed -> "partial_stores:$stores"
+                else -> "not_persisted"
+            }
+            Save(confirmed, stores, if (confirmed) rev else -1L, false, why)
         }
-        val rc = readRev(runCatching { cps(app) }.getOrNull(), key)
-        val rd = readRev(runCatching { dps(app) }.getOrNull(), key)
-        val confirmed = rc == rev || rd == rev
-        return Save(confirmed, stores, if (confirmed) rev else -1L, false,
-            if (confirmed) (if (stores == 2) "" else "partial_stores:$stores") else "not_persisted")
+        if (!locked.executed) {
+            return Save(false, 0, -1L, false, "lock_${locked.reason}")
+        }
+        return locked.value!!
     }
 
     fun putStringEx(c: Context, key: String, value: String?): Save =
         if (value == null) removeEx(c, key) else {
             val app = c.applicationContext
+            ProcLock.withLock(lockFile(app, key)) { putStringLocked(app, key, value) }
+                .let { if (it.executed) it.value!! else Save(false, 0, -1L, false, "lock_${it.reason}") }
+        }
+
+    /** Внутренняя запись строки — ВЫЗЫВАТЬ ТОЛЬКО под [ProcLock]. */
+    private fun putStringLocked(app: Context, key: String, value: String): Save {
             val rev = nextRev(app, key)
             val stores = writeBoth(app, key, rev) { ed ->
                 ed.putString(key, value)
@@ -195,13 +248,14 @@ object Prefs2 {
             val dv = runCatching { pd?.getString(key, null) }.getOrNull()
             val conflict = rc == rd && rc >= 0L && cv != null && dv != null && cv != dv
             val confirmed = (rc == rev && cv == value) || (rd == rev && dv == value)
-            Save(confirmed, stores, if (confirmed) rev else -1L, conflict,
+            return Save(confirmed, stores, if (confirmed) rev else -1L, conflict,
                 when {
+                    conflict -> "conflict_same_rev"
                     confirmed && stores == 2 -> ""
                     confirmed -> "partial_stores:$stores"
                     else -> "not_persisted"
                 })
-        }
+    }
 
     /** Оставить для совместимости: `true`, если запись подтверждена хотя бы в одной копии. */
     fun putBoolean(c: Context, key: String, value: Boolean): Boolean =
@@ -226,14 +280,39 @@ object Prefs2 {
         )
     }
 
+    /**
+     * iter48 §Г — ТРЁХЗНАЧНОЕ чтение тумблера: `null` = «неизвестно» (копии в конфликте или
+     * значение прочитать нельзя). Именно это значение обязано доходить до UI и до логики
+     * применения: подставлять `default` нельзя, иначе интерфейс показывает выдуманное
+     * состояние, а автоматика действует «вслепую».
+     */
+    fun getBooleanOrNull(c: Context, key: String): Boolean? =
+        when (val r = readBoolean(c, key)) {
+            is Toggles45.Resolved.Value -> r.v
+            Toggles45.Resolved.Deleted -> false
+            Toggles45.Resolved.Conflict, Toggles45.Resolved.Unknown -> null
+        }
+
+    /**
+     * Двузначное чтение для НЕкритичных мест (совместимость).
+     *
+     * §Г iter48: неизвестность здесь ОБЯЗАТЕЛЬНО становится видимой в журнале — молчаливая
+     * подстановка `default` и была дефектом («тумблер сам выключился»). Всё, что решает
+     * применять/не применять, должно использовать [getBooleanOrNull] (или `readBoolean`).
+     */
     fun getBoolean(c: Context, key: String, default: Boolean = false): Boolean =
         when (val r = readBoolean(c, key)) {
             is Toggles45.Resolved.Value -> r.v
-            // Конфликт равных ревизий: порядок неизвестен. Отдаём сохранённое значение только
-            // если копии СОВПАЛИ (тогда конфликта нет); иначе — default и запись в журнал
-            // делает вызывающий через readBoolean. Молча выбирать «удобное» нельзя.
             Toggles45.Resolved.Deleted -> false
-            Toggles45.Resolved.Conflict, Toggles45.Resolved.Unknown -> default
+            Toggles45.Resolved.Conflict -> {
+                AppLog.w("CENTRAL_Prefs2", "PREFS_UNKNOWN key=$key reason=conflict_same_rev " +
+                    "fallback=$default (порядок записей неизвестен: значение НЕ выдаётся за решение владельца)")
+                default
+            }
+            Toggles45.Resolved.Unknown -> {
+                AppLog.w("CENTRAL_Prefs2", "PREFS_UNKNOWN key=$key reason=unreadable fallback=$default")
+                default
+            }
         }
 
     fun getString(c: Context, key: String, default: String? = null): String? {
