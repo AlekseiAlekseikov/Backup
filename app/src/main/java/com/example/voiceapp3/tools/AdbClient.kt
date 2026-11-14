@@ -556,26 +556,58 @@ object AdbClient {
      * сверка размера через `wc -c`, запуск `sh <path>`, удаление файла.
      * Возвращает Pair<rc, out>, где out содержит stdout+stderr выполнения.
      */
+    /**
+     * Доставить и выполнить скрипт; вернуть КОД и ВЫВОД (совместимость с прежними вызовами).
+     *
+     * Для тех, кому важна фаза (звук, TTL), есть [executeScriptDetailed]: «скрипт не доставлен»,
+     * «запуск передан» и «исход неизвестен» — РАЗНЫЕ состояния, и от них зависит, можно ли
+     * повторять операцию (см. iter52 §4.2).
+     */
     fun executeScript(name: String, script: String, timeoutMs: Int = 40000, expectRoot: Boolean = true): Pair<Int, String> {
-        // iter51 §3.1: логика доставки вынесена в [ScriptDelivery] и исполняется ЗДЕСЬ (production
-        // путь), а не только в тесте. Изменения против прежней версии:
-        //  • имя файла УНИКАЛЬНО на каждый вызов (было фиксированное `voiceapp3_<name>.sh`:
-        //    два процесса с одинаковым `name` затирали файл друг друга даже при сериализации
-        //    заливок внутри одного процесса);
-        //  • решение «прямо или чанками» принимается по ФАКТИЧЕСКОЙ длине UTF-8;
-        //  • при неудачной заливке/сверке размера скрипт НЕ запускается и это видно в rc.
+        val res = executeScriptDetailed(name, script, timeoutMs, expectRoot)
+        return Pair(res.rc, res.out)
+    }
+
+    /**
+     * Та же доставка, но с явной фазой ([ScriptDelivery.State]).
+     *
+     * Разбор результата вынесен в production, а не в тест: именно здесь решается, что писать в
+     * журнал и что считать применённым.
+     */
+    fun executeScriptDetailed(
+        name: String,
+        script: String,
+        timeoutMs: Int = 40000,
+        expectRoot: Boolean = true
+    ): ScriptDelivery.Result {
         val bytes = ScriptChunker.bytesOf(script)
-        if (bytes.size <= ScriptDelivery.DIRECT_LIMIT) return execute(script, timeoutMs, expectRoot)
+        if (bytes.size <= ScriptDelivery.DIRECT_LIMIT) {
+            val (rc, out) = execute(script, timeoutMs, expectRoot)
+            val lost = out.contains("ERR_ADB_TIMEOUT") || out.contains("ERR_ADB_")
+            val plan = ScriptDelivery.plan(name, script)
+            return ScriptDelivery.Result(
+                rc, out, plan, 1,
+                if (lost) ScriptDelivery.State.RUN_UNKNOWN else ScriptDelivery.State.RUN_SENT,
+                true, false, "", lost
+            )
+        }
         val res = synchronized(scriptUploadLock) {
             ScriptDelivery.deliver(name, script, timeoutMs, expectRoot, ::execute)
         }
-        if (res.delivered && res.sizeChecked) {
-            AppLog.i(TAG, "SCRIPT_UPLOAD name=$name ${res.wire()}")
-        } else {
-            AppLog.e(TAG, "SCRIPT_UPLOAD FAIL name=$name ${res.wire()} " +
-                "out=${LogKit.redactCmd(res.out.replace('\n', ' '), 300)}")
+        when (res.state) {
+            ScriptDelivery.State.RUN_CONFIRMED, ScriptDelivery.State.RUN_SENT ->
+                AppLog.i(TAG, "SCRIPT_UPLOAD name=$name ${res.wire()}")
+            ScriptDelivery.State.UPLOAD_INCOMPLETE, ScriptDelivery.State.TOO_LARGE ->
+                AppLog.e(TAG, "SCRIPT_UPLOAD FAIL name=$name ${res.wire()} " +
+                    "out=${LogKit.redactCmd(res.out.replace('\n', ' '), 300)}")
+            ScriptDelivery.State.RUN_UNKNOWN ->
+                AppLog.e(TAG, "SCRIPT_UPLOAD UNKNOWN name=$name ${res.wire()} " +
+                    "(ответ потерян: запуск МОГ произойти; повтор не выполняется — нужна " +
+                    "сверка фактического состояния функции)")
+            ScriptDelivery.State.NOT_SENT ->
+                AppLog.w(TAG, "SCRIPT_UPLOAD NOT_SENT name=$name ${res.wire()}")
         }
-        return Pair(res.rc, res.out)
+        return res
     }
 
     /**
