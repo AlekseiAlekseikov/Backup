@@ -78,6 +78,7 @@ internal object TtlVerify {
             "CHECK_OWNER" in ttlCheckLine -> "CHECK_OWNER"
             "CHAIN_COLLISION" in ttlCheckLine -> "CHAIN_COLLISION"
             "READ_UNKNOWN" in ttlCheckLine -> "READ_UNKNOWN"
+            "OWN_LEFT_STOP" in ttlCheckLine -> "OWN_LEFT_STOP"
             "APPLY_FAILED" in ttlCheckLine -> "APPLY_FAILED"
             "NOT_APPLIED" in ttlCheckLine -> "NOT_APPLIED"
             "\u2192 VERIFIED" in ttlCheckLine -> "VERIFIED"
@@ -111,6 +112,9 @@ internal object TtlVerify {
         val notApplied = "NOT_APPLIED" in ttlCheckLine ||
             v4Verify == "NOT_APPLIED" || v6Verify == "NOT_APPLIED"
         val quotedRefused = "reason=quoted_spec_needs_owner" in out
+        // iter50 §5.1(3): своё правило снять не удалось — повторное включение остановлено.
+        // В таблице могло остаться КОРРЕКТНОЕ правило от прошлого раза; это не «включилось сейчас».
+        val ownLeftStop = ttlVerdict == "OWN_LEFT_STOP"
         val foreignN = foreign4?.toIntOrNull() ?: 0
         val foreignN6 = foreign6?.toIntOrNull() ?: 0
 
@@ -145,6 +149,9 @@ internal object TtlVerify {
             !expected -> null
             noUplink ->
                 "нет uplink (правило без uplink не ставим — ломает CarPlay), TTL_TRY variant=none reason=no_uplink"
+            ownLeftStop ->
+                "своё правило снять не удалось (TTL_DEL rc≠0): повторное включение остановлено, " +
+                    "чтобы рядом не появилось второе правило. TTL не подтверждён — посмотрите TTL_DEL/TTL_OWN."
             v4Count < 1 || v4Verify != "OK" ->
                 "rule_not_installed: своего правила TTL в mangle/${
                     TtlScript.OUR_CHAIN

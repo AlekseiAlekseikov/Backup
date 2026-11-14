@@ -277,8 +277,13 @@ class Iter49Test {
     fun mountOwnershipUsesDeviceAndInodeNotJustThePrefix() {
         val b = LockMountScripts.bindScript("/data/local/tmp/carlock_custom_g1_ab.wav")
         assertTrue("staging dev:inode снимается", b.contains("STAGE_DEV_INO"))
-        assertTrue("владение доказывается dev:inode", b.contains("method=dev_ino"))
-        assertTrue("несовпадение инода — не наше", b.contains("reason=inode_mismatch"))
+        // iter50 §4.2: владение слоем доказывается ОЖИДАЕМЫМ root (по фактической таблице)
+        // и dev:inode; несовпадение любого признака — не наше/не подтверждено.
+        assertTrue("ожидаемый root считается по таблице",
+            b.contains("expected_root_for") && b.contains("method=longest_mount_prefix"))
+        assertTrue("несовпадение root — не наше", b.contains("vwhy=\"root_mismatch\""))
+        assertTrue("несовпадение инода — не подтверждено", b.contains("dev_ino_mismatch"))
+        assertTrue("факт печатается даже при неудачной проверке", b.contains("MOUNT_FACT:"))
         assertTrue("порядок слоёв не выдаётся за гарантию",
             b.contains("top_guaranteed=no"))
     }

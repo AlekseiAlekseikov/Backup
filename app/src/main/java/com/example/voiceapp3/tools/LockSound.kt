@@ -985,17 +985,27 @@ object LockSound {
                 // Раньше реестр заполнялся только в «счастливой» ветке: если во время bind
                 // владелец выключил звук, слои уже стояли, а реестр о них не знал — снять их
                 // потом было нечем (и «своё» оставалось висеть до перезагрузки).
-                val mountedFacts = MountInfo.parseMountedOk(bindRes.second)
-                    .mapNotNull { (target, src) ->
-                        if (!isOurLockPath(target)) null
-                        else OwnMount(target, src.ifEmpty { stagePath }, gen)
-                    }
-                if (mountedFacts.isNotEmpty()) {
+                // iter50 §4.3: реестр пополняется ФАКТАМИ `MOUNT_FACT` (печатаются после
+                // КАЖДОГО успешного mount), а не только строками `MOUNTED_OK`. Раньше отказ
+                // проверки (в т.ч. дефект разбора, найденный в этой итерации) оставлял реально
+                // созданный слой без учёта — снять его потом было нечем.
+                val allFacts = MountInfo.parseMountFacts(bindRes.second)
+                val mountedFacts = allFacts
+                    .filter { isOurLockPath(it.target) }
+                    .map { f -> OwnMount(f.target, f.source.ifEmpty { stagePath }, gen) }
+                if (allFacts.isNotEmpty()) {
                     val merged = mergeOwnMounts(readOwnMounts(ctx), mountedFacts)
                     writeOwnMounts(ctx, merged)
                     AppLog.i(ctx, TAG, "LOCKSOUND_REGISTRY write_before_converge gen=$gen " +
-                        "layers=${mountedFacts.size} total=${merged.size} " +
-                        "(факт слоя записан до любых дальнейших действий)")
+                        "facts=${allFacts.size} verified=${allFacts.count { it.state == MountInfo.FactState.VERIFIED }} " +
+                        "unverified=${allFacts.count { it.state == MountInfo.FactState.UNVERIFIED }} " +
+                        "unknown=${allFacts.count { it.state == MountInfo.FactState.UNKNOWN }} " +
+                        "total=${merged.size} " +
+                        "(факт слоя записан до любых дальнейших действий; pending не выдаётся за успех)")
+                    for (f in allFacts) {
+                        AppLog.i(ctx, TAG, "LOCKSOUND_MOUNT_FACT target_is_ours=${isOurLockPath(f.target)} " +
+                            f.wire())
+                    }
                 }
                 if (ok && (genChanged || desiredOff)) {
                     // Факт для ЭТОГО поколения не публикуем: он относится к устаревшему выбору.
@@ -1220,7 +1230,7 @@ object LockSound {
                         "(снятие не начиналось: root не обязан давать namespace init)")
                     return@execute
                 }
-                val script = LockMountScripts.restoreScript(entries.map { it.target })
+                val script = LockMountScripts.restoreScript(entries.map { it.target to it.source })
                 val res = AdbClient.execute(script, 20000)
                 AppLog.i(ctx, TAG, "LOCKSOUND_UNMOUNT [exitCode=${res.first}]: " + res.second.trim().take(800))
                 val parsed = MountInfo.parseRestore(res.second)

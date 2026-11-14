@@ -92,6 +92,39 @@ jump_count() {
   jump_specs ${D}1 | wc -l | tr -d ' '
 }
 
+# iter50 §5.1: `-D` требует ОТДЕЛЬНЫЕ argv. Цикл по строкам с IFS=<newline> давал
+# спецификацию ОДНИМ аргументом ("<-o wlan0 -j VAPP_TTL>"), iptables такой вызов отвергает,
+# и наши правила оставались на месте. Разбираем строку на токены сами и передаём их как
+# отдельные позиционные параметры; `eval` НЕ используется, набор допустимых символов
+# ограничен, поэтому подстановки/кавычки/`;` через спецификацию невозможны.
+# Возврат 1 — спецификация вне нашего узкого формата (удалять её нельзя).
+split_spec() {
+  spec=${D}1
+  # Разрешены только символы обычных argv (пробел — разделитель токенов). Всё остальное —
+  # кавычки, $, обратная кавычка, ;, &, |, <, >, скобки, \, *?[]{}~# — отказ: это либо не наш
+  # формат, либо попытка подстановки. Разбор идёт БЕЗ eval, поэтому подстановки невозможны даже
+  # теоретически, но такие правила мы всё равно не трогаем (чужое/непонятное).
+  case "${D}spec" in
+    *[!A-Za-z0-9./:_[:blank:]=,!@+-]*) return 1 ;;
+  esac
+  set -- ${D}spec
+  [ ${D}# -ge 2 ] || return 1
+  case "${D}1" in
+    -*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Удаление ОДНОГО нашего перехода: точные отдельные argv, rc возвращается вызывающему.
+del_jump() {
+  d_tool=${D}1; d_spec=${D}2
+  split_spec "${D}d_spec" || { echo "spec_unsupported"; return 1; }
+  # Позиционные параметры функции заменяются токенами спецификации; каждая передаётся
+  # ОТДЕЛЬНЫМ argv. Глоббинг исключён: символы *?[] отвергнуты split_spec.
+  set -- ${D}d_spec
+  ${D}d_tool -w 5 -t mangle -D POSTROUTING "${D}@"
+}
+
 # Состояние нашей цепочки: absent | empty | ours | collision | unknown.
 # unknown — прочитать нельзя (нет бинарника/прав/lock): это НЕ «правил нет».
 chain_state() {
@@ -159,26 +192,28 @@ drop_family() {
   # (`-o wlan0 -j VAPP_TTL`), поэтому обычный `for ${D}spec in ${D}(...)` разбил бы её на слова
   # и попытался бы удалить не то правило. IFS меняется только на время цикла.
   del_ok=0; del_fail=0
-  NL=${D}(printf '\nx'); NL=${D}{NL%x}
-  OLD_IFS=${D}IFS; IFS=${D}NL
-  for spec in ${D}(jump_specs "${D}tool"); do
+  # Построчное чтение: IFS не меняется, а строка разбирается на ОТДЕЛЬНЫЕ argv внутри
+  # `del_jump`. Спецификация с кавычками/`;`/`$` не разбирается и не удаляется вовсе.
+  while IFS= read -r spec; do
     [ -z "${D}spec" ] && continue
-    # Спецификация с кавычками/экранированием означает сложные match-условия. Такой переход
-    # создали не мы (наш всегда ровно "-o <uplink> -j <OUR>"), а разобрать его без риска
-    # удалить не то правило нельзя — отказ безопаснее (как требует §5.1).
-    Q1="'"; Q2='"'; BS='\'
+    Q1="'"; Q2='"'; BS='\\'
     case "${D}spec" in
       *${D}{Q1}*|*${D}{Q2}*|*${D}{BS}*)
         echo "TTL_DEL family=${D}fam spec=\"${D}spec\" rc=refused reason=quoted_spec_needs_owner"
         del_fail=${D}((del_fail+1)); continue ;;
     esac
-    if ${D}tool -w 5 -t mangle -D POSTROUTING ${D}spec 2>/dev/null; then
+    spec_out=${D}(del_jump "${D}tool" "${D}spec" 2>/dev/null); rc=${D}?
+    if [ "${D}rc" = "0" ]; then
       del_ok=${D}((del_ok+1)); echo "TTL_DEL family=${D}fam spec=\"${D}spec\" rc=0"
+    elif [ "${D}rc" = "1" ] && [ "${D}spec_out" = "spec_unsupported" ]; then
+      echo "TTL_DEL family=${D}fam spec=\"${D}spec\" rc=refused reason=spec_outside_our_format"
+      del_fail=${D}((del_fail+1))
     else
-      del_fail=${D}((del_fail+1)); echo "TTL_DEL family=${D}fam spec=\"${D}spec\" rc=nonzero"
+      del_fail=${D}((del_fail+1)); echo "TTL_DEL family=${D}fam spec=\"${D}spec\" rc=nonzero rc_value=${D}rc"
     fi
-  done
-  IFS=${D}OLD_IFS
+  done <<EOF_SPECS
+${D}(jump_specs "${D}tool")
+EOF_SPECS
   if [ "${D}del_fail" != "0" ]; then
     # Часть переходов снять нельзя (сложная спецификация/отказ). Нашу цепочку НЕ чистим и
     # НЕ удаляем: иначе получится «висячая» цепочка без правила, а TTL останется применённым
@@ -210,6 +245,7 @@ READ_V6=ok; [ "${D}CS_V6" = "unknown" ] && READ_V6=failed
 echo "TTL_OWNERSHIP v4=${D}CS_V4 v6=${D}CS_V6 v6_supported=${D}V6_SUPPORTED read_v4=${D}READ_V4 read_v6=${D}READ_V6 own_chain=${D}OUR"
 
 VARIANT=none
+TTL_STOP=0
 ROLLED_BACK=no
 TOUCHED_v4=no
 TOUCHED_v6=no
@@ -223,23 +259,42 @@ if [ "${D}ENABLE" = "1" ]; then
     NOT_OWNED=""
     case "${D}CS_V4" in collision|empty|unknown) NOT_OWNED="v4=${D}CS_V4";; esac
     if [ "${D}V6_SUPPORTED" = "1" ]; then
-      case "${D}CS_V6" in collision|empty|unknown) NOT_OWNED="${D}{NOT_OWNED} v6=${D}CS_V6}";; esac
+      case "${D}CS_V6" in
+        collision|empty|unknown)
+          if [ -n "${D}NOT_OWNED" ]; then NOT_OWNED="${D}NOT_OWNED v6=${D}CS_V6"
+          else NOT_OWNED="v6=${D}CS_V6"; fi ;;
+      esac
     fi
-    if [ -n "${D}{NOT_OWNED// /}" ]; then
-      echo "TTL_TRY action=skip_all reason=family_not_owned ${D}{NOT_OWNED# }"
+    # POSIX: никаких ${D}{NOT_OWNED// /} — `//` это bashism, на #!/bin/sh (dash) это
+    # «Bad substitution» и скрипт обрывается на середине.
+    if [ -n "${D}NOT_OWNED" ]; then
+      echo "TTL_TRY action=skip_all reason=family_not_owned ${D}NOT_OWNED"
     else
       VARIANT=uplink
       # --- v4 ---
       drop_out4=${D}(drop_family iptables "${D}RULE4" v4); echo "${D}drop_out4"
+      # iter50 §5.1(3): если своё снять НЕ удалось (partial/unknown/collision/skip),
+      # безусловно продолжать -N/-A нельзя — рядом со старым правилом появилось бы второе,
+      # а «слепой rollback» чужого состояния запрещён. Явный отказ с причиной.
+      case "${D}drop_out4" in
+        *:partial*|*:unknown*|*:collision*|*:skip*) echo "TTL_TRY action=stop reason=v4_own_not_removed"; TTL_STOP=1 ;;
+      esac
+      if [ "${D}TTL_STOP" = "0" ]; then
       iptables -w 5 -t mangle -N "${D}OUR" 2>/dev/null
       iptables -w 5 -t mangle -A "${D}OUR" -j TTL --ttl-set 65 2>&1
       rc_a=${D}?; echo "TTL_ADD family=v4 chain=${D}OUR rc=${D}rc_a"
       iptables -w 5 -t mangle -A POSTROUTING -o "${D}UPLINK" -j "${D}OUR" 2>&1
       rc_j=${D}?; echo "TTL_ADD family=v4 jump scope=\"-o ${D}UPLINK\" rc=${D}rc_j"
       TOUCHED_v4=yes
+      fi
       # --- v6 ---
-      if [ "${D}V6_SUPPORTED" = "1" ]; then
+      if [ "${D}V6_SUPPORTED" = "1" ] && [ "${D}TTL_STOP" = "0" ]; then
         drop_out6=${D}(drop_family ip6tables "${D}RULE6" v6); echo "${D}drop_out6"
+        case "${D}drop_out6" in
+          *:partial*|*:unknown*|*:collision*|*:skip*) echo "TTL_TRY action=stop reason=v6_own_not_removed"; TTL_STOP=1 ;;
+        esac
+      fi
+      if [ "${D}V6_SUPPORTED" = "1" ] && [ "${D}TTL_STOP" = "0" ]; then
         ip6tables -w 5 -t mangle -N "${D}OUR" 2>/dev/null
         ip6tables -w 5 -t mangle -A "${D}OUR" -j HL --hl-set 65 2>&1
         rc_a6=${D}?; echo "TTL_ADD family=v6 chain=${D}OUR rc=${D}rc_a6"
@@ -247,17 +302,25 @@ if [ "${D}ENABLE" = "1" ]; then
         rc_j6=${D}?; echo "TTL_ADD family=v6 jump scope=\"-o ${D}UPLINK\" rc=${D}rc_j6"
         TOUCHED_v6=yes
       fi
+      # iter50 §5.1(3): если мы ОСТАНОВИЛИСЬ (своё снять не удалось), -N/-A не выполнялись,
+      # поэтому rc_* остались пустыми. Пустое значение нельзя трактовать как «rc != 0» —
+      # иначе печатается ложный TTL_ROLLBACK и в худшем случае трогается цепочка без нужды.
+      if [ "${D}TTL_STOP" = "1" ]; then
+        rc_a=skip; rc_j=skip; rc_a6=skip; rc_j6=skip
+      fi
       # Половинчатое включение не оставляем: если хоть одна семья не встала, снимаем обе.
       # Порядок важен: сначала ТОЧНЫЙ переход, затем -F, затем -X (иначе -X вернёт "Too many links").
       need_rb=no
-      [ "${D}rc_a" != "0" ] && need_rb=yes
-      [ "${D}rc_j" != "0" ] && need_rb=yes
-      if [ "${D}V6_SUPPORTED" = "1" ]; then
-        [ "${D}rc_a6" != "0" ] && need_rb=yes
-        [ "${D}rc_j6" != "0" ] && need_rb=yes
+      if [ "${D}TTL_STOP" = "0" ]; then
+        [ "${D}rc_a" != "0" ] && need_rb=yes
+        [ "${D}rc_j" != "0" ] && need_rb=yes
+        if [ "${D}V6_SUPPORTED" = "1" ]; then
+          [ "${D}rc_a6" != "0" ] && need_rb=yes
+          [ "${D}rc_j6" != "0" ] && need_rb=yes
+        fi
       fi
       if [ "${D}need_rb" = "yes" ]; then
-        echo "TTL_ROLLBACK reason=incomplete rc4=${D}rc_a/${D}rc_j rc6=${D}{rc_a6:-n}/ ${D}{rc_j6:-n}"
+        echo "TTL_ROLLBACK reason=incomplete rc4=${D}rc_a/${D}rc_j rc6=${D}{rc_a6:-n}/${D}{rc_j6:-n}"
         if [ "${D}TOUCHED_v6" = "yes" ]; then
           ip6tables -w 5 -t mangle -D POSTROUTING -o "${D}UPLINK" -j "${D}OUR" >/dev/null 2>&1; rj6=${D}?
           ip6tables -w 5 -t mangle -F "${D}OUR" >/dev/null 2>&1; rf6=${D}?
@@ -284,7 +347,8 @@ if [ "${D}ENABLE" = "1" ]; then
         while [ "${D}n" -gt 1 ] 2>/dev/null; do
           s=${D}(jump_specs "${D}tool" | head -1)
           [ -z "${D}s" ] && break
-          ${D}tool -w 5 -t mangle -D POSTROUTING ${D}s 2>/dev/null || break
+          # тот же безопасный путь: отдельные argv, без eval и склейки
+          del_jump "${D}tool" "${D}s" >/dev/null 2>&1 || break
           n=${D}(jump_count "${D}tool")
         done
       done
@@ -375,6 +439,9 @@ fi
 if [ "${D}ENABLE" = "1" ]; then
   if [ "${D}VERIFY_V4" = "UNKNOWN" ] || [ "${D}VERIFY_V6" = "UNKNOWN" ]; then VERDICT=READ_UNKNOWN
   elif [ "${D}VERIFY_V4" = "COLLISION" ] || [ "${D}VERIFY_V6" = "COLLISION" ]; then VERDICT=CHAIN_COLLISION
+  # iter50 §5.1(3): остановка из-за неснятого своего правила — НЕ успех, даже если в таблице
+  # стоит корректное правило (оно осталось от прошлого раза, а не выставлено сейчас).
+  elif [ "${D}TTL_STOP" = "1" ]; then VERDICT=OWN_LEFT_STOP
   elif [ "${D}VERIFY_V4" = "OK" ] && [ "${D}VERIFY_V6" = "OK" ] && [ "${D}SCOPE_UPLINK_ONLY" = "yes" ]; then VERDICT=SCOPED_OK
   elif [ "${D}VERIFY_V4" = "OK" ] && [ "${D}VERIFY_V6" = "SKIPPED" ] && [ "${D}SCOPE_UPLINK_ONLY" = "yes" ]; then VERDICT=SCOPED_V4_ONLY
   elif [ "${D}ROLLED_BACK" = "yes" ]; then VERDICT=APPLY_FAILED

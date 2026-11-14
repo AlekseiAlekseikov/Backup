@@ -436,7 +436,10 @@ class Iter48Test {
     @Test
     fun restoreScriptReportsPerTargetAndKeepsStageWhileLayersLeft() {
         val s = LockMountScripts.restoreScript(
-            listOf("/vendor/etc/carlock/a.wav", "/vendor/etc/carlock/b.wav")
+            listOf(
+                "/vendor/etc/carlock/a.wav" to "/data/local/tmp/carlock_custom_a.wav",
+                "/vendor/etc/carlock/b.wav" to "/data/local/tmp/carlock_custom_b.wav"
+            )
         )
         assertTrue(s.contains("STOCK_OK:/vendor/etc/carlock/a.wav"))
         assertTrue(s.contains("STOCK_UNPROVEN:/vendor/etc/carlock/b.wav"))

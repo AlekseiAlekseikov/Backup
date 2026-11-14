@@ -134,11 +134,76 @@ internal object MountInfo {
     fun parseMountedOk(output: String): List<Pair<String, String>> =
         output.lineSequence().map { it.trim() }
             .filter { it.startsWith("MOUNTED_OK:") }
+            .mapNotNull { line -> parsePair(line.removePrefix("MOUNTED_OK:")) }
+            .toList()
+
+    /**
+     * iter50 §4.3: ФАКТ слоя после успешного `mount` — независимо от результата проверки.
+     *
+     * Прежде реестр пополнялся ТОЛЬКО строками `MOUNTED_OK`. Любой отказ проверки (или дефект
+     * разбора, который и был найден в iter50) оставлял реально созданный bind-слой без учёта —
+     * снять его потом было нечем. Теперь `MOUNT_FACT` печатается после каждого успешного
+     * `mount`, и запись попадает в реестр с честным состоянием.
+     */
+    enum class FactState {
+        /** Проверка подтвердила именно наш слой (root + dev:inode). */
+        VERIFIED,
+        /** Слой есть, но проверка не сошлась (чужой/не тот root, другой inode). */
+        UNVERIFIED,
+        /** Слой мог появиться, а доказать нельзя (нет таблицы/stat, повреждённая строка). */
+        UNKNOWN
+    }
+
+    data class MountFact(
+        val target: String,
+        val source: String,
+        val state: FactState,
+        val mid: String,
+        val root: String,
+        val devIno: String,
+        val reason: String,
+        val mountRc: String
+    ) {
+        fun wire(): String = "state=${state.name.lowercase()} mid=$mid root=$root " +
+            "dev_ino=$devIno reason=$reason mount_rc=$mountRc"
+
+        /**
+         * Слой НАДО помнить: он существует (mount вернул 0). `VERIFIED` — подтверждён,
+         * `UNVERIFIED`/`UNKNOWN` — запись сохраняется как pending, чтобы её можно было снять
+         * позже, не выдавая её за доказанно нашу.
+         */
+        @Suppress("unused")
+        val remember: Boolean get() = true
+    }
+
+    private fun parsePair(body: String): Pair<String, String>? {
+        val cut = body.substringBefore(" mid=").trim()
+        val target = cut.substringBefore('|').trim()
+        val source = cut.substringAfter('|', "").trim()
+        return if (target.isEmpty()) null else target to source
+    }
+
+    /** Разбор строк `MOUNT_FACT:<target>|<stage> state=… mid=… root=… dev_ino=… reason=… mount_rc=…`. */
+    fun parseMountFacts(output: String): List<MountFact> =
+        output.lineSequence().map { it.trim() }
+            .filter { it.startsWith("MOUNT_FACT:") }
             .mapNotNull { line ->
-                val body = line.removePrefix("MOUNTED_OK:").substringBefore(" mid=").trim()
-                val target = body.substringBefore('|').trim()
-                val source = body.substringAfter('|', "").trim()
-                if (target.isEmpty()) null else target to source
+                val rest = line.removePrefix("MOUNT_FACT:")
+                val head = rest.substringBefore(' ').trim()
+                val target = head.substringBefore('|').trim()
+                val source = head.substringAfter('|', "").trim()
+                if (target.isEmpty()) return@mapNotNull null
+                fun field(k: String): String {
+                    val m = Regex("(?:^|\\s)" + Regex.escape(k) + "=(\\S+)").find(rest)
+                    return m?.groupValues?.get(1) ?: "unknown"
+                }
+                val state = when (field("state")) {
+                    "verified" -> FactState.VERIFIED
+                    "unverified" -> FactState.UNVERIFIED
+                    else -> FactState.UNKNOWN
+                }
+                MountFact(target, source, state, field("mid"), field("root"), field("dev_ino"),
+                    field("reason"), field("mount_rc"))
             }
             .toList()
 
