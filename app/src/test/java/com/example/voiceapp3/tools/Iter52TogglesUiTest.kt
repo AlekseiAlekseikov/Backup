@@ -29,39 +29,123 @@ class Iter52TogglesUiTest {
 
     private val panel = "src/main/java/com/example/voiceapp3/ui/ToolsPanel.kt"
 
-    // ───────────────── §8.2: удержание клика ─────────────────
+    // ───────────────── §9.1: решение принимается по ПРИЧИНЕ, а не по числу ответов ─────────────────
+    //
+    // iter52 §8.2 держала клик по счётчику несогласий; iter53 §9.1 заменила счётчик причинной
+    // моделью (номер клика + ревизия записи в снимке). Поведение «поздний снимок не откатывает
+    // клик» сохранено, но доказательство теперь есть, поэтому тесты ниже проверяют его.
+
+    private fun pending(id: Long = 7L, value: Boolean = true, age: Long = 0L) =
+        ToolsStateCausality.PendingClick("ttl65", value, id, 0L) // requestedAtMs не важен: age задаём явно
+
+    private fun ack(id: Long, rev: Long, ok: Boolean = true) =
+        ToolsStateCausality.WriteAck("ttl65", id, ok, rev)
+
+    private fun decide(
+        pending: ToolsStateCausality.PendingClick?,
+        ack: ToolsStateCausality.WriteAck?,
+        snapshotValue: Boolean?,
+        snapshotRev: Long?,
+        age: Long = 0L
+    ) = ToolsStateCausality.decide(pending, ack, snapshotValue, snapshotRev, age)
 
     @Test
     fun withoutClickSnapshotIsApplied() {
-        assertEquals(Toggles45.HoldOutcome.APPLY_SNAPSHOT,
-            Toggles45.holdAfterSnapshot(null, true))
-        assertEquals(Toggles45.HoldOutcome.APPLY_SNAPSHOT,
-            Toggles45.holdAfterSnapshot(null, null))
+        assertEquals(ToolsStateCausality.Decision.APPLY_SNAPSHOT,
+            decide(null, null, true, 5L))
+        assertEquals(ToolsStateCausality.Decision.APPLY_SNAPSHOT,
+            decide(null, ack(3, 5), false, 5L))
     }
 
     @Test
     fun unknownSnapshotNeverOverridesClick() {
-        val hold = Toggles45.ClickHold(value = true)
+        val p = pending()
         assertEquals("неизвестность — не факт, клик держим",
-            Toggles45.HoldOutcome.KEEP_CLICK, Toggles45.holdAfterSnapshot(hold, null))
-        assertEquals(Toggles45.HoldOutcome.KEEP_CLICK,
-            Toggles45.holdAfterSnapshot(hold.copy(disagreements = 5), null))
+            ToolsStateCausality.Decision.KEEP_CLICK, decide(p, ack(7, 4), null, 9L))
+        assertEquals(ToolsStateCausality.Decision.KEEP_CLICK,
+            decide(p, null, null, 9L, age = 60_000L))
     }
 
     @Test
-    fun lateSnapshotDoesNotRollClickBack() {
-        val hold = Toggles45.ClickHold(value = true)
-        assertEquals("первый противоречащий снимок может быть старым",
-            Toggles45.HoldOutcome.KEEP_CLICK, Toggles45.holdAfterSnapshot(hold, false))
-        assertEquals("снимок согласился — удержание снимается",
-            Toggles45.HoldOutcome.CLEAR_CONFIRMED, Toggles45.holdAfterSnapshot(hold, true))
+    fun staleSnapshotDoesNotRollClickBack() {
+        // Снимок посчитан ДО записи: его ревизия меньше ревизии подтверждения.
+        assertEquals("свежесть не доказана — держим выбор владельца",
+            ToolsStateCausality.Decision.KEEP_CLICK, decide(pending(), ack(7, 9), false, 8L))
+        // Снимок без ревизии ничего не доказывает.
+        assertEquals(ToolsStateCausality.Decision.KEEP_CLICK,
+            decide(pending(), ack(7, 9), false, null))
+        // Записи ещё нет вовсе.
+        assertEquals(ToolsStateCausality.Decision.KEEP_CLICK, decide(pending(), null, false, 99L))
+        // Подтверждение есть и снимок прочитан ПОСЛЕ записи, значение совпало.
+        assertEquals(ToolsStateCausality.Decision.CLEAR_CONFIRMED,
+            decide(pending(), ack(7, 9), true, 9L))
     }
 
     @Test
-    fun secondDisagreementShowsTheFactAndSaysSo() {
-        val hold = Toggles45.ClickHold(value = true, disagreements = 1)
-        assertEquals("второй раз — это факт, а не гонка",
-            Toggles45.HoldOutcome.APPLY_SNAPSHOT_CONFLICT, Toggles45.holdAfterSnapshot(hold, false))
+    fun twoOldResponsesAreStillNotAFact() {
+        // Главный дефект iter52: «второй несогласный снимок = факт». Теперь два (и двадцать)
+        // старых снимков не перетирают клик — они одинаково НЕ доказывают, что видели запись.
+        repeat(20) {
+            assertEquals(ToolsStateCausality.Decision.KEEP_CLICK,
+                decide(pending(), ack(7, 9), false, 8L))
+        }
+    }
+
+    @Test
+    fun provenContradictionIsShownAsFact() {
+        // Запись подтверждена, снимок прочитан после неё и показывает ДРУГОЕ значение — факт.
+        assertEquals(ToolsStateCausality.Decision.SNAPSHOT_CONTRADICTS_WRITE,
+            decide(pending(), ack(7, 9), false, 9L))
+    }
+
+    @Test
+    fun failedWriteIsReportedInsteadOfFakeSuccess() {
+        assertEquals(ToolsStateCausality.Decision.WRITE_FAILED,
+            decide(pending(), ack(7, 9, ok = false), true, 9L))
+    }
+
+    @Test
+    fun ackOfNewerClickSupersedesOldOne() {
+        // Владелец кликнул ещё раз (номер больше): старый клик больше не держим.
+        assertEquals(ToolsStateCausality.Decision.APPLY_SNAPSHOT,
+            decide(pending(id = 7), ack(8, 9), false, 9L))
+    }
+
+    @Test
+    fun missingAckBecomesHonestUnconfirmed() {
+        assertEquals("в пределах ожидания держим",
+            ToolsStateCausality.Decision.KEEP_CLICK, decide(pending(), null, false, 9L, age = 100L))
+        assertEquals("по истечении — честно «не подтверждено», а не выдуманный успех",
+            ToolsStateCausality.Decision.UNCONFIRMED,
+            decide(pending(), null, false, 9L, age = ToolsStateCausality.UNCONFIRMED_AFTER_MS))
+    }
+
+    @Test
+    fun clickIdsAreMonotonicAndAcksKeepTheNewest() {
+        ToolsStateCausality.resetForTest()
+        val a = ToolsStateCausality.nextClickId()
+        val b = ToolsStateCausality.nextClickId()
+        assertTrue("номера кликов растут: $a → $b", b > a)
+        ToolsStateCausality.recordAck(ack(b, 10))
+        ToolsStateCausality.recordAck(ack(a, 11)) // старый клик не должен перетереть новый ack
+        assertEquals(b, ToolsStateCausality.ackFor("ttl65")?.clickId)
+        // «Чужой» отправитель без номера не создаёт подтверждения.
+        ToolsStateCausality.recordAck(ack(-1, 12))
+        assertEquals(b, ToolsStateCausality.ackFor("ttl65")?.clickId)
+    }
+
+    @Test
+    fun acksSurviveWireRoundTrip() {
+        ToolsStateCausality.resetForTest()
+        ToolsStateCausality.recordAck(ack(5, 42))
+        val json = ToolsStateCausality.acksJson()
+        val back = ToolsStateCausality.readAcks(json)
+        assertEquals(5L, back["ttl65"]?.clickId)
+        assertEquals(42L, back["ttl65"]?.rev)
+        assertEquals(true, back["ttl65"]?.ok)
+        // Мусор вместо $acks — «подтверждений нет», а не падение снимка.
+        assertTrue(ToolsStateCausality.readAcks(com.google.gson.JsonObject()).isEmpty())
+        ToolsStateCausality.resetForTest()
     }
 
     // ───────────────── §8.2: холодный старт ─────────────────
@@ -94,11 +178,14 @@ class Iter52TogglesUiTest {
     }
 
     @Test
-    fun panelReallyUsesClickHoldDecision() {
+    fun panelReallyUsesCausalDecision() {
         val p = code(panel)
-        assertTrue("решение принимается production-функцией",
-            p.contains("Toggles45.holdAfterSnapshot("))
-        assertTrue("удержание ставится на клике", p.contains("clickHold[key] = "))
+        assertTrue("решение принимается production-функцией причины, а не счётчиком",
+            p.contains("ToolsStateCausality.decide("))
+        assertFalse("эвристика «два ответа = факт» удалена",
+            p.contains("holdAfterSnapshot(") || p.contains("clickHold"))
+        assertTrue("номер клика ставится на клике", p.contains("ToolsStateCausality.nextClickId()"))
+        assertTrue("номер клика уходит в запись", p.contains("addProperty(\"clickId\", clickId)"))
         assertTrue("и видно в журнале, почему снимок не применён", p.contains("TOGGLE_HOLD"))
         assertTrue("конфликт назван честно", p.contains("TOGGLE_CONFLICT"))
         // Красного текста и новых кнопок для этих состояний быть не должно (мандат §8.2).

@@ -490,6 +490,11 @@ class UiBridge(
                     val obj: JsonObject = JsonParser.parseString(data).asJsonObject
                     val key = obj.get("key")?.asString
                     val element = obj.get("value")
+                    // iter53 §9.1: номер клика — часть контракта записи. Пришёл от панели/страницы —
+                    // вернётся в снимке вместе с ревизией; нет (чужой отправитель) → -1, и тогда
+                    // снимок не выдаётся за подтверждение этой записи.
+                    val clickId = obj.get("clickId")?.takeIf { it.isJsonPrimitive }
+                        ?.let { runCatching { it.asLong }.getOrNull() } ?: -1L
                     if (key == null || element == null) null
                     else {
                         val value: Any = if (element.isJsonPrimitive && element.asJsonPrimitive.isBoolean) {
@@ -497,16 +502,16 @@ class UiBridge(
                         } else {
                             element.asString
                         }
-                        key to value
+                        Triple(key, value, clickId)
                     }
                 }.getOrElse { Log.w(TAG, "settings.change parse failed", it); null }
                 if (parsed != null) {
-                    val (key, value) = parsed
+                    val (key, value, clickId) = parsed
                     if (key == "theme") {
                         TelemetryPrefsMirror.rememberShellTheme(activity, value.toString())
                     }
                     com.example.voiceapp3.tools.BgWorker.run("UiBridge.settings.change/$key", {
-                        tools.applyFromUi(key, value)
+                        tools.applyFromUi(key, value, clickId)
                     }) { res ->
                         res.getOrNull()?.let { result ->
                             lastToolsResult = result
@@ -842,21 +847,45 @@ class UiBridge(
     /** Наибольший доставленный номер запроса (монотонный сторож доставки). */
     private val toolsStateDelivered = java.util.concurrent.atomic.AtomicLong(0)
 
-    /** Читает состояние с проверкой ревизии изменений (см. [ToolsBackend.revision]). */
-    private fun readToolsState(): com.google.gson.JsonObject {
+    /**
+     * iter53 §9.1: снимок + РЕВИЗИЯ ЗАПИСИ, на фоне которой он прочитан.
+     *
+     * Это и есть причинность: `rev` — значение [ToolsBackend.revision] после завершения чтения.
+     * Снимок с `rev >= ack.rev` доказуемо прочитан после нашей записи, поэтому его значение по
+     * ключу — факт, а не «ещё один ответ». Снимок без rev (старый путь/чужой отправитель) ничего
+     * не доказывает и не перетирает выбор владельца.
+     */
+    private class Snapshot(val json: com.google.gson.JsonObject, val rev: Long)
+
+    private fun readToolsStateWithRev(): Snapshot {
         // Составной снимок читается из нескольких источников; если во время чтения что-то
         // записали, значения могут относиться к разным моментам. Перечитываем ОДИН раз.
+        //
+        // Причинность берётся ДО чтения (rev0): снимок гарантированно отражает только те
+        // записи, которые ЗАВЕРШИЛИСЬ раньше rev0. Взять ревизию после чтения было бы гонкой:
+        // запись, завершившаяся во время чтения, «подтвердила» бы устаревшие значения.
         val rev0 = tools.revision()
         var st = tools.state()
         if (tools.revision() != rev0) st = tools.state()
-        return st
+        return Snapshot(st, rev0)
+    }
+
+    /** Читает состояние с проверкой ревизии изменений (см. [ToolsBackend.revision]). */
+    private fun readToolsState(): com.google.gson.JsonObject = readToolsStateWithRev().json
+
+    /** Причинность в снимке: ревизия записи и подтверждения конкретных записей. */
+    private fun attachCausality(st: com.google.gson.JsonObject, rev: Long) {
+        st.addProperty("rev", rev)
+        st.add("\$acks", com.example.voiceapp3.tools.ToolsStateCausality.acksJson())
     }
 
     private fun pushToolsState() {
         // Номер — ДО чтения состояния (§4.1 iter46).
         val seq = toolsStateSeq.incrementAndGet()
-        val state = readToolsState()
+        val snap = readToolsStateWithRev()
+        val state = snap.json
         if (!markToolsStateDelivered(seq, "push")) return
+        attachCausality(state, snap.rev)
         state.addProperty("seq", seq)
         state.addProperty("stateLoaded", true)
         lastToolsResult?.let { state.add("last", it.toJson()) }
@@ -882,10 +911,12 @@ class UiBridge(
         // §4.1 iter46: номер выдаётся В МОМЕНТ ЗАПРОСА, до чтения состояния.
         val seq = toolsStateSeq.incrementAndGet()
         com.example.voiceapp3.tools.BgWorker.run("UiBridge.toolsState/$reason", {
-            readToolsState()
+            readToolsStateWithRev()
         }) { res ->
-            val json = res.getOrNull() ?: return@run
+            val snap = res.getOrNull() ?: return@run
+            val json = snap.json
             if (!markToolsStateDelivered(seq, reason)) return@run
+            attachCausality(json, snap.rev)
             json.addProperty("seq", seq)
             json.addProperty("stateLoaded", true)
             lastToolsResult?.let { json.add("last", it.toJson()) }

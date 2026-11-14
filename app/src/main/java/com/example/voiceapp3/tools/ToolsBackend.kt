@@ -1006,7 +1006,37 @@ enum class Choice(
      * Возвращает `null`, если ключ реестру неизвестен (тогда его обрабатывает
      * прежний путь шелла — телеметрические ключи `auto`/`gps`/`cont`/...).
      */
-    fun applyFromUi(key: String, value: Any?): ToolsResult? {
+    fun applyFromUi(key: String, value: Any?): ToolsResult? = applyFromUiImpl(key, value)
+
+    /**
+     * iter53 §9.1: запись + ДОКАЗАТЕЛЬСТВО для конкретного клика.
+     *
+     * `clickId` приходит от UI (панель/страница) и возвращается обратно в снимке вместе с
+     * ревизией записи на момент её завершения ([writeRevision]). Только эта пара доказывает,
+     * что снимок видел результат ИМЕННО этой записи; количество ответов ничего не доказывает.
+     */
+    fun applyFromUi(key: String, value: Any?, clickId: Long): ToolsResult? {
+        val res = applyFromUiImpl(key, value)
+        if (res != null && clickId >= 0) {
+            // Ревизия «запись ЗАВЕРШЕНА» растёт здесь, а не только в начале записи: иначе снимок,
+            // прочитанный в середине записи (ревизия уже выросла), мог бы «подтвердить» её
+            // старым значением. Снимок берёт ревизию ДО чтения, поэтому видит только
+            // завершённые записи.
+            val revAfter = writeRevision.incrementAndGet()
+            ToolsStateCausality.recordAck(
+                ToolsStateCausality.WriteAck(
+                    key = key,
+                    clickId = clickId,
+                    ok = res.ok,
+                    rev = revAfter,
+                    detail = res.summary
+                )
+            )
+        }
+        return res
+    }
+
+    private fun applyFromUiImpl(key: String, value: Any?): ToolsResult? {
         Toggle.fromKey(key)?.let { toggle ->
             val b = when (value) {
                 is Boolean -> value

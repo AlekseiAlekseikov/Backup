@@ -160,6 +160,13 @@ class ToolsPanel(
         val d = runCatching { JsonParser.parseString(json).asJsonObject }.getOrNull() ?: return
         // §4 iter45: снимки нумеруются на стороне backend. Поздний ответ, посчитанный РАНЬШЕ
         // уже применённого, не должен откатывать тумблеры назад (гонка async-ответов).
+        // iter53 §9.1: причинность разбирается production-функцией (та же, что в тестах).
+        val meta = com.example.voiceapp3.tools.ToolsSnapshotFold.read(d)
+        snapshotRev = meta.rev
+        val acks = meta.acks
+        val nowMs = android.os.SystemClock.uptimeMillis()
+        // Решения по КАЖДОМУ ключу отдельно — той же функцией, что проверяют тесты.
+        val decisions = com.example.voiceapp3.tools.ToolsSnapshotFold.decideAll(d, pendingClicks, nowMs)
         val seq = d.get("seq")?.takeIf { it.isJsonPrimitive }?.let {
             runCatching { it.asLong }.getOrNull()
         }
@@ -184,26 +191,54 @@ class ToolsPanel(
         }
         for ((k, v) in d.entrySet()) {
             // iter52 §8.2: снимок, пришедший после клика, не перетирает выбор владельца.
-            val hold = clickHold[k]
-            if (hold != null && !k.startsWith("\$") && v.isJsonPrimitive) {
+            val pend = pendingClicks[k]
+            if (pend != null && !k.startsWith("\$") && v.isJsonPrimitive) {
                 val snapVal = runCatching { v.asBoolean }.getOrNull()
-                when (com.example.voiceapp3.tools.Toggles45.holdAfterSnapshot(hold, snapVal)) {
-                    com.example.voiceapp3.tools.Toggles45.HoldOutcome.KEEP_CLICK -> {
-                        clickHold[k] = hold.copy(disagreements = hold.disagreements + 1)
-                        AppLog.i("ToolsPanel", "TOGGLE_HOLD key=$k click=${hold.value} snapshot=$snapVal " +
-                            "action=keep_click disagreements=${hold.disagreements + 1} " +
-                            "(снимок посчитан до/во время клика: выбор владельца НЕ откатываем)")
+                val decision = decisions[k]
+                    ?: com.example.voiceapp3.tools.ToolsStateCausality.decide(
+                        pending = pend,
+                        ack = acks[k],
+                        snapshotValue = snapVal,
+                        snapshotRev = snapshotRev,
+                        ageMs = nowMs - pend.requestedAtMs
+                    )
+                when (decision) {
+                    com.example.voiceapp3.tools.ToolsStateCausality.Decision.KEEP_CLICK -> {
+                        AppLog.i("ToolsPanel", "TOGGLE_HOLD key=$k click=${pend.value} click_id=${pend.clickId} " +
+                            "snapshot=$snapVal snapshot_rev=${snapshotRev ?: "none"} ack_rev=${acks[k]?.rev ?: "none"} " +
+                            "action=keep_click (снимок не доказал, что видел нашу запись)")
                         continue
                     }
-                    com.example.voiceapp3.tools.Toggles45.HoldOutcome.APPLY_SNAPSHOT_CONFLICT -> {
-                        clickHold.remove(k)
-                        AppLog.w("ToolsPanel", "TOGGLE_CONFLICT key=$k click=${hold.value} snapshot=$snapVal " +
-                            "action=apply_snapshot (снимок второй раз противоречит выбору: показываем " +
-                            "фактическое состояние; выбор НЕ считается применённым)")
+                    com.example.voiceapp3.tools.ToolsStateCausality.Decision.UNCONFIRMED -> {
+                        unconfirmedKeys[k] = "unconfirmed"
+                        AppLog.w("ToolsPanel", "TOGGLE_UNCONFIRMED key=$k click_id=${pend.clickId} " +
+                            "age_ms=${nowMs - pend.requestedAtMs} action=keep_click " +
+                            "(подтверждения записи нет: выбор показывается как НЕ подтверждённый)")
+                        continue
                     }
-                    com.example.voiceapp3.tools.Toggles45.HoldOutcome.CLEAR_CONFIRMED ->
-                        clickHold.remove(k)
-                    com.example.voiceapp3.tools.Toggles45.HoldOutcome.APPLY_SNAPSHOT -> Unit
+                    com.example.voiceapp3.tools.ToolsStateCausality.Decision.WRITE_FAILED -> {
+                        pendingClicks.remove(k)
+                        unconfirmedKeys[k] = "write_failed"
+                        AppLog.w("ToolsPanel", "TOGGLE_WRITE_FAILED key=$k click=${pend.value} " +
+                            "click_id=${pend.clickId} action=apply_snapshot " +
+                            "(запись вернула ошибку: успех не изображается)")
+                    }
+                    com.example.voiceapp3.tools.ToolsStateCausality.Decision.SNAPSHOT_CONTRADICTS_WRITE -> {
+                        pendingClicks.remove(k)
+                        unconfirmedKeys[k] = "conflict"
+                        AppLog.w("ToolsPanel", "TOGGLE_CONFLICT key=$k click=${pend.value} snapshot=$snapVal " +
+                            "click_id=${pend.clickId} ack_rev=${acks[k]?.rev} snapshot_rev=${snapshotRev ?: "none"} " +
+                            "action=apply_snapshot (снимок прочитан ПОСЛЕ записи и показывает другое значение: " +
+                            "это факт, а не гонка)")
+                    }
+                    com.example.voiceapp3.tools.ToolsStateCausality.Decision.CLEAR_CONFIRMED -> {
+                        pendingClicks.remove(k)
+                        unconfirmedKeys.remove(k)
+                        AppLog.i("ToolsPanel", "TOGGLE_CONFIRMED key=$k click=${pend.value} " +
+                            "click_id=${pend.clickId} ack_rev=${acks[k]?.rev} snapshot_rev=${snapshotRev ?: "none"}")
+                    }
+                    com.example.voiceapp3.tools.ToolsStateCausality.Decision.APPLY_SNAPSHOT ->
+                        pendingClicks.remove(k)
                 }
             }
             if (k == "last") {
@@ -1095,20 +1130,18 @@ class ToolsPanel(
         val triState = prefsState?.takeIf { it.isNotEmpty() }
             ?: when (raw) { true -> "on"; false -> "off"; null -> "unknown" }
         // Холодный старт: последнее известное берётся с диска (если в этой сессии ещё не читали).
-        val hold = clickHold[key]
+        val pend = pendingClicks[key]
         val lastKnown = lastKnownOf(key)
         val on = when {
-            // Выбор владельца, не подтверждённый снимком, показывается как есть.
-            hold != null && triState?.lowercase() != "on" && triState?.lowercase() != "off" -> hold.value
-            hold != null && Toggles45.knownPosition(triState) != hold.value -> hold.value
+            // iter53 §9.1: пока запись не доказана, показываем ВЫБОР ВЛАДЕЛЬЦА (и отдельной
+            // подписью честно говорим, что он не подтверждён), а не «старое» значение.
+            pend != null -> pend.value
             key != "perfJit" -> Toggles45.switchPosition(triState, lastKnown, def)
             else -> JitRef.switchPosition(jitConfirmed ?: "unknown", raw ?: def)
         }
         Toggles45.knownPosition(triState)?.let { known ->
-            if (hold == null || hold.value == known) {
-                clickHold.remove(key)
-                rememberKnown(key, known)
-            }
+            // Последним известным считаем только то, что не перекрыто неподтверждённым выбором.
+            if (pend == null) rememberKnown(key, known)
         }
         val row = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -1117,6 +1150,10 @@ class ToolsPanel(
         }
         val info = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
         val titleText = when {
+            // iter53 §9.1: неподтверждённая запись называется своим именем, без ложного успеха.
+            unconfirmedKeys[key] == "write_failed" -> "$title · не применено (запись не удалась)"
+            unconfirmedKeys[key] == "conflict" -> "$title · не применено (сохранено другое значение)"
+            unconfirmedKeys[key] == "unconfirmed" -> "$title · запись не подтверждена"
             prefsUnknownByBackend -> "$title · состояние не подтверждено"
             unknownToggle -> "$title · состояние ещё не прочитано"
             key == "perfJit" && jitConfirmed == "unknown" -> "$title · состояние неизвестно"
@@ -1131,13 +1168,22 @@ class ToolsPanel(
             // Само событие клика (до любых фоновых задач): устаревшие async-ответы, посчитанные
             // раньше, уже не применятся к тумблеру, тексту и предупреждению.
             if (key == "perfJit") runCatching { AppPerformance.markJitClick() }
-            // iter52 §8.2: с этого момента выбор владельца держится, пока снимок с ним не
-            // согласится; поздний снимок его не перетирает (см. holdAfterSnapshot).
-            clickHold[key] = com.example.voiceapp3.tools.Toggles45.ClickHold(checked)
+            // iter53 §9.1: у клика есть номер. Он едет на backend и возвращается в снимке вместе
+            // с ревизией записи — только это доказывает, что снимок видел ИМЕННО нашу запись.
+            // Пока доказательства нет, показываем выбор владельца; новые клики перекрывают старые.
+            val clickId = com.example.voiceapp3.tools.ToolsStateCausality.nextClickId()
+            pendingClicks[key] = com.example.voiceapp3.tools.ToolsStateCausality.PendingClick(
+                key = key,
+                value = checked,
+                clickId = clickId,
+                requestedAtMs = android.os.SystemClock.uptimeMillis()
+            )
+            unconfirmedKeys.remove(key)
             state.addProperty(key, checked)
             send("settings.change", JsonObject().apply {
                 addProperty("key", key)
                 addProperty("value", checked)
+                addProperty("clickId", clickId)
             }.toString())
             toast("$title · ${if (checked) "вкл" else "выкл"}")
         }
@@ -1548,10 +1594,25 @@ class ToolsPanel(
     }
 
     /**
-     * iter52 §8.2: выбор владельца, ещё не подтверждённый снимком. Пока он здесь, поздний
-     * снимок НЕ перетирает тумблер (см. [Toggles45.holdAfterSnapshot]).
+     * iter53 §9.1: выбор владельца, ожидающий ДОКАЗАТЕЛЬСТВА записи.
+     *
+     * У каждого клика есть номер (`clickId`), который едет на backend и возвращается в снимке
+     * вместе с ревизией записи. Пока снимок не показал нашу запись, значение тумблера —
+     * выбор владельца; доказательство приходит только из `ToolsStateCausality.decide`, а не из
+     * количества ответов.
      */
-    private val clickHold = HashMap<String, com.example.voiceapp3.tools.Toggles45.ClickHold>()
+    private val pendingClicks = HashMap<String, com.example.voiceapp3.tools.ToolsStateCausality.PendingClick>()
+
+    /**
+     * Ключи, по которым запись НЕ подтверждена: `write_failed` (запись вернула ошибку),
+     * `conflict` (снимок увидел нашу запись и показывает другое значение) или `unconfirmed`
+     * (подтверждения нет дольше [com.example.voiceapp3.tools.ToolsStateCausality.UNCONFIRMED_AFTER_MS]).
+     * Это видимая подпись, а не «ложный успех».
+     */
+    private val unconfirmedKeys = HashMap<String, String>()
+
+    /** Ревизия записи из последнего снимка (`rev`). `null` — снимок без причины. */
+    private var snapshotRev: Long? = null
 
     private fun boolState(key: String): Boolean? {
         // §6.2 iter47: ключа нет в ПОСЛЕДНЕМ снимке → «не прочитано» (даже если старое значение
