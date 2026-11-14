@@ -323,13 +323,18 @@ class JitPersistenceTest {
         dpsDisk[JitRef.KEY_AUTO] = false
         val (cps, dps) = bothPrefs()
         val s = store(cps, dps)
-        s.putSnapshot(true, snapTrue, mk(state = JitRef.OpMark.SENDING))
+        // iter49 §8: отметка вычисляется ОДИН раз. Раньше `mk(...)` вызывался заново и в
+        // утверждении, поэтому два вызова попадали в соседние миллисекунды и тест падал
+        // примерно в 1 прогоне из 10 (наблюдалось 3 из 25) — флак хелпера, не поведение кода.
+        val sending = mk(state = JitRef.OpMark.SENDING)
+        s.putSnapshot(true, snapTrue, sending)
         cpsDisk[JitRef.KEY_AUTO] = false       // значение после записи снимка
         dpsDisk[JitRef.KEY_AUTO] = false
-        val r = s.updateMark(mk(state = JitRef.OpMark.REPLIED))
+        val replied = JitRef.OpMark.of(sending.op, sending.want, JitRef.OpMark.REPLIED, sending.ts)
+        val r = s.updateMark(replied)
         assertEquals(2, r.ok)
         for (disk in listOf(cpsDisk, dpsDisk)) {
-            assertEquals(mk(state = JitRef.OpMark.REPLIED).wire(), disk[JitRef.KEY_MARK])
+            assertEquals(replied.wire(), disk[JitRef.KEY_MARK])
             assertEquals("пользовательский ключ не тронут", false, disk[JitRef.KEY_AUTO])
             assertEquals(true, disk[JitRef.KEY_PEDIDO])
         }
