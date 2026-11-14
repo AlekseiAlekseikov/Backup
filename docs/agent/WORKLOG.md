@@ -1603,3 +1603,61 @@ CI `43464916714` (`15dd3b2`) — success (сборка; unit-тестов в wor
   `getPrefs` после рефакторинга; исправлено в `2087f72`.
 - **1.0.63 на машине НЕ проверялась.** ⛔ остаётся: слышимость звука, реальный TTL на проводе,
   `umount`/namespace, факт JIT-компиляции, первопричина блока NUL, сквозной Android-тест журнала.
+
+---
+
+## iter48 (2026-10-22) — TTL-владение, mountinfo, ревизии, zygote, логи
+
+Мандат: `ПРОМПТ_iter48_ИСПРАВИТЬ_TTL_ЗВУК_JIT_ТУМБЛЕРЫ_ЛОГИ.md` (§А–§И приоритетнее приложения).
+Ветка `fix/v2`. Версия не повышалась: `versionCode=63`, `versionName=1.0.63`.
+
+### Причины (по коду на `6a944c0`)
+- §Б TTL: `del_all` перебирал ВСЕ правила POSTROUTING с `ttl-set`/`hl-set`; владение не проверялось.
+  `TtlRunner.execute` пропускал фоновый повод при `curGen == lastAppliedGen && ok`; повод на границе
+  `unlock` терялся; бюджет проходов отбрасывал последнее намерение; `FOREIGN = ALL − OWN` давал 0
+  при живом чужом правиле; `onRootRestored` никем не назначался.
+- §В: первый бин `/proc/mounts` — устройство ФС, не путь bind-источника → свой слой считался чужим;
+  `umount || true` скрывал провал; реестр не пополнялся в ветке «намерение изменилось».
+- §Г: ревизия `max+1` без межпроцессной сериализации; конфликт мог вернуться как `confirmed`;
+  `getBoolean` сводил Conflict/Unknown к default; UI не знал о неизвестности.
+- §Д: `zygoteStartMs()` в production всегда `null` (переопределения не было — отчёт iter47 завышал);
+  допуск `mark−60 s` засчитывал старт ДО команды.
+- §Е: ротация удаляла `.1` до rename; существующий `.new` обнулялся; при занятом JVM-локе строка
+  терялась; слияние spill шло без лока.
+- Попутно: регулярки разбора `TTL_V4/TTL_V6` с двойным экранированием (`\\s`) → `TTL_V6` после
+  пробела не разбирался вовсе.
+
+### Сделано
+- `TtlScript`: цепочка `mangle/VAPP_TTL` как метка владения, `drop_own`, `report_foreign`,
+  `TTL_LEGACY action=keep`, `TTL_OWN removed=ok|partial`, `TTL_OFF OK|PARTIAL|FAILED`,
+  `FOREIGN_*` считается по POSTROUTING.
+- `TtlVerify` (новый, чистый): разбор вывода вынесен из Android-объекта, экранирование исправлено,
+  OFF+чужие = `PARTIAL`.
+- `TtlRunner`: очередь поводов (счётчик), удалён пропуск «уже применено», закрыта граница `unlock`,
+  бюджет не теряет намерение, запрещён повторный вход того же потока.
+- `NetworkTtl`: `ttlRuleCounts` считает свои правила; OFF с чужими = confirmed + `foreign_rules_remain`;
+  реальное событие root-ready; `desiredOrNull` для раннера.
+- `AdbClient`: подписка на переходы состояния канала (`addRootStateListener`).
+- `LockSound` + `MountInfo` + `LockMountScripts`: владение слоем по `mountinfo` (mount ID/root),
+  `umount` с проверкой, чужой слой не трогаем, namespace-проверка, реестр до сходимости,
+  чистка реестра только по доказанным записям.
+- `ProcLock` (новый) + `Prefs2`: межпроцессный lock вокруг read-modify-write, конфликт ≠ confirmed,
+  `removeEx` по tombstone и отсутствию значения, `getBooleanOrNull` + `PREFS_UNKNOWN`.
+- `ToolsBackend`: `<key>State` = on/off/unknown + `prefsUnknown`.
+- `ZygoteStart` (новый) + `JitNet`: реальное чтение `starttime`/`uptime`; допуск убран (строго `zs > ts`),
+  формулировки журнала честные.
+- `FileLogCore`: атомарная ротация без предудаления `.1`, `.new` не обнуляется, spill при занятом
+  JVM-локе, слияние под локом с возвратом данных при неудаче.
+- Тесты: `Iter48Test` (24) — §Б7, вердикты, поводы, mountinfo, zygote, ротация/spill.
+
+### Проверено / не проверено
+- `bash runtests.sh` → **OK (470 tests)** (было 446).
+- bash-эмулятор iptables: чужое правило сохраняется на ON и OFF, OFF при чужом = `PARTIAL`,
+  идемпотентность ON, нет uplink → правила не создаются.
+- bash-эмулятор mount/umount/mountinfo: чужой слой цел, `TARGET_SKIP foreign_layer_present`,
+  `umount` без `|| true`, restore по доказанным записям.
+- `bash -n` для всех четырёх сгенерированных скриптов — OK.
+- `kotlinc` по затронутым файлам: только «unresolved reference» (нет androidx/onnx в песочнице).
+- **На ГУ не проверялось.** ⛔ слышимость звука, реальный TTL на проводе, namespace init,
+  факт JIT-компиляции, межпроцессная запись настроек на двух процессах.
+- CI (`Build APK`) — см. отчёт `docs/agent/REPORT_iter48_TTL_звук_JIT_логи_тумблеры.md`.
