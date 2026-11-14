@@ -90,9 +90,15 @@ expected_root_for() {
     [ -n "${'$'}id" ] || continue
     case "${'$'}mm" in *:*) ;; *) continue ;; esac
     rmp=${'$'}(mi_unesc "${'$'}mp")
-    case "${'$'}want" in
-      "${'$'}rmp"|"${'$'}rmp"/*) : ;;
-      *) continue ;;
+    # iter51 §3.4(2): корень '/' — особый случай. Шаблон "${'$'}rmp"/* при rmp=/ образует
+    # `//*`, который НЕ обязан совпасть с `/data/...`, поэтому такой mount раньше либо терялся,
+    # либо (как самый длинный из совпавших) подменял настоящий. Сравниваем нормализованный путь.
+    case "${'$'}rmp" in
+      /) case "${'$'}want" in /*) : ;; *) continue ;; esac ;;
+      *) case "${'$'}want" in
+           "${'$'}rmp"|"${'$'}rmp"/*) : ;;
+           *) continue ;;
+         esac ;;
     esac
     plen=${'$'}{#rmp}
     if [ "${'$'}plen" -gt "${'$'}best" ]; then
@@ -102,7 +108,12 @@ expected_root_for() {
   [ "${'$'}best" -gt 0 ] || return 1
   # Отрезаем от пути ТОТ mount point, по которому выбрали best, а не последний из таблицы:
   # иначе следующая строка с чужой точкой монтирования сдвигает rel и root считается неверно.
-  rel=${'$'}{want#"${'$'}bmp"}
+  if [ "${'$'}bmp" = "/" ]; then
+    # root самой ФС = "/" → остаток это весь путь; при brows=/ результат тоже "/data/..."
+    rel=${'$'}{want}
+  else
+    rel=${'$'}{want#"${'$'}bmp"}
+  fi
   [ -n "${'$'}rel" ] || rel=""
   case "${'$'}brows" in
     */) case "${'$'}rel" in /*) rel=${'$'}{rel#/} ;; esac ;;
@@ -264,6 +275,23 @@ echo "OWN_LAYERS_TOTAL=${'$'}(awk '${'$'}4 ~ /^\// && ${'$'}5 ~ /^\/vendor\/etc\
         sb.append("\n")
         sb.append("echo \"MOUNT_ORDER method=mountinfo_order top_guaranteed=no\"\n")
         sb.append("STAGE_PREFIX=${shQuote(STAGE_PREFIX)}\n")
+        // iter51 §3.4(1): строгий барьер namespace В ЭТОЙ ЖЕ shell-операции и ДО любого side
+        // effect. Отдельная предварительная команда (`NS_PRE` в LockSound) доказывает namespace
+        // только СВОЕГО вызова: следующая команда может попасть в другой namespace.
+        sb.append(
+            """
+if [ "${'$'}NS_OK" != "1" ]; then
+  echo "RESTORE_BLOCKED reason=namespace_not_proven self=${'$'}{NS_SELF:-unknown} init=${'$'}{NS_INIT:-unknown} action=none"
+  echo "OWN_LAYERS_TOTAL=${'$'}(awk '${'$'}4 ~ /^\\// && ${'$'}5 ~ /^\\/vendor\\/etc\\/carlock/ {c++} END {print c+0}' "${'$'}MI" 2>/dev/null)"
+  exit 0
+fi
+if [ ! -r "${'$'}MI" ]; then
+  echo "RESTORE_BLOCKED reason=mountinfo_unreadable path=${'$'}MI action=none"
+  exit 0
+fi
+""".trimIndent()
+        )
+        sb.append("\n")
         sb.append(
             """
 # Снять свои слои на цели с ОЖИДАЕМЫМ root источника. 0 — своих нет, 3 — чужой сверху,

@@ -161,4 +161,59 @@ class Iter50MountLayerTest {
             out.contains("STOCK_UNPROVEN:${t.absolutePath}") && !out.contains("STOCK_OK:${t.absolutePath}"))
         assertTrue("слой остался в таблице", st.mountinfo.readText().contains(t.absolutePath))
     }
+
+    // ───────────── iter51 §3.4: строгий барьер namespace и корень '/' ─────────────
+
+    @Test
+    fun restoreRefusesToUmountWhenNamespaceIsNotProven() {
+        val (st, targets, env) = stand()
+        val t = wav(targets)
+        // Слой создан раньше (реестр помнит его), но текущий shell — в ДРУГОМ namespace.
+        st.exec(LockMountScripts.bindScript(stage), "bind.sh", env)
+        val before = st.mountinfo.readText()
+        val (rc, out) = st.exec(
+            LockMountScripts.restoreScript(listOf(t.absolutePath to stage)),
+            "restore.sh",
+            env + mapOf("NS_DIFFERS" to "1")
+        )
+        assertEquals("скрипт завершился штатно, ничего не сняв", 0, rc)
+        assertTrue("барьер назван: $out", out.contains("RESTORE_BLOCKED reason=namespace_not_proven"))
+        assertTrue("ни одного umount не выполнено: ${st.mountCalls()}", st.mountCalls().none { it.startsWith("umount") })
+        assertTrue("слой остался в таблице", st.mountinfo.readText().contains(t.absolutePath))
+        assertEquals("таблица не изменилась", before, st.mountinfo.readText())
+        assertFalse("STOCK_OK не заявляется", out.contains("STOCK_OK:"))
+    }
+
+    @Test
+    fun restoreIsBlockedWhenMountinfoIsUnreadable() {
+        val (st, targets, env) = stand()
+        val t = wav(targets)
+        st.exec(LockMountScripts.bindScript(stage), "bind.sh", env)
+        val (rc, out) = st.exec(
+            LockMountScripts.restoreScript(listOf(t.absolutePath to stage)),
+            "restore.sh",
+            env + mapOf("MOUNTINFO" to "/nonexistent/mountinfo")
+        )
+        assertEquals(0, rc)
+        // MOUNTINFO задаётся стендом всегда — проверяем через нечитаемый путь.
+        assertTrue("либо барьер таблицы, либо отсутствие доказанного слоя: $out",
+            out.contains("RESTORE_BLOCKED reason=mountinfo_unreadable") ||
+                (out.contains("STOCK_UNPROVEN") && !out.contains("STOCK_OK")))
+        assertTrue("umount не выполнялся", st.mountCalls().none { it.startsWith("umount") })
+    }
+
+    @Test
+    fun rootFilesystemAsOnlyParentStillYieldsCorrectExpectedRoot() {
+        // Единственный родитель — корень ФС: /data/local/tmp покрыт mount point "/" с root "/".
+        val st = Iter50Stand()
+        st.mountinfo.writeText("1 0 8:1 / / rw - ext4 /dev/root rw\n")
+        val targets = File(st.dir, "carlock").apply { mkdirs() }
+        val stageFile = File(st.dir, "carlock_custom_stage.wav").apply { writeText("RIFF") }
+        val env = mapOf("TARGET_DIR" to targets.absolutePath)
+        val t = wav(targets)
+        val (_, out) = st.exec(LockMountScripts.bindScript(stageFile.absolutePath), "bind.sh", env)
+        // Ожидаемый root при единственном '/' = полный путь источника (а не "//...").
+        assertTrue("root вычислен без '//': $out", !out.contains("EXPECTED_ROOT value=//"))
+        assertTrue("факт по цели есть: $out", out.contains("MOUNT_FACT:${t.absolutePath}"))
+    }
 }
