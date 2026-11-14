@@ -208,23 +208,27 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
                 override fun desired(): Boolean? = appCtxRef?.let { desiredOrNull(it) }
 
                 override fun intentGen(): Long =
-                    appCtxRef?.let { Prefs2.getLong(it, PREF_TTL_65_INTENT_GEN, 0L) } ?: 0L
+                    appCtxRef?.let { Prefs2.getLongOrNull(it, PREF_TTL_65_INTENT_GEN) } ?: 0L
 
                 override fun beginIntent(want: Boolean): Long {
                     val c = appCtxRef ?: return -1L
-                    // §4.2 п.1: сначала НАМЕРЕНИЕ, с фактическим результатом записи.
-                    val save = Prefs2.putBooleanEx(c, PREF_TTL_65_ACTIVE, want)
-                    if (!save.confirmed) {
-                        AppLog.w(TAG, "TTL_INTENT_WRITE_FAILED want=$want ${save.wire()} " +
-                            "(намерение НЕ подтверждено: «применено» заявлять нельзя)")
+                    // §4.2 п.1 + iter49 §5.3: НАМЕРЕНИЕ и его ПОКОЛЕНИЕ — ОДНА транзакция.
+                    // Раньше это были две записи (`getLong+1`, затем `putLong`), причём результат
+                    // второй не проверялся: «намерение подтверждено» заявлялось при неизвестном
+                    // поколении, и факт `applied` мог ссылаться на поколение, которого нет.
+                    val tx = Prefs2.putBooleanAndBumpLongEx(c, PREF_TTL_65_ACTIVE, want,
+                        PREF_TTL_65_INTENT_GEN)
+                    if (!tx.confirmed) {
+                        AppLog.w(TAG, "TTL_INTENT_WRITE_FAILED want=$want ${tx.wire()} " +
+                            "(намерение+поколение НЕ подтверждены одной транзакцией: «применено» " +
+                            "заявлять нельзя)")
                         return -1L
                     }
-                    if (save.partial) {
-                        AppLog.i(TAG, "TTL_INTENT_PARTIAL want=$want ${save.wire()} " +
+                    if (tx.save.partial || tx.genSave.partial) {
+                        AppLog.i(TAG, "TTL_INTENT_PARTIAL want=$want ${tx.wire()} " +
                             "(записалась только одна копия — вторая будет согласована следующей записью)")
                     }
-                    val gen = Prefs2.getLong(c, PREF_TTL_65_INTENT_GEN, 0L) + 1L
-                    Prefs2.putLong(c, PREF_TTL_65_INTENT_GEN, gen)
+                    val gen = tx.gen
                     Prefs2.putString(c, PREF_TTL_65_APPLIED,
                         if (want) "pending" else Prefs2.getString(c, PREF_TTL_65_APPLIED, "off") ?: "off")
                     if (want) Prefs2.putString(c, PREF_TTL_65_PENDING_REASON, "applying")

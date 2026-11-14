@@ -94,7 +94,11 @@ class Toggles45UiTest {
         val j = code(jit)
         assertTrue("граница окна операции задана", j.contains("STALE_MARK_MS"))
         assertTrue("решение по правилу Toggles45", j.contains("Toggles45.isStale"))
-        assertTrue("истечение не выдаётся за успех", j.contains("Это разблокировка по времени"))
+        // iter49 §7: текст заменён на точный — истечение окна/старт zygote НЕ доказывают, что
+        // команда не выполнится позже. Политика: выход из неопределённости называется явно.
+        assertTrue("истечение не выдаётся за успех", j.contains("JIT_OP_ABANDONED"))
+        assertTrue("возможность позднего исполнения не отрицается",
+            j.contains("late_answer_possible=1"))
         assertTrue("устаревший снимок не применяется на старте", j.contains("stale_snapshot"))
         assertTrue("старый снимок не возвращает Wi-Fi", j.contains("wifi_restore=none"))
     }

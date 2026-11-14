@@ -216,6 +216,56 @@ class Iter49Test {
         assertTrue("сказано, что переход оставлен и почему", "не разобран" in p.detail)
     }
 
+    // ───────────────── §7: выход из неопределённости — политика, а не текст ─────────────────
+
+    private fun JitFake.Store.seedOldUndefined(op: String, ageMs: Long) = apply {
+        val mark = JitRef.OpMark.of(op, true, JitRef.OpMark.UNDEFINED,
+            System.currentTimeMillis() - ageMs).wire()
+        for (i in listOf(0, 1)) {
+            setIn(i, JitRef.KEY_RESTORE, "wifi=1")
+            setIn(i, JitRef.KEY_MARK, mark)
+        }
+    }
+
+    @Test
+    fun expiredUndefinedIsAnExplicitExitNotAProofOfNoLateRun() {
+        val logs = mutableListOf<String>()
+        JitOp.resetStateForTest()
+        val store = JitFake.Store().seedOldUndefined("op-old", 16 * 60_000L)
+        val net = JitFake.Net(wifi = true)
+        val shell = JitFake.QueueShell()
+
+        val c = JitOp.click(store, net, shell, want = true, log = { synchronized(logs) { logs.add(it) } })
+        val text = synchronized(logs) { logs.joinToString("\n") }
+
+        assertTrue("клик разрешён (бессрочного запрета нет)", c.blocked == null)
+        assertTrue("выход назван явно", text.contains("JIT_OP_ABANDONED") && text.contains("exit="))
+        assertTrue("возможность позднего ответа признана", text.contains("late_answer_possible=1"))
+        assertFalse(
+            "нельзя утверждать, что команда не может выполниться позже",
+            text.contains("не может оставаться в очереди")
+        )
+        assertTrue("старый снимок не применяется", text.contains("snapshot_reused=no"))
+        assertEquals("op-old", JitOp.lastAbandonedOp())
+    }
+
+    @Test
+    fun lateAnswerOfAbandonedOperationIsNotAttributedToTheNewOne() {
+        val logs = mutableListOf<String>()
+        JitOp.resetStateForTest()
+        val store = JitFake.Store().seedOldUndefined("op-old", 16 * 60_000L)
+        val net = JitFake.Net(wifi = true)
+        JitOp.click(store, net, JitFake.QueueShell(), want = true, log = { })
+        // Поздний ответ приходит с id СТАРОЙ операции, а в хранилище уже другая отметка.
+        store.setIn(0, JitRef.KEY_MARK, JitRef.OpMark.of("op-new", true, JitRef.OpMark.SENDING,
+            System.currentTimeMillis()).wire())
+        store.setIn(1, JitRef.KEY_MARK, store.maps[0][JitRef.KEY_MARK])
+        JitOp.onLateOutcome(store, "op-old", 0, "done", log = { synchronized(logs) { logs.add(it) } })
+        val text = synchronized(logs) { logs.joinToString("\n") }
+        assertTrue("ответ помечен как не приписанный", text.contains("attributed=no"))
+        assertTrue("видно, какая операция оставлена", text.contains("abandoned_op=op-old"))
+    }
+
     // ───────────────── §5: скрипт не выходит за свои границы ─────────────────
 
     @Test
