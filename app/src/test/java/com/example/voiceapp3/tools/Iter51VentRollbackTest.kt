@@ -62,4 +62,25 @@ class Iter51VentRollbackTest {
         assertTrue("откат использует mutateOwners", branch.contains("mutateOwners {"))
         assertTrue("решение принимает чистая функция", branch.contains("ventRollbackOwners("))
     }
+
+    @Test
+    fun abaWithSameContentButNewerGenerationIsNotRolledBack() {
+        val doorA = 0x1
+        val doorB = 0x2
+        val before = setOf(doorA, doorB)
+        val installed = setOf(doorA, doorB)
+        // Содержимое «как мы записали», но поколение другое: пока летела команда VHAL, набор
+        // успел измениться и вернуться к тому же виду (A→B→A). Откат стёр бы живую мутацию.
+        assertNull(
+            "одинаковое содержимое при другом поколении — не повод откатывать",
+            ventRollbackOwners(installed, installed, emptySet(), genNow = 7L, genInstalled = 5L)
+        )
+        assertEquals(
+            "поколение не менялось — откат своей записи разрешён",
+            emptySet<Int>(),
+            ventRollbackOwners(installed, installed, emptySet(), genNow = 5L, genInstalled = 5L)
+        )
+        // Без переданных поколений поведение прежнее (совместимость вызовов).
+        assertEquals(emptySet<Int>(), ventRollbackOwners(installed, installed, emptySet()))
+    }
 }

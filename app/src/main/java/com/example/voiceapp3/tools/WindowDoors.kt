@@ -534,7 +534,9 @@ object WindowDoors {
             set.addAll(ownersAfter)
             if (set.isEmpty() && legacy) map.remove(windowAreaId)
         }
-        val after = synchronized(ventOwners) { ventOwners[windowAreaId]?.toSet() ?: emptySet() }
+        // iter52 §10: набор и ПОКОЛЕНИЕ сразу после нашей установки — одним lock.
+        val (snapAfter, genAtInstall) = ownersSnapshotWithGen()
+        val after = snapAfter[windowAreaId]?.toSet() ?: emptySet()
         val pos = posBefore ?: -1
         val decision = ventCloseDecision(
             door = doorAreaId, window = windowAreaId,
@@ -583,7 +585,8 @@ object WindowDoors {
             var rolledBack = false
             mutateOwners { map ->
                 val now = map[windowAreaId]?.toSet() ?: emptySet()
-                val restore = ventRollbackOwners(now, ownersAfter, before)
+                // Сверка содержимого И поколения — под ОДНИМ lock с мутацией (ABA).
+                val restore = ventRollbackOwners(now, ownersAfter, before, ventGen.get(), genAtInstall)
                 if (restore != null) {
                     val set = map.getOrPut(windowAreaId) { HashSet() }
                     set.clear()
@@ -817,7 +820,14 @@ internal fun ventRollbackOwners(
     current: Set<Int>,
     installed: Set<Int>,
     before: Set<Int>,
+    /** Поколение сейчас и поколение сразу после НАШЕЙ установки (iter52 §10: ABA). */
+    genNow: Long? = null,
+    genInstalled: Long? = null,
 ): Set<Int>? = when {
+    // iter52 §10: ABA. Содержимое могло вернуться к нашему набору (другая дверь добавила и
+    // убрала владельца), но поколение ДРУГОЕ — значит запись живёт своей жизнью, и откат
+    // стёр бы уже случившуюся мутацию. Поэтому при известных поколениях они обязаны совпасть.
+    genNow != null && genInstalled != null && genNow != genInstalled -> null
     // Никто не менял после нас — честный откат своей же записи.
     current == installed -> before
     // Набор уже другой: чужая (более новая) запись важнее нашего отката.
