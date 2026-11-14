@@ -81,8 +81,9 @@ class JitOrchestratorTest {
             assertTrue(store.presentIn(i, JitRef.KEY_AUTO))
             assertTrue(store.presentIn(i, JitRef.KEY_RESTORE))
         }
-        assertEquals(1, shell.pending.size)
-        assertTrue(shell.pending.first().contains("ctl.restart zygote"))
+        // iter51 §7: в транспорте ровно ОДИН payload (служебные claim/terminal-запросы не в счёт).
+        assertEquals(1, shell.pending.payloadCmds().size)
+        assertTrue(shell.pending.payloadCmds().first().contains("ctl.restart zygote"))
     }
 
     @Test

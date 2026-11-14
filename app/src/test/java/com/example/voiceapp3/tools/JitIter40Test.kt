@@ -59,7 +59,7 @@ class JitIter40Test {
         val executed = mutableListOf<String>()
         override fun exec(command: String, timeoutMs: Int): Pair<Int, String> {
             executed += command
-            return 137 to "ERR_ADB_TIMEOUT"
+            return JitDev.exec(command) { 137 to "ERR_ADB_TIMEOUT" }
         }
         override fun mapsExcerpt(): String? = null
         override fun onLateOutcome(cb: (Int, String) -> Unit) { armed = cb }
@@ -295,7 +295,8 @@ class JitIter40Test {
         val shell = JitFake.QueueShell()
         val c = JitOp.click(store, net, shell, want = true, log = ::log)
         assertEquals("previous_unfinished", c.blocked)
-        assertTrue("shell не запускался", shell.pending.isEmpty())
+        // iter51 §7: читающий запрос claim/terminal допустим, payload — нет.
+        assertTrue("payload не отправлялся", shell.pending.payloadCmds().isEmpty())
         assertTrue("сеть не менялась", net.requests.isEmpty())
         assertTrue("снимок прежний", store.contains(JitRef.KEY_RESTORE))
         assertNotNull("оценка сохранённой операции приложена к результату", c.stored)
@@ -309,10 +310,14 @@ class JitIter40Test {
         val started = mutableListOf<String>()
         val shell = object : JitRef.JitShell {
             override fun exec(command: String, timeoutMs: Int): Pair<Int, String> {
-                val out = JitOp.onProcessStart(store, JitFake.Net(wifi = true),
-                    JitFake.Scheduler(), ::log)
-                started += out.reason
-                return 0 to "ok"
+                // iter51 §7: старт процесса приходит на КОМАНДУ ЦЕПОЧКИ, а не на служебные
+                // claim/terminal-запросы — иначе один клик «породил» бы три старта.
+                return JitDev.exec(command) {
+                    val out = JitOp.onProcessStart(store, JitFake.Net(wifi = true),
+                        JitFake.Scheduler(), ::log)
+                    started += out.reason
+                    0 to "ok"
+                }
             }
             override fun mapsExcerpt(): String? = null
         }
@@ -463,7 +468,8 @@ class JitIter40Test {
         val store = JitNet.AndroidStore({ cps }, { dps })
         // Транспорт, который отвечает: исход операции `replied`, а не «потерян».
         val okShell = object : JitRef.JitShell {
-            override fun exec(command: String, timeoutMs: Int) = 0 to "ok"
+            override fun exec(command: String, timeoutMs: Int): Pair<Int, String> =
+                JitDev.exec(command) { 0 to "ok" }
             override fun mapsExcerpt(): String? = null
         }
         // Первый клик пишет пару, затем «DPS пропадает» — оценка обязана это увидеть.

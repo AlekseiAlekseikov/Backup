@@ -439,14 +439,18 @@ object JitFake {
 
         override fun exec(command: String, timeoutMs: Int): Pair<Int, String> {
             pending += command
-            if (runInline > 0 && command.contains("zygote")) {
-                runInline--
-                val (rc, out) = stand?.exec(command, getprop) ?: Pair(0, "")
-                executed += Triple(command, rc, out)
-                pending.remove(command)
-                return rc to out
+            // iter51 §7: служебные команды (claim/terminal) обслуживает модель устройства, а
+            // таймаут относится к payload — так же, как на реальном канале.
+            return JitDev.exec(command) {
+                if (runInline > 0 && command.contains("zygote")) {
+                    runInline--
+                    val (rc, out) = stand?.exec(command, getprop) ?: Pair(0, "")
+                    executed += Triple(command, rc, out)
+                    pending.remove(command)
+                    return@exec rc to out
+                }
+                137 to "ERR_ADB_TIMEOUT"
             }
-            return 137 to "ERR_ADB_TIMEOUT"
         }
 
         override fun mapsExcerpt(): String? = maps
@@ -461,15 +465,20 @@ object JitFake {
 
         override fun exec(command: String, timeoutMs: Int): Pair<Int, String> {
             executed += command
-            if (!command.contains("getprop")) return 0 to ""
-            return if (answers.isEmpty()) default else answers.removeAt(0)
+            return JitDev.exec(command) {
+                if (!command.contains("getprop")) return@exec 0 to ""
+                if (answers.isEmpty()) default else answers.removeAt(0)
+            }
         }
 
         override fun mapsExcerpt(): String? = maps
 
         fun queueGetprop(rc: Int, out: String) { answers += rc to out }
 
-        fun scriptCommands(): List<String> = executed.filterNot { it.contains("getprop") }
+        /** Команды PAYLOAD: служебные claim/terminal-запросы цепочки сюда не относятся. */
+        fun scriptCommands(): List<String> = executed.filterNot {
+            it.contains("getprop") || it.contains("voiceapp3_jit")
+        }
     }
 
     /** Shell, который блокируется внутри `exec`, пока тест не отпустит: гонки и параллельность. */
@@ -483,11 +492,14 @@ object JitFake {
         var whileBlocked: (() -> Unit)? = null
 
         override fun exec(command: String, timeoutMs: Int): Pair<Int, String> {
-            calls.incrementAndGet()
-            entered.countDown()
-            whileBlocked?.invoke()
-            release.await(5, TimeUnit.SECONDS)
-            return result
+            // Служебные claim/terminal-команды не блокируются: они короткие и идут ДО payload.
+            return JitDev.exec(command) {
+                calls.incrementAndGet()
+                entered.countDown()
+                whileBlocked?.invoke()
+                release.await(5, TimeUnit.SECONDS)
+                result
+            }
         }
 
         override fun mapsExcerpt(): String? = maps

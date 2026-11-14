@@ -720,7 +720,7 @@ object JitRef {
 
     // ─────────────────────────── скрипт: `w0/la.run` ───────────────────────────
 
-    private fun scriptBody(want: Boolean): String {
+    private fun scriptBody(want: Boolean, guard: String = ""): String {
         val D = "$"
         val drain = "        svc wifi disable\n" +
             "        _n=0\n" +
@@ -733,14 +733,29 @@ object JitRef {
             "        done\n"
         val props = "        setprop $PROP_USEJIT ${if (want) "true" else "false"}\n" +
             "        setprop ctl.restart zygote\n    "
-        return "\n" + drain + mount + props
+        return guard + "\n" + drain + mount + props
     }
 
     /** Литерал `w0/la.run` целиком, включая шаг монтирований — эталон для сверки. */
     fun referenceScript(want: Boolean): String = scriptBody(want)
 
-    /** Скрипт, который отправляется: тот же литерал, вариантов нет. */
-    fun chainScript(want: Boolean): String = scriptBody(want)
+    /**
+     * Скрипт, который отправляется: тот же литерал референса + (если задана) ГВАРДИЯ владения.
+     *
+     * Гвардия (`JitOwn.guard`) стоит ДО первого side effect: при чужом claim payload печатает
+     * `JIT_REFUSED` и выходит, ничего не меняя. Она же пишет `START`/`END` в terminal-файл
+     * операции — это единственный факт исхода, привязанный к id самой операции.
+     */
+    fun chainScript(want: Boolean, guard: String = ""): String = scriptBody(want, guard)
+
+    /** iter51 §7: тестовый фасад на литерал референса (без гвардии). */
+    internal fun referenceScriptForTest(want: Boolean): String = referenceScript(want)
+
+    /** iter51 §7: тестовый фасад на отправляемый скрипт (с гвардией). */
+    internal fun chainScriptForTest(want: Boolean, guard: String): String = chainScript(want, guard)
+
+    /** Значение свойства JIT (для проверки, что литерал референса не подменён). */
+    internal const val PROP_USEJIT_VALUE_TEST = PROP_USEJIT
 
     /** Отметка о шаге монтирований для лога: он есть, как в референсе. */
     fun mountStepNote(): String = MOUNT_STEP_NOTE
@@ -1696,10 +1711,37 @@ object JitOp {
                         "(id=${stored.mark?.op}) не будет приписан новой)"
                 )
             }
+            // §7 iter51: ПУТЬ ВЫХОДА ИЗ НЕИЗВЕСТНОСТИ. Пока исход прошлой операции не доказан,
+            // читаем её terminal-файл (короткая команда, не payload): `END rc=…` или `JIT_REFUSED`
+            // доказывают, что ЭТА операция уже закончилась. Это снимает блокировку без рестарта
+            // zygote, без reboot и без «подождать окно»; старт zygote и новый pid сюда не входят.
+            val prevOpId = stored.mark?.op
+            val prevTerm = if (prevOpId != null &&
+                (!staleOp || CHAIN_UNDEFINED.get() || stored.state == JitRef.StoredState.UNDEFINED)
+            ) probeTerminal(shell, prevOpId, log) else null
+            val prevResolved = prevTerm != null && (prevTerm.finished || prevTerm.refused)
+            if (prevResolved && prevOpId != null) {
+                val dec = JitOwn.clickDecision(
+                    JitOwn.Op(prevOpId, stored.mark?.ts ?: 0L, stored.mark?.want ?: false,
+                        JitOwn.State.UNKNOWN),
+                    prevTerm
+                )
+                CHAIN_UNDEFINED.set(false)
+                log(
+                    "JIT_OP_RESOLVED op=$prevOpId evidence=terminal " +
+                        "term=«${prevTerm!!.wire()}» risk=${dec.risk} " +
+                        "(исход прошлой команды доказан ЕЁ ЖЕ terminal-файлом: ${
+                            if (prevTerm.finished) "payload завершился" else "payload отказался работать"
+                        }; снимок прошлой операции НЕ применяется и НЕ перезаписывается, " +
+                        "JIT-компиляция этим НЕ доказана)"
+                )
+            }
+
             val blockedReason = when {
                 // Неопределённость в RAM — то же состояние, что и в отметке; порядок важен.
-                (!staleOp && CHAIN_UNDEFINED.get()) ||
-                    (stored.state == JitRef.StoredState.UNDEFINED && !staleOp) -> "chain_undefined"
+                (!staleOp && CHAIN_UNDEFINED.get() && !prevResolved) ||
+                    (stored.state == JitRef.StoredState.UNDEFINED && !staleOp && !prevResolved) ->
+                    "chain_undefined"
                 restoreBusy -> "restore_pending"
                 stored.state == JitRef.StoredState.PENDING -> "previous_unfinished"
                 stored.state == JitRef.StoredState.AMBIGUOUS -> "previous_ambiguous"
@@ -1888,14 +1930,55 @@ object JitOp {
                 )
                 return Click(want, snap, write, read, -1, "", blocked, previousUndefined)
             }
+            // §7 iter51: ЗАХВАТ ВЛАДЕНИЯ до любых изменений настроек. Claim — короткая команда
+            // (десятки байт), поэтому идёт обычным транспортом. Если записать/проверить его не
+            // удалось, payload НЕ отправляется: иначе гвардия на устройстве не смогла бы отличить
+            // нашу операцию от чужой, и поздний старт остался бы неотличимым.
+            val opState = JitOwn.Op(opId, mark.ts, want, JitOwn.State.CREATED)
+            val claimRes = runCatching { shell.exec(JitOwn.claimCmd(opState), 8_000) }
+                .getOrElse { t -> Pair(-1, "ERR_${t.javaClass.simpleName}") }
+            val claimRead = JitOwn.Op.parseClaim(
+                Regex("op=[A-Za-z0-9_.-]+;ts=\\d+;want=[01]").find(claimRes.second)?.value
+            )
+            val claimVerified = claimRes.first == 0 && claimRead?.id == opId
+            log(
+                if (claimVerified)
+                    "JIT_CLAIM op=$opId taken=1 verified=1 path=${JitOwn.CLAIM} want=$want " +
+                        "(владение записано ДО изменения настроек; чужой/устаревший payload " +
+                        "теперь откажется работать сам — см. JIT_REFUSED)"
+                else
+                    // Настоящую защиту даёт ГВАРДИЯ в самом payload: она читает claim на
+                    // устройстве и при несовпадении НИЧЕГО не делает. Провал записи claim не
+                    // доказывает, что канал мёртв (23 КБ скрипт идёт другим путём), поэтому
+                    // клик не отменяется — но заявлять «владение подтверждено» нельзя.
+                    "JIT_CLAIM op=$opId taken=0 verified=0 rc=${claimRes.first} " +
+                        "claim=«${claimRead?.id ?: "none"}» path=${JitOwn.CLAIM} action=proceed " +
+                        "(запись/чтение claim не подтверждены — исход решит гвардия payload'а: " +
+                        "если claim на устройстве не наш, скрипт откажется работать и это будет " +
+                        "видно как JIT_REFUSED; настройки при этом вернутся)"
+            )
             log("dalvik.vm.usejit -> $want; reiniciando o framework")
             log(
                 "JIT_CHAIN_SENT op=$opId ${JitRef.mountStepNote()} timeout_ms=${JitRef.CHAIN_TIMEOUT_MS} " +
                     "restart=not_claimed command=w0/la.run (литерал референса)"
             )
-            val (rc, out) = shell.exec(JitRef.chainScript(want), JitRef.CHAIN_TIMEOUT_MS)
+            val (rc, out) = shell.exec(JitRef.chainScript(want, JitOwn.guard(opState)),
+                JitRef.CHAIN_TIMEOUT_MS)
             val outcome = JitRef.chainOutcome(rc, out)
-            val undefined = outcome != JitRef.ChainOutcome.REPLY_RECEIVED
+            // §7 iter51: ФАЗА по фактам устройства. Ответ транспорта — не доказательство исхода;
+            // terminal-файл ЭТОЙ операции — доказательство (START/END/refused). Ошибка чтения
+            // terminal'а не «додумывается»: тогда исход остаётся неизвестным.
+            val myTerm = probeTerminal(shell, opId, log)
+            val phase = JitOwn.classify(outcome == JitRef.ChainOutcome.REPLY_RECEIVED, myTerm)
+            // §7: «ответ транспорта есть, terminal не прочитан» — это SENT, как и на HEAD
+            // (исход не доказан, но и канал не потерян). Неопределённость — только UNKNOWN и
+            // STARTED (payload начался и не оставил END).
+            val undefined = phase == JitOwn.State.UNKNOWN || phase == JitOwn.State.STARTED
+            log(
+                "JIT_OP_PHASE op=$opId phase=${phase.name.lowercase()} term=«${
+                    myTerm?.wire() ?: "unreadable"
+                }» — ${JitOwn.stateNote(phase)}"
+            )
             CHAIN_UNDEFINED.set(undefined)
             val state = if (undefined) JitRef.OpMark.UNDEFINED else JitRef.OpMark.REPLIED
             val markUpd = runCatching { store.updateMark(mark.copy(state = state)) }
@@ -1907,6 +1990,34 @@ object JitOp {
                     "out=${out.trim().take(200).ifEmpty { "empty" }} " +
                     "(ответ транспорта ≠ подтверждение рестарта zygote; состояние покажет сверка)"
             )
+            if (phase == JitOwn.State.REFUSED) {
+                // Доказанный no-op на устройстве: гвардия увидела ЧУЖОЙ claim. Ничего не
+                // выполнено (ни сеть, ни свойства, ни zygote) — значит и «применено» заявлять
+                // нельзя, и снимок прошлой операции оставлять нельзя: возвращаем настройки
+                // только там, где принадлежность доказана, и снимаем СВОИ ключи.
+                val plan = runCatching {
+                    JitRef.planRestore(prev, store.readOperation(), opId, snap)
+                }.getOrElse { JitRef.RestorePlan(emptyList(), emptyList(), listOf("read_failed")) }
+                val rb = runCatching { store.restorePrevious(plan.owned) }
+                    .getOrElse { t -> JitRef.WriteResult.none("exception:${t.javaClass.simpleName}") }
+                val rm = runCatching { store.removeOwned(opId) }
+                    .getOrElse { t ->
+                        JitRef.OwnedRemoval(0, 0, 0, true, true,
+                            "exception:${t.javaClass.simpleName}")
+                    }
+                CHAIN_UNDEFINED.set(false)
+                log(
+                    "JIT_CHAIN_REFUSED op=$opId rc=$rc term=«${myTerm?.wire() ?: "?"}» " +
+                        "prev_restore=${rb.ok}/${rb.attempted} restore_plan=«${plan.brief()}» " +
+                        "cleanup=«${rm.brief()}» restart=not_happened internet=not_checked " +
+                        "action=revert_settings " +
+                        "(payload отказался работать: claim на устройстве принадлежит другой " +
+                        "операции — доказанный no-op. Сеть и свойства НЕ менялись, JIT не включён; " +
+                        "настройки возвращаются только там, где принадлежность доказана " +
+                        "(«${plan.brief()}»), свои ключи операции снимаются)"
+                )
+                return Click(want, null, write, read, rc, out, null, previousUndefined)
+            }
             if (undefined) {
                 log(
                     "JIT_CHAIN_ERROR op=$opId rc=$rc reason=channel_lost action=none " +
@@ -1921,6 +2032,36 @@ object JitOp {
         } finally {
             CLICK_SLOT.compareAndSet(token, null)
         }
+    }
+
+    /**
+     * §7 iter51: прочитать «claim + terminal» ЭТОЙ операции короткой командой.
+     *
+     * `null` — прочитать не удалось (транспорт/ошибка): неизвестность НЕ снимается, и мы не
+     * подменяем её догадкой.
+     */
+    private fun probeTerminal(
+        shell: JitRef.JitShell,
+        opId: String,
+        log: (String) -> Unit
+    ): JitOwn.Terminal? {
+        val r = runCatching { shell.exec(JitOwn.readCmd(opId), 8_000) }.getOrElse { t ->
+            log(
+                "JIT_OP_PROBE op=$opId read=failed reason=${t.javaClass.simpleName} " +
+                    "(terminal не прочитан: исход операции остаётся неизвестным)"
+            )
+            return null
+        }
+        val term = JitOwn.parseTerminal(opId, r.second, r.first)
+        if (term == null) {
+            log(
+                "JIT_OP_PROBE op=$opId read=failed rc=${r.first} out=«${r.second.trim().take(120)}» " +
+                    "(terminal не прочитан: исход операции остаётся неизвестным)"
+            )
+        } else {
+            log("JIT_OP_PROBE op=$opId read=ok ${term.wire()} note=${term.note}")
+        }
+        return term
     }
 
     /**

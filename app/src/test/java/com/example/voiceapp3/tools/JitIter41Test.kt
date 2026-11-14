@@ -51,7 +51,8 @@ class JitIter41Test {
         val executed = mutableListOf<String>()
         override fun exec(command: String, timeoutMs: Int): Pair<Int, String> {
             executed += command
-            return 137 to "ERR_ADB_TIMEOUT"
+            // iter51 §7: claim/terminal обслуживает модель устройства; таймаут — про payload.
+            return JitDev.exec(command) { 137 to "ERR_ADB_TIMEOUT" }
         }
         override fun mapsExcerpt(): String? = null
     }
@@ -62,7 +63,8 @@ class JitIter41Test {
         val executed = mutableListOf<String>()
         override fun exec(command: String, timeoutMs: Int): Pair<Int, String> {
             executed += command
-            return 137 to "ERR_ADB_TIMEOUT"
+            // iter51 §7: claim/terminal обслуживает модель устройства; таймаут — про payload.
+            return JitDev.exec(command) { 137 to "ERR_ADB_TIMEOUT" }
         }
         override fun mapsExcerpt(): String? = null
         override fun onLateOutcome(cb: (rc: Int, out: String) -> Unit) { armed = cb }
@@ -130,7 +132,7 @@ class JitIter41Test {
         // 1. Клик: снимок записан, ответ транспорта потерян.
         val click = JitOp.click(t.store, net, shell, want = false, log = ::log)
         assertNull("клик не заблокирован", click.blocked)
-        assertEquals("цепочка отправлена один раз", 1, shell.executed.size)
+        assertEquals("цепочка отправлена один раз", 1, shell.executed.payloadCmds().size)
         assertTrue("неопределённость зафиксирована в RAM", JitOp.chainUndefined())
         assertEquals("на диске отметка undefined", "undefined", t.stateOnDisk())
 
@@ -160,7 +162,7 @@ class JitIter41Test {
         val fresh = TimeoutShell()
         val next = JitOp.click(t.store, JitFake.Net(wifi = true), fresh, want = true, log = ::log)
         assertEquals("новый клик заблокирован", "chain_undefined", next.blocked)
-        assertEquals("shell не вызывался", 0, fresh.executed.size)
+        assertEquals("payload не отправлялся", 0, fresh.executed.payloadCmds().size)
         assertNotNull("операция всё ещё опознаётся", JitRef.OpMark.parse(t.markOnDisk()))
         assertEquals("op не подменён", opId, JitRef.OpMark.parse(t.markOnDisk())!!.op)
     }
@@ -186,7 +188,7 @@ class JitIter41Test {
         val fresh = TimeoutShell()
         val c = JitOp.click(t.store, JitFake.Net(wifi = false), fresh, want = false, log = ::log)
         assertEquals("chain_undefined", c.blocked)
-        assertEquals(0, fresh.executed.size)
+        assertEquals(0, fresh.executed.payloadCmds().size)
     }
 
     @Test
@@ -213,7 +215,7 @@ class JitIter41Test {
         val shell = TimeoutShell()
         val c = JitOp.click(t.store, net, shell, want = true, log = ::log)
         assertEquals("previous_unfinished", c.blocked)
-        assertEquals("новая цепочка не отправлена", 0, shell.executed.size)
+        assertEquals("новая цепочка не отправлена", 0, shell.executed.payloadCmds().size)
     }
 
     @Test
@@ -240,7 +242,7 @@ class JitIter41Test {
         val again = TimeoutShell()
         val c = JitOp.click(t.store, JitFake.Net(wifi = true), again, want = true, log = ::log)
         assertEquals("chain_undefined", c.blocked)
-        assertEquals(0, again.executed.size)
+        assertEquals(0, again.executed.payloadCmds().size)
     }
 
     @Test
@@ -261,7 +263,7 @@ class JitIter41Test {
         val shell = TimeoutShell()
         assertEquals("chain_undefined",
             JitOp.click(t.store, JitFake.Net(wifi = true), shell, want = false, log = ::log).blocked)
-        assertEquals(0, shell.executed.size)
+        assertEquals(0, shell.executed.payloadCmds().size)
     }
 
     @Test
@@ -297,7 +299,7 @@ class JitIter41Test {
             val shell = TimeoutShell()
             val c = JitOp.click(t.store, JitFake.Net(wifi = true), shell, want = want, log = ::log)
             assertEquals("направление $want — заблокировано", "chain_undefined", c.blocked)
-            assertEquals(0, shell.executed.size)
+            assertEquals(0, shell.executed.payloadCmds().size)
         }
     }
 
@@ -357,7 +359,7 @@ class JitIter41Test {
         val shell = TimeoutShell()
         val c = JitOp.click(t.store, JitFake.Net(wifi = true), shell, want = true, log = ::log)
         assertEquals("previous_ambiguous", c.blocked)
-        assertEquals("ни записи, ни shell", 0, shell.executed.size)
+        assertEquals("ни записи, ни payload", 0, shell.executed.payloadCmds().size)
 
         val sched = JitFake.Scheduler()
         val start = JitOp.onProcessStart(t.store, JitFake.Net(wifi = true), sched, ::log)
@@ -388,7 +390,7 @@ class JitIter41Test {
         val shell = TimeoutShell()
         val c = JitOp.click(store, JitFake.Net(wifi = true), shell, want = true, log = ::log)
         assertEquals("prev_unknown", c.blocked)
-        assertEquals("shell не вызывался", 0, shell.executed.size)
+        assertEquals("payload не отправлялся", 0, shell.executed.payloadCmds().size)
     }
 
     @Test
@@ -428,7 +430,7 @@ class JitIter41Test {
         val shell = TimeoutShell()
         val c = JitOp.click(store, JitFake.Net(wifi = true), shell, want = true, log = ::log)
         assertEquals("prev_unknown", c.blocked)
-        assertEquals(0, shell.executed.size)
+        assertEquals(0, shell.executed.payloadCmds().size)
     }
 
     @Test
@@ -454,7 +456,7 @@ class JitIter41Test {
         JitOp.onProcessStart(t.store, net, sched, ::log)
         sched.drain()
 
-        assertEquals("shell не вызывался ни разу", 0, shell.executed.size)
+        assertEquals("payload не отправлялся ни разу", 0, shell.executed.payloadCmds().size)
         assertEquals("сеть меняли только возвратом клиентского Wi-Fi", listOf("wifi=true"), net.requests)
         assertTrue("отметка на диске", t.markOnDisk()?.startsWith("op=op-safe") == true)
         assertEquals("снимок на диске", "wifi=1", t.snapshotOnDisk())
@@ -494,7 +496,7 @@ class JitIter41Test {
         val next = TimeoutShell()
         val c = JitOp.click(t.store, JitFake.Net(wifi = true), next, want = false, log = ::log)
         assertEquals("chain_undefined", c.blocked)
-        assertEquals(0, next.executed.size)
+        assertEquals(0, next.executed.payloadCmds().size)
         assertTrue("снимок на месте", t.cpsDisk.containsKey(JitRef.KEY_RESTORE))
     }
 

@@ -101,7 +101,7 @@ class JitIsoStand(rules: Int = 0) {
         val executed = mutableListOf<String>()
         override fun exec(command: String, timeoutMs: Int): Pair<Int, String> {
             executed += command
-            return this@JitIsoStand.exec(command, getprop)
+            return JitDev.exec(command) { this@JitIsoStand.exec(command, getprop) }
         }
         override fun mapsExcerpt(): String? = maps
     }
