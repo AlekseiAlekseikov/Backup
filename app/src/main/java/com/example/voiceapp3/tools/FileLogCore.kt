@@ -354,11 +354,47 @@ object FileLogCore {
         }
     }
 
-    /** Стабильный в пределах процесса тег (pid из `/proc/self`, иначе — случайный). */
-    private val processTag: String by lazy {
-        runCatching { File("/proc/self").canonicalFile.name }.getOrNull()
-            ?.takeIf { it.isNotEmpty() && it.all { ch -> ch.isDigit() } }
-            ?: ("p" + Integer.toHexString(System.identityHashCode(Any())))
+    /**
+     * iter52 §9.1 — ИДЕНТИЧНОСТЬ ПРОЦЕССА, а не «pid».
+     *
+     * PID переиспользуется: после падения (и тем более после перезагрузки) тот же номер может
+     * достаться ДРУГОМУ процессу, и `p<случайный>` у него будет другим — но имя файла с одним
+     * pid'ом уже занято. Поэтому тег = `pid-<boot_id[:8]>-<starttime из /proc/self/stat>`:
+     *  • `boot_id` отличает загрузки системы;
+     *  • `starttime` (поле 22) отличает процессы внутри одной загрузки при переиспользовании pid.
+     * Если что-то из этого прочитать нельзя — тег остаётся уникальным за счёт случайной части,
+     * а «живость» такого файла считается НЕДОКАЗАННОЙ (см. [pidLooksAlive]).
+     */
+    private val processTag: String by lazy { buildTag(readPid(), readBootId(), readStartTime(readPid())) }
+
+    /** Собрать тег идентичности. Пустые части опускаются, но уникальность сохраняется. */
+    internal fun buildTag(pid: String?, bootId: String?, startTime: String?): String {
+        val random = "r" + Integer.toHexString(System.identityHashCode(Any()))
+        val p = pid?.takeIf { it.isNotEmpty() && it.all { c -> c.isDigit() } } ?: return "p$random"
+        val b = bootId?.take(8)?.takeIf { it.isNotEmpty() }
+        val st = startTime?.takeIf { it.isNotEmpty() && it.all { c -> c.isDigit() } }
+        return if (b != null && st != null) "$p-$b-$st" else "$p-$random"
+    }
+
+    /** pid из `/proc/self`, `null` — прочитать нельзя. */
+    internal fun readPid(): String? =
+        runCatching { File("/proc/self").canonicalFile.name }
+            .getOrNull()?.takeIf { it.isNotEmpty() && it.all { c -> c.isDigit() } }
+
+    /** `/proc/sys/kernel/random/boot_id`: меняется при каждой загрузке. */
+    internal fun readBootId(): String? =
+        runCatching { File("/proc/sys/kernel/random/boot_id").readText().trim() }
+            .getOrNull()?.replace("-", "")?.takeIf { it.isNotEmpty() }
+
+    /** Поле 22 `/proc/<pid>/stat` (starttime в тиках после загрузки). */
+    internal fun readStartTime(pid: String?): String? {
+        if (pid == null) return null
+        val stat = runCatching { File(procRoot, "$pid/stat").readText() }.getOrNull() ?: return null
+        // Второе поле — имя процесса в скобках, может содержать пробелы: режем по последней ')'.
+        val rest = stat.substringAfterLast(')').trim()
+        val fields = rest.split(' ').filter { it.isNotEmpty() }
+        // rest начинается с поля 3 (state); starttime — поле 22 → индекс 19 в rest.
+        return fields.getOrNull(19)?.takeIf { it.all { c -> c.isDigit() } }
     }
 
     /** §8.1 iter50: честная заметка о последнем слиянии (пусто — всё прошло штатно). */
@@ -409,6 +445,23 @@ object FileLogCore {
      */
     private fun pidLooksAlive(pid: String, files: List<File>): Boolean {
         if (pid == processTag) return true
+        // Тег с идентичностью (`pid-boot-start`) — сравниваем ФАКТЫ, а не возраст.
+        val parts = pid.split('-')
+        if (parts.size >= 3 && parts[0].all { it.isDigit() }) {
+            val boot = parts[1]
+            val start = parts[2]
+            val myBoot = readBootId()
+            // Другая загрузка системы: процесс из прошлой загрузки мёртв, даже если /proc/<pid> есть.
+            if (myBoot != null && !myBoot.startsWith(boot)) return false
+            val nowStart = readStartTime(parts[0])
+            // pid переиспользован: starttime другой → это ДРУГОЙ процесс.
+            if (nowStart != null && nowStart != start) return false
+            if (nowStart != null && nowStart == start && File(procRoot, parts[0]).exists()) return true
+            // Прочитать /proc не удалось — «не уверены»: не трогаем (лучше не забрать живое).
+            return true
+        }
+        // Старый формат (`<pid>` без identity): pid есть, но доказать принадлежность нельзя.
+        // Живым считаем, только если id-файла нет и возраст в пределах окна.
         if (!pid.all { it.isDigit() }) return true   // `p<hash>` без pid — своим не считаем
         if (!File(procRoot, pid).exists()) return false
         val newest = files.maxOfOrNull { it.lastModified() } ?: 0L
@@ -426,7 +479,11 @@ object FileLogCore {
      * @return пары «файл → его pid», отсортированные по имени (детерминированный порядок).
      */
     internal fun orphanFilesOf(dir: File, name: String): List<Pair<File, String>> {
-        val re = Regex("^" + Regex.escape(name) + "\\.(\\d+|p[0-9a-f]+)\\.spill(\\.drain.*)?$")
+        // iter52 §9.1: тег теперь несёт идентичность процесса (`<pid>-<boot8>-<starttime>` или
+        // `<pid>-r<hash>`), поэтому шаблон обязан её принимать — иначе осиротевшие файлы нового
+        // формата просто не находились (строки журнала оставались на диске навсегда).
+        val tag = "(?:[0-9]+(?:-[0-9a-fA-F]+-[0-9]+)?|[0-9]+-r[0-9a-f]+|p[0-9a-f]+)"
+        val re = Regex("^" + Regex.escape(name) + "\\.(" + tag + ")\\.spill(\\.drain.*)?$")
         val all = runCatching { dir.listFiles()?.toList() ?: emptyList() }.getOrDefault(emptyList())
         val byPid = mutableMapOf<String, MutableList<File>>()
         for (f in all) {
@@ -591,6 +648,26 @@ object FileLogCore {
      *
      * @return true — файла больше нет (удалён сейчас или отсутствовал); false — остался.
      */
+    /** iter52 §9.4: результат чтения work-файла — три РАЗНЫХ факта, а не «пусто/непусто». */
+    internal enum class WorkReadKind { TEXT, EMPTY, UNREADABLE }
+
+    internal data class WorkRead(val kind: WorkReadKind, val text: String?, val error: String? = null)
+
+    /**
+     * Разбор результата чтения work-файла.
+     *
+     * Ошибка чтения НЕ равна пустому файлу: пустой файл можно удалить (в нём ничего нет), а
+     * нечитаемый — нельзя (в нём могут быть строки журнала, которые мы просто не видим).
+     */
+    internal fun classifyWorkRead(result: kotlin.Result<String>): WorkRead = when {
+        result.isFailure -> WorkRead(
+            WorkReadKind.UNREADABLE, null,
+            result.exceptionOrNull()?.javaClass?.simpleName ?: "unknown"
+        )
+        result.getOrNull().isNullOrEmpty() -> WorkRead(WorkReadKind.EMPTY, "")
+        else -> WorkRead(WorkReadKind.TEXT, result.getOrNull())
+    }
+
     internal fun deleteVerified(f: File): Boolean {
         val ok = runCatching { f.delete() }.getOrDefault(false)
         if (ok) return true
@@ -614,11 +691,22 @@ object FileLogCore {
         if (!work.isFile) return 0
         val lockFile = File(work.parentFile, work.name + ".lock")
         val outcome = ProcLock.withLock(lockFile, timeoutMs = 500L) {
-            val text = runCatching { work.readText() }.getOrNull()
-            if (text.isNullOrEmpty()) {
-                if (!deleteVerified(work)) notes += "empty_work_kept:«${work.name}»"
-                return@withLock 0
+            // iter52 §9.4: ОШИБКА ЧТЕНИЯ ≠ ПУСТОЙ ФАЙЛ. Раньше `readText()` под `runCatching`
+            // отдавал null и это считалось «файл пуст»: work-файл удалялся, а строки журнала
+            // исчезали. Теперь нечитаемый файл остаётся на диске и это видно в заметке.
+            val read = classifyWorkRead(runCatching { work.readText() })
+            when (read.kind) {
+                WorkReadKind.UNREADABLE -> {
+                    notes += "work_unreadable_kept:«${work.name}»:${read.error}"
+                    return@withLock -1
+                }
+                WorkReadKind.EMPTY -> {
+                    if (!deleteVerified(work)) notes += "empty_work_kept:«${work.name}»"
+                    return@withLock 0
+                }
+                WorkReadKind.TEXT -> Unit
             }
+            val text = read.text ?: ""
             val r = append(dir, name, text, maxBytes = Long.MAX_VALUE)
             if (!r.written || r.spilled) {
                 // Не удалось — work остаётся как есть (данные не теряются).
@@ -629,7 +717,10 @@ object FileLogCore {
             if (!deleteVerified(work)) {
                 notes += "work_delete_failed:«${work.name}»( возможны дубли при повторе )"
             }
-            if (!deleteVerified(lockFile)) notes += "lockfile_kept:«${lockFile.name}»"
+            // iter52 §9.3: файл лока НЕ удаляется, пока он удерживается. Удаление под локом
+            // позволяло другому процессу создать новый файл с тем же именем и войти в критическую
+            // секцию параллельно. Лок-файл крошечный — оставляем его навсегда (это стабильный
+            // межпроцессный замок, а не мусор).
             text.count { it == '\n' }
         }
         if (!outcome.executed) return Int.MIN_VALUE
