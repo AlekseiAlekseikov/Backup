@@ -1,8 +1,8 @@
 # REPORT iter51 — звук замка, TTL, JIT, тумблеры, логи
 
 **Ветка:** `fix/v2` · **версия:** `versionCode=63`, `versionName=1.0.63` (**не повышалась**) ·
-**SOURCE_SHA:** `23273b8` (коммит с кодом этой итерации) · **исходный HEAD:** `a67f568`
-(iter50) · **итоговый HEAD:** `23273b887b8eaf861d751251f4dbc16426ac794b` ·
+**SOURCE_SHA:** `64ccb0f` (коммит с кодом этой итерации) · **исходный HEAD:** `a67f568`
+(iter50) · **HEAD после handoff:** `64ccb0f` + коммит маркера ·
 **На ГУ ничего не запускалось**, APK владелец собирает и подписывает сам.
 
 Мандат: `uploads/ПРОМПТ_iter51_СКВОЗНОЕ_ИСПРАВЛЕНИЕ_ЗВУК_TTL_JIT_ЛОГИ.md`.
@@ -304,7 +304,8 @@ AVAS/status bar/плагин не трогались.
 |---|---|---|
 | JVM-тесты | `bash runtests.sh` | **OK (609 tests)** |
 | компиляция production-кода | тот же прогон (`kotlinc 1.9.24`) | без ошибок |
-| CI | GitHub Actions на точном HEAD | см. `WORKLOG.md` (сборка; тесты в CI не запускаются) |
+| CI `Build APK` | run `43628779760` на `64ccb0f` | **success** (~17 мин); тесты в CI не запускаются |
+| CI (первый заход) | run `43627831587` на `aad13b2` | **failure**: `LockSound.kt:975 Unresolved reference 'Stage0'` — исправлено в `64ccb0f`; это единственная проверка компиляции `LockSound.kt`/`AdbClient.kt`, локальный стенд их не собирает (см. §10.1) |
 
 Коммиты итерации (в порядке применения):
 
@@ -316,7 +317,19 @@ AVAS/status bar/плагин не трогались.
 747a65b  §8.1 окна: откат через mutateOwners
 147abde  §7(JIT): claim/terminal/гвардия/выход из неизвестности
 23273b8  §5 инварианты тумблеров
+bce779d  отчёт + WORKLOG
+aad13b2  SOURCE_SHA=23273b8
+64ccb0f  fix: Stage0 внутри LockSound (найдено CI) -> SOURCE_SHA=64ccb0f
 ```
+
+### 10.1 Пробел в локальной проверке (важно)
+
+Локальный стенд компилирует **не все** production-файлы: `LockSound.kt` и `AdbClient.kt` требуют
+Android `Context`/`AudioAttributes`/`Settings` и в стенд не входят. Именно поэтому опечатка
+`LockOp.Stage0` (класс объявлен внутри `LockSound`) дошла до CI и уронила сборку `aad13b2`.
+Единственный барьер для этих двух файлов — CI `Build APK`; для остальных изменённых файлов
+(`ScriptDelivery`, `LockOp`, `JitOwn`, `JitNetCore`, `FileLogCore`, `WindowDoors`, `TtlVerify`,
+`Prefs2`, `LockMountScripts`) барьер — локальный прогон 609 тестов.
 
 **Владельцу:** файл `REVIEW_iter50_*.md` в загрузках отсутствует (в `/home/user/uploads` есть
 только `REVIEW_iter33p*`, `review_iter7/9/22/26.md`) — независимый аудит iter50 не прочитан и не
