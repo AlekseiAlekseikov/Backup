@@ -1703,3 +1703,38 @@ CI `43464916714` (`15dd3b2`) — success (сборка; unit-тестов в wor
 - **На ГУ не проверялось.** ⛔ слышимость звука, реальный TTL на проводе, namespace init,
   факт JIT-компиляции, межпроцессная запись настроек на двух процессах.
 - CI (`Build APK`) — см. отчёт `docs/agent/REPORT_iter48_TTL_звук_JIT_логи_тумблеры.md`.
+
+## iter50 — TTL (argв/politikа), звук замка, prefs/UI, логи, окна
+
+- `LockMountScripts`: путь staging через `"$STAGE_PATH"` (кавычки `shQuote` не попадают в путь),
+  `mrc=$?`/`rc=$?`/`rc2=$?` (раньше — литеральный `$`, из-за чего **любой** mount считался отказом),
+  `bmp` в `expected_root_for` (root считался по последней строке таблицы), `TARGET_DIR` переопределяем
+  (стенд), факт слоя `MOUNT_FACT` печатается всегда.
+- `MountInfo`/`LockSound`: реестр из фактов (`OwnMount(target, source, gen)`), `restoreScript(pairs)`,
+  `facts=/verified=/unverified=/unknown=`, `LOCKSOUND_MOUNT_FACT`.
+- `TtlScript`: `split_spec`/`del_jump` (argv без склейки, без `eval`), `TTL_STOP` → stop вместо дубля
+  `-N/-A`, `OWN_LEFT_STOP` раньше `SCOPED_OK`, POSIX-проверка `NOT_OWNED` (на dash было
+  `Bad substitution` и обрыв скрипта), `rc_*=skip` + rollback только при `TTL_STOP=0`.
+- `TtlVerify`: `OWN_LEFT_STOP` → `FAILED` с причиной.
+- `Prefs2`: `Copy`/`CopyFact`/`putBooleanCore`/`removeCore`/`putStringCore`/`putBoolAndBumpCore`;
+  `confirmed` = `committed && rev && value` в ОДНОЙ копии, `stores`=реальные commit, `readback` отдельно,
+  `commit_false_readback_only`, `dpsOrNull` вместо фоллбэка, `nextGen` без переполнения.
+- `Toggles45` + `ToolsPanel`: `switchPosition/knownPosition` — при `unknown` не подставляется default.
+- `FileLogCore`: восстановление `.drain` без нового spill, уникальные work-имена, `FileLock` на
+  `<work>.lock`, `lastDrainNote`; ротация — `fsync` отделён от факта записи, результат `delete(.new)`
+  не игнорируется, `.new` повышается при пропавшем активном файле. `AppFileLogger`: `LOG_SPILL_DRAIN_FAILED`.
+- `WindowDoors`: `mutateOwners{}` (поколение при ЛЮБОЙ мутации), `ownersSnapshotWithGen()`,
+  `ventCloseOutcome()` (`readback_missing` больше не «закрыто»), `ventLateReadbackMayDropOwners()`.
+- Стенды: `Iter50Stand.kt` (настоящий `sh`, fake iptables/ip6tables/mount/umount/stat/ip/readlink),
+  локальные `android24.jar` + `carstub.jar` → `Prefs2`/`ProcLock`/`WindowDoors`/`AppFileLogger`
+  впервые компилируются и тестируются локально.
+- Тесты: `Iter50TtlArgvTest` (8), `Iter50MountLayerTest` (9), `Iter50ScriptInvariantsTest` (4),
+  `Iter50Prefs2Test` (13), `Iter50TogglePositionTest` (5), `Iter50DrainTest` (7), `Iter50VentTest` (7).
+
+### Проверено / не проверено
+- `bash runtests.sh` → **OK (548 tests)** (было 493).
+- Исполнение всех 4 сгенерированных скриптов в `/bin/sh`; `sh -n` + инварианты.
+- **§7 JIT: опасная цепочка не изменялась** — безопасность отмены/отсутствия позднего выполнения
+  недоказуема доступными средствами; остаток и план испытания — в отчёте iter50.
+- **На ГУ не проверялось.** ⛔ слышимость звука, TTL на проводе, namespace init, факт JIT-компиляции,
+  VHAL окон, реальный файловый стек прошивки.
