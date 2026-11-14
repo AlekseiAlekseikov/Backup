@@ -51,12 +51,13 @@ internal object JitDev {
      * @return ответ устройства, либо `null` — команда не служебная, пусть решает сам fake.
      */
     fun handle(command: String): Pair<Int, String>? {
-        // 1) Запись claim: `printf '%s\n' '<строка>' > /data/local/tmp/voiceapp3_jit.claim … && cat …`
-        if (command.startsWith("printf") && command.contains(JitOwn.CLAIM)) {
+        // 1) Запись claim: iter53 §5.2 — она идёт ПОД lock и отвечает протоколом CL_*.
+        //    `printf '%s\n' '<строка>' > /data/local/tmp/voiceapp3_jit.claim`.
+        if (command.contains("CL_BEGIN") && command.contains(JitOwn.CLAIM)) {
             val line = Regex("printf '%s[^']*' '([^']*)'").find(command)?.groupValues?.get(1)
-                ?: return 1 to ""            // запись не удалась — как «нет прав»
+                ?: return 0 to "CL_BEGIN\nCL_STATUS=failed\nCL_END"
             claim = line
-            return 0 to line
+            return 0 to "CL_BEGIN\nCL_STATUS=taken\nCL_VALUE=$line\nCL_END"
         }
         // 2) Чтение claim + terminal одной командой.
         //

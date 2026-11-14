@@ -194,9 +194,13 @@ class Iter51JitOwnershipTest {
             override fun exec(command: String, timeoutMs: Int): Pair<Int, String> {
                 // Отвечаем на запись claim успешно, но НЕ сохраняем его: на устройстве остаётся
                 // claim прошлой операции — ровно так выглядит «запись не дошла».
-                if (command.startsWith("printf") && command.contains(JitOwn.CLAIM)) {
+                if (command.contains("CL_BEGIN") && command.contains(JitOwn.CLAIM)) {
+                    // Устройство «подтверждает» запись протоколом, но фактически на диске остаётся
+                    // claim другой операции (имитация недошедшей записи): принятое на веру
+                    // подтверждение не должно превращаться в «владение наше».
+                    val mine = Regex("printf '%s[^']*' '([^']*)'").find(command)!!.groupValues[1]
                     JitDev.claimForTest(JitOwn.Op("someone-else", 9L, false, JitOwn.State.CLAIMED).claimLine())
-                    return 0 to JitDev.claim!!       // команда «подтвердила» запись, но она не вступила
+                    return 0 to "CL_BEGIN\nCL_STATUS=taken\nCL_VALUE=$mine\nCL_END"
                 }
                 if (command.contains("CLAIM_STATUS=")) return JitDev.handle(command)!!
                 if (command.contains("setprop ctl.restart zygote")) {
@@ -228,7 +232,7 @@ class Iter51JitOwnershipTest {
         val store = JitFake.Store()
         val shell = object : JitRef.JitShell {
             override fun exec(command: String, timeoutMs: Int): Pair<Int, String> {
-                if (command.startsWith("printf") && command.contains(JitOwn.CLAIM)) {
+                if (command.contains("CL_BEGIN") && command.contains(JitOwn.CLAIM)) {
                     return 1 to "Permission denied"
                 }
                 if (command.contains("CLAIM_STATUS=")) return 0 to reply(null, null)

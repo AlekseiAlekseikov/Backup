@@ -480,7 +480,7 @@ class Iter48Test {
         )
         assertFalse(
             "равенство времени тоже не доказательство",
-            JitOp.zygoteRestartEvidence(mark, mark.ts, now)
+            JitOp.zygoteRestartEvidence(mark, mark.tsMs, now)
         )
         assertTrue(
             "строго позже — признак есть (но только для снятия блокировки нового клика)",

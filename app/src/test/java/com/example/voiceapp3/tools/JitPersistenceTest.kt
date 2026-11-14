@@ -330,7 +330,7 @@ class JitPersistenceTest {
         s.putSnapshot(true, snapTrue, sending)
         cpsDisk[JitRef.KEY_AUTO] = false       // значение после записи снимка
         dpsDisk[JitRef.KEY_AUTO] = false
-        val replied = JitRef.OpMark.of(sending.op, sending.want, JitRef.OpMark.REPLIED, sending.ts)
+        val replied = JitRef.OpMark.of(sending.op, sending.want, JitRef.OpMark.REPLIED, sending.tsMs)
         val r = s.updateMark(replied)
         assertEquals(2, r.ok)
         for (disk in listOf(cpsDisk, dpsDisk)) {

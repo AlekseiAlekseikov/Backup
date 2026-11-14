@@ -389,32 +389,51 @@ object JitRef {
      *              ответил целиком (это НЕ доказательство рестарта zygote); `undefined` — ответа не
      *              было (команда могла остаться в очереди)
      */
-    data class OpMark(val op: String, val ts: Long, val want: Boolean, val state: String) {
+    data class OpMark(
+        val op: String,
+        /** iter53 §5.1: ВСЕГДА миллисекунды — единица видна из имени поля. */
+        val tsMs: Long,
+        val want: Boolean,
+        val state: String
+    ) {
         fun wire(): String =
-            "op=$op;ts=$ts;want=${if (want) 1 else 0};state=$state"
+            "op=$op;ts_ms=$tsMs;ts_s=${JitOwn.msToS(tsMs)};want=${if (want) 1 else 0};state=$state"
 
         companion object {
             const val SENDING = "sending"
             const val REPLIED = "replied"
             const val UNDEFINED = "undefined"
 
-            private val RE = Regex("^op=([A-Za-z0-9_.-]{1,48});ts=(\\d{1,19});want=([01]);state=(sending|replied|undefined)$")
+            // Поле времени: `ts_ms` (новое), `ts_s` (новое), оба сразу (так пишет [wire]) либо
+            // легаси `ts=`. Единица нормализуется в миллисекунды через [JitOwn.Op.parseTsMs].
+            private val RE = Regex(
+                "^op=([A-Za-z0-9_.-]{1,48});" +
+                    "(?:ts_ms=\\d{1,19};ts_s=\\d{1,19}|ts_ms=\\d{1,19}|ts_s=\\d{1,19}|ts=\\d{1,19})" +
+                    ";want=([01]);state=(sending|replied|undefined)$"
+            )
 
-            /** `null` — отметки нет или она не нашего формата (значит операция не опознана). */
+            /**
+             * `null` — отметки нет или она не нашего формата (значит операция не опознана).
+             *
+             * Старые записи `ts=<n>` принимаются: единица определяется по величине (>= 1e11 — мс,
+             * иначе секунды) и нормализуется в миллисекунды. Отметка вне допустимого диапазона —
+             * `null`, а не «примерно ноль»: неизвестный возраст нельзя превращать в «свежая».
+             */
             fun parse(raw: String?): OpMark? {
                 if (raw == null) return null
-                val m = RE.matchEntire(raw) ?: return null
+                val m = RE.matchEntire(raw.trim()) ?: return null
+                val ts = JitOwn.Op.parseTsMs(raw) ?: return null
                 return OpMark(
                     op = m.groupValues[1],
-                    ts = m.groupValues[2].toLongOrNull() ?: 0L,
-                    want = m.groupValues[3] == "1",
-                    state = m.groupValues[4]
+                    tsMs = ts,
+                    want = m.groupValues[2] == "1",
+                    state = m.groupValues[3]
                 )
             }
 
             /** Отметка для тестов/адаптеров, где идентификатор задаётся явно. */
-            fun of(op: String, want: Boolean, state: String = SENDING, ts: Long = 0L) =
-                OpMark(op, ts, want, state)
+            fun of(op: String, want: Boolean, state: String = SENDING, tsMs: Long = 0L) =
+                OpMark(op, tsMs, want, state)
         }
     }
 
@@ -615,7 +634,7 @@ object JitRef {
                 readable = readable, total = reads.size
             )
         }
-        val stamps = marks.map { it.ts }.distinct()
+        val stamps = marks.map { it.tsMs }.distinct()
         if (stamps.size > 1) {
             return StoredOp(
                 StoredState.AMBIGUOUS,
@@ -1461,7 +1480,7 @@ object JitOp {
 
     /** Возраст отметки операции (мс) или `null`, если её нет/время нечитаемо. */
     private fun markAgeMs(mark: JitRef.OpMark?): Long? {
-        val ts = mark?.ts ?: return null
+        val ts = mark?.tsMs ?: return null
         if (ts <= 0L) return null
         return (System.currentTimeMillis() - ts).coerceAtLeast(0L)
     }
@@ -1490,7 +1509,7 @@ object JitOp {
         nowMs: Long,
         limitMs: Long = WIFI_ENABLE_MAX_AGE_MS
     ): Pair<Boolean, String> {
-        val ts = mark?.ts ?: return false to "mark_absent"
+        val ts = mark?.tsMs ?: return false to "mark_absent"
         if (ts <= 0L) return false to "mark_ts_unreadable"
         if (ts > nowMs) return false to "clock_shift_back"
         val age = nowMs - ts
@@ -1522,7 +1541,7 @@ object JitOp {
         zygoteStartMs: Long?,
         nowMs: Long
     ): Boolean {
-        val ts = mark?.ts ?: return false
+        val ts = mark?.tsMs ?: return false
         val zs = zygoteStartMs ?: return false
         if (ts <= 0L || zs <= 0L) return false
         // Отметка/старт «из будущего» — часы сдвинуты, порядок не доказан.
@@ -1536,7 +1555,7 @@ object JitOp {
 
     /** §7.2: отметка операции пережила окно (правило — [Toggles45.isStale]). */
     private fun opExpired(mark: JitRef.OpMark?): Boolean =
-        Toggles45.isStale(mark?.ts, System.currentTimeMillis(), STALE_MARK_MS)
+        Toggles45.isStale(mark?.tsMs, System.currentTimeMillis(), STALE_MARK_MS)
 
     /**
      * Одна конкретная запланированная задача возврата Wi-Fi (не «весь процесс»).
@@ -1672,7 +1691,7 @@ object JitOp {
             if (evidenceOp) {
                 log(
                     "JIT_UNDEFINED_RESOLVED op=${stored.mark?.op} evidence=zygote_started_after_mark " +
-                        "mark_ts=${stored.mark?.ts} zygote_start=$zygoteStart age_ms=$age " +
+                        "mark_ts_ms=${stored.mark?.tsMs} zygote_start=$zygoteStart age_ms=$age " +
                         "wifi_restore=none clicks=allowed " +
                         "(текущий zygote СТАРТОВАЛ ПОСЛЕ отметки операции — строгое сравнение без " +
                         "допуска. Это НЕ доказывает, что рестарт выполнила наша команда (zygote мог " +
@@ -1722,7 +1741,7 @@ object JitOp {
             val prevResolved = prevTerm != null && (prevTerm.finished || prevTerm.refused)
             if (prevResolved && prevOpId != null) {
                 val dec = JitOwn.clickDecision(
-                    JitOwn.Op(prevOpId, stored.mark?.ts ?: 0L, stored.mark?.want ?: false,
+                    JitOwn.Op(prevOpId, stored.mark?.tsMs ?: 0L, stored.mark?.want ?: false,
                         JitOwn.State.UNKNOWN),
                     prevTerm
                 )
@@ -1930,33 +1949,78 @@ object JitOp {
                 )
                 return Click(want, snap, write, read, -1, "", blocked, previousUndefined)
             }
-            // §7 iter51: ЗАХВАТ ВЛАДЕНИЯ до любых изменений настроек. Claim — короткая команда
-            // (десятки байт), поэтому идёт обычным транспортом. Если записать/проверить его не
-            // удалось, payload НЕ отправляется: иначе гвардия на устройстве не смогла бы отличить
-            // нашу операцию от чужой, и поздний старт остался бы неотличимым.
-            val opState = JitOwn.Op(opId, mark.ts, want, JitOwn.State.CREATED)
+
+            /**
+             * iter53 §5.2: ОТКАТ НАМЕРЕНИЯ, когда shell не отправлен по решению ВЛАДЕНИЯ
+             * (`op_in_flight` / `claim_not_confirmed`). Возврат выполняется по доказанной
+             * принадлежности (та же функция, что и в ветке `blocked`) — чужое не трогаем.
+             */
+            fun abortIntent(code: String, why: String): Click {
+                val ops = runCatching { store.readOperation() }.getOrDefault(emptyList())
+                val plan = JitRef.planRestore(prev, ops, opId, snap)
+                val rb = if (plan.owned.isEmpty()) {
+                    JitRef.WriteResult.none("nothing_proven_owned")
+                } else synchronized(INTENT_LOCK) {
+                    runCatching { store.restorePrevious(plan.owned) }
+                        .getOrElse { t -> JitRef.WriteResult.none("exception:" + t.javaClass.simpleName) }
+                }
+                val leftPedido = runCatching { store.contains(JitRef.KEY_PEDIDO) }.getOrDefault(false)
+                val leftRestore = runCatching { store.getString(JitRef.KEY_RESTORE) }.getOrNull()
+                log(
+                    "JIT_CLICK want=$want op=$opId blocked=$code prev_restore=${rb.ok}/${rb.attempted} " +
+                        "restore_plan=«${plan.brief()}» left_pedido=$leftPedido " +
+                        "left_restore=${leftRestore ?: "none"} action=none commands=0 " +
+                        "($why. Сеть, свойства и zygote НЕ менялись)"
+                )
+                return Click(want, snap, write, read, -1, "", code, previousUndefined, 1, stored)
+            }
+            // §7 iter51 + iter53 §5.2: ЗАХВАТ ВЛАДЕНИЯ до любых изменений настроек, и он же
+            // сериализован на устройстве: claim пишется ПОД ТЕМ ЖЕ lock, что держит payload.
+            //  • `busy` — владелец lock жив (или его смерть не доказуема): payload НЕ отправляется,
+            //    потому что второй опасный шаг (svc wifi / setprop / ctl.restart zygote) не должен
+            //    идти конкурентно. Владельцу показывается id операции, которая ещё идёт;
+            //  • `taken` — владение наше, цепочка отправляется;
+            //  • `failed` — запись/чтение claim не подтверждены (канал, права). Payload всё равно
+            //    отправлять нельзя «вслепую»: его гвардия прочитает claim и, если он не наш,
+            //    откажется работать — то есть клик гарантированно ничего не сделает, а мы бы
+            //    записали «отправлено». Поэтому клик останавливается здесь, честно.
+            val opState = JitOwn.Op(opId, mark.tsMs, want, JitOwn.State.CREATED)
             val claimRes = runCatching { shell.exec(JitOwn.claimCmd(opState), 8_000) }
-                .getOrElse { t -> Pair(-1, "ERR_${t.javaClass.simpleName}") }
-            val claimRead = JitOwn.Op.parseClaim(
-                Regex("op=[A-Za-z0-9_.-]+;ts=\\d+;want=[01]").find(claimRes.second)?.value
-            )
-            val claimVerified = claimRes.first == 0 && claimRead?.id == opId
-            log(
-                if (claimVerified)
+                .getOrElse { t -> Pair(-1, "ERR_${'$'}{t.javaClass.simpleName}") }
+            when (val cw = JitOwn.claimResult(claimRes.first, claimRes.second)) {
+                is JitOwn.ClaimWrite.Taken -> log(
                     "JIT_CLAIM op=$opId taken=1 verified=1 path=${JitOwn.CLAIM} want=$want " +
-                        "(владение записано ДО изменения настроек; чужой/устаревший payload " +
+                        "claim=«${cw.line}» " +
+                        "(владение записано ПОД lock ДО изменения настроек; устаревший payload " +
                         "теперь откажется работать сам — см. JIT_REFUSED)"
-                else
-                    // Настоящую защиту даёт ГВАРДИЯ в самом payload: она читает claim на
-                    // устройстве и при несовпадении НИЧЕГО не делает. Провал записи claim не
-                    // доказывает, что канал мёртв (23 КБ скрипт идёт другим путём), поэтому
-                    // клик не отменяется — но заявлять «владение подтверждено» нельзя.
-                    "JIT_CLAIM op=$opId taken=0 verified=0 rc=${claimRes.first} " +
-                        "claim=«${claimRead?.id ?: "none"}» path=${JitOwn.CLAIM} action=proceed " +
-                        "(запись/чтение claim не подтверждены — исход решит гвардия payload'а: " +
-                        "если claim на устройстве не наш, скрипт откажется работать и это будет " +
-                        "видно как JIT_REFUSED; настройки при этом вернутся)"
-            )
+                )
+                is JitOwn.ClaimWrite.Busy -> {
+                    val legacy = !cw.owner.contains("pid=")
+                    log(
+                        "JIT_CLAIM op=$opId taken=0 busy=1 owner=«${cw.owner}» " +
+                            "path=${JitOwn.CLAIM} action=none " +
+                            "(на устройстве уже исполняется другая JIT-операция либо её смерть " +
+                            "не доказана: второй опасный шаг конкурентно НЕ запускается, снимок " +
+                            "не применяется; повторный клик возможен, когда владелец завершится " +
+                            "и напишет свой END — время само по себе блокировку не снимает)"
+                    )
+                    return abortIntent(
+                        if (legacy) "lock_unverified" else "op_in_flight",
+                        "на устройстве владеет другая JIT-операция «${'$'}{cw.owner}» и её " +
+                            "завершение не доказано: второй опасный шаг конкурентно не запускается. " +
+                            "Payload НЕ отправлен; окончание владельца (его END) откроет путь к " +
+                            "следующему ручному клику — время блокировку не снимает"
+                    )
+                }
+                is JitOwn.ClaimWrite.Failed -> log(
+                    "JIT_CLAIM op=$opId taken=0 verified=0 failed=«${cw.why}» rc=${claimRes.first} " +
+                        "path=${JitOwn.CLAIM} action=proceed " +
+                        "(запись/чтение claim НЕ подтверждены — «владение получено» не заявляется. " +
+                        "Исход решит гвардия payload'а: если claim на устройстве не наш, скрипт " +
+                        "откажется работать ДО первого опасного действия и это будет видно как " +
+                        "JIT_REFUSED по terminal-файлу; настройки при этом возвращаются)"
+                )
+            }
             log("dalvik.vm.usejit -> $want; reiniciando o framework")
             log(
                 "JIT_CHAIN_SENT op=$opId ${JitRef.mountStepNote()} timeout_ms=${JitRef.CHAIN_TIMEOUT_MS} " +
@@ -2367,7 +2431,7 @@ object JitOp {
             }
             log(
                 "JIT_START snapshot=${restore.snap.wire()} format=${restore.format} op=${mark.op} " +
-                    "mark_state=${mark.state} mark_ts=${mark.ts} identification=ok removed=none " +
+                    "mark_state=${mark.state} mark_ts_ms=${mark.tsMs} identification=ok removed=none " +
                     "stored=«${stored.brief()}» " +
                     "delay_ms=${JitRef.RESTORE_DELAY_MS} scheduled=$scheduled " +
                     "action=${if (scheduled) "restore_scheduled" else "none"} internet=not_checked " +

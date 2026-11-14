@@ -3,6 +3,7 @@ package com.example.voiceapp3.tools
 import java.io.File
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -101,16 +102,149 @@ class Iter52JitOwnTest {
     }
 
     @Test
-    fun staleLockIsTakenOverAndThatIsWrittenDown() {
-        claim().writeText("op=a;ts=1700000000;want=1")
-        val old = System.currentTimeMillis() / 1000 - (JitOwn.LOCK_STALE_S + 60)
-        lock().writeText("op=dead;ts=$old")
+    fun ageAloneNeverTakesOverLock() {
+        // iter53 §5.1/§5.2: возраст блокировки НЕ доказывает смерть shell. Старая запись без
+        // идентичности владельца (так писала прошлая версия) не перехватывается НИКОГДА.
+        claim().writeText("op=a;ts_ms=1700000000000;want=1")
+        val oldS = System.currentTimeMillis() / 1000 - (JitOwn.LOCK_AGE_NOTE_S + 3600)
+        lock().writeText("op=dead;ts_s=$oldS")
         val effect = File(base, "EFFECT_STALE")
         val (rc, out) = run(payload("a", effect))
         assertEquals(0, rc)
-        assertTrue("перехват брошенной блокировки назван: $out", out.contains("JIT_LOCK_STALE owner="))
-        assertTrue("действие выполнено после перехвата", effect.exists())
+        assertTrue("отказ назван: $out", out.contains("JIT_REFUSED op=a reason=lock_held"))
+        assertTrue("возраст только сообщается: $out", !out.contains("JIT_LOCK_TAKEOVER"))
+        assertFalse("устаревшая команда НЕ выполнена", effect.exists())
+        assertTrue("чужую блокировку не сняли", lock().exists())
+        assertTrue("и не перезаписали", lock().readText().startsWith("op=dead;"))
+        assertTrue("START не писался", !term("a").readText().contains("START"))
+    }
+
+    @Test
+    fun lockOfProvablyDeadOwnerIsTakenOverWithProof() {
+        // Доказательство смерти — pid из lock и его отсутствие в /proc (+ стартовая метка).
+        claim().writeText("op=a;ts_ms=1700000000000;want=1")
+        val deadPid = firstFreePid()
+        assertNotNull("не нашли свободный pid для теста", deadPid)
+        lock().writeText(
+            "op=dead;ts_ms=1700000000000;ts_s=1700000000;inst=dead-1;pid=$deadPid;" +
+                "pstart=123;boot=other-boot"
+        )
+        val effect = File(base, "EFFECT_TO")
+        val (rc, out) = run(payload("a", effect))
+        assertEquals(0, rc)
+        assertTrue("перехват с ДОКАЗАТЕЛЬСТВОМ назван: $out", out.contains("JIT_LOCK_TAKEOVER proof=owner_dead"))
+        assertTrue("действие выполнено ПОСЛЕ доказанной смерти", effect.exists())
         assertFalse("своя блокировка освобождена", lock().exists())
+    }
+
+    @Test
+    fun lockOfLiveOwnerBlocksAndSecondPayloadDoesNotRun() {
+        org.junit.Assume.assumeTrue("нужен /proc для проверки живости", File("/proc/1").isDirectory)
+        claim().writeText("op=a;ts_ms=1700000000000;want=1")
+        // Владелец — этот же тестовый процесс: он жив, значит перехвата быть не должно.
+        val mePid = ProcessHandle.current().pid()
+        val pst = pstartOf(mePid) ?: run { org.junit.Assume.assumeTrue(false); return }
+        val boot = bootId() ?: "-"
+        lock().writeText("op=b;ts_ms=1700000000000;ts_s=1700000000;inst=b-1;pid=$mePid;" +
+            "pstart=$pst;boot=$boot")
+        val effect = File(base, "EFFECT_LIVE")
+        val (rc, out) = run(payload("a", effect))
+        assertEquals(0, rc)
+        assertFalse("второй payload не выполнил действие", effect.exists())
+        assertTrue("причина названа: $out", out.contains("reason=lock_held"))
+        assertTrue("живую блокировку не тронули", lock().readText().startsWith("op=b;"))
+    }
+
+    @Test
+    fun ownerEndInTerminalProvesCompletionAndAllowsTakeover() {
+        // Даже без pid: собственный END владельца в ЕГО terminal-файле — доказательство
+        // завершения (это не таймер), и путь к следующему клику открывается.
+        claim().writeText("op=a;ts_ms=1700000000000;want=1")
+        lock().writeText("op=prev;ts_ms=1700000000000;ts_s=1700000000")
+        term("prev").writeText("START ts=1 op=prev\nEND rc=0 op=prev\n")
+        val effect = File(base, "EFFECT_END")
+        val (rc, out) = run(payload("a", effect))
+        assertEquals(0, rc)
+        assertTrue("перехват по факту END: $out", out.contains("JIT_LOCK_TAKEOVER proof=owner_dead"))
+        assertTrue(effect.exists())
+    }
+
+    @Test
+    fun sameOpIdSecondInstanceIsNotOwner() {
+        // Повтор ТОГО ЖЕ opId при уже работающем экземпляре не становится владельцем.
+        org.junit.Assume.assumeTrue("нужен /proc для проверки живости", File("/proc/1").isDirectory)
+        val opId = "dup-op"
+        claim().writeText("op=$opId;ts_ms=1700000000000;want=1")
+        val mePid = ProcessHandle.current().pid()
+        val pst = pstartOf(mePid) ?: run { org.junit.Assume.assumeTrue(false); return }
+        lock().writeText("op=$opId;ts_ms=1700000000000;ts_s=1700000000;inst=$opId-1;" +
+            "pid=$mePid;pstart=$pst;boot=${bootId() ?: "-"}")
+        val effect = File(base, "EFFECT_DUP")
+        val (rc, out) = run(payload(opId, effect))
+        assertEquals(0, rc)
+        assertFalse("второй экземпляр ничего не сделал", effect.exists())
+        assertTrue("причина: $out", out.contains("reason=same_op_live"))
+    }
+
+    @Test
+    fun claimChangedWhileWaitingForLockIsRefused() {
+        // Ровно гонка из аудита §5.2: payload прочитал claim=A, «задержался», затем claim
+        // переписан на B, а lock свободен. Проверка ПОД lock обязана это увидеть.
+        claim().writeText("op=a;ts_ms=1700000000000;want=1")
+        val effect = File(base, "EFFECT_TOCTOU")
+        // Подкладываем «медленный» старт: gвардия сгенерирована, но перед запуском claim меняется.
+        val script = payload("a", effect)
+        claim().writeText("op=b;ts_ms=1700000000001;want=0")
+        val (rc, out) = run(script)
+        assertEquals(0, rc)
+        assertTrue("отказ назван: $out", out.contains("JIT_REFUSED op=a reason=superseded"))
+        assertFalse("устаревшее действие не выполнено", effect.exists())
+        assertFalse("lock не остался нашим", lock().exists())
+        assertTrue("START не писался", !term("a").readText().contains("START"))
+    }
+
+    @Test
+    fun concurrentPayloadsAreSerialisedByDeviceLock() {
+        // Настоящая одновременность: первый payload держит lock (sleep внутри «опасной» части),
+        // второй стартует в этот момент и обязан отказаться — второй опасный шаг не идёт
+        // параллельно. Это проверка ФАКТИЧЕСКОГО числа side effect, а не текста лога.
+        claim().writeText("op=a;ts_ms=1700000000000;want=1")
+        val e1 = File(base, "EFFECT_C1")
+        val e2 = File(base, "EFFECT_C2")
+        val slow = payload("a", e1).replace(
+            "touch '${e1.absolutePath}'",
+            "sleep 2; touch '${e1.absolutePath}'"
+        )
+        val f1 = File(base, "c1.sh").also { it.writeText(slow) }
+        val f2 = File(base, "c2.sh").also { it.writeText(payload("a", e2)) }
+        val p1 = ProcessBuilder(sh, f1.absolutePath).redirectErrorStream(true).start()
+        Thread.sleep(400)
+        val p2 = ProcessBuilder(sh, f2.absolutePath).redirectErrorStream(true).start()
+        val o2 = p2.inputStream.bufferedReader().readText(); p2.waitFor()
+        val o1 = p1.inputStream.bufferedReader().readText(); p1.waitFor()
+        assertTrue("первый выполнил действие (o1=«$o1»)", e1.exists())
+        assertFalse("второй НЕ выполнил действие параллельно (o2=«$o2»)", e2.exists())
+        assertTrue("второй отказался с причиной: «$o2»",
+            o2.contains("reason=lock_held") || o2.contains("reason=same_op_live"))
+        assertFalse("lock освобождён после штатного завершения", lock().exists())
+    }
+
+    /** Поле 22 `/proc/<pid>/stat` — стартовая метка процесса (идентичность pid). */
+    private fun pstartOf(pid: Long): String? = runCatching {
+        File("/proc/$pid/stat").readText().substringAfterLast(") ").split(' ')[19]
+    }.getOrNull()
+
+    private fun bootId(): String? = runCatching {
+        File("/proc/sys/kernel/random/boot_id").readText().trim()
+    }.getOrNull()?.takeIf { it.isNotEmpty() }
+
+    /** Первый pid, которого нет в /proc: «процесс доказанно мёртв». */
+    private fun firstFreePid(): Long? {
+        if (!File("/proc/1").isDirectory) return null
+        for (p in listOf(99_999L, 99_998L, 123_457L, 654_321L)) {
+            if (!File("/proc/$p").exists()) return p
+        }
+        return null
     }
 
     @Test
