@@ -158,79 +158,19 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
         out.lineSequence().firstOrNull { it.startsWith("TTL_RESULT ") }?.trim().orEmpty()
 
     /**
-     * iter33m §1 — ЧЕСТНЫЙ разбор итога скрипта.
-     *
-     * Правила (мандат §1.3):
-     *   • ON успешен ТОЛЬКО при `TTL_V4>=1` И `VERIFY_V4=OK` И скоупе `uplink_only=yes` И `variant=uplink`;
-     *     нет uplink (`TTL_TRY variant=none reason=no_uplink`) — провал, никакого «применено частично»;
-     *   • OFF успешен ТОЛЬКО при `TTL_V4=0 && TTL_V6=0` И `TTL_OFF … result=OK`;
-     *     осталось правило — `FAILED` с честной причиной (в логе 07.11 было `PARTIAL` при v4=1 v6=1);
-     *   • PARTIAL у TTL больше не возвращается: либо правило подтверждено, либо нет.
+     * iter48 §Ж: разбор вывода ВЫНЕСЕН в чистый [TtlVerify] — он покрыт JVM-тестами
+     * (`Iter48Test`), в отличие от этого объекта, который тянет Android-зависимости.
+     * Здесь остаётся только отображение вердикта на `ToolsStep.Status`.
      */
     private fun parseVerifyResult(expected: Boolean, out: String): Pair<ToolsStep.Status, String> {
-        // iter33n §4.2: ТОЛЬКО строгий разбор `TTL_V4=<n>` / `TTL_V6=<n>` из сводной строки.
-        // Было `parseKv(...)`, который для строки `TTL_V4=0 TTL_V6=0 VERIFY_V4=OFF_OK …`
-        // возвращал в v4 весь хвост строки, а v6 — "null": отсюда ложное
-        // «TTL_OFF не выполнился: осталось правило v4=0 … v6=null» при полностью снятых правилах.
-        fun num(key: String): String? =
-            Regex("(?:^|\\s|_)$key=(\\d+)").find(out)?.groupValues?.get(1)
-        fun flag(key: String): String? =
-            Regex("(?:^|\\s)$key=([A-Za-z0-9_-]+)").find(out)?.groupValues?.get(1)
-        val v4 = num("TTL_V4")
-        val v6 = num("TTL_V6")
-        val v4Verify = flag("VERIFY_V4")
-        val v6Verify = flag("VERIFY_V6")
-        val ttlCheckLine = out.lineSequence().firstOrNull { it.startsWith("TTL_CHECK:") } ?: ""
-        val ttlVerdict = when {
-            "SCOPED_OK" in ttlCheckLine -> "SCOPED_OK"
-            "OFF_OK" in ttlCheckLine -> "OFF_OK"
-            "CHECK_OWNER" in ttlCheckLine -> "CHECK_OWNER"
-            "→ VERIFIED" in ttlCheckLine -> "VERIFIED"
-            "→ MISMATCH" in ttlCheckLine -> "MISMATCH"
-            "→ INDIRECT" in ttlCheckLine -> "INDIRECT"
-            "→ UNVERIFIED" in ttlCheckLine -> "UNVERIFIED"
-            else -> ""
+        val p = TtlVerify.parse(expected, out)
+        val status = when (p.verdict) {
+            TtlVerify.Verdict.OK -> ToolsStep.Status.OK
+            TtlVerify.Verdict.PARTIAL -> ToolsStep.Status.PARTIAL
+            TtlVerify.Verdict.FAILED -> ToolsStep.Status.FAILED
+            TtlVerify.Verdict.BLOCKED -> ToolsStep.Status.BLOCKED
         }
-        val tryLine = out.lineSequence().firstOrNull { it.startsWith("TTL_TRY") } ?: ""
-        val scopeLine = out.lineSequence().firstOrNull { it.startsWith("TTL_SCOPE") } ?: ""
-        val variant = Regex("variant=([^ ]+)").find(tryLine)?.groupValues?.get(1) ?: ""
-        val noUplink = variant == "none" && "reason=no_uplink" in tryLine
-        val uplinkOnly = "uplink_only=yes" in scopeLine
-        val hasLock = out.lowercase().contains("xtables lock")
-        val hasPerm = out.lowercase().contains("permission denied") || out.lowercase().contains("avc: denied")
-        val hasNoRoot = out.contains("ERR_ROOT_CHANNEL_UNAVAILABLE")
-        val noTarget = out.lowercase().contains("no chain/target/match")
-        val v4Count = v4?.toIntOrNull() ?: 0
-        val v6Count = v6?.toIntOrNull() ?: 0
-        val offLine = out.lineSequence().firstOrNull { it.startsWith("TTL_OFF ") } ?: ""
-        val offOk = "result=OK" in offLine
-
-        val reason = when {
-            // iter23 P2.6: честный текст — канал это 5555, а не «второй»/резервный порт.
-            hasNoRoot -> "канал недоступен — 5555 не отвечает (uid=1000). Проверьте «Для разработчика» → «Проверить root»."
-            hasPerm   -> "Permission denied (нужен root-шелл uid=0)"
-            hasLock   -> "xtables lock (iptables занят) — правило не применилось, повторите"
-            noTarget  -> "iptables target 'TTL' не поддерживается ядром (модуль отсутствует)"
-            !expected && !(v4 == "0" && v6 == "0" && offOk) ->
-                "TTL_OFF не выполнился: осталось правило v4=$v4 v6=$v6 (см. TTL_DEL/TTL_SANITIZED/TTL_FOREIGN)"
-            !expected -> null
-            noUplink -> "нет uplink (правило без uplink не ставим — ломает CarPlay), TTL_TRY variant=none reason=no_uplink"
-            v4Count < 1 || v4Verify != "OK" ->
-                "rule_not_installed: правила TTL в mangle/POSTROUTING нет (TTL_V4=$v4 VERIFY_V4=$v4Verify)"
-            !uplinkOnly ->
-                "правило без скоупа -o <uplink> — запрещено (CarPlay): $scopeLine"
-            else -> null
-        }
-        val status = when {
-            reason == null -> ToolsStep.Status.OK
-            hasNoRoot -> ToolsStep.Status.BLOCKED
-            else -> ToolsStep.Status.FAILED
-        }
-        val detail = if (reason == null) {
-            if (expected) "TTL_V4=$v4 TTL_V6=$v6 VERIFY=$v4Verify/$v6Verify scoped=uplink_only verdict=$ttlVerdict"
-            else "TTL_V4=0 TTL_V6=0 VERIFY=$v4Verify/$v6Verify verdict=$ttlVerdict TTL_OFF result=OK"
-        } else reason
-        return status to detail
+        return status to p.detail
     }
 
     @Volatile private var ttlLastRunAtMs: Long = 0L
@@ -265,15 +205,7 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
                 override fun apply(want: Boolean): TtlRunner.Outcome = runTransport(want, "runner")
             },
             store = object : TtlRunner.Store {
-                override fun desired(): Boolean? {
-                    val r = Prefs2.readBoolean(appCtxRef ?: return null, PREF_TTL_65_ACTIVE)
-                    return when (r) {
-                        is Toggles45.Resolved.Value -> r.v
-                        Toggles45.Resolved.Deleted -> false
-                        // Конфликт/неизвестность: НЕ выдумываем ни ON, ни OFF.
-                        Toggles45.Resolved.Conflict, Toggles45.Resolved.Unknown -> null
-                    }
-                }
+                override fun desired(): Boolean? = appCtxRef?.let { desiredOrNull(it) }
 
                 override fun intentGen(): Long =
                     appCtxRef?.let { Prefs2.getLong(it, PREF_TTL_65_INTENT_GEN, 0L) } ?: 0L
@@ -331,6 +263,17 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
         )
     }
 
+    /**
+     * Намерение владельца для РАННЕРА: `null` — прочитать достоверно нельзя (копии в конфликте
+     * или значение неизвестно). В этом случае ни ON, ни OFF вслепую не применяется.
+     */
+    private fun desiredOrNull(context: Context): Boolean? =
+        when (val r = Prefs2.readBoolean(context, PREF_TTL_65_ACTIVE)) {
+            is Toggles45.Resolved.Value -> r.v
+            Toggles45.Resolved.Deleted -> false
+            Toggles45.Resolved.Conflict, Toggles45.Resolved.Unknown -> null
+        }
+
     /** Контекст приложения для лямбд раннера (ставится при первом обращении/инициализации). */
     @Volatile private var appCtxRef: Context? = null
 
@@ -364,11 +307,19 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
             }
         }
         val (status, reason) = parseVerifyResult(want, output)
-        val ok = status == ToolsStep.Status.OK
+        // iter48 §Б: OFF с `result=PARTIAL reason=foreign_rules_remain` — СВОИ правила сняты
+        // (readback own=0), поэтому желаемое состояние OFF достигнуто; но полным «OK» это не
+        // является и в журнале остаётся честная причина. Чужое не удаляли.
+        val ownOffReached = !want && status == ToolsStep.Status.PARTIAL
+        val ok = status == ToolsStep.Status.OK || ownOffReached
         ttlLastRunAtMs = SystemClock.uptimeMillis()
         AppLog.i(TAG, "TTL_APPLY_RESULT source=$source want=$want rc=$exitCode ok=$ok " +
-            "ms=${ttlLastRunAtMs - t0} reason=«${reason ?: ""}»")
-        return TtlRunner.Outcome(ok, reason ?: if (ok) "" else status.wire)
+            "own_off_reached=$ownOffReached ms=${ttlLastRunAtMs - t0} reason=«${reason ?: ""}»")
+        return TtlRunner.Outcome(
+            ok,
+            reason ?: if (ok) "foreign_rules_remain" else status.wire,
+            if (ok && status == ToolsStep.Status.PARTIAL) "foreign_rules_remain" else ""
+        )
     }
 
     /** Факт применения: значение + поколение + загрузка (все три проверяются при чтении). */
@@ -457,12 +408,60 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
      * Возвращает (v4_rule_count, v6_rule_count); при недоступности канала — (-1, -1).
      */
     fun ttlRuleCounts(): Pair<Int, Int> = runCatching {
-        val (_, out) = AdbClient.execute(
-            "iptables -t mangle -S POSTROUTING 2>/dev/null | grep -c ttl-set; " +
-                "ip6tables -t mangle -S POSTROUTING 2>/dev/null | grep -c hl-set", 5000, expectRoot = false)
+        // iter48 §Б: «своё» = правила ВНУТРИ нашей цепочки + переходы на неё. Считать только
+        // `ttl-set` в POSTROUTING нельзя: после перехода на отдельную цепочку собственное
+        // правило там не видно, и boot решал бы «правил нет», хотя цепочка стоит.
+        // Чужие правила сюда НЕ входят (их не удаляем и за свои не считаем).
+        val ch = TtlScript.OUR_CHAIN
+        val cmd = "n4=$(iptables -t mangle -S $ch 2>/dev/null | grep -c ttl-set); " +
+            "j4=$(iptables -t mangle -S POSTROUTING 2>/dev/null | grep -c -- \"-j $ch\"); " +
+            "n6=$(ip6tables -t mangle -S $ch 2>/dev/null | grep -c hl-set); " +
+            "j6=$(ip6tables -t mangle -S POSTROUTING 2>/dev/null | grep -c -- \"-j $ch\"); " +
+            "echo $((n4+j4)); echo $((n6+j6))"
+        val (_, out) = AdbClient.execute(cmd, 5000, expectRoot = false)
         val nums = out.lineSequence().mapNotNull { it.trim().toIntOrNull() }.toList()
         Pair(nums.getOrElse(0) { -1 }, nums.getOrElse(1) { -1 })
     }.getOrDefault(Pair(-1, -1))
+
+    /**
+     * iter48 §Б — «канал root вернулся» как РЕАЛЬНОЕ событие, а не таймер.
+     *
+     * Дефект iter47: `AdbClient.onRootRestored` — одиночный колбэк, и его никто не назначал;
+     * для TTL события «root готов» в production не существовало вовсе (тест это имитировал).
+     *
+     * Теперь подписка процесс-локальная (живёт в `object AdbClient`, переживает lifecycle
+     * активити и недоступность канала), а повод — только переход в ROOT. Шторма нет: переход
+     * фиксируется на СМЕНЕ состояния; проход идёт на BgWorker, не на main.
+     */
+    @Volatile private var rootReadyHook: ((String, String) -> Unit)? = null
+
+    fun registerRootReadyHook(context: Context) {
+        val app = ensureCtx(context)
+        if (rootReadyHook != null) {
+            AppLog.i(TAG, "root-ready hook already registered — skip (single instance)")
+            return
+        }
+        val hook: (String, String) -> Unit = { state, reason ->
+            if (state == AdbClient.RootState.ROOT.name) {
+                BgWorker.post("NetworkTtl.rootReady") {
+                    val desired = desiredOrNull(app)
+                    AppLog.i(TAG, "TTL_ROOT_READY reason=$reason desired=${desired ?: "unknown"} " +
+                        "action=verify (проверка правил; Wi-Fi здесь не включаем и намерение не меняем)")
+                    if (desired == null) {
+                        AppLog.i(TAG, "TTL_ROOT_READY action=none reason=desired_unknown")
+                    } else {
+                        val res = runner.onBackgroundTrigger("root_ready")
+                        AppLog.i(TAG, "TTL_ROOT_READY result=${res?.request} " +
+                            "confirmed=${res?.confirmed} desired=${desired(app)} " +
+                            "applied=${appliedState(app)}")
+                    }
+                }
+            }
+        }
+        rootReadyHook = hook
+        AdbClient.addRootStateListener(hook)
+        AppLog.i(TAG, "root-ready hook registered (real state transition, not timer)")
+    }
 
     /**
      * Регистрация сетевого ресивера: при поднятии/изменении сети пере-проверяем/
@@ -542,6 +541,9 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
             ctx.registerReceiver(recv, filter)
             networkReceiver = recv
             AppLog.i(TAG, "network receiver registered (single instance)")
+            // §Б iter48: вместе с сетевыми событиями поднимаем РЕАЛЬНОЕ событие канала root.
+            runCatching { registerRootReadyHook(ctx) }
+                .onFailure { AppLog.w(TAG, "registerRootReadyHook failed: ${it.message}") }
         } catch (t: Throwable) {
             AppLog.e(TAG, "registerNetworkReceiver failed: ${t.message}", t)
         }

@@ -222,9 +222,33 @@ object AdbClient {
     private const val SCRIPT_UPLOAD_TRIES = 3
     private val rootRestoreDone = java.util.concurrent.atomic.AtomicBoolean(false)
 
-    /** Колбэк «root вернулся» — один проход восстановления (`bootrestore pass=1`). */
+    /**
+     * Колбэк «root вернулся» — один проход восстановления (`bootrestore pass=1`).
+     *
+     * iter48 §Б: ОДИН такой колбэк мало для реальных подписчиков (TTL, звук): второй молча
+     * затирал первого, и «событие канала» до него не доходило. Подписка — [addRootStateListener];
+     * эта переменная оставлена для совместимости и вызывается ровно на переходе в ROOT.
+     */
     @Volatile
     var onRootRestored: (() -> Unit)? = null
+
+    /**
+     * Подписчики на РЕАЛЬНЫЙ переход состояния канала: `(to, reason) -> Unit`.
+     *
+     * Событие процесс-локальное (живёт в `object AdbClient`, а не в Activity), поэтому не
+     * зависит от lifecycle экрана. Шторма нет: [transitionRootState] вызывается только на
+     * СМЕНЕ состояния (`from != to`), повторы одного и того же состояния молчат.
+     */
+    private val rootStateListeners =
+        java.util.concurrent.CopyOnWriteArrayList<(String, String) -> Unit>()
+
+    fun addRootStateListener(listener: (String, String) -> Unit) {
+        if (!rootStateListeners.contains(listener)) rootStateListeners.add(listener)
+    }
+
+    fun removeRootStateListener(listener: (String, String) -> Unit) {
+        rootStateListeners.remove(listener)
+    }
 
     fun currentRootState(): RootState = rootState.get()
 
@@ -246,6 +270,11 @@ object AdbClient {
             }
         }
         if (to != RootState.ROOT) rootRestoreDone.set(false)
+        // §Б iter48: реальные подписчики события. Исключение одного не мешает остальным.
+        for (l in rootStateListeners) {
+            runCatching { l(to.name, reason) }
+                .onFailure { AppLog.w(TAG, "root state listener threw on $to: ${it.message}") }
+        }
         // iter33l §3.1: ЛЮБОЙ переход в SHELL_NO_ROOT — ОДНА попытка восстановления на событие,
         // и это ПОЛНОЕ ПЕРЕПОДКЛЮЧЕНИЕ канала (не `ctl.restart adbd`): см. [reconnectRoot].
         if (to == RootState.ROOT) rootRecoveryDone.set(false)
