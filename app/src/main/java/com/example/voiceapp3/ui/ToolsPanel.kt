@@ -1,6 +1,8 @@
 package com.example.voiceapp3.ui
 
 import android.app.Activity
+import com.example.voiceapp3.tools.AppLog
+import com.example.voiceapp3.tools.Prefs2
 import android.app.AlertDialog
 import android.graphics.Typeface
 import android.graphics.drawable.ColorDrawable
