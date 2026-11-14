@@ -48,11 +48,37 @@ NS_INIT=${'$'}(readlink /proc/1/ns/mnt 2>/dev/null)
 echo "MOUNT_NS self=${'$'}{NS_SELF:-unknown} init=${'$'}{NS_INIT:-unknown}"
 NS_OK=0
 [ -n "${'$'}NS_SELF" ] && [ -n "${'$'}NS_INIT" ] && [ "${'$'}NS_SELF" = "${'$'}NS_INIT" ] && NS_OK=1
+STAGE_PATH=$stage
+STAGE_DEV_INO=${'$'}(stat -c '%d:%i' $stage 2>/dev/null)
 [ "${'$'}NS_OK" = "1" ] || echo "MOUNT_NS_MISMATCH self=${'$'}{NS_SELF:-unknown} init=${'$'}{NS_INIT:-unknown} action=none reason=namespace_differs"
 
-mi_layers() { awk -v t="${'$'}1" '${'$'}5==t {print ${'$'}1"|"${'$'}4}' /proc/self/mountinfo 2>/dev/null; }
+mi_layers() { awk -v t="${'$'}1" '${'$'}5==t {print ${'$'}1"|"${'$'}3"|"${'$'}4}' /proc/self/mountinfo 2>/dev/null; }
 mi_count() { mi_layers "${'$'}1" | wc -l | tr -d ' '; }
+# iter49 §4: `tail -1` — это ПОРЯДОК СТРОК mountinfo, а не гарантированный «верхний слой».
+# Ядро вправе отдать записи в другом порядке, поэтому порядок называется вслух, а не
+# выдаётся за факт: решение о снятии опирается ещё и на доказательство владения.
 mi_top() { mi_layers "${'$'}1" | tail -1; }
+echo "MOUNT_ORDER method=mountinfo_order top_guaranteed=no"
+
+# Доказательство владения слоем: корень монтирования = НАШ staging-путь И устройство/инод
+# цели совпадают с staging-файлом (для bind файла stat(цель) отдаёт инод источника).
+# Литеральный префикс сам по себе доказательством не считается: чужой bind может иметь
+# похожий корень. Если инод доказать нельзя — слой НЕ снимаем (отказ безопаснее).
+own_layer() {
+  t="${'$'}1"; top=${'$'}2; root=${'$'}{top#*|*|}; mid=${'$'}{top%%|*}
+  case "${'$'}root" in ${'$'}STAGE_PATH) : ;; *) return 1 ;; esac
+  tgt=$(stat -c '%d:%i' "${'$'}t" 2>/dev/null)
+  if [ -z "${'$'}STAGE_DEV_INO" ] || [ -z "${'$'}tgt" ]; then
+    echo "OWN_PROOF:${'$'}t method=none reason=stat_unavailable mid=${'$'}mid root=${'$'}root"
+    return 1
+  fi
+  if [ "${'$'}tgt" != "${'$'}STAGE_DEV_INO" ]; then
+    echo "OWN_PROOF:${'$'}t method=none reason=inode_mismatch mid=${'$'}mid root=${'$'}root tgt=${'$'}tgt stage=${'$'}STAGE_DEV_INO"
+    return 1
+  fi
+  echo "OWN_PROOF:${'$'}t method=dev_ino mid=${'$'}mid root=${'$'}root"
+  return 0
+}
 
 # Снять ТОЛЬКО свои слои на цели. Возврат: 0 — своих не осталось; 3 — сверху чужой слой;
 # 4 — снятие не подтверждено; 5 — предел попыток.
@@ -62,12 +88,11 @@ drop_own_layers() {
     n=${'$'}((n+1))
     top=${'$'}(mi_top "${'$'}t")
     if [ -z "${'$'}top" ]; then echo "OWN_LAYERS:absent:${'$'}t"; return 0; fi
-    mid=${'$'}{top%%|*}; root=${'$'}{top#*|}
-    case "${'$'}root" in
-      /data/local/tmp/carlock_custom*) : ;;
-      *) echo "FOREIGN_MOUNT:${'$'}t mid=${'$'}mid root=${'$'}root";
-         return 3 ;;
-    esac
+    mid=${'$'}{top%%|*}; root=${'$'}{top#*|*|}
+    if ! own_layer "${'$'}t" "${'$'}top"; then
+      echo "FOREIGN_MOUNT:${'$'}t mid=${'$'}mid root=${'$'}root reason=ownership_not_proven"
+      return 3
+    fi
     before=${'$'}(mi_count "${'$'}t")
     umount "${'$'}t" 2>/dev/null; rc=${'$'}?
     after=${'$'}(mi_count "${'$'}t")
@@ -151,10 +176,13 @@ drop_own_layers() {
     n=${'$'}((n+1))
     top=${'$'}(mi_top "${'$'}t")
     if [ -z "${'$'}top" ]; then return 0; fi
-    mid=${'$'}{top%%|*}; root=${'$'}{top#*|}
+    mid=${'$'}{top%%|*}; root=${'$'}{top#*|*|}
+    # iter49 §4: путь из реестра — это НАША запись о слое, но сама по себе она не доказывает,
+    # что сверху не чужой слой. Поэтому: корень обязан быть нашим staging-путём, а чужой
+    # верхний слой останавливает снятие и НЕ считается «снятым».
     case "${'$'}root" in
-      /data/local/tmp/carlock_custom*) : ;;
-      *) echo "FOREIGN_MOUNT:${'$'}t mid=${'$'}mid root=${'$'}root"; return 3 ;;
+      /data/local/tmp/carlock_custom*) echo "OWN_PROOF:${'$'}t method=registry_root mid=${'$'}mid root=${'$'}root" ;;
+      *) echo "FOREIGN_MOUNT:${'$'}t mid=${'$'}mid root=${'$'}root reason=ownership_not_proven"; return 3 ;;
     esac
     before=${'$'}(mi_count "${'$'}t")
     umount "${'$'}t" 2>/dev/null; rc=${'$'}?

@@ -61,6 +61,17 @@ object AppFileLogger {
                 Log.e(TAG, "LOG_TAIL_NUL_DETECTED file=«${f.name}» bytes=$nul pre_init=true " +
                     "action=append_after (старые записи не переписываются; новые пишутся под локом и с fsync)")
             }
+            // iter49 §8: нули ВНУТРИ файла (а не только в хвосте). Раньше проверялись лишь
+            // последние 64 КиБ, поэтому блок нулей в середине журнала не обнаруживался.
+            // `-1` = прочитать нельзя; это не «нулей нет» и так и сообщается.
+            val inside = FileLogCore.nulInside(f)
+            if (inside > 0) {
+                Log.e(TAG, "LOG_NUL_INSIDE file=«${f.name}» count=$inside pre_init=true " +
+                    "action=none (файл владельца не переписываем; диагностика честно сообщает о дырах)")
+            } else if (inside < 0) {
+                Log.w(TAG, "LOG_NUL_SCAN_FAILED file=«${f.name}» (прочитать файл не удалось: " +
+                    "утверждать, что нулей нет, нельзя)")
+            }
         }
         i("LOGGER", "=== Logger init, primary=${primaryFile?.absolutePath} mirror=${mirrorFile?.absolutePath} ===")
     }

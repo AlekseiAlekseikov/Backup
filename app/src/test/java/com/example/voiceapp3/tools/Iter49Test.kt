@@ -266,6 +266,100 @@ class Iter49Test {
         assertTrue("видно, какая операция оставлена", text.contains("abandoned_op=op-old"))
     }
 
+    // ───────────────── §4: монтирования — владение по inode, namespace до действий ─────────────────
+
+    private fun src(path: String): String {
+        val rel = "src/main/java/com/example/voiceapp3/tools/$path"
+        return listOf(java.io.File(rel), java.io.File("app/$rel")).first { it.isFile }.readText()
+    }
+
+    @Test
+    fun mountOwnershipUsesDeviceAndInodeNotJustThePrefix() {
+        val b = LockMountScripts.bindScript("/data/local/tmp/carlock_custom_g1_ab.wav")
+        assertTrue("staging dev:inode снимается", b.contains("STAGE_DEV_INO"))
+        assertTrue("владение доказывается dev:inode", b.contains("method=dev_ino"))
+        assertTrue("несовпадение инода — не наше", b.contains("reason=inode_mismatch"))
+        assertTrue("порядок слоёв не выдаётся за гарантию",
+            b.contains("top_guaranteed=no"))
+    }
+
+    @Test
+    fun namespaceIsCheckedBeforeAnyMountAction() {
+        val l = src("LockSound.kt")
+        val pre = l.indexOf("NS_PRE")
+        val act = l.indexOf("AdbClient.execute(script, 20000)")
+        assertTrue("есть проверка namespace", pre > 0)
+        assertTrue("проверка идёт ДО снятия", pre in 1 until act)
+        assertTrue("при несовпадении actions нет", l.contains("reason=namespace_differs"))
+    }
+
+    @Test
+    fun foreignLayerAboveKeepsOurRecordPending() {
+        val l = src("LockSound.kt")
+        assertFalse(
+            "чужой верхний слой больше не исключается из недоказанных",
+            l.contains("it.target !in provenTargets && it.target !in foreignLeft")
+        )
+        assertTrue("недоказанное остаётся в реестре", l.contains("val unproven = entries.filter { it.target !in provenTargets }"))
+        assertTrue("причина названа", l.contains("pending_foreign_layer_above"))
+    }
+
+    // ───────────────── §8: ротация не даёт дубликатов, NUL внутри файла ─────────────────
+
+    @Test
+    fun rotationDoesNotDuplicateLineWhenNewPartKept() {
+        val dir = java.io.File.createTempFile("it49", "").let { it.delete(); it.mkdirs(); it }
+        val active = java.io.File(dir, "v.log")
+        active.writeText("old\n")
+        // `.1` — непустой каталог: переименование поверх невозможно.
+        java.io.File(dir, "v.log.1").apply { mkdir(); java.io.File(this, "x").writeText("busy") }
+        // `.new` уже содержит данные прошлой неудачной ротации. Раньше строка писалась и в
+        // активный файл, и оставалась в `.new` → при следующем повышении `.new` появлялся дубль.
+        java.io.File(dir, "v.log.new").writeText("prev-line\n")
+
+        val r = FileLogCore.append(dir, "v.log", "line\n", maxBytes = 4)
+        assertTrue("строка не потеряна", r.written)
+        assertFalse("ротация не заявлена", r.rotated)
+        assertTrue("причина названа", r.reason.contains("rotate_rename_failed"))
+        assertFalse("в активный файл дубль не писался",
+            active.readText().contains("line\n"))
+        assertTrue("строка легла в .new после предыдущих данных",
+            java.io.File(dir, "v.log.new").readText() == "prev-line\nline\n")
+        dir.deleteRecursively()
+    }
+
+    @Test
+    fun nulBytesAreFoundInsideFileNotOnlyAtTail() {
+        val f = java.io.File.createTempFile("it49nul", ".log")
+        f.writeBytes(byteArrayOf('a'.code.toByte(), 0, 'b'.code.toByte(), 0, 'c'.code.toByte(),
+            '\n'.code.toByte()))
+        assertEquals("нули внутри найдены", 2, FileLogCore.nulInside(f))
+        assertEquals("хвост чистый", 0, FileLogCore.tailNulBytes(f))
+        f.delete()
+    }
+
+    @Test
+    fun drainFileIsNotDeletedWhenSpillRestoreFails() {
+        val core = src("FileLogCore.kt")
+        assertTrue("отказ возврата данных не скрывается",
+            core.contains("if (restored) runCatching { work.delete() }"))
+    }
+
+    // ───────────────── §9: ABA у владельцев окна ─────────────────
+
+    @Test
+    fun lateReadbackChecksOwnersGenerationNotOnlyContent() {
+        val w = src("WindowDoors.kt")
+        assertTrue("поколение набора владельцев есть", w.contains("ventGen"))
+        assertTrue("сверяется содержимое И поколение",
+            w.contains("ventGen.get() == genAtAttempt"))
+        assertTrue("ABA-проверка видна в журнале", w.contains("aba_checked=yes"))
+        assertFalse(
+            "одного сравнения содержимого недостаточно",
+            w.contains("if (now == ownersAtAttempt && now.isEmpty()) {")
+        )
+    }
+
     // ───────────────── §5: скрипт не выходит за свои границы ─────────────────
 
     @Test

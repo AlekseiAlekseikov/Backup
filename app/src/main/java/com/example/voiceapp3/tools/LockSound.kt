@@ -1197,6 +1197,29 @@ object LockSound {
                 //  • владение слоем доказывается по mountinfo (root = наш staging), не по /proc/mounts;
                 //  • чужой верхний слой не снимается;
                 //  • каждый umount проверяется перечитыванием mountinfo; `|| true` больше нет.
+                // iter49 §4: проверка пространства монтирования — ДО любого действия.
+                // Раньше namespace выяснялся уже ПОСЛЕ выполнения скрипта: снятие в чужом
+                // пространстве имён выглядело как «команда выполнена», а система слой не теряла.
+                val nsPre = runCatching {
+                    AdbClient.execute(
+                        "echo NS_PRE self=\$(readlink /proc/self/ns/mnt 2>/dev/null) " +
+                            "init=\$(readlink /proc/1/ns/mnt 2>/dev/null)", 6000
+                    ).second
+                }.getOrDefault("")
+                val nsPreMatch = Regex("NS_PRE self=(\\S+) init=(\\S+)").find(nsPre)
+                val nsSame = nsPreMatch != null &&
+                    nsPreMatch.groupValues[1] == nsPreMatch.groupValues[2]
+                AppLog.i(ctx, TAG, "LOCKSOUND_UNMOUNT NS_PRE ${nsPre.trim().take(160)} " +
+                    "same=$nsSame checked_before_action=yes")
+                if (!nsSame) {
+                    // Никаких umount: слой в нашем пространстве имён системе не виден, а «снято»
+                    // заявлять нельзя. Реестр сохраняется целиком.
+                    markApplied(ctx, false, "unmount_namespace_differs_pre")
+                    AppLog.w(ctx, TAG, "LOCKSOUND_UNMOUNT action=none reason=namespace_differs " +
+                        "checked_before_action=yes registry_kept=${entries.size} " +
+                        "(снятие не начиналось: root не обязан давать namespace init)")
+                    return@execute
+                }
                 val script = LockMountScripts.restoreScript(entries.map { it.target })
                 val res = AdbClient.execute(script, 20000)
                 AppLog.i(ctx, TAG, "LOCKSOUND_UNMOUNT [exitCode=${res.first}]: " + res.second.trim().take(800))
@@ -1216,8 +1239,12 @@ object LockSound {
                 }
                 val provenTargets = parsed.proven.toSet()
                 val foreignLeft = parsed.foreignLeft.toSet()
-                val unproven = entries.filter { it.target !in provenTargets && it.target !in foreignLeft }
+                // iter49 §4: «сверху чужой слой» — это НЕ «нашего слоя нет». Под чужим слоем мог
+                // остаться наш, поэтому такая запись остаётся PENDING (реестр не чистится):
+                // раньше `foreignLeft` исключался из `unproven`, и учёт нашего слоя терялся.
+                val unproven = entries.filter { it.target !in provenTargets }
                 val kept = unproven
+                val pendingOwned = kept.size
                 // Реестр чистим ТОЛЬКО по доказанным записям. Недоказанные остаются — иначе
                 // приложение «забыло» бы свои слои и снять их потом было бы нечем.
                 if (kept.isEmpty()) writeOwnMounts(ctx, emptyList())
@@ -1230,6 +1257,8 @@ object LockSound {
                     ctx, false,
                     when {
                         clean -> "off"
+                        foreignLeft.isNotEmpty() && !allProven ->
+                            "pending_foreign_layer_above:${pendingOwned}"
                         !allProven -> "unmount_unproven:${unproven.joinToString(",") { it.target }}"
                         else -> "own_layers_left:$ownLayersLeft"
                     }

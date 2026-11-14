@@ -172,6 +172,11 @@ object FileLogCore {
             // становится активным. Любой отказ оставляет данные: либо в `.new`, либо в активном.
             // §Е iter48: 1) `.new` НЕ обнуляется — если в нём остались данные от прошлой
             // неудачной ротации, они сохраняются (дописываем, а не setLength(0)).
+            // iter49 §8: состояние `.new` ДО нашей дозаписи. Если там остались данные прошлой
+            // неудачной ротации, класть эту же строку ещё и в активный файл нельзя — при
+            // следующем успешном повышении `.new` строка попала бы в журнал дважды.
+            val freshHadData = runCatching { fresh.isFile && fresh.length() > 0L }
+                .getOrDefault(false)
             val wroteNew = runCatching {
                 RandomAccessFile(fresh, "rw").use { out ->
                     out.seek(out.length())
@@ -207,8 +212,16 @@ object FileLogCore {
             }
             if (!moved) {
                 // Прежняя часть осталась на месте (например, `.1` — непустой каталог).
-                // §Е: строку НЕ теряем — дозаписываем в активный файл, ротация не заявляется.
-                // Причина видна в Result: `rotate_rename_failed:appended_to_active`.
+                // iter49 §8: раньше здесь строка дозаписывалась в АКТИВНЫЙ файл, хотя `.new`
+                // уже содержит НОВУЮ часть (с этой же строкой). При следующей удачной ротации
+                // `.new` становится активным — и эти строки оказывались в журнале ДВАЖДЫ.
+                // Теперь при непустом `.new` дозапись идёт только в него (duplicate=false),
+                // а в активный файл пишем лишь когда `.new` пуст (там нечего потерять).
+                if (freshHadData) {
+                    return Result(true, fresh, "rotate_rename_failed:kept_in_new", false, 0,
+                        locked)
+                }
+                runCatching { fresh.delete() }
                 val nul = tailNulBytes(active)
                 val direct = appendDirect(active, line, nulBefore = nul, locked = locked)
                 return direct.copy(
@@ -348,19 +361,43 @@ object FileLogCore {
             val r = append(dir, name, text, maxBytes = Long.MAX_VALUE)
             if (!r.written || r.spilled) {
                 // Не удалось — возвращаем данные обратно в spill, ничего не теряем.
-                runCatching {
+                val restored = runCatching {
                     RandomAccessFile(spill, "rw").use { out ->
                         out.seek(out.length())
                         out.write(text.toByteArray(Charsets.UTF_8))
+                        runCatching { out.fd.sync() }.isSuccess
                     }
-                }
-                runCatching { work.delete() }
+                }.getOrDefault(false)
+                // iter49 §8: если вернуть данные не удалось, `.drain` НЕ удаляем — иначе строки
+                // журнала исчезают вместе с файлом при скрытом отказе переноса.
+                if (restored) runCatching { work.delete() }
                 return@synchronized -1
             }
             runCatching { work.delete() }
             text.count { it == '\n' }
         }
     }
+
+    /**
+     * iter49 §8: `0x00` ВНУТРИ файла, а не только в хвосте.
+     *
+     * Прежняя проверка смотрела лишь последние 64 КиБ: блок нулей в середине (после чего журнал
+     * дописывался) не обнаруживался вовсе. Возвращает {@code -1}, если файл прочитать нельзя —
+     * это НЕ «нулей нет».
+     */
+    fun nulInside(f: File): Int = runCatching {
+        if (!f.isFile) return@runCatching 0
+        var count = 0
+        java.io.FileInputStream(f).use { input ->
+            val buf = ByteArray(64 * 1024)
+            while (true) {
+                val n = input.read(buf)
+                if (n <= 0) break
+                for (i in 0 until n) if (buf[i] == 0.toByte()) count++
+            }
+        }
+        count
+    }.getOrDefault(-1)
 
     /** Сколько `0x00` подряд в самом хвосте файла (0 — хвост чистый). */
     fun tailNulBytes(f: File): Int = runCatching {

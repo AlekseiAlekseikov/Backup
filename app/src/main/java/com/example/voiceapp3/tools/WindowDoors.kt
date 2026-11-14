@@ -94,6 +94,20 @@ object WindowDoors {
      */
     private val ventOwners = HashMap<Int, MutableSet<Int>>()
 
+    /**
+     * iter49 §9 — ПОКОЛЕНИЕ набора владельцев (ABA-защита).
+     *
+     * Прежняя проверка позднего readback сравнивала только СОДЕРЖИМОЕ набора
+     * (`now == ownersAtAttempt`). Этого мало: набор мог измениться A → B → A (за это время
+     * другая дверь успела открыться и закрыться, либо запись пересоздана), и сравнение
+     * «равно» пропустило бы удаление ЖИВОЙ записи. Счётчик растёт при каждом изменении
+     * набора, поэтому совпадение содержимого при разных поколениях означает «было изменение».
+     */
+    private val ventGen = java.util.concurrent.atomic.AtomicLong(0)
+
+    /** Текущее поколение набора владельцев (для сверки поздних ответов). */
+    internal fun ventOwnersGeneration(): Long = ventGen.get()
+
     /** Набор дверей-владельцев окна (создаётся по требованию). */
     private fun ownersOf(w: Int): MutableSet<Int> = synchronized(ventOwners) { ventOwners.getOrPut(w) { HashSet() } }
 
@@ -488,6 +502,8 @@ object WindowDoors {
             set.clear()
             set.addAll(ownersAfter)
             if (set.isEmpty() && legacy) ventOwners.remove(windowAreaId)
+            // iter49 §9: любое изменение набора — новое поколение (ABA-защита позднего readback).
+            ventGen.incrementAndGet()
         }
         val after = synchronized(ventOwners) { ventOwners[windowAreaId]?.toSet() ?: emptySet() }
         val pos = posBefore ?: -1
@@ -550,20 +566,25 @@ object WindowDoors {
             val ownersAtAttempt = synchronized(ventOwners) {
                 ventOwners[retryWin]?.toSortedSet()?.toList() ?: emptyList()
             }
+            val genAtAttempt = ventGen.get()
             com.example.voiceapp3.tools.BgWorker.postDelayed("ventLateReadback", 1_500L) {
                 runCatching {
                     val late = readWindowPos(cpm, retryWin)
                     if (late != null && kotlin.math.abs(late - WINDOW_CLOSED_POS) <= WINDOW_CLOSE_TOLERANCE) {
                         val unchanged = synchronized(ventOwners) {
                             val now = ventOwners[retryWin]?.toSortedSet()?.toList() ?: emptyList()
-                            if (now == ownersAtAttempt && now.isEmpty()) {
+                            // Сверяются ОБА факта: содержимое И поколение. A→B→A даёт равное
+                            // содержимое, но другое поколение — значит запись живёт, её не трогаем.
+                            if (now == ownersAtAttempt && now.isEmpty() && ventGen.get() == genAtAttempt) {
                                 ventOwners.remove(retryWin)
+                                ventGen.incrementAndGet()
                                 true
                             } else false
                         }
                         if (!unchanged) {
                             AppLog.i(appCtx, TAG, "VENT_CLOSE_LATE_KEPT win=${hex(retryWin)} " +
                                 "pos_after=$late reason=owners_changed_since_attempt " +
+                                "gen_attempt=$genAtAttempt gen_now=${ventGen.get()} aba_checked=yes " +
                                 "(запись владельцев изменена позже — поздний readback её не трогает)")
                         }
                         persistVentOwners(appCtx)
