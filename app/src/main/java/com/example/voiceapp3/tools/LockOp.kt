@@ -77,6 +77,84 @@ internal object LockOp {
     }
 
     /**
+     * iter52 §5.1 — ЖУРНАЛ КАК СПИСОК ОПЕРАЦИЙ, а не один перезаписываемый файл.
+     *
+     * На HEAD iter51 запись была одна: следующий запуск перетирал незавершённую операцию, и
+     * восстановить по ней ничего было нельзя. Здесь каждая строка — отдельное состояние
+     * операции; актуальное состояние операции = ПОСЛЕДНЯЯ строка с её `id`.
+     *
+     * Формат строки: `<время>|<encode()>`; повреждённая строка пропускается, но считается
+     * (`broken`), чтобы «не читается» не превращалось в «операций не было».
+     */
+    data class Journal(
+        val ops: Map<String, BindOp>,
+        val broken: Int,
+        val lines: Int
+    ) {
+        /** Операции, по которым исход НЕ разрешён: нужна сверка, а не «всё хорошо». */
+        fun unresolved(): List<BindOp> = ops.values.filter {
+            it.state == State.PLANNED || it.state == State.UNDEFINED
+        }
+
+        fun last(): BindOp? = ops.values.maxByOrNull { it.gen }
+
+        fun wire(): String =
+            "ops=${ops.size} unresolved=${unresolved().size} broken=$broken lines=$lines"
+    }
+
+    /** Разбор журнала: последняя строка по каждому `id` побеждает. */
+    fun parseJournal(text: String?): Journal {
+        if (text.isNullOrBlank()) return Journal(emptyMap(), 0, 0)
+        var broken = 0
+        var lines = 0
+        val out = LinkedHashMap<String, BindOp>()
+        for (raw in text.lineSequence()) {
+            val t = raw.trim()
+            if (t.isEmpty()) continue
+            lines++
+            val payload = t.substringAfter('|', "")
+            val op = decode(payload)
+            if (op == null) {
+                broken++
+                continue
+            }
+            out[op.id] = op
+        }
+        return Journal(out, broken, lines)
+    }
+
+    /** Строка журнала для добавления: время + закодированное состояние. */
+    fun journalLine(op: BindOp, now: Long): String = "$now|${op.encode()}"
+
+    /**
+     * iter52 §5.1(3) — вердикт сверки незавершённой операции по выводу restore-скрипта.
+     *
+     * Почему отдельная функция: решение «что делать с потерянной операцией» должно быть
+     * проверяемым на РЕАЛЬНОМ выводе скрипта, а не только в тесте с подставленным результатом.
+     *
+     *  • [STOCK_RESTORED] — своих слоёв не осталось (сняты сейчас или их не было);
+     *  • [FOREIGN_LEFT]  — сверху чужой слой: чужое НЕ трогаем, запись остаётся;
+     *  • [UNPROVEN]      — таблица/namespace не прочитаны, идентичность не доказана.
+     */
+    enum class Reconcile { STOCK_RESTORED, FOREIGN_LEFT, UNPROVEN }
+
+    fun reconcileVerdict(rc: Int, out: String): Reconcile = when {
+        out.contains("FOREIGN_MOUNT:") || out.contains("STOCK_FOREIGN_LEFT:") -> Reconcile.FOREIGN_LEFT
+        out.contains("STOCK_UNPROVEN:") || out.contains("RESTORE_BLOCKED") -> Reconcile.UNPROVEN
+        out.contains("STOCK_OK:") || out.contains("UMOUNTED_OK:") ||
+            out.contains("UMOUNT_DETACHED:") -> Reconcile.STOCK_RESTORED
+        // Пустой/непонятный вывод при rc=0: «ничего не печаталось» ≠ «слоя нет».
+        rc != 0 -> Reconcile.UNPROVEN
+        else -> Reconcile.UNPROVEN
+    }
+
+    /** Состояние журнала, соответствующее вердикту (для честного статуса операции). */
+    fun stateForVerdict(v: Reconcile): State = when (v) {
+        Reconcile.STOCK_RESTORED -> State.DONE
+        Reconcile.FOREIGN_LEFT, Reconcile.UNPROVEN -> State.UNDEFINED
+    }
+
+    /**
      * Доказательство по каждой цели.
      *
      * `complete` = набор целей известен достоверно, на каждую ожидаемую цель есть РОВНО один

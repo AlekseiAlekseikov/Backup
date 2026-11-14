@@ -189,6 +189,12 @@ object LockSound {
         bindFailCount = 0
         bindDisabledUntilBoot = false
         AppLog.i(ctx, TAG, "LOCK_SOUND_INTENT desired=$enabled source=user_click gen=$bindGen")
+        // iter52 §5.1(3): смена намерения — реальная точка сверки журнала. OFF после потерянного
+        // ответа bind должен СНЯТЬ наш слой (иначе он остаётся висеть без учёта), а ON — довести
+        // до выбранного файла. Сверка идёт до применения, в фоне (ADB внутри).
+        BgWorker.post("LockSound.reconcileIntent") {
+            runCatching { reconcilePendingOps(ctx.applicationContext, "intent_desired=$enabled") }
+        }
         val prefReadback = Prefs2.getBoolean(ctx, PREF_LOCK_SOUND_ENABLED, false)
         steps += ToolsStep(
             step = "persist_pref",
@@ -795,6 +801,9 @@ object LockSound {
         val lockEnabled = isEnabled(ctx)
         val unlockEnabled = isUnlockSoundEnabled(ctx)
         AppLog.i(ctx, TAG, "onBootOrWatchdog: проверка звуков замка (lock=$lockEnabled unlock=$unlockEnabled) vol=${getVolume(ctx)}% delay=${getDelayMs(ctx)}ms")
+        // iter52 §5.1(3): сначала СВЕРКА незавершённых операций из журнала (после падения/
+        // потери ответа на устройстве мог остаться наш слой), потом обычное применение.
+        runCatching { reconcilePendingOps(ctx, "boot_or_watchdog") }
         if (lockEnabled) {
             val path = getSelectedPath(ctx)
             // OEM-логика при boot: пишем путь в lock_car_audio_path и enable=1
@@ -852,7 +861,7 @@ object LockSound {
      *  3. setenforce 0 убран (P5).
      *  4. VERIFY по SRC_INODE/TGT_INODE и по /proc/mounts.
      */
-    private fun applySystemLockSoundBind(ctx: Context, soundFile: File) {
+    private fun applySystemLockSoundBind(ctx: Context, soundFile: File, reconcileFirst: Boolean = true) {
         // §6.2 iter46: «до boot» больше не блокирует бессрочно — только до подходящего события;
         // флаг оставлен для совместимости и снимается в onConditionsRestored/смене выбора.
         if (bindDisabledUntilBoot) {
@@ -868,6 +877,12 @@ object LockSound {
         val appCtx = ctx.applicationContext
         // P1: всё что ниже — ADB/mount, на BgWorker а не на main.
         BgWorker.post("LockSound.bind") {
+            // iter52 §5.1(2): незавершённую операцию нельзя перетирать новой. Сверяем журнал
+            // ДО записи собственного PLANNED; если сверка показала чужой/недоказанный слой —
+            // он останется в журнале как UNDEFINED, и мы это увидим в логе, а не потеряем.
+            // reconcileFirst=false — это вызов ИЗ сверки: иначе сверка → применение → сверка
+            // зацикливается на записи, которую снять нельзя (чужой слой).
+            if (reconcileFirst) runCatching { reconcilePendingOps(appCtx, "before_bind") }
             try {
                 // §5.2 iter47: staging-файл УНИКАЛЕН для (поколение + содержимое). Раньше все
                 // задачи писали в один и тот же путь: параллельная задача могла подменить файл
@@ -1237,6 +1252,8 @@ object LockSound {
      */
     fun onConditionsRestored(ctx: Context, source: String) {
         if (!isEnabled(ctx)) return
+        // iter52 §5.1(3): «условия вернулись» — тоже точка сверки незавершённых операций.
+        runCatching { reconcilePendingOps(ctx.applicationContext, "conditions_restored:$source") }
         bindFailCount = 0
         bindDisabledUntilBoot = false
         bindGen++
@@ -1379,31 +1396,122 @@ object LockSound {
     private fun mountsFile(ctx: Context): File = File(ctx.applicationContext.filesDir, "locksound_mounts.txt")
 
     /** Файл журнала операций звука (iter51 §3.3). */
-    private fun opFile(ctx: Context): File = File(ctx.applicationContext.filesDir, "locksound_op.txt")
+    /**
+     * iter52 §5.1: журнал операций — APPEND-логи (переживает несколько операций и перезапуск).
+     *
+     * Раньше один файл `locksound_op.txt` перезаписывался каждой операцией, поэтому
+     * незавершённая запись исчезала при следующем запуске, а `readOpJournal` вообще не
+     * вызывался production-кодом. Теперь:
+     *  • каждая запись — отдельная строка (см. [LockOp.parseJournal]);
+     *  • запись ПРОВЕРЯЕТСЯ чтением (и это видно в логе, а не заявляется);
+     *  • чтение используется в [reconcilePendingOps] из реальных событий.
+     */
+    private fun opFile(ctx: Context): File = File(ctx.applicationContext.filesDir, "locksound_ops.log")
+
+    /** Дописать состояние операции и ПОДТВЕРДИТЬ его чтением. */
+    internal fun writeOpJournal(ctx: Context, op: LockOp.BindOp): Boolean =
+        appendOp(ctx, op, "planned")
 
     /**
-     * Записать операцию ДО side effect и ПРОВЕРИТЬ запись чтением.
+     * Добавить запись и проверить, что именно она прочиталась обратно.
      *
-     * Честная граница: `writeText` без `fsync` не гарантирует сохранность при отключении питания;
-     * проверка чтением ловит отказ записи (нет места/прав), но не потерю питания.
+     * @return true — запись подтверждена чтением; false — писать в журнал нельзя (и side effect
+     *   тогда не выполняется вызывающим).
      */
-    internal fun writeOpJournal(ctx: Context, op: LockOp.BindOp): Boolean {
-        val ok = runCatching { opFile(ctx).writeText(op.encode()) }.isSuccess
-        if (!ok) return false
-        val back = runCatching { LockOp.decode(opFile(ctx).readText()) }.getOrNull()
-        return back?.id == op.id && back.state == op.state
+    internal fun appendOp(ctx: Context, op: LockOp.BindOp, tag: String): Boolean {
+        val file = opFile(ctx)
+        val line = LockOp.journalLine(op, System.currentTimeMillis())
+        val written = runCatching {
+            file.parentFile?.mkdirs()
+            file.appendText(line + "\n")
+        }.isSuccess
+        // Читаем ВСЕГДА: подтверждение — это факт чтения, а не отсутствие исключения.
+        val back = LockOp.parseJournal(runCatching { file.readText() }.getOrNull())
+        val confirmed = back.ops[op.id]?.state == op.state && back.ops[op.id]?.gen == op.gen
+        if (!written || !confirmed) {
+            AppLog.e(ctx, TAG, "LOCKSOUND_OP write=unconfirmed tag=$tag ${op.wire()} " +
+                "written=$written journal=«${back.wire()}» (журнал не подтверждён: неизвестно, " +
+                "а не «операции не было»)")
+            return false
+        }
+        AppLog.i(ctx, TAG, "LOCKSOUND_OP tag=$tag ${op.wire()} journal=«${back.wire()}»")
+        return true
     }
 
-    /** Обновить состояние операции после ответа (или оставить `UNDEFINED`). */
+    /** Обновить состояние операции (append новой строки) и подтвердить запись. */
     internal fun finishOpJournal(ctx: Context, op: LockOp.BindOp, state: LockOp.State, reason: String) {
         val now = op.copy(state = state, reason = reason)
-        runCatching { opFile(ctx).writeText(now.encode()) }
-        AppLog.i(ctx, TAG, "LOCKSOUND_OP ${state.name.lowercase()} ${now.wire()}")
+        // iter52 §5.1(4): результат записи проверяется; DONE без подтверждения не заявляется.
+        if (!appendOp(ctx, now, "finish_${state.name.lowercase()}")) {
+            AppLog.e(ctx, TAG, "LOCKSOUND_OP DONE_NOT_PERSISTED op=${op.id} state=${state.name.lowercase()} " +
+                "reason=$reason (состояние операции не зафиксировано на диске)")
+        }
     }
 
-    /** Текущая запись журнала (для сверки при следующем реальном событии). */
-    internal fun readOpJournal(ctx: Context): LockOp.BindOp? =
-        runCatching { LockOp.decode(opFile(ctx).readText()) }.getOrNull()
+    /** Текущий журнал (все операции с последним состоянием). */
+    internal fun readOpJournal(ctx: Context): LockOp.Journal =
+        LockOp.parseJournal(runCatching { opFile(ctx).readText() }.getOrNull())
+
+    /**
+     * iter52 §5.1(3): СВЕРКА НЕЗАВЕРШЁННЫХ ОПЕРАЦИЙ ИЗ ЖУРНАЛА — на реальном пути.
+     *
+     * Вызывается из событий: старт/сторожевая проверка, возврат root-канала, смена намерения
+     * (ON/OFF/смена файла), перед новой отправкой bind. Для каждой незавершённой операции:
+     *  1. отправляется restore-скрипт по ЕЁ целям и ЕЁ staging-источнику — скрипт снимает только
+     *     слой, чей root совпадает с ожидаемым, и отказывается трогать чужой;
+     *  2. по фактическому выводу операция переводится в DONE (снято/слоя нет) либо остаётся
+     *     UNDEFINED с причиной (`foreign_above`/`unproven`) — чужое не трогаем;
+     *  3. после сверки состояние доводится до ПОСЛЕДНЕГО сохранённого намерения владельца.
+     *
+     * @return true — была хотя бы одна незавершённая операция (значит, нужна сходимость).
+     */
+    internal fun reconcilePendingOps(ctx: Context, source: String): Boolean {
+        val journal = readOpJournal(ctx)
+        val pending = journal.unresolved()
+        if (pending.isEmpty()) {
+            AppLog.i(ctx, TAG, "LOCKSOUND_RECONCILE source=$source action=none journal=«${journal.wire()}»")
+            return false
+        }
+        AppLog.i(ctx, TAG, "LOCKSOUND_RECONCILE source=$source pending=${pending.size} " +
+            "journal=«${journal.wire()}» ops=${pending.joinToString(",") { it.id }} " +
+            "(незавершённые операции будут сверены по фактической таблице монтирований)")
+        val appCtx = ctx.applicationContext
+        for (op in pending) {
+            val entries = op.targets.map { it to op.stage }
+            if (entries.isEmpty() || op.stage.isEmpty()) {
+                finishOpJournal(appCtx, op, LockOp.State.UNDEFINED, "reconcile_no_targets")
+                AppLog.e(appCtx, TAG, "LOCKSOUND_RECONCILE op=${op.id} action=none reason=no_targets " +
+                    "(в записи нет целей/staging: снять наугад нельзя, запись сохранена)")
+                continue
+            }
+            val script = LockMountScripts.restoreScript(entries)
+            val (rc, out) = AdbClient.executeScript("lock_reconcile_restore", script, 30000)
+            // Вердикт — чистая функция, проверенная на РЕАЛЬНОМ выводе restore-скрипта.
+            val verdict = LockOp.reconcileVerdict(rc, out)
+            val state = LockOp.stateForVerdict(verdict)
+            val reason = when (verdict) {
+                LockOp.Reconcile.STOCK_RESTORED -> "reconciled_restore"
+                LockOp.Reconcile.FOREIGN_LEFT -> "foreign_above_left"
+                LockOp.Reconcile.UNPROVEN -> "reconcile_unproven"
+            }
+            finishOpJournal(appCtx, op, state, reason)
+            AppLog.i(appCtx, TAG, "LOCKSOUND_RECONCILE op=${op.id} rc=$rc " +
+                "verdict=${verdict.name.lowercase()} state=${state.name.lowercase()} " +
+                "out=${out.replace('\n', ' ').take(300)}")
+        }
+        // Сходимость к последнему сохранённому намерению (не к «состоянию до»).
+        if (isEnabled(appCtx)) {
+            val path = getSelectedPath(appCtx)
+            if (path.isNotEmpty() && File(path).exists()) {
+                AppLog.i(appCtx, TAG, "LOCKSOUND_RECONCILE action=converge_to_intent desired=true " +
+                    "(после сверки возвращаем звук к последнему выбору владельца)")
+                applySystemLockSoundBind(appCtx, File(path), reconcileFirst = false)
+            }
+        } else {
+            markApplied(appCtx, false, "reconciled_off")
+        }
+        return true
+    }
 
     /** Хэш пути staging: короткая детерминированная метка, без содержимого WAV. */
     internal object Stage0 {
