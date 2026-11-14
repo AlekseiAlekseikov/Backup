@@ -31,6 +31,7 @@ import com.example.voiceapp3.nav.NavTheme
 import com.example.voiceapp3.tools.AppPerformance
 import com.example.voiceapp3.tools.BgWorker
 import com.example.voiceapp3.tools.JitRef
+import com.example.voiceapp3.tools.Toggles45
 import com.google.gson.JsonArray
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
@@ -1062,10 +1063,15 @@ class ToolsPanel(
         // Раньше при частичном/повреждённом снимке отсутствующий ключ считался прочитанным и
         // подменялся дефолтом (у 17 из 19 тумблеров это false) — ложное «выключено».
         val unknownToggle = raw == null || prefsUnknownByBackend
-        // Положение при неизвестности берётся из сохранённого намерения (это НЕ факт — подпись
-        // выше говорит «не подтверждено»); выдумывать `def` вместо намерения нельзя.
-        val on = if (key != "perfJit") (raw ?: def)
+        // §6.3 iter50: положение при `unknown` больше НЕ берётся из `raw ?: def` (raw == default,
+        // который backend подставляет при неизвестности). Используется трёхзначная модель:
+        // подтверждённое on/off — факт (и запоминается как последнее известное), `unknown` —
+        // последнее известное в этой сессии, и только при полном отсутствии информации `def`.
+        val triState = prefsState?.takeIf { it.isNotEmpty() }
+            ?: when (raw) { true -> "on"; false -> "off"; null -> "unknown" }
+        val on = if (key != "perfJit") Toggles45.switchPosition(triState, lastKnownPos[key], def)
                  else JitRef.switchPosition(jitConfirmed ?: "unknown", raw ?: def)
+        Toggles45.knownPosition(triState)?.let { lastKnownPos[key] = it }
         val row = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -1472,6 +1478,14 @@ class ToolsPanel(
     // ── Значения снимка ───────────────────────────────────────────────────
 
     /** Как JS: '0' и 0 — выключено; прочие примитивы — по truthiness. */
+    /**
+     * §6.3 iter50: последнее ПОДТВЕРЖДЁННОЕ положение каждого тумблера (по `*State`), чтобы при
+     * `unknown` не подставлять backend default и не терять уже показанный факт. Живёт только в
+     * этом экземпляре панели: переживает перерисовку/частичный снимок, но не выдаётся за
+     * сохранённое намерение (подпись «состояние не подтверждено» остаётся).
+     */
+    private val lastKnownPos = HashMap<String, Boolean>()
+
     private fun boolState(key: String): Boolean? {
         // §6.2 iter47: ключа нет в ПОСЛЕДНЕМ снимке → «не прочитано» (даже если старое значение
         // ещё лежит в слитом `state`). Раньше слитый снимок показывал устаревшее значение.

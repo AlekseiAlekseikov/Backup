@@ -88,11 +88,19 @@ object Prefs2 {
         /** В другой копии обнаружена РАВНАЯ ревизия с другим значением. */
         val conflict: Boolean,
         /** Причина отказа/частичности (пусто — всё подтверждено). */
-        val reason: String
+        val reason: String,
+        /**
+         * §6.1 iter50: сколько копий ПРОЧИТАЛИСЬ с нашей ревизией и нашим значением.
+         *
+         * `readback > 0` при `stores == 0` — это и есть дефект, который искали: `commit()`
+         * вернул false (или бросил исключение), но in-memory состояние уже изменилось, поэтому
+         * чтение «подтверждает» запись, которой на диск не легло. Такая запись НЕ durable.
+         */
+        val readback: Int = 0
     ) {
         val partial: Boolean get() = confirmed && stores < 2
         fun wire(): String =
-            "confirmed=$confirmed stores=$stores rev=$rev conflict=$conflict" +
+            "confirmed=$confirmed stores=$stores readback=$readback rev=$rev conflict=$conflict" +
                 (if (reason.isEmpty()) "" else " reason=«$reason»")
     }
 
@@ -136,27 +144,147 @@ object Prefs2 {
     private fun lockFile(app: Context, key: String): java.io.File =
         java.io.File(lockDir(app), "prefs_" + key.replace('/', '_') + ".lock")
 
-    private fun writeBoth(
-        app: Context,
+    /**
+     * §6.1 iter50 — одна копия настроек. `prefs == null` — копия НЕДОСТУПНА (direct boot,
+     * отсутствие device-protected storage): это не «пустые настройки» и не второй store.
+     */
+    internal data class Copy(val name: String, val prefs: SharedPreferences?)
+
+    /**
+     * §6.1 iter50 — факт записи ОДНОЙ копии.
+     *
+     * Разделение «коммит» и «чтение» здесь принципиальное: `Editor.commit()` может вернуть
+     * `false` уже после того, как in-memory состояние изменено, поэтому «прочиталось» ≠
+     * «сохранено». Подтверждение требует `committed && revOk && valueOk` в ОДНОЙ копии.
+     */
+    internal data class CopyFact(
+        val name: String,
+        val available: Boolean,
+        val committed: Boolean,
+        val rev: Long,
+        val revOk: Boolean,
+        val valueOk: Boolean
+    ) {
+        val ok: Boolean get() = available && committed && revOk && valueOk
+    }
+
+    /**
+     * Реальные копии для боевого контекста.
+     *
+     * `dpsOrNull` (а НЕ `dps` с фоллбэком на CPS): при недоступном device-protected storage
+     * раньше возвращалась та же CPS, и одна физическая запись считалась двумя `stores`.
+     */
+    internal fun copiesOf(app: Context): List<Copy> = listOf(
+        Copy("cps", runCatching { cps(app) }.getOrNull()),
+        Copy("dps", runCatching { dpsOrNull(app) }.getOrNull())
+    )
+
+    /** Следующая ревизия по фактическим копиям (часы не используются как доказательство). */
+    internal fun nextRevOf(copies: List<Copy>, key: String): Long =
+        maxOf(copies.map { readRev(it.prefs, key) }.maxOrNull() ?: -1L, 0L) + 1
+
+    /** Записать одну и ту же транзакцию в каждую доступную копию; вернуть РЕАЛЬНЫЕ `commit()`. */
+    internal fun writeAll(
+        copies: List<Copy>,
         key: String,
         rev: Long,
+        whoTag: String,
         put: (SharedPreferences.Editor) -> Unit
-    ): Int {
-        var ok = 0
-        for (p in listOf(runCatching { cps(app) }.getOrNull(), runCatching { dps(app) }.getOrNull())) {
-            if (p == null) continue
-            val committed = try {
-                val ed = p.edit()
-                put(ed)
-                ed.putLong(revKey(key), rev)
-                ed.putString(ownerKey(key), who)
-                ed.commit()
-            } catch (_: Throwable) {
-                false
-            }
-            if (committed) ok++
+    ): List<Boolean> = copies.map { cp ->
+        val p = cp.prefs ?: return@map false
+        try {
+            val ed = p.edit()
+            put(ed)
+            ed.putLong(revKey(key), rev)
+            ed.putString(ownerKey(key), whoTag)
+            ed.commit()
+        } catch (_: Throwable) {
+            false
         }
-        return ok
+    }
+
+    /** Сводка по фактам копий. `conflict` считается там, где известны значения. */
+    private fun summarize(facts: List<CopyFact>, rev: Long, conflict: Boolean): Save {
+        val stores = facts.count { it.committed }
+        val readback = facts.count { it.available && it.revOk && it.valueOk }
+        val confirmed = !conflict && facts.any { it.ok }
+        val why = when {
+            conflict -> "conflict_same_rev"
+            confirmed && stores == 2 -> ""
+            confirmed -> "partial_stores:$stores"
+            readback > 0 -> "commit_false_readback_only:$readback"
+            else -> "not_persisted"
+        }
+        return Save(confirmed, stores, if (confirmed) rev else -1L, conflict, why, readback)
+    }
+
+    /** §6.1 iter50: запись boolean в набор копий. БЕЗ Context — это позволяет исполнить ровно
+     *  этот код в JVM-тесте с поддельными `SharedPreferences`. */
+    internal fun putBooleanCore(
+        copies: List<Copy>,
+        key: String,
+        value: Boolean,
+        rev: Long,
+        whoTag: String
+    ): Save {
+        val commits = writeAll(copies, key, rev, whoTag) { ed ->
+            ed.putBoolean(key, value)
+            ed.putBoolean(delKey(key), false)
+        }
+        val seen = copies.map { cp ->
+            runCatching { cp.prefs?.let { if (it.contains(key)) it.getBoolean(key, value) else null } }
+                .getOrNull()
+        }
+        val facts = copies.mapIndexed { i, cp ->
+            CopyFact(cp.name, cp.prefs != null, commits[i], readRev(cp.prefs, key),
+                readRev(cp.prefs, key) == rev, seen[i] == value)
+        }
+        val conflict = copies.size == 2 && copies[0].prefs != null && copies[1].prefs != null &&
+            readRev(copies[0].prefs, key) == readRev(copies[1].prefs, key) &&
+            readRev(copies[0].prefs, key) >= 0L && seen[0] != null && seen[1] != null &&
+            seen[0] != seen[1]
+        return summarize(facts, rev, conflict)
+    }
+
+    /** §6.1 iter50: удаление как tombstone в набор копий. */
+    internal fun removeCore(copies: List<Copy>, key: String, rev: Long, whoTag: String): Save {
+        val commits = writeAll(copies, key, rev, whoTag) { ed ->
+            ed.remove(key)
+            ed.putBoolean(delKey(key), true)
+        }
+        val facts = copies.mapIndexed { i, cp ->
+            val r = readRev(cp.prefs, key)
+            val gone = runCatching { cp.prefs?.let { !it.contains(key) } }.getOrNull() == true
+            val tomb = runCatching { cp.prefs?.let { readDel(it, key) } }.getOrNull() == true
+            CopyFact(cp.name, cp.prefs != null, commits[i], r, r == rev, gone && tomb)
+        }
+        return summarize(facts, rev, false)
+    }
+
+    /** §6.1 iter50: запись строки в набор копий. */
+    internal fun putStringCore(
+        copies: List<Copy>,
+        key: String,
+        value: String,
+        rev: Long,
+        whoTag: String
+    ): Save {
+        val commits = writeAll(copies, key, rev, whoTag) { ed ->
+            ed.putString(key, value)
+            ed.putBoolean(delKey(key), false)
+        }
+        val seen = copies.map { cp ->
+            runCatching { cp.prefs?.getString(key, null) }.getOrNull()
+        }
+        val facts = copies.mapIndexed { i, cp ->
+            val r = readRev(cp.prefs, key)
+            CopyFact(cp.name, cp.prefs != null, commits[i], r, r == rev, seen[i] == value)
+        }
+        val conflict = copies.size == 2 && copies[0].prefs != null && copies[1].prefs != null &&
+            readRev(copies[0].prefs, key) == readRev(copies[1].prefs, key) &&
+            readRev(copies[0].prefs, key) >= 0L && seen[0] != null && seen[1] != null &&
+            seen[0] != seen[1]
+        return summarize(facts, rev, conflict)
     }
 
     /**
@@ -168,29 +296,8 @@ object Prefs2 {
     fun putBooleanEx(c: Context, key: String, value: Boolean): Save {
         val app = c.applicationContext
         val locked = ProcLock.withLock(lockFile(app, key)) {
-            val rev = nextRev(app, key)
-            val stores = writeBoth(app, key, rev) { ed ->
-                ed.putBoolean(key, value)
-                ed.putBoolean(delKey(key), false)
-            }
-            val pc = runCatching { cps(app) }.getOrNull()
-            val pd = runCatching { dps(app) }.getOrNull()
-            val rc = readRev(pc, key)
-            val rd = readRev(pd, key)
-            val cv = runCatching { pc?.let { if (it.contains(key)) it.getBoolean(key, value) else null } }.getOrNull()
-            val dv = runCatching { pd?.let { if (it.contains(key)) it.getBoolean(key, value) else null } }.getOrNull()
-            val conflict = rc == rd && rc >= 0L && cv != null && dv != null && cv != dv
-            // §Г iter48: при конфликте равных ревизий запись НЕ подтверждена, даже если наша
-            // копия содержит наше значение: во второй копии лежит другое, и порядок неизвестен.
-            val storeConfirmed = (rc == rev && cv == value) || (rd == rev && dv == value)
-            val confirmed = storeConfirmed && !conflict
-            val why = when {
-                conflict -> "conflict_same_rev"
-                confirmed && stores == 2 -> ""
-                confirmed -> "partial_stores:$stores"
-                else -> "not_persisted"
-            }
-            Save(confirmed, stores, if (confirmed) rev else -1L, conflict, why)
+            val copies = copiesOf(app)
+            putBooleanCore(copies, key, value, nextRevOf(copies, key), who)
         }
         if (!locked.executed) {
             return Save(false, 0, -1L, false,
@@ -206,31 +313,8 @@ object Prefs2 {
     fun removeEx(c: Context, key: String): Save {
         val app = c.applicationContext
         val locked = ProcLock.withLock(lockFile(app, key)) {
-            val rev = nextRev(app, key)
-            val stores = writeBoth(app, key, rev) { ed ->
-                ed.remove(key)
-                ed.putBoolean(delKey(key), true)
-            }
-            val pc = runCatching { cps(app) }.getOrNull()
-            val pd = runCatching { dps(app) }.getOrNull()
-            val rc = readRev(pc, key)
-            val rd = readRev(pd, key)
-            // §Г iter48: удаление подтверждено не «ревизией», а ФАКТОМ: в копии нет значения,
-            // tombstone стоит, и ревизия — наша. Иначе «удалено» могло означать лишь то, что
-            // запись дошла до одной копии, а во второй значение живо.
-            val goneC = pc == null || !pc.contains(key)
-            val goneD = pd == null || !pd.contains(key)
-            val delC = readDel(pc, key)
-            val delD = readDel(pd, key)
-            val okC = rc == rev && goneC && delC
-            val okD = rd == rev && goneD && delD
-            val confirmed = okC || okD
-            val why = when {
-                confirmed && stores == 2 && okC && okD -> ""
-                confirmed -> "partial_stores:$stores"
-                else -> "not_persisted"
-            }
-            Save(confirmed, stores, if (confirmed) rev else -1L, false, why)
+            val copies = copiesOf(app)
+            removeCore(copies, key, nextRevOf(copies, key), who)
         }
         if (!locked.executed) {
             return Save(false, 0, -1L, false, "lock_${locked.reason}")
@@ -241,35 +325,11 @@ object Prefs2 {
     fun putStringEx(c: Context, key: String, value: String?): Save =
         if (value == null) removeEx(c, key) else {
             val app = c.applicationContext
-            ProcLock.withLock(lockFile(app, key)) { putStringLocked(app, key, value) }
-                .let { if (it.executed) it.value!! else Save(false, 0, -1L, false, "lock_${it.reason}") }
+            ProcLock.withLock(lockFile(app, key)) {
+                val copies = copiesOf(app)
+                putStringCore(copies, key, value, nextRevOf(copies, key), who)
+            }.let { if (it.executed) it.value!! else Save(false, 0, -1L, false, "lock_${it.reason}") }
         }
-
-    /** Внутренняя запись строки — ВЫЗЫВАТЬ ТОЛЬКО под [ProcLock]. */
-    private fun putStringLocked(app: Context, key: String, value: String): Save {
-            val rev = nextRev(app, key)
-            val stores = writeBoth(app, key, rev) { ed ->
-                ed.putString(key, value)
-                ed.putBoolean(delKey(key), false)
-            }
-            val pc = runCatching { cps(app) }.getOrNull()
-            val pd = runCatching { dps(app) }.getOrNull()
-            val rc = readRev(pc, key)
-            val rd = readRev(pd, key)
-            val cv = runCatching { pc?.getString(key, null) }.getOrNull()
-            val dv = runCatching { pd?.getString(key, null) }.getOrNull()
-            val conflict = rc == rd && rc >= 0L && cv != null && dv != null && cv != dv
-            // iter49 §6: `confirmed` и `conflict` одновременно — противоречие: если в двух копиях
-            // равная ревизия и РАЗНЫЕ значения, порядок записей неизвестен, подтверждать нельзя.
-            val confirmed = ((rc == rev && cv == value) || (rd == rev && dv == value)) && !conflict
-            return Save(confirmed, stores, if (confirmed) rev else -1L, conflict,
-                when {
-                    conflict -> "conflict_same_rev"
-                    confirmed && stores == 2 -> ""
-                    confirmed -> "partial_stores:$stores"
-                    else -> "not_persisted"
-                })
-    }
 
     /** Оставить для совместимости: `true`, если запись подтверждена хотя бы в одной копии. */
     fun putBoolean(c: Context, key: String, value: Boolean): Boolean =
@@ -439,58 +499,92 @@ object Prefs2 {
         return v
     }
 
-    /** Внутренняя часть [putBooleanAndBumpLongEx] — ВЫЗЫВАТЬ ТОЛЬКО под обоими lock. */
-    private fun writeBoolAndBump(app: Context, boolKey: String, value: Boolean, longKey: String): Save2 {
-        val genNow = getLongOrNull(app, longKey) ?: 0L
-        val genNew = genNow + 1L
-        val revB = nextRev(app, boolKey)
-        val revL = nextRev(app, longKey)
-        var stores = 0
-        for (p in listOf(runCatching { cps(app) }.getOrNull(), runCatching { dps(app) }.getOrNull())) {
-            if (p == null) continue
-            val ok = try {
+    /**
+     * §6.1 iter50 — транзакция intent+generation по набору копий (без Context, чтобы её можно
+     * было исполнить в JVM-тесте).
+     *
+     * Обе части пишутся ОДНИМ `commit()` в каждую копию, а подтверждение требует, чтобы В ОДНОЙ
+     * И ТОЙ ЖЕ копии были верны и ревизия intent, и значение intent, и ревизия поколения, и само
+     * поколение. Прежняя версия складывала `stores` по числу успешных commit и считала
+     * `okL` по любой копии — при частичном коммите это давало ложное «подтверждено».
+     */
+    internal fun putBoolAndBumpCore(
+        copies: List<Copy>,
+        boolKey: String,
+        value: Boolean,
+        longKey: String,
+        genNew: Long,
+        revB: Long,
+        revL: Long,
+        whoTag: String
+    ): Save2 {
+        val commits = copies.map { cp ->
+            val p = cp.prefs ?: return@map false
+            try {
                 val ed = p.edit()
                 ed.putBoolean(boolKey, value)
                 ed.putBoolean(delKey(boolKey), false)
                 ed.putLong(revKey(boolKey), revB)
-                ed.putString(ownerKey(boolKey), who)
+                ed.putString(ownerKey(boolKey), whoTag)
                 ed.putLong(longKey, genNew)
                 ed.putBoolean(delKey(longKey), false)
                 ed.putLong(revKey(longKey), revL)
-                ed.putString(ownerKey(longKey), who)
+                ed.putString(ownerKey(longKey), whoTag)
                 ed.commit()
             } catch (_: Throwable) {
                 false
             }
-            if (ok) stores++
         }
-        val pc = runCatching { cps(app) }.getOrNull()
-        val pd = runCatching { dps(app) }.getOrNull()
         fun boolOf(p: SharedPreferences?): Boolean? = runCatching {
             p?.let { if (it.contains(boolKey)) it.getBoolean(boolKey, value) else null }
         }.getOrNull()
         fun longOf(p: SharedPreferences?): Long? = runCatching {
             p?.let { if (it.contains(longKey)) it.getLong(longKey, -1L) else null }
         }.getOrNull()
-        val bC = boolOf(pc); val bD = boolOf(pd)
-        val lC = longOf(pc); val lD = longOf(pd)
-        val conflictB = readRev(pc, boolKey) == readRev(pd, boolKey) &&
-            readRev(pc, boolKey) >= 0L && bC != null && bD != null && bC != bD
-        val conflictL = readRev(pc, longKey) == readRev(pd, longKey) &&
-            readRev(pc, longKey) >= 0L && lC != null && lD != null && lC != lD
-        val okB = ((readRev(pc, boolKey) == revB && bC == value) ||
-            (readRev(pd, boolKey) == revB && bD == value)) && !conflictB
-        val okL = ((readRev(pc, longKey) == revL && lC == genNew) ||
-            (readRev(pd, longKey) == revL && lD == genNew)) && !conflictL
-        fun save(ok: Boolean, conflict: Boolean): Save =
-            Save(ok, stores, if (ok) 1L else -1L, conflict,
-                when {
-                    conflict -> "conflict_same_rev"
-                    ok && stores == 2 -> ""
-                    ok -> "partial_stores:$stores"
-                    else -> "not_persisted"
-                })
-        return Save2(save(okB, conflictB), save(okL, conflictL), if (okB && okL) genNew else -1L)
+        val bSeen = copies.map { boolOf(it.prefs) }
+        val lSeen = copies.map { longOf(it.prefs) }
+        val factsB = copies.mapIndexed { i, cp ->
+            val r = readRev(cp.prefs, boolKey)
+            CopyFact(cp.name, cp.prefs != null, commits[i], r, r == revB, bSeen[i] == value)
+        }
+        val factsL = copies.mapIndexed { i, cp ->
+            val r = readRev(cp.prefs, longKey)
+            CopyFact(cp.name, cp.prefs != null, commits[i], r, r == revL, lSeen[i] == genNew)
+        }
+        val conflictB = copies.size == 2 && copies[0].prefs != null && copies[1].prefs != null &&
+            readRev(copies[0].prefs, boolKey) == readRev(copies[1].prefs, boolKey) &&
+            readRev(copies[0].prefs, boolKey) >= 0L && bSeen[0] != null && bSeen[1] != null &&
+            bSeen[0] != bSeen[1]
+        val conflictL = copies.size == 2 && copies[0].prefs != null && copies[1].prefs != null &&
+            readRev(copies[0].prefs, longKey) == readRev(copies[1].prefs, longKey) &&
+            readRev(copies[0].prefs, longKey) >= 0L && lSeen[0] != null && lSeen[1] != null &&
+            lSeen[0] != lSeen[1]
+        val saveB = summarize(factsB, revB, conflictB)
+        val saveL = summarize(factsL, revL, conflictL)
+        // Поколение выдаётся только если ОБЕ части подтверждены в одной и той же копии.
+        val genConfirmed = factsB.indices.any { factsB[it].ok && factsL[it].ok }
+        return Save2(saveB, saveL, if (genConfirmed) genNew else -1L)
+    }
+
+    /**
+     * §6.1(5) iter50 — следующее поколение БЕЗ переполнения.
+     *
+     * `genNow + 1` на `Long.MAX_VALUE` дал бы отрицательное число, а `getLongOrNull` вернул бы
+     * `null`/0 при неизвестном предыдущем значении. Поколение — метка операции, а не счётчик
+     * денег: при переполнении честнее начать с 1 (старые поколения уже не совпадут, потому что
+     * текущее состояние намерения перезаписано этой же транзакцией), чем писать отрицательное.
+     */
+    internal fun nextGen(prev: Long?): Long =
+        if (prev == null || prev <= 0L || prev >= Long.MAX_VALUE) 1L else prev + 1L
+
+    /** Внутренняя часть [putBooleanAndBumpLongEx] — ВЫЗЫВАТЬ ТОЛЬКО под обоими lock. */
+    internal fun writeBoolAndBump(app: Context, boolKey: String, value: Boolean, longKey: String): Save2 {
+        val copies = copiesOf(app)
+        val genNew = nextGen(getLongOrNull(app, longKey))
+        return putBoolAndBumpCore(
+            copies, boolKey, value, longKey, genNew,
+            nextRevOf(copies, boolKey), nextRevOf(copies, longKey), who
+        )
     }
 
     /** Диагностическая строка: показать значения из обоих хранилищ. */
