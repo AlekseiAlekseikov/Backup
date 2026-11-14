@@ -38,8 +38,8 @@ class Iter48Test {
             s.contains("mangle -A " + q + d + "OUR" + q + " -j TTL --ttl-set 65")
         )
         assertTrue(
-            "переход в нашу цепочку один и со скоупом",
-            s.contains("-A POSTROUTING " + d + "SCOPE -j " + q + d + "OUR" + q)
+            "переход в нашу цепочку ставится ТОЛЬКО со скоупом -o <uplink>",
+            s.contains("-A POSTROUTING -o " + q + d + "UPLINK" + q + " -j " + q + d + "OUR" + q)
         )
         // Ни одного «удалить всё, где есть ttl-set/hl-set»: именно это снимало чужие правила.
         val deleteAllByValue = Regex("-S POSTROUTING[^\n]*grep[^\n]*ttl-set[^\n]*-D")
@@ -52,10 +52,16 @@ class Iter48Test {
             "историческое правило остаётся: владение не доказано",
             s.contains("TTL_LEGACY v4 action=keep reason=ownership_unproven")
         )
-        // Снятие идёт ТОЛЬКО по переходам на нашу цепочку.
-        assertTrue(
-            "удаление переходов — по имени цепочки, а не по значению 65",
+        // Снятие идёт ТОЛЬКО по переходам на нашу цепочку, и target сравнивается ЦЕЛИКОМ:
+        // подстрочный grep по "-j VAPP_TTL" задевал бы чужую цепочку VAPP_TTL_OTHER (iter49 §5.1).
+        assertTrue("переходы ищутся awk-сравнением токена после -j", s.contains("jump_specs()"))
+        assertFalse(
+            "никакого подстрочного grep по имени цепочки",
             s.contains("grep -- " + q + "-j " + d + "OUR" + q)
+        )
+        assertTrue(
+            "имя цепочки само по себе не доказательство владения",
+            s.contains("action=keep reason=chain_content_not_ours")
         )
     }
 
@@ -66,7 +72,7 @@ class Iter48Test {
             TtlScript.build(false), TtlScript.sanitizeScript()
         )
         val off = TtlScript.build(false)
-        assertTrue("OFF снимает только своё", off.contains("drop_own"))
+        assertTrue("OFF снимает только своё", off.contains("drop_family iptables"))
         assertTrue("выключение не включает Wi-Fi", !off.contains("svc wifi"))
         // Скрипт один на оба режима (ставится только в ветке ENABLE=1) — проверяем режим,
         // а не текст: фактическое поведение OFF проверено на bash-эмуляторе iptables (§Б7).

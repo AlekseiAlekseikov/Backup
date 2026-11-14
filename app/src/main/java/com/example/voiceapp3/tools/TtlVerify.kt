@@ -58,8 +58,13 @@ internal object TtlVerify {
     fun parse(expected: Boolean, out: String): Parsed {
         val v4 = num(out, "TTL_V4")
         val v6 = num(out, "TTL_V6")
-        val ownJ4 = num(out, "OWN_J4")
-        val ownJ6 = num(out, "OWN_J6")
+        val ownJ4 = num(out, "OWN_J4") ?: num(out, "J4")
+        val ownJ6 = num(out, "OWN_J6") ?: num(out, "J6")
+        // iter49 §5.2: «прочитано/не прочитано» печатается отдельно от «сколько правил».
+        val read4 = flag(out, "READ_V4")
+        val read6 = flag(out, "READ_V6")
+        val chain4 = flag(out, "CHAIN4")
+        val chain6 = flag(out, "CHAIN6")
         val foreign4 = num(out, "FOREIGN_V4")
         val foreign6 = num(out, "FOREIGN_V6")
         val v4Verify = flag(out, "VERIFY_V4")
@@ -69,7 +74,12 @@ internal object TtlVerify {
             "SCOPED_OK" in ttlCheckLine -> "SCOPED_OK"
             "OFF_OK" in ttlCheckLine -> "OFF_OK"
             "OFF_OWN_FOREIGN_LEFT" in ttlCheckLine -> "OFF_OWN_FOREIGN_LEFT"
+            "SCOPED_V4_ONLY" in ttlCheckLine -> "SCOPED_V4_ONLY"
             "CHECK_OWNER" in ttlCheckLine -> "CHECK_OWNER"
+            "CHAIN_COLLISION" in ttlCheckLine -> "CHAIN_COLLISION"
+            "READ_UNKNOWN" in ttlCheckLine -> "READ_UNKNOWN"
+            "APPLY_FAILED" in ttlCheckLine -> "APPLY_FAILED"
+            "NOT_APPLIED" in ttlCheckLine -> "NOT_APPLIED"
             "\u2192 VERIFIED" in ttlCheckLine -> "VERIFIED"
             "\u2192 MISMATCH" in ttlCheckLine -> "MISMATCH"
             "\u2192 INDIRECT" in ttlCheckLine -> "INDIRECT"
@@ -92,15 +102,41 @@ internal object TtlVerify {
         val offPartialForeign = "result=PARTIAL" in offLine && "foreign_rules_remain" in offLine
         val ownLine = line(out, "TTL_OWN ")
         val ownPartial = "removed=partial" in ownLine
+        // iter49 §5.2: пустой ответ `2>/dev/null` больше не выдаётся за «правил нет».
+        val readFailed = read4 == "failed" || read6 == "failed"
+        val offUnknownReadFail = offLine.contains("result=UNKNOWN") || "reason=read_failed" in out
+        val collision = chain4 == "collision" || chain6 == "collision" ||
+            v4Verify == "COLLISION" || v6Verify == "COLLISION" || "CHAIN_COLLISION" in ttlCheckLine
+        val rolledBack = "APPLY_FAILED" in ttlCheckLine || "TTL_ROLLBACK" in out
+        val notApplied = "NOT_APPLIED" in ttlCheckLine ||
+            v4Verify == "NOT_APPLIED" || v6Verify == "NOT_APPLIED"
+        val quotedRefused = "reason=quoted_spec_needs_owner" in out
         val foreignN = foreign4?.toIntOrNull() ?: 0
         val foreignN6 = foreign6?.toIntOrNull() ?: 0
 
         val reason: String? = when {
+            readFailed || offUnknownReadFail ->
+                "правила прочитать не удалось (READ_V4=${read4 ?: "?"} READ_V6=${read6 ?: "?"}) — " +
+                    "состояние НЕИЗВЕСТНО, а не «правил нет». Повторите и посмотрите TTL_FOREIGN."
+            collision ->
+                "цепочка ${TtlScript.OUR_CHAIN} занята не нами (CHAIN4=${chain4 ?: "?"} " +
+                    "CHAIN6=${chain6 ?: "?"}): содержимое не совпадает с нашим правилом. Чужое не " +
+                    "трогаем (ни -F, ни -X): TTL не применён."
+            rolledBack ->
+                "включение откатано целиком: половинчатое состояние (только v4 или только v6) не " +
+                    "оставлено. Смотрите TTL_ADD/TTL_ROLLBACK — iptables не принял правило."
+            notApplied ->
+                "не применялось: состояние одной из семей не наше (или не прочитано) — " +
+                    "включать половину нельзя."
             hasNoRoot -> "канал недоступен — 5555 не отвечает (uid=1000). Проверьте «Для разработчика» → «Проверить root»."
             hasPerm -> "Permission denied (нужен root-шелл uid=0)"
             hasLock -> "xtables lock (iptables занят) — правило не применилось, повторите"
             noTarget -> "iptables target 'TTL' не поддерживается ядром (модуль отсутствует)"
             !expected && offPartialForeign -> null
+            !expected && quotedRefused && ownPartial ->
+                "свои переходы сняты не все: переход со сложной спецификацией (кавычки/match) не " +
+                    "разобран и оставлен как есть — удалять по догадке нельзя. TTL мог остаться " +
+                    "включённым, состояние частичное."
             !expected && ownPartial ->
                 "своё снято не полностью ($ownLine) — состояние неизвестно, повторите"
             !expected && !(v4 == "0" && v6 == "0" && offOk) ->
@@ -153,6 +189,10 @@ internal object TtlVerify {
                 "variant" to variant.ifEmpty { "?" },
                 "uplink_only" to if (uplinkOnly) "yes" else "no",
                 "verdict" to ttlVerdict.ifEmpty { "?" },
+                "chain_v4" to (chain4 ?: "?"),
+                "chain_v6" to (chain6 ?: "?"),
+                "read_v4" to (read4 ?: "?"),
+                "read_v6" to (read6 ?: "?"),
                 "ttl_off" to offLine.ifEmpty { "-" },
                 "ttl_own" to ownLine.ifEmpty { "-" }
             )
