@@ -386,6 +386,68 @@ object FileLogCore {
         File(spill.parentFile, "${spill.name}.drain.${processTag}-${drainSeq.incrementAndGet()}")
 
     /**
+     * §7 iter51: сколько времени после последней записи pid считается живым.
+     * 30 минут: дольше процесса, который просто висит без записи в журнал, но заведомо меньше
+     * времени жизни «осиротевшего» файла, который надо забрать.
+     */
+    private val ORPHAN_GRACE_MS = 30L * 60L * 1000L
+
+    /** §7 iter51: где искать `/proc/<pid>` (подменяется в тестах). */
+    internal var procRoot: File = File("/proc")
+
+    /** §7 iter51: часы (подменяются в тестах). */
+    internal var clock: () -> Long = { System.currentTimeMillis() }
+
+    /**
+     * §7 iter51: считаем ли процесс ЦИФРОВОГО pid живым.
+     *
+     * PID ПЕРЕИСПОЛЬЗУЕТСЯ: `/proc/<pid>` может существовать, но принадлежать уже ДРУГОМУ
+     * процессу. Поэтому одного наличия каталога недостаточно — живым считаем только если файл
+     * журнала этого pid изменялся недавно ([ORPHAN_GRACE_MS]). Обратная ошибка тоже недопустима:
+     * пока процесс жив и ЕЩЁ может дописать, забирать его spill нельзя (получим дубли и гонку),
+     * поэтому «не уверены → не трогаем».
+     */
+    private fun pidLooksAlive(pid: String, files: List<File>): Boolean {
+        if (pid == processTag) return true
+        if (!pid.all { it.isDigit() }) return true   // `p<hash>` без pid — своим не считаем
+        if (!File(procRoot, pid).exists()) return false
+        val newest = files.maxOfOrNull { it.lastModified() } ?: 0L
+        return clock() - newest <= ORPHAN_GRACE_MS
+    }
+
+    /**
+     * §7 iter51: осиротевшие (`spill`/`.drain`) файлы ВСЕХ наших pid для этого журнала.
+     *
+     * Дефект: восстановление смотрело только на `spill` СВОЕГО pid (`<log>.<pid>.spill`).
+     * Умерший процесс оставлял `<log>.<pid>.spill` и `.drain.<pid>-N`, которые больше никто и
+     * никогда не забирал — строки журнала оставались на диске навсегда. Здесь они находятся, а
+     * живые и чужие (другое имя журнала) не затрагиваются.
+     *
+     * @return пары «файл → его pid», отсортированные по имени (детерминированный порядок).
+     */
+    internal fun orphanFilesOf(dir: File, name: String): List<Pair<File, String>> {
+        val re = Regex("^" + Regex.escape(name) + "\\.(\\d+|p[0-9a-f]+)\\.spill(\\.drain.*)?$")
+        val all = runCatching { dir.listFiles()?.toList() ?: emptyList() }.getOrDefault(emptyList())
+        val byPid = mutableMapOf<String, MutableList<File>>()
+        for (f in all) {
+            if (!f.isFile) continue
+            if (f.name.endsWith(".lock")) continue
+            val m = re.find(f.name) ?: continue
+            byPid.getOrPut(m.groupValues[1]) { mutableListOf() }.add(f)
+        }
+        val out = mutableListOf<Pair<File, String>>()
+        for ((pid, files) in byPid) {
+            if (pid == processTag) continue               // свой — штатным путём ниже
+            if (pidLooksAlive(pid, files)) {
+                // Живой (или неотличимый от живого) — не трогаем; факт виден в заметке.
+                continue
+            }
+            files.sortedBy { it.name }.forEach { out.add(it to pid) }
+        }
+        return out
+    }
+
+    /**
      * §8.1: перенести накопленный spill в основной журнал под локом. Возвращает число
      * перенесённых строк (`-1` — не удалось целиком, данные не удалены).
      *
@@ -407,6 +469,41 @@ object FileLogCore {
         var failed = false
         var skipped = 0
         val notes = mutableListOf<String>()
+
+        // 0) §7 iter51: сначала забираем файлы УМЕРШИХ наших процессов (свои — ниже, штатно).
+        var orphans = 0
+        for ((f, pid) in orphanFilesOf(dir, name)) {
+            val w: File
+            if (f.name.contains(".drain")) {
+                w = f
+            } else {
+                // Чужой по pid, но наш по журналу spill: переносим в уникальное имя и сливаем
+                // штатным путём. Если переименовать нельзя — не читаем «на месте и не удаляя»:
+                // иначе строки могли бы задвоиться.
+                val t = uniqueWork(f)
+                if (!runCatching { f.renameTo(t) }.getOrDefault(false)) {
+                    notes += "orphan_rename_failed:«${f.name}»pid=$pid"
+                    continue
+                }
+                w = t
+            }
+            val n = mergeWork(active, dir, name, w, notes)
+            when {
+                n == Int.MIN_VALUE -> {
+                    skipped++
+                    notes += "orphan_locked:«${w.name}»pid=$pid"
+                }
+                n < 0 -> {
+                    failed = true
+                    notes += "orphan_not_merged:«${w.name}»pid=$pid"
+                }
+                else -> {
+                    orphans++
+                    merged += n
+                }
+            }
+        }
+        if (orphans > 0) notes += "orphans_recovered:$orphans"
 
         // 1) Восстановление оставшихся work-файлов — всегда, даже если нового spill нет.
         val leftovers = runCatching {
@@ -441,7 +538,7 @@ object FileLogCore {
                             }
                         }.getOrDefault(false)
                         if (back) {
-                            if (!runCatching { work.delete() }.isSuccess) {
+                            if (!deleteVerified(work)) {
                                 notes += "work_dup_possible:«${work.name}»"
                             }
                             0
@@ -455,12 +552,13 @@ object FileLogCore {
                     // неудачной записи.
                     val text = runCatching { spill.readText() }.getOrNull()
                     if (text.isNullOrEmpty()) {
-                        runCatching { spill.delete() }
+                        // §7: пустой spill, который не удалось удалить, — не «успех по умолчанию».
+                        if (!deleteVerified(spill)) notes += "empty_spill_kept:«${spill.name}»"
                         0
                     } else {
                         val r = append(dir, name, text, maxBytes = Long.MAX_VALUE)
                         if (!r.written || r.spilled) -1 else {
-                            val del = runCatching { spill.delete() }.isSuccess
+                            val del = deleteVerified(spill)
                             if (!del) notes += "spill_delete_failed:«${spill.name}»"
                             text.count { it == '\n' }
                         }
@@ -485,6 +583,22 @@ object FileLogCore {
     }
 
     /**
+     * §7 iter51: удаление проверяется по ВОЗВРАЩЁННОМУ boolean, а не по «не было исключения».
+     *
+     * `runCatching { f.delete() }.isSuccess` истинно и тогда, когда `delete()` вернул `false`
+     * (файл не удалён: занят, нет прав, уже подменён). Из-за этого «удалено» заявлялось для
+     * файлов, которые оставались на диске, и журнал терял след дублей.
+     *
+     * @return true — файла больше нет (удалён сейчас или отсутствовал); false — остался.
+     */
+    internal fun deleteVerified(f: File): Boolean {
+        val ok = runCatching { f.delete() }.getOrDefault(false)
+        if (ok) return true
+        // `delete()` == false может означать и «файла уже нет» — это НЕ отказ.
+        return !f.exists()
+    }
+
+    /**
      * Слить ОДИН work-файл в основной журнал.
      *
      * @return число строк; `-1` — запись не удалась (work-файл сохранён);
@@ -502,7 +616,7 @@ object FileLogCore {
         val outcome = ProcLock.withLock(lockFile, timeoutMs = 500L) {
             val text = runCatching { work.readText() }.getOrNull()
             if (text.isNullOrEmpty()) {
-                if (!runCatching { work.delete() }.isSuccess) notes += "empty_work_kept:«${work.name}»"
+                if (!deleteVerified(work)) notes += "empty_work_kept:«${work.name}»"
                 return@withLock 0
             }
             val r = append(dir, name, text, maxBytes = Long.MAX_VALUE)
@@ -512,10 +626,10 @@ object FileLogCore {
             }
             // §8.1(2): исходник удаляется только после подтверждённой дозаписи; неудача не
             // скрывается — при повторе возможны дубли, и это сказано прямо.
-            if (!runCatching { work.delete() }.isSuccess) {
+            if (!deleteVerified(work)) {
                 notes += "work_delete_failed:«${work.name}»( возможны дубли при повторе )"
             }
-            runCatching { lockFile.delete() }
+            if (!deleteVerified(lockFile)) notes += "lockfile_kept:«${lockFile.name}»"
             text.count { it == '\n' }
         }
         if (!outcome.executed) return Int.MIN_VALUE
