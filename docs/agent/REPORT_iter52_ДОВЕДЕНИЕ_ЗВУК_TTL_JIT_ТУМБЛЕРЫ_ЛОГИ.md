@@ -22,8 +22,13 @@
 | 7 | `c539c38` | §9 логи: идентичность процесса (`boot_id`+`starttime`), нечитаемый work не удаляется, лок не удаляется под локом |
 | 8 | `4d28c71` | §10 окна: ABA по поколению при откате владельцев |
 | 9 | `01f684f` | §8.2 тумблеры: последнее известное на диске, поздний снимок не перетирает клик |
+| 10 | `c4791d3` | отчёт и WORKLOG iter52 |
+| 11 | `0d375ad` | фикс компиляции `ToolsPanel` (импорты `AppLog`/`Prefs2`), CI зелёный |
 
 Локальный стенд: `bash runtests.sh` → **`OK (661 tests)`** (на входе было `OK (609 tests)`).
+CI `Build APK` на финальном код-коммите `0d375ad`: **run `43642156111` — success**
+(первая попытка `43641309591` упала на `Unresolved reference AppLog/Prefs2` в `ToolsPanel.kt` —
+недостающие импорты добавлены коммитом `0d375ad`).
 Стенд компилирует `LockOp`, `LockMountScripts`, `TtlScript`, `TtlVerify`, `TtlRunner`, `JitOwn`,
 `FileLogCore`, `Toggles45`, `ScriptDelivery`; **не** компилирует `LockSound.kt`, `JitNetCore.kt`,
 `JitNet.kt`, `ToolsPanel.kt`, `WindowDoors.kt` — их проверяет CI (`Build APK`).
