@@ -138,15 +138,92 @@ internal object LockOp {
      */
     enum class Reconcile { STOCK_RESTORED, FOREIGN_LEFT, UNPROVEN }
 
-    fun reconcileVerdict(rc: Int, out: String): Reconcile = when {
-        out.contains("FOREIGN_MOUNT:") || out.contains("STOCK_FOREIGN_LEFT:") -> Reconcile.FOREIGN_LEFT
-        out.contains("STOCK_UNPROVEN:") || out.contains("RESTORE_BLOCKED") -> Reconcile.UNPROVEN
-        out.contains("STOCK_OK:") || out.contains("UMOUNTED_OK:") ||
-            out.contains("UMOUNT_DETACHED:") -> Reconcile.STOCK_RESTORED
-        // Пустой/непонятный вывод при rc=0: «ничего не печаталось» ≠ «слоя нет».
-        rc != 0 -> Reconcile.UNPROVEN
-        else -> Reconcile.UNPROVEN
+    /**
+     * Разбор вывода сверки ПО КАЖДОЙ ОЖИДАЕМОЙ ЦЕЛИ (iter53 §7.2).
+     *
+     * iter52 возвращал `STOCK_RESTORED` при наличии ХОТЯ БЫ ОДНОГО `STOCK_OK`/`UMOUNTED_OK`, не
+     * сверяя, что ответ содержит итог для КАЖДОЙ ожидаемой цели, и проверял `rc` только после
+     * поиска успешных маркеров. Частичный/обрезанный ответ либо один успешный `umount` перед
+     * последующим отказом давали DONE. Lazy detach тоже не равен доказанному штатному состоянию.
+     *
+     * Теперь:
+     *  • `rc != 0` проверяется ПЕРВЫМ — при ненулевом коде успех не заявляется вообще;
+     *  • каждая ожидаемая цель обязана иметь РОВНО ОДИН маркер;
+     *  • `UMOUNT_DETACHED` (lazy) и маркеры по целям ВНЕ ожидаемого набора не дают DONE;
+     *  • пустой ожидаемый набор → [Reconcile.UNPROVEN]: доказать нечего.
+     *
+     * @return подробный результат: что именно доказано, чего не хватает, что лишнее.
+     */
+    data class Reconciled(
+        val verdict: Reconcile,
+        val expected: List<String>,
+        val proven: List<String>,
+        val missing: List<String>,
+        val extra: List<String>,
+        val duplicates: List<String>,
+        val detached: List<String>,
+        val note: String
+    ) {
+        fun wire(): String =
+            "verdict=${verdict.name.lowercase()} expected=${expected.size} proven=${proven.size} " +
+                "missing=${missing.ifEmpty { listOf("none") }.joinToString(",")} " +
+                "extra=${extra.ifEmpty { listOf("none") }.joinToString(",")} " +
+                "dup=${duplicates.ifEmpty { listOf("none") }.joinToString(",")} " +
+                "detached=${detached.ifEmpty { listOf("none") }.joinToString(",")} note=$note"
     }
+
+    private val TARGET_MARKER = Regex("^(STOCK_OK|UMOUNTED_OK|UMOUNT_DETACHED):(\\S+)\\s*(.*)$")
+
+    fun reconcileDetail(rc: Int, out: String, expected: Collection<String>): Reconciled {
+        val exp = expected.filter { it.isNotBlank() }.distinct()
+        fun r(v: Reconcile, note: String, proven: List<String> = emptyList(),
+              missing: List<String> = exp, extra: List<String> = emptyList(),
+              dup: List<String> = emptyList(), det: List<String> = emptyList()) =
+            Reconciled(v, exp, proven, missing, extra, dup, det, note)
+
+        // 1) Отказы, при которых чужое/неизвестное НЕ трогаем (это не «успех», rc их не отменяет).
+        if (out.contains("FOREIGN_MOUNT:") || out.contains("STOCK_FOREIGN_LEFT:"))
+            return r(Reconcile.FOREIGN_LEFT, "foreign_above")
+        if (out.contains("STOCK_UNPROVEN:") || out.contains("RESTORE_BLOCKED"))
+            return r(Reconcile.UNPROVEN, "unproven_marker")
+        // 2) Код возврата — ДО поиска успешных маркеров: при rc≠0 «STOCK_OK» ничего не доказывает
+        //    (именно этот порядок был дефектом: успех искали первым и находили).
+        if (rc != 0) return r(Reconcile.UNPROVEN, "rc=$rc")
+        // 3) По маркерам на цель.
+        val stock = LinkedHashMap<String, MutableList<String>>()
+        for (line in out.lineSequence()) {
+            val m = TARGET_MARKER.matchEntire(line.trim()) ?: continue
+            stock.getOrPut(m.groupValues[2]) { mutableListOf() }.add(m.groupValues[1])
+        }
+        val proven = mutableListOf<String>()
+        val missing = mutableListOf<String>()
+        val dup = mutableListOf<String>()
+        val det = mutableListOf<String>()
+        for (t in exp) {
+            val marks = stock[t] ?: run { missing += t; null } ?: continue
+            // `UMOUNTED_OK` — это шаг снятия, `STOCK_OK` — итоговое состояние цели после снятия.
+            // Доказательством служит РОВНО ОДИН итоговый `STOCK_OK`; повтор того же маркера или
+            // второй итог по той же цели — уже не доказательство (подмена/склейка вывода).
+            val finals = marks.count { it == "STOCK_OK" }
+            val umounts = marks.count { it == "UMOUNTED_OK" }
+            if (finals > 1 || umounts > 1) dup += t
+            if (marks.any { it == "UMOUNT_DETACHED" }) det += t
+            if (finals == 1) proven += t
+        }
+        val extra = stock.keys.filter { it !in exp }
+        val ok = exp.isNotEmpty() && missing.isEmpty() && dup.isEmpty() &&
+            extra.isEmpty() && det.isEmpty() && proven.size == exp.size
+        return if (ok) r(Reconcile.STOCK_RESTORED, "all_targets", proven, emptyList())
+        else r(Reconcile.UNPROVEN, "incomplete", proven, missing, extra, dup, det)
+    }
+
+    /**
+     * Совместимость: тот же вердикт, но БЕЗ набора ожидаемых целей доказать нельзя — поэтому
+     * при пустом [expected] результат всегда [Reconcile.UNPROVEN] (раньше одиночный `STOCK_OK`
+     * считался доказательством «всё снято»).
+     */
+    fun reconcileVerdict(rc: Int, out: String, expected: Collection<String> = emptyList()): Reconcile =
+        reconcileDetail(rc, out, expected).verdict
 
     /** Состояние журнала, соответствующее вердикту (для честного статуса операции). */
     fun stateForVerdict(v: Reconcile): State = when (v) {
@@ -239,4 +316,66 @@ internal object LockOp {
             expected.isEmpty() -> false to "no_targets"
             else -> true to ""
         }
+
+    // ─────────────────────────── iter53 §7.1: миграция старой записи ───────────────────────────
+
+    /**
+     * Результат разбора СТАРОЙ записи `locksound_op.txt` (одна операция в одном файле).
+     *
+     * Смысл разделения: «файла нет», «запись разобрана» и «файл есть, но не разобран» — ТРИ
+     * разных факта. Последний НЕЛЬЗЯ превращать в «операций не было»: под ним может стоять
+     * реально созданный слой.
+     */
+    sealed interface LegacyRead {
+        /** Файла нет (или он пуст по факту отсутствия). */
+        data object Absent : LegacyRead
+        /** Валидная запись: переносится в журнал как есть (незавершённая — со своим состоянием). */
+        data class Parsed(val op: BindOp) : LegacyRead
+        /** Файл есть и не пуст, но не разобран: сохраняется как операция «неизвестно». */
+        data class Unknown(val raw: String, val why: String) : LegacyRead
+    }
+
+    /**
+     * Разбор старой записи.
+     *
+     * Принимаются оба встречавшихся вида: строка журнала (`<время>|id=…`) и «голая» строка
+     * `id=…;gen=…`. Всё прочее — [LegacyRead.Unknown]. Запись без целей/`stage` допустима: она
+     * останется UNDEFINED и попадёт в сверку как «снять нечего — нужен ручной разбор», а не как
+     * доказанное отсутствие слоя.
+     */
+    fun parseLegacyOp(raw: String?): LegacyRead {
+        if (raw == null) return LegacyRead.Absent
+        val text = raw.trim()
+        if (text.isEmpty()) return LegacyRead.Absent
+        val payload = if (text.contains('|')) text.substringAfterLast('|').trim() else text
+        val op = decode(payload)
+            ?: return LegacyRead.Unknown(text.take(300), "not_our_format")
+        // Старое состояние `done`/`failed` сохраняется; всё остальное — требует сверки.
+        val state = when (op.state) {
+            State.DONE, State.FAILED -> op.state
+            else -> State.UNDEFINED
+        }
+        return if (op.targets.isEmpty() || op.stage.isEmpty()) {
+            LegacyRead.Parsed(op.copy(state = State.UNDEFINED, reason = "legacy_no_targets"))
+        } else {
+            LegacyRead.Parsed(op.copy(state = state, reason = "legacy_migrated"))
+        }
+    }
+
+    /**
+     * Как перенести старую запись в журнал: append И ТОЛЬКО ПОТОМ переименование оригинала.
+     *
+     * Идемпотентность: журнал хранит последнюю строку по `id`, поэтому повторный перенос той же
+     * записи (сбой между append и rename) не создаёт дубля операции. Если append не подтвердился
+     * чтением, оригинал НЕ переименовывается и не удаляется.
+     *
+     * @param appended true — строка реально подтверждена чтением журнала.
+     */
+    fun migrationStep(read: LegacyRead, appended: Boolean): MigrationAction = when (read) {
+        is LegacyRead.Absent -> MigrationAction.Nothing
+        is LegacyRead.Parsed, is LegacyRead.Unknown ->
+            if (appended) MigrationAction.RenameLegacy else MigrationAction.KeepLegacy
+    }
+
+    enum class MigrationAction { Nothing, RenameLegacy, KeepLegacy }
 }

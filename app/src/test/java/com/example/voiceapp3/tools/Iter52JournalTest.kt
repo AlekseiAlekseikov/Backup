@@ -124,7 +124,8 @@ class Iter52JournalTest {
         // Сверка: настоящий production-скрипт по целям и staging ИЗ ЖУРНАЛА.
         val script = LockMountScripts.restoreScript(pending.first().targets.map { it to pending.first().stage })
         val (rc, out) = st.exec(script, "reconcile.sh", env)
-        val verdict = LockOp.reconcileVerdict(rc, out)
+        // iter53 §7.2: вердикт требует покрытия ВСЕХ ожидаемых целей — передаём набор из журнала.
+        val verdict = LockOp.reconcileVerdict(rc, out, pending.first().targets)
         assertEquals("слой снят и это подтверждено: $out", LockOp.Reconcile.STOCK_RESTORED, verdict)
         assertFalse("слоя больше нет", st.mountinfo.readText().contains(t.absolutePath))
 
@@ -140,13 +141,17 @@ class Iter52JournalTest {
         // Реальный скрипт в окружении без слоя: STOCK_OK есть. А вот ПУСТОЙ вывод — не успех.
         assertEquals(LockOp.Reconcile.UNPROVEN, LockOp.reconcileVerdict(0, ""))
         assertEquals(LockOp.Reconcile.UNPROVEN, LockOp.reconcileVerdict(0, "MOUNT_NS self=x init=x same=1\n"))
-        // STOCK_OK печатается скриптом ТОЛЬКО когда слой снят И подтверждён (left==0 && rc==0),
-        // поэтому это доказательство по цели и не зависит от агрегатного кода выхода.
-        assertEquals(LockOp.Reconcile.STOCK_RESTORED, LockOp.reconcileVerdict(1, "STOCK_OK:/t"))
+        // iter53 §7.2: rc≠0 больше НЕ перекрывается успешным маркером — код возврата первым.
+        assertEquals(LockOp.Reconcile.UNPROVEN, LockOp.reconcileVerdict(1, "STOCK_OK:/t", listOf("/t")))
         // А вот «слой остался» при любом rc — не успех.
         assertEquals(LockOp.Reconcile.UNPROVEN, LockOp.reconcileVerdict(0, "UMOUNT_FAILED:/t\n"))
-        assertEquals(LockOp.Reconcile.STOCK_RESTORED, LockOp.reconcileVerdict(0, "STOCK_OK:/t\n"))
-        assertEquals(LockOp.Reconcile.STOCK_RESTORED, LockOp.reconcileVerdict(0, "UMOUNTED_OK:/t\nSTOCK_OK:/t\n"))
+        assertEquals(LockOp.Reconcile.STOCK_RESTORED, LockOp.reconcileVerdict(0, "STOCK_OK:/t\n", listOf("/t")))
+        // `UMOUNTED_OK` + итоговый `STOCK_OK` по той же цели — это шаг + итог, а не дубликат.
+        assertEquals(LockOp.Reconcile.STOCK_RESTORED,
+            LockOp.reconcileVerdict(0, "UMOUNTED_OK:/t\nSTOCK_OK:/t\n", listOf("/t")))
+        assertEquals("два итоговых маркера на одну цель — не доказательство",
+            LockOp.Reconcile.UNPROVEN,
+            LockOp.reconcileVerdict(0, "STOCK_OK:/t\nSTOCK_OK:/t\n", listOf("/t")))
         assertEquals(LockOp.Reconcile.FOREIGN_LEFT, LockOp.reconcileVerdict(3, "FOREIGN_MOUNT:/t mid=1 root=/x expected=/y\n"))
         assertEquals(LockOp.Reconcile.UNPROVEN, LockOp.reconcileVerdict(0, "RESTORE_BLOCKED reason=namespace_not_proven\n"))
         assertEquals(LockOp.Reconcile.UNPROVEN, LockOp.reconcileVerdict(0, "STOCK_UNPROVEN:/t reason=layers_left\n"))
@@ -167,7 +172,7 @@ class Iter52JournalTest {
         val (rc, out) = st.exec(
             LockMountScripts.restoreScript(pending.targets.map { it to pending.stage }), "reconcile.sh", env
         )
-        val verdict = LockOp.reconcileVerdict(rc, out)
+        val verdict = LockOp.reconcileVerdict(rc, out, listOf(t.absolutePath))
         val state = LockOp.stateForVerdict(verdict)
         j.append(pending.copy(state = state, reason = "foreign_above_left"))
 
@@ -192,7 +197,7 @@ class Iter52JournalTest {
             "reconcile.sh",
             env + mapOf("MOUNTINFO" to "/nonexistent/mountinfo")
         )
-        val verdict = LockOp.reconcileVerdict(rc, out)
+        val verdict = LockOp.reconcileVerdict(rc, out, listOf(t.absolutePath))
         assertEquals("нечитаемая таблица — не «слоя нет»: $out", LockOp.Reconcile.UNPROVEN, verdict)
         assertEquals(LockOp.State.UNDEFINED, LockOp.stateForVerdict(verdict))
         assertTrue("слой остался (его никто не снимал вслепую)", st.mountinfo.readText().contains(t.absolutePath))
@@ -223,7 +228,7 @@ class Iter52JournalTest {
         val script = LockMountScripts.restoreScript(listOf(t.absolutePath to env.getValue("STAGE")))
         val (rc, out) = st.exec(script, "reconcile.sh", env)
         assertEquals("нет слоя — это STOCK_OK, а не отказ: $out", LockOp.Reconcile.STOCK_RESTORED,
-            LockOp.reconcileVerdict(rc, out))
+            LockOp.reconcileVerdict(rc, out, listOf(t.absolutePath)))
     }
 
     // ─────────── §5.2: верхний слой определяется по mount_id, а не по порядку строк ───────────
@@ -255,7 +260,8 @@ class Iter52JournalTest {
         assertFalse("нижний слой не принят за наш по порядку строк: $out", out.contains("FOREIGN_MOUNT:${t.absolutePath}"))
         assertEquals("снятие ровно одно: ${st.mountCalls()}", 1, st.mountCalls().count { it.startsWith("umount") })
         assertFalse("нашей строки в таблице больше нет", st.mountinfo.readText().contains(ours))
-        assertEquals("исход назван по факту", LockOp.Reconcile.STOCK_RESTORED, LockOp.reconcileVerdict(rc, out))
+        assertEquals("исход назван по факту", LockOp.Reconcile.STOCK_RESTORED,
+            LockOp.reconcileVerdict(rc, out, listOf(t.absolutePath)))
     }
 
     @Test

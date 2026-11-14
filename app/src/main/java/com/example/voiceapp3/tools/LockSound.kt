@@ -1486,9 +1486,75 @@ object LockSound {
         }
     }
 
+    /** Старая запись (iter50 и раньше): одна операция в одном файле. */
+    private fun legacyOpFile(ctx: Context): File =
+        File(ctx.applicationContext.filesDir, "locksound_op.txt")
+
+    /**
+     * iter53 §7.1 — ПЕРЕНОС СТАРОЙ ЗАПИСИ В ЖУРНАЛ.
+     *
+     * Почему это нужно: до iter52 состояние операции жило в одном файле `locksound_op.txt`, а
+     * production читает только `locksound_ops.log`. Значит после обновления незавершённая
+     * операция прошлой версии становилась невидимой — и созданный ею слой никто не сверял.
+     *
+     * Правила (идемпотентно и crash-safe):
+     *  1. файла нет → ничего не делаем;
+     *  2. запись разобрана → ДОБАВЛЯЕМ её в журнал и ПОДТВЕРЖДАЕМ чтением; только после этого
+     *     переименовываем оригинал (`*.migrated`), чтобы сбой не потерял данные;
+     *  3. запись есть, но не разобрана → добавляем операцию `UNDEFINED reason=legacy_corrupt`,
+     *     которая попадает в сверку как «нужен ручной разбор» (НЕ «операций не было»);
+     *  4. append не подтверждён → оригинал не переименовываем и не удаляем.
+     *
+     * Повторный перенос безопасен: журнал хранит последнюю строку по `id`.
+     */
+    internal fun migrateLegacyOp(ctx: Context) {
+        val legacy = legacyOpFile(ctx)
+        if (!legacy.exists()) return
+        val raw = runCatching { legacy.readText() }.getOrNull()
+        val read = LockOp.parseLegacyOp(raw)
+        val op: LockOp.BindOp = when (read) {
+            is LockOp.LegacyRead.Absent -> {
+                AppLog.w(ctx, TAG, "LOCKSOUND_MIGRATE file=present_read=none action=none " +
+                    "(файл есть, но прочитать его не удалось: считаем неизвестностью, не «пусто»)")
+                return
+            }
+            is LockOp.LegacyRead.Parsed -> read.op
+            is LockOp.LegacyRead.Unknown -> LockOp.BindOp(
+                id = "legacy-" + System.currentTimeMillis(),
+                gen = 0L,
+                desired = false,
+                stage = "",
+                targets = emptyList(),
+                state = LockOp.State.UNDEFINED,
+                reason = "legacy_corrupt:${read.why}"
+            )
+        }
+        val appended = appendOp(ctx, op, "migrate_legacy")
+        when (LockOp.migrationStep(read, appended)) {
+            LockOp.MigrationAction.RenameLegacy -> {
+                val dst = File(legacy.parentFile, legacy.name + ".migrated")
+                val ok = runCatching { legacy.renameTo(dst) }.getOrDefault(false)
+                AppLog.i(ctx, TAG, "LOCKSOUND_MIGRATE ${op.wire()} appended=1 " +
+                    "renamed=$ok dst=${dst.name} " +
+                    "(старая запись перенесена в журнал; оригинал сохранён как ${
+                        if (ok) "*.migrated" else "исходный файл (переименование не удалось)"
+                    })")
+            }
+            LockOp.MigrationAction.KeepLegacy ->
+                AppLog.e(ctx, TAG, "LOCKSOUND_MIGRATE ${op.wire()} appended=0 action=keep " +
+                    "(журнал не подтвердил запись: оригинал НЕ переименован и НЕ удалён — " +
+                    "повторная попытка на следующем событии)")
+            LockOp.MigrationAction.Nothing -> Unit
+        }
+    }
+
     /** Текущий журнал (все операции с последним состоянием). */
-    internal fun readOpJournal(ctx: Context): LockOp.Journal =
-        LockOp.parseJournal(runCatching { opFile(ctx).readText() }.getOrNull())
+    internal fun readOpJournal(ctx: Context): LockOp.Journal {
+        // Читаем журнал ТОЛЬКО после попытки переноса старой записи: иначе незавершённая операция
+        // прошлой версии останется невидимой для сверки.
+        migrateLegacyOp(ctx)
+        return LockOp.parseJournal(runCatching { opFile(ctx).readText() }.getOrNull())
+    }
 
     /**
      * iter52 §5.1(3): СВЕРКА НЕЗАВЕРШЁННЫХ ОПЕРАЦИЙ ИЗ ЖУРНАЛА — на реальном пути.
@@ -1534,8 +1600,10 @@ object LockSound {
             }
             val script = LockMountScripts.restoreScript(entries)
             val (rc, out) = AdbClient.executeScript("lock_reconcile_restore", script, 30000)
-            // Вердикт — чистая функция, проверенная на РЕАЛЬНОМ выводе restore-скрипта.
-            val verdict = LockOp.reconcileVerdict(rc, out)
+            // iter53 §7.2: вердикт требует покрытия ВСЕХ ожидаемых целей и rc=0; одиночный
+            // `STOCK_OK` доказательством «всё снято» больше не считается.
+            val detail = LockOp.reconcileDetail(rc, out, op.targets)
+            val verdict = detail.verdict
             val state = LockOp.stateForVerdict(verdict)
             val reason = when (verdict) {
                 LockOp.Reconcile.STOCK_RESTORED -> "reconciled_restore"
@@ -1544,7 +1612,7 @@ object LockSound {
             }
             finishOpJournal(appCtx, op, state, reason)
             AppLog.i(appCtx, TAG, "LOCKSOUND_RECONCILE op=${op.id} rc=$rc " +
-                "verdict=${verdict.name.lowercase()} state=${state.name.lowercase()} " +
+                "verdict=${verdict.name.lowercase()} ${detail.wire()} state=${state.name.lowercase()} " +
                 "out=${out.replace('\n', ' ').take(300)}")
         }
         // Сходимость к последнему сохранённому намерению (не к «состоянию до»).
