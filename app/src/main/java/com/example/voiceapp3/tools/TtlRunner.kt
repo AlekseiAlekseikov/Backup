@@ -37,6 +37,9 @@ import java.util.concurrent.locks.ReentrantLock
  *  • межпроцессная защита: [gate] — только внутри JVM. Второй процесс (или второй экземпляр
  *    приложения) этим lock не сериализуется; это ограничение записано и в журнал, и в отчёт.
  */
+/** Задержка запланированного продолжения после исчерпания бюджета (мс). */
+internal const val CONTINUATION_DELAY_MS = 3_000L
+
 class TtlRunner(
     private val transport: Transport,
     private val store: Store,
@@ -111,6 +114,60 @@ class TtlRunner(
 
     /** Жёсткий предел проходов одного цикла — защита от «шторма намерений», не от поводов. */
     private val hardPassLimit: Int get() = maxOf(maxPasses, 1) * 4
+
+    /**
+     * iter53 §8.3 — РЕАЛЬНОЕ ПРОДОЛЖЕНИЕ после исчерпания бюджета.
+     *
+     * Раньше в журнал писалось `pending_until_next_trigger`, хотя никакого «следующего повода»
+     * могло не быть (сеть стабильна, владелец больше не кликает): обещание продолжения ничем не
+     * обеспечивалось. Теперь:
+     *  • планировщик внедряется из production ([continuationScheduler]);
+     *  • продолжений не больше одного одновременно ([continuationArmed]): новый повод во время
+     *    ожидания не создаёт вторую задачу — он поднимает [pending], и одна запланированная
+     *    задача обслуживает всё (coalescing);
+     *  • если планировщик не внедрён, в журнал пишется честное `action=pending_no_scheduler`
+     *    (никакого «продолжим сами»), и работа остаётся видимой в [pendingWork].
+     */
+    enum class Continuation { SCHEDULED, COALESCED, NO_SCHEDULER }
+
+    /**
+     * Внедряемый планировщик: (задержка мс, задача). Production подставляет обработчик main-looper.
+     * `null` — продолжение невозможно, и это честно сообщается.
+     */
+    @Volatile
+    var continuationScheduler: ((Long, () -> Unit) -> Unit)? = null
+
+    /** Сколько раз продолжение реально запускалось (для тестов/отчёта). */
+    @Volatile
+    var continuationsRun: Int = 0
+        private set
+
+    private val continuationArmed = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** Одна задача на все накопившиеся поводы: coalescing по факту ожидания. */
+    private fun armContinuation(source: String): Continuation {
+        if (!continuationArmed.compareAndSet(false, true)) return Continuation.COALESCED
+        val sched = continuationScheduler
+        if (sched == null) {
+            continuationArmed.set(false)
+            log("TTL_PASS continuation source=$source action=pending_no_scheduler " +
+                "(планировщик продолжения не внедрён: обещать «продолжим сами» нельзя; " +
+                "намерение сохранено и будет применено на следующем реальном поводе)")
+            return Continuation.NO_SCHEDULER
+        }
+        sched(CONTINUATION_DELAY_MS) {
+            continuationArmed.set(false)
+            continuationsRun++
+            pending.incrementAndGet()
+            runCatching { onBackgroundTrigger("continuation") }.onFailure { t ->
+                log("TTL_PASS continuation failed reason=${t.javaClass.simpleName} " +
+                    "(повод остался в счётчике; следующий реальный повод повторит попытку)")
+            }
+        }
+        log("TTL_PASS continuation source=$source action=scheduled delay_ms=$CONTINUATION_DELAY_MS " +
+            "(продолжение после бюджета: не «надеемся на повод», а запланированная задача)")
+        return Continuation.SCHEDULED
+    }
 
     fun isRunning(): Boolean = gate.isLocked
 
@@ -297,8 +354,12 @@ class TtlRunner(
             if (!moreWork) break
             if (passes >= maxPasses) {
                 if (total >= hardPassLimit) {
+                    // iter53 §8.3: не обещание «до следующего повода», а реально запланированная
+                    // задача с coalescing. «Применено» по-прежнему не заявляется.
+                    val cont = armContinuation(source)
                     log("TTL_PASS stop reason=budget passes=$passes total=$total " +
-                        "intentChanged=$intentChanged action=pending_until_next_trigger " +
+                        "intentChanged=$intentChanged action=pending_continuation " +
+                        "continuation=${cont.name.lowercase()} " +
                         "(предел продолжений: «применено» не заявляется, намерение сохранено)")
                     break
                 }
@@ -328,5 +389,7 @@ class TtlRunner(
         lastAppliedOk = false
         passesDone = 0
         pending.set(0)
+        continuationArmed.set(false)
+        continuationsRun = 0
     }
 }

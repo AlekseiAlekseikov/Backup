@@ -46,12 +46,18 @@ internal object TtlScript {
     internal const val RULE_V4 = "-j TTL --ttl-set 65"
     internal const val RULE_V6 = "-j HL --hl-set 65"
 
-    fun build(enable: Boolean): String {
+    fun build(enable: Boolean, gen: String = "default"): String {
         val enableBit = if (enable) "1" else "0"
+        // `gen` — не секрет и не «доказательство по себе»: он лишь делает владение проверяемым
+        // (метка в самом правиле). Если gen не задан, метка всё равно есть и постоянна.
+        val safeGen = gen.filter { it.isLetterOrDigit() || it == '_' || it == '-' }.take(32)
+            .ifEmpty { "default" }
         return """
 set +e
 ENABLE=@ENABLE_VALUE@
 OUR=@OUR_CHAIN@
+# Метка владения: поколение операции приходит из production (стабильно в пределах применения).
+OWN_GEN=@OWN_GEN@
 RULE4='@RULE_V4@'
 RULE6='@RULE_V6@'
 echo '=== TTL_SCRIPT start enable='${D}ENABLE' chain='${D}OUR' ==='
@@ -75,6 +81,31 @@ EXPECTED_JUMP=""
 
 V6_SUPPORTED=0
 command -v ip6tables >/dev/null 2>&1 && V6_SUPPORTED=1
+
+# iter53 §8.1 — ДОКАЗУЕМОЕ ВЛАДЕНИЕ ЦЕПОЧКОЙ.
+# Имя цепи и содержимое правила может совпасть у чужой цепи, поэтому новое правило помечается
+# комментарием (`-m comment --comment`). Поддержка ПРОВЕРЯЕТСЯ, а не предполагается: пробное
+# правило создаётся во временной цепи и сразу удаляется.
+#  • COMMENT_OK=1 — владение доказывается маркером;
+#  • COMMENT_OK=0 — маркера нет; тогда владение НЕ заявляется по одному содержимому, и цепочка
+#    без маркера в чужом/неизвестном состоянии не удаляется (см. chain_state).
+OWN_TAG="voiceapp3:ttl:${D}OWN_GEN"
+COMMENT_OK=0
+if iptables -t mangle -N VAPP_TTLPROBE 2>/dev/null; then
+  if iptables -w 5 -t mangle -A VAPP_TTLPROBE -m comment --comment "${D}OWN_TAG" -j RETURN 2>/dev/null; then
+    COMMENT_OK=1
+    echo "OWN_MARKER self=${D}OWN_TAG probe=ok"
+  else
+    echo "OWN_MARKER self=${D}OWN_TAG probe=unsupported action=fallback_name"
+  fi
+  iptables -w 5 -t mangle -F VAPP_TTLPROBE 2>/dev/null
+  iptables -w 5 -t mangle -X VAPP_TTLPROBE 2>/dev/null
+else
+  echo "OWN_MARKER self=${D}OWN_TAG probe=unavailable action=fallback_name"
+fi
+# Аргументы правила с маркером (если поддерживается).
+MARK_ARGS=""
+[ "${D}COMMENT_OK" = "1" ] && MARK_ARGS="-m comment --comment ${D}OWN_TAG"
 
 # ---------- владение: точные сравнения, а не подстроки ----------
 # Спецификации переходов POSTROUTING, у которых target — ТОЧНО наше имя.
@@ -173,6 +204,25 @@ chain_state() {
   if [ "${D}n" = "0" ]; then echo empty; return; fi
   if [ "${D}n" = "1" ]; then
     body=${D}(printf '%s\n' "${D}out" | grep '^-A ' | sed "s/^-A ${D}OUR //")
+    # Без маркера владение НЕ доказано, даже при точном совпадении содержимого: такую цепочку
+    # нельзя ни чистить, ни удалять (чужое правило могло совпасть байт в байт).
+    case "${D}body" in
+      *"${D}OWN_TAG"*) : ;;
+      *)
+        if [ "${D}body" = "${D}want" ]; then
+          # Точное совпадение содержимого — единственное доказательство для немаркированной
+          # цепочки. Различаем два случая: маркер ПОДДЕРЖИВАЕТСЯ (это наша цепочка, созданная
+          # до iter53 — её можно пересоздать уже с маркером) и маркер НЕ поддержан (тогда
+          # немаркированное правило и есть единственно достижимый вид нашего состояния).
+          if [ "${D}COMMENT_OK" = "1" ]; then echo legacy_unmarked; else echo ours_unmarked; fi
+          return
+        fi ;;
+    esac
+    body=${D}(printf '%s\n' "${D}body" | sed "s/-m comment --comment ${D}OWN_TAG //")
+    # Владение — по МАРКЕРУ в самом правиле (см. OWN_TAG): имя цепи и содержимое могли
+    # совпасть у чужой цепи, поэтому «наши» мы называем только помеченное. Ссылки (в том числе
+    # `-g` и из других цепей) проверяются ОТДЕЛЬНО и ДО удаления (ref_other_count/TTL_REF_KEEP):
+    # цепочка может быть нашей, но нужной чужой цепи — тогда её нельзя ни чистить, ни удалять.
     if [ "${D}body" = "${D}want" ]; then echo ours; return; fi
   fi
   echo collision
@@ -221,6 +271,13 @@ drop_family() {
     absent)  echo "TTL_OWN family=${D}fam state=absent action=none"; echo "${D}fam:none"; return 0 ;;
     empty)   echo "TTL_OWN family=${D}fam state=empty action=keep reason=empty_chain_origin_unproven"; echo "${D}fam:skip"; return 0 ;;
     collision) echo "TTL_OWN family=${D}fam state=collision action=keep reason=chain_content_not_ours"; echo "${D}fam:collision"; return 0 ;;
+    # iter53 §8.1 — МИГРАЦИЯ. Цепочка старше iter53 маркера не несла, но её единственное
+    # правило совпадает с ожидаемым БАЙТ В БАЙТ, поэтому это доказуемо наше старое правило:
+    # его можно снять и пересоздать уже с маркером. Факт миграции называется явно.
+    legacy_unmarked)
+      echo "TTL_MIGRATE family=${D}fam from=legacy_unmarked to=marked supported=1 note=\"правило совпадает с ожидаемым, но без метки: снимаем и создаём с меткой\"" ;;
+    ours_unmarked)
+      [ "${D}COMMENT_OK" = "1" ] && { echo "TTL_OWN family=${D}fam state=ours_unmarked action=keep reason=marker_expected_but_absent"; echo "${D}fam:skip"; return 0; } ;;
     unknown) echo "TTL_OWN family=${D}fam state=unknown action=skip reason=read_failed"; echo "${D}fam:unknown"; return 0 ;;
   esac
   # состояние ours: снимаем ИМЕННО наши переходы (точное сравнение target), затем цепочку
@@ -326,6 +383,17 @@ if [ "${D}ENABLE" = "1" ]; then
     else
       VARIANT=uplink
       # --- v4 ---
+      # iter53 §8.1: маркер не поддержан ядром и правило уже ровно такое, как нужно —
+      # НЕ пересоздаём его на каждом проходе (иначе TTL мигает на каждом событии сети,
+      # а между -F и -A правило реально отсутствует).
+      KEEP_V4=no
+      if [ "${D}COMMENT_OK" = "0" ] && [ "${D}CS_V4" = "ours_unmarked" ] && \
+         [ "${D}(jump_count iptables)" = "1" ] && [ "${D}(jump_specs iptables | head -1)" = "${D}EXPECTED_JUMP" ]; then
+        KEEP_V4=yes
+      fi
+      if [ "${D}KEEP_V4" = "yes" ]; then
+        echo "TTL_KEEP family=v4 state=ours_unmarked reason=marker_unsupported note=\"правило уже совпадает с ожидаемым\""
+      else
       drop_out4=${D}(drop_family iptables "${D}RULE4" v4); echo "${D}drop_out4"
       # iter50 §5.1(3): если своё снять НЕ удалось (partial/unknown/collision/skip),
       # безусловно продолжать -N/-A нельзя — рядом со старым правилом появилось бы второе,
@@ -335,43 +403,59 @@ if [ "${D}ENABLE" = "1" ]; then
       esac
       if [ "${D}TTL_STOP" = "0" ]; then
       iptables -w 5 -t mangle -N "${D}OUR" 2>/dev/null
-      iptables -w 5 -t mangle -A "${D}OUR" -j TTL --ttl-set 65 2>&1
-      rc_a=${D}?; echo "TTL_ADD family=v4 chain=${D}OUR rc=${D}rc_a"
+      # shellcheck disable=SC2086
+      iptables -w 5 -t mangle -A "${D}OUR" ${D}MARK_ARGS -j TTL --ttl-set 65 2>&1
+      rc_a=${D}?; echo "TTL_ADD family=v4 chain=${D}OUR marker=${D}COMMENT_OK rc=${D}rc_a"
       iptables -w 5 -t mangle -A POSTROUTING -o "${D}UPLINK" -j "${D}OUR" 2>&1
       rc_j=${D}?; echo "TTL_ADD family=v4 jump scope=\"-o ${D}UPLINK\" rc=${D}rc_j"
       TOUCHED_v4=yes
       fi
+      fi
       # --- v6 ---
-      if [ "${D}V6_SUPPORTED" = "1" ] && [ "${D}TTL_STOP" = "0" ]; then
+      KEEP_V6=no
+      if [ "${D}V6_SUPPORTED" = "1" ] && [ "${D}TTL_STOP" = "0" ] && [ "${D}COMMENT_OK" = "0" ] && \
+         [ "${D}CS_V6" = "ours_unmarked" ] && [ "${D}(jump_count ip6tables)" = "1" ] && \
+         [ "${D}(jump_specs ip6tables | head -1)" = "${D}EXPECTED_JUMP" ]; then
+        KEEP_V6=yes; echo "TTL_KEEP family=v6 state=ours_unmarked reason=marker_unsupported"
+      fi
+      if [ "${D}V6_SUPPORTED" = "1" ] && [ "${D}TTL_STOP" = "0" ] && [ "${D}KEEP_V6" != "yes" ]; then
         drop_out6=${D}(drop_family ip6tables "${D}RULE6" v6); echo "${D}drop_out6"
         case "${D}drop_out6" in
           *:partial*|*:unknown*|*:collision*|*:skip*) echo "TTL_TRY action=stop reason=v6_own_not_removed"; TTL_STOP=1 ;;
         esac
       fi
-      if [ "${D}V6_SUPPORTED" = "1" ] && [ "${D}TTL_STOP" = "0" ]; then
+      if [ "${D}V6_SUPPORTED" = "1" ] && [ "${D}TTL_STOP" = "0" ] && [ "${D}KEEP_V6" != "yes" ]; then
         ip6tables -w 5 -t mangle -N "${D}OUR" 2>/dev/null
-        ip6tables -w 5 -t mangle -A "${D}OUR" -j HL --hl-set 65 2>&1
-        rc_a6=${D}?; echo "TTL_ADD family=v6 chain=${D}OUR rc=${D}rc_a6"
+        # shellcheck disable=SC2086
+        ip6tables -w 5 -t mangle -A "${D}OUR" ${D}MARK_ARGS -j HL --hl-set 65 2>&1
+        rc_a6=${D}?; echo "TTL_ADD family=v6 chain=${D}OUR marker=${D}COMMENT_OK rc=${D}rc_a6"
         ip6tables -w 5 -t mangle -A POSTROUTING -o "${D}UPLINK" -j "${D}OUR" 2>&1
         rc_j6=${D}?; echo "TTL_ADD family=v6 jump scope=\"-o ${D}UPLINK\" rc=${D}rc_j6"
         TOUCHED_v6=yes
       fi
-      # iter50 §5.1(3): если мы ОСТАНОВИЛИСЬ (своё снять не удалось), -N/-A не выполнялись,
-      # поэтому rc_* остались пустыми. Пустое значение нельзя трактовать как «rc != 0» —
-      # иначе печатается ложный TTL_ROLLBACK и в худшем случае трогается цепочка без нужды.
-      if [ "${D}TTL_STOP" = "1" ]; then
-        rc_a=skip; rc_j=skip; rc_a6=skip; rc_j6=skip
+      # iter53 §8.2: откат решается по ФАКТУ изменения, а не по значениям rc.
+      # Раньше при `TTL_STOP=1` (v6 отказалась после того, как v4 уже применена) rc обнулялись
+      # в `skip`, блок отката пропускался целиком — и v4 оставалась изменённой при отказе v6.
+      # Теперь: `TOUCHED_*` фиксирует реальное изменение, и любая «остановка» после него требует
+      # снятия обеих семей.
+      if [ "${D}TTL_STOP" = "1" ] && { [ "${D}TOUCHED_v4" = "yes" ] || [ "${D}TOUCHED_v6" = "yes" ]; }; then
+        echo "TTL_TRY action=stop reason=partial_after_stop v4=${D}TOUCHED_v4 v6=${D}TOUCHED_v6"
       fi
       # Половинчатое включение не оставляем: если хоть одна семья не встала, снимаем обе.
       # Порядок важен: сначала ТОЧНЫЙ переход, затем -F, затем -X (иначе -X вернёт "Too many links").
       need_rb=no
-      if [ "${D}TTL_STOP" = "0" ]; then
+      # 1) любая изменённая семья обязана быть снята, если цепочка/переход не встали;
+      if [ "${D}TOUCHED_v4" = "yes" ]; then
         [ "${D}rc_a" != "0" ] && need_rb=yes
         [ "${D}rc_j" != "0" ] && need_rb=yes
-        if [ "${D}V6_SUPPORTED" = "1" ]; then
-          [ "${D}rc_a6" != "0" ] && need_rb=yes
-          [ "${D}rc_j6" != "0" ] && need_rb=yes
-        fi
+      fi
+      if [ "${D}TOUCHED_v6" = "yes" ]; then
+        [ "${D}rc_a6" != "0" ] && need_rb=yes
+        [ "${D}rc_j6" != "0" ] && need_rb=yes
+      fi
+      # 2) остановка ПОСЛЕ уже сделанного изменения (например, v6 отказала после v4) — откат;
+      if [ "${D}TTL_STOP" = "1" ]; then
+        if [ "${D}TOUCHED_v4" = "yes" ] || [ "${D}TOUCHED_v6" = "yes" ]; then need_rb=yes; fi
       fi
       if [ "${D}need_rb" = "yes" ]; then
         echo "TTL_ROLLBACK reason=incomplete rc4=${D}rc_a/${D}rc_j rc6=${D}{rc_a6:-n}/${D}{rc_j6:-n}"
@@ -441,8 +525,21 @@ ALL_V4=${D}(count_ttl_rules iptables 'ttl-set')
 ALL_V6=0; [ "${D}V6_SUPPORTED" = "1" ] && ALL_V6=${D}(count_ttl_rules ip6tables 'hl-set')
 FOREIGN_V4=${D}ALL_V4
 FOREIGN_V6=${D}ALL_V6
-OWN_V4=0; [ "${D}CS2_V4" = "ours" ] && OWN_V4=1; [ "${D}CS2_V4" = "unknown" ] && OWN_V4=-1
-OWN_V6=0; [ "${D}CS2_V6" = "ours" ] && OWN_V6=1; [ "${D}CS2_V6" = "unknown" ] && OWN_V6=-1
+# iter53 §8.1: «нашим» считается marked `ours`, либо `ours_unmarked` — но ТОЛЬКО когда маркер
+# не поддержан ядром: тогда иного доказуемого вида нашего состояния не существует.
+OWN_OK_V4=no
+case "${D}CS2_V4" in
+  ours) OWN_OK_V4=yes ;;
+  ours_unmarked) [ "${D}COMMENT_OK" = "0" ] && OWN_OK_V4=yes ;;
+esac
+OWN_OK_V6=no
+case "${D}CS2_V6" in
+  ours) OWN_OK_V6=yes ;;
+  ours_unmarked) [ "${D}COMMENT_OK" = "0" ] && OWN_OK_V6=yes ;;
+esac
+
+OWN_V4=0; [ "${D}OWN_OK_V4" = "yes" ] && OWN_V4=1; [ "${D}CS2_V4" = "unknown" ] && OWN_V4=-1
+OWN_V6=0; [ "${D}OWN_OK_V6" = "yes" ] && OWN_V6=1; [ "${D}CS2_V6" = "unknown" ] && OWN_V6=-1
 RULE_TTL=-1; [ "${D}OWN_V4" = "1" ] && RULE_TTL=65
 RULE_HL=-1; [ "${D}OWN_V6" = "1" ] && RULE_HL=65
 
@@ -455,7 +552,7 @@ elif [ "${D}CS2_V4" = "empty" ]; then
   if [ "${D}TOUCHED_v4" = "yes" ]; then VERIFY_V4=FAIL; else VERIFY_V4=COLLISION; fi
 elif [ "${D}ENABLE" = "1" ] && [ "${D}CS2_V4" = "absent" ] && [ "${D}TOUCHED_v4" != "yes" ]; then VERIFY_V4=NOT_APPLIED
 elif [ "${D}ENABLE" = "1" ]; then
-  if [ "${D}CS2_V4" = "ours" ] && [ "${D}J4" = "1" ] && [ "${D}JS4_RAW" = "${D}EXPECTED_JUMP" ] && \
+  if [ "${D}OWN_OK_V4" = "yes" ] && [ "${D}J4" = "1" ] && [ "${D}JS4_RAW" = "${D}EXPECTED_JUMP" ] && \
      [ "${D}REFS_OUT4" = "0" ]; then VERIFY_V4=OK; fi
 else
   if [ "${D}CS2_V4" = "absent" ] && [ "${D}J4" = "0" ] && [ "${D}REFS_ANY4" = "0" ]; then VERIFY_V4=OFF_OK; fi
@@ -469,7 +566,7 @@ if [ "${D}V6_SUPPORTED" = "1" ]; then
     if [ "${D}TOUCHED_v6" = "yes" ]; then VERIFY_V6=FAIL; else VERIFY_V6=COLLISION; fi
   elif [ "${D}ENABLE" = "1" ] && [ "${D}CS2_V6" = "absent" ] && [ "${D}TOUCHED_v6" != "yes" ]; then VERIFY_V6=NOT_APPLIED
   elif [ "${D}ENABLE" = "1" ]; then
-    if [ "${D}CS2_V6" = "ours" ] && [ "${D}J6" = "1" ] && [ "${D}JS6_RAW" = "${D}EXPECTED_JUMP" ] && \
+    if [ "${D}OWN_OK_V6" = "yes" ] && [ "${D}J6" = "1" ] && [ "${D}JS6_RAW" = "${D}EXPECTED_JUMP" ] && \
        [ "${D}REFS_OUT6" = "0" ]; then VERIFY_V6=OK; fi
   else
     if [ "${D}CS2_V6" = "absent" ] && [ "${D}J6" = "0" ] && [ "${D}REFS_ANY6" = "0" ]; then VERIFY_V6=OFF_OK; fi
@@ -488,8 +585,10 @@ if [ "${D}ENABLE" = "0" ]; then
     fi
   elif [ "${D}VERIFY_V4" = "COLLISION" ] || [ "${D}VERIFY_V6" = "COLLISION" ]; then
     echo "TTL_OFF own_v4=${D}OWN_V4 own_v6=${D}OWN_V6 result=PARTIAL reason=foreign_chain_collision action=keep"
-  else
-    echo "TTL_OFF own_v4=${D}OWN_V4 own_v6=${D}OWN_V6 foreign_v4=${D}FOREIGN_V4 foreign_v6=${D}FOREIGN_V6 result=FAILED reason=own_rules_left"
+  elif [ "${D}REFS_ANY4" != "0" ] || [ "${D}REFS_ANY6" != "0" ]; then
+    # iter53 §8.1: цепочку нельзя ни чистить, ни удалять, пока на неё ссылаются из других мест —
+    # иначе сломается ЧУЖОЕ поведение. Это не «снято» и не «сломалось»: честный PARTIAL с причиной.
+    echo "TTL_OFF own_v4=${D}OWN_V4 own_v6=${D}OWN_V6 foreign_v4=${D}FOREIGN_V4 foreign_v6=${D}FOREIGN_V6 result=PARTIAL reason=referenced_elsewhere action=keep refs_out4=${D}REFS_OUT4 refs_any4=${D}REFS_ANY4 refs_out6=${D}REFS_OUT6 refs_any6=${D}REFS_ANY6"
   fi
 fi
 
@@ -522,6 +621,7 @@ else
   elif [ "${D}VERIFY_V4" = "OFF_OK" ] && { [ "${D}VERIFY_V6" = "OFF_OK" ] || [ "${D}VERIFY_V6" = "SKIPPED" ]; }; then
     if [ "${D}FOREIGN_V4" = "0" ] && [ "${D}FOREIGN_V6" = "0" ]; then VERDICT=OFF_OK; else VERDICT=OFF_OWN_FOREIGN_LEFT; fi
   elif [ "${D}VERIFY_V4" = "COLLISION" ] || [ "${D}VERIFY_V6" = "COLLISION" ]; then VERDICT=CHAIN_COLLISION
+  elif [ "${D}REFS_ANY4" != "0" ] || [ "${D}REFS_ANY6" != "0" ]; then VERDICT=REF_ELSEWHERE
   else VERDICT=CHECK_OWNER; fi
 fi
 
@@ -532,6 +632,7 @@ echo '=== TTL_SCRIPT end ==='
             .replace("ARROW", "\u2192")
             .replace("@ENABLE_VALUE@", enableBit)
             .replace("@OUR_CHAIN@", OUR_CHAIN)
+            .replace("@OWN_GEN@", safeGen)
             .replace("@RULE_V4@", RULE_V4)
             .replace("@RULE_V6@", RULE_V6)
     }

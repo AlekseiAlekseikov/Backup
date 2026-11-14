@@ -35,7 +35,9 @@ class Iter48Test {
         val s = TtlScript.build(true)
         assertTrue(
             "своя цепочка: правило TTL внутри нашей цепочки",
-            s.contains("mangle -A " + q + d + "OUR" + q + " -j TTL --ttl-set 65")
+            // iter53 §8.1: правило несёт метку владения — именно она делает «свою» цепочку
+            // доказуемо своей (имя и содержимое могли совпасть у чужой цепи).
+            s.contains("mangle -A " + q + d + "OUR" + q + " " + d + "MARK_ARGS -j TTL --ttl-set 65")
         )
         assertTrue(
             "переход в нашу цепочку ставится ТОЛЬКО со скоупом -o <uplink>",

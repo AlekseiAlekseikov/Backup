@@ -65,7 +65,11 @@ class Iter50TtlArgvTest {
         st.exec(on(), "on2.sh")
         assertEquals(
             "ровно одно наше правило в цепочке и один переход",
-            listOf("VAPP_TTL -j TTL --ttl-set 65", "POSTROUTING -o wlan0 -j VAPP_TTL"),
+            // iter53 §8.1: правило несёт метку владения (comment), иначе владение недоказуемо.
+            listOf(
+                "VAPP_TTL -m comment --comment voiceapp3:ttl:default -j TTL --ttl-set 65",
+                "POSTROUTING -o wlan0 -j VAPP_TTL"
+            ),
             st.rules("iptables")
         )
     }
@@ -105,12 +109,19 @@ class Iter50TtlArgvTest {
         // Главное: рядом со старым правилом не появилось второе.
         assertEquals(
             "дубликатов нет: второе -A/-N после неудачного -D не выполнено",
-            listOf("VAPP_TTL -j TTL --ttl-set 65", "POSTROUTING -o wlan0 -j VAPP_TTL"),
+            // iter53 §8.1: правило несёт метку владения (comment), иначе владение недоказуемо.
+            listOf(
+                "VAPP_TTL -m comment --comment voiceapp3:ttl:default -j TTL --ttl-set 65",
+                "POSTROUTING -o wlan0 -j VAPP_TTL"
+            ),
             st.rules("iptables")
         )
         assertTrue(
             "ни одного прибавления после отказа: ${st.argv()}",
-            st.argv().none { it.contains("<-A>") || it.contains("<-N>") }
+            // Проба поддержки `-m comment` (VAPP_TTLPROBE) — не изменение таблицы mangle:
+            // её команды исключены из проверки «после отказа ничего не добавлялось».
+            st.argv().filterNot { it.contains("VAPP_TTLPROBE") }
+                .none { it.contains("<-A>") || it.contains("<-N>") }
         )
     }
 
