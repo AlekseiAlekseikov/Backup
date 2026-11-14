@@ -40,9 +40,13 @@ class JitIter40Test {
         state: String = JitRef.OpMark.REPLIED,
         stores: List<Int> = listOf(0, 1)
     ) = apply {
+        // Отметка вычисляется ОДИН раз: иначе CPS и DPS получали соседние миллисекунды,
+        // `assessStored` видел «расхождение копий» (mark_ts_conflict) и тест падал
+        // в зависимости от порядка запуска. Это флак хелпера, а не поведение кода.
+        val mark = JitRef.OpMark.of(op, want, state, System.currentTimeMillis()).wire()
         for (i in stores) {
             setIn(i, JitRef.KEY_RESTORE, snap)
-            setIn(i, JitRef.KEY_MARK, JitRef.OpMark.of(op, want, state, System.currentTimeMillis()).wire())
+            setIn(i, JitRef.KEY_MARK, mark)
         }
     }
 
