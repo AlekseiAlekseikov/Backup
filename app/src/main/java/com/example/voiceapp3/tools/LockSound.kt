@@ -972,7 +972,7 @@ object LockSound {
                 // после ответа: потеря ответа/смерть процесса оставляла реально созданные слои
                 // без учёта, и снять их было нечем. Если запись не подтверждена чтением —
                 // bind не отправляется (иначе возможно необратимое неучтённое монтирование).
-                val opId = "bind_" + gen + "_" + LockOp.Stage0.hash(stagePath)
+                val opId = "bind_" + gen + "_" + Stage0.hash(stagePath)
                 val op = LockOp.BindOp(
                     id = opId, gen = gen, desired = true, stage = stagePath,
                     targets = glideTargets, state = LockOp.State.PLANNED
