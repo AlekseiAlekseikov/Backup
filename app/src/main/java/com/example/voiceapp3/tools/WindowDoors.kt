@@ -573,10 +573,24 @@ object WindowDoors {
                 "result=closed pos_after=${posAfter ?: "?"}")
         } else {
             // Владельцев не удаляем: окно не закрылось, значит дверь всё ещё «держит» его.
-            synchronized(ventOwners) {
-                val set = ownersOf(windowAreaId)
-                set.clear()
-                set.addAll(before)   // вернуть как было до попытки
+            //
+            // §8.1 iter51: откат к `before` идёт через ЕДИНУЮ точку мутации и только пока набор
+            // не изменился. Раньше набор переписывался напрямую в обход `mutateOwners`: (а) без
+            // увеличения поколения, (б) поверх ЛЮБОГО изменения, сделанного за время команды
+            // VHAL, — владелец, добавленный другой дверью, молча стирался, и его окно больше
+            // никто не закрывал. Теперь: содержимое равно тому, что мы сами записали ⇒ откат;
+            // иначе запись живёт и не трогается.
+            var rolledBack = false
+            mutateOwners { map ->
+                val now = map[windowAreaId]?.toSet() ?: emptySet()
+                val restore = ventRollbackOwners(now, ownersAfter, before)
+                if (restore != null) {
+                    val set = map.getOrPut(windowAreaId) { HashSet() }
+                    set.clear()
+                    set.addAll(restore)         // вернуть как было до попытки
+                    if (set.isEmpty() && legacy) map.remove(windowAreaId)
+                    rolledBack = true                // иначе запись живёт: не трогаем
+                }
             }
             persistVentOwners(appCtx)
             // §9 iter46: `getIntProperty` возвращает ПОСЛЕДНЕЕ известное значение VHAL, а
@@ -585,6 +599,7 @@ object WindowDoors {
             // воздействий не делаем (никаких «дожать», повторных setIntProperty и т.п.).
             AppLog.w(appCtx, TAG, "VENT_CLOSE_UNCONFIRMED win=${hex(windowAreaId)} door=${hex(doorAreaId)} " +
                 "pos=$pos pos_after=${posAfter ?: "?"} written=$written owners_after=${ownersHex(after)} " +
+                "rolled_back=$rolledBack " +
                 "reason=$outcome " +
                 "physical_failure=not_claimed action=none " +
                 "(значение VHAL могло не обновиться на момент чтения; один отложенный readback " +
@@ -785,6 +800,28 @@ internal fun ventCloseOutcome(
     posAfter == null -> "readback_missing"
     kotlin.math.abs(posAfter - closedPos) <= tolerance -> "closed"
     else -> "late_readback"
+}
+
+/**
+ * §8.1 iter51: можно ли ОТКАТИТЬ набор владельцев окна к состоянию до попытки закрытия.
+ *
+ * Попытка закрытия сначала записала `installed` (обычно `before + дверь`). Пока команда VHAL
+ * летела, другая дверь могла добавить владельца. Прямое восстановление `before` в обход
+ * [mutateOwners] затирало такую запись: окно оставалось без владельца и его больше никто не
+ * закрывал. Поэтому откат разрешён ровно тогда, когда текущий набор — это то, что записали МЫ
+ * (никто не менял), и запрещён, если набор уже другой.
+ *
+ * @return набор для записи, либо `null` — «не трогать» (запись живёт своей жизнью).
+ */
+internal fun ventRollbackOwners(
+    current: Set<Int>,
+    installed: Set<Int>,
+    before: Set<Int>,
+): Set<Int>? = when {
+    // Никто не менял после нас — честный откат своей же записи.
+    current == installed -> before
+    // Набор уже другой: чужая (более новая) запись важнее нашего отката.
+    else -> null
 }
 
 /**
