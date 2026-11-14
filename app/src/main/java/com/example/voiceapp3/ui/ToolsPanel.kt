@@ -181,6 +181,29 @@ class ToolsPanel(
             else -> 0
         }
         for ((k, v) in d.entrySet()) {
+            // iter52 §8.2: снимок, пришедший после клика, не перетирает выбор владельца.
+            val hold = clickHold[k]
+            if (hold != null && !k.startsWith("\$") && v.isJsonPrimitive) {
+                val snapVal = runCatching { v.asBoolean }.getOrNull()
+                when (com.example.voiceapp3.tools.Toggles45.holdAfterSnapshot(hold, snapVal)) {
+                    com.example.voiceapp3.tools.Toggles45.HoldOutcome.KEEP_CLICK -> {
+                        clickHold[k] = hold.copy(disagreements = hold.disagreements + 1)
+                        AppLog.i("ToolsPanel", "TOGGLE_HOLD key=$k click=${hold.value} snapshot=$snapVal " +
+                            "action=keep_click disagreements=${hold.disagreements + 1} " +
+                            "(снимок посчитан до/во время клика: выбор владельца НЕ откатываем)")
+                        continue
+                    }
+                    com.example.voiceapp3.tools.Toggles45.HoldOutcome.APPLY_SNAPSHOT_CONFLICT -> {
+                        clickHold.remove(k)
+                        AppLog.w("ToolsPanel", "TOGGLE_CONFLICT key=$k click=${hold.value} snapshot=$snapVal " +
+                            "action=apply_snapshot (снимок второй раз противоречит выбору: показываем " +
+                            "фактическое состояние; выбор НЕ считается применённым)")
+                    }
+                    com.example.voiceapp3.tools.Toggles45.HoldOutcome.CLEAR_CONFIRMED ->
+                        clickHold.remove(k)
+                    com.example.voiceapp3.tools.Toggles45.HoldOutcome.APPLY_SNAPSHOT -> Unit
+                }
+            }
             if (k == "last") {
                 last = if (v.isJsonObject) v.asJsonObject else last
             } else if (!k.startsWith("\$")) {
@@ -1069,9 +1092,22 @@ class ToolsPanel(
         // последнее известное в этой сессии, и только при полном отсутствии информации `def`.
         val triState = prefsState?.takeIf { it.isNotEmpty() }
             ?: when (raw) { true -> "on"; false -> "off"; null -> "unknown" }
-        val on = if (key != "perfJit") Toggles45.switchPosition(triState, lastKnownPos[key], def)
-                 else JitRef.switchPosition(jitConfirmed ?: "unknown", raw ?: def)
-        Toggles45.knownPosition(triState)?.let { lastKnownPos[key] = it }
+        // Холодный старт: последнее известное берётся с диска (если в этой сессии ещё не читали).
+        val hold = clickHold[key]
+        val lastKnown = lastKnownOf(key)
+        val on = when {
+            // Выбор владельца, не подтверждённый снимком, показывается как есть.
+            hold != null && triState?.lowercase() != "on" && triState?.lowercase() != "off" -> hold.value
+            hold != null && Toggles45.knownPosition(triState) != hold.value -> hold.value
+            key != "perfJit" -> Toggles45.switchPosition(triState, lastKnown, def)
+            else -> JitRef.switchPosition(jitConfirmed ?: "unknown", raw ?: def)
+        }
+        Toggles45.knownPosition(triState)?.let { known ->
+            if (hold == null || hold.value == known) {
+                clickHold.remove(key)
+                rememberKnown(key, known)
+            }
+        }
         val row = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -1093,6 +1129,9 @@ class ToolsPanel(
             // Само событие клика (до любых фоновых задач): устаревшие async-ответы, посчитанные
             // раньше, уже не применятся к тумблеру, тексту и предупреждению.
             if (key == "perfJit") runCatching { AppPerformance.markJitClick() }
+            // iter52 §8.2: с этого момента выбор владельца держится, пока снимок с ним не
+            // согласится; поздний снимок его не перетирает (см. holdAfterSnapshot).
+            clickHold[key] = com.example.voiceapp3.tools.Toggles45.ClickHold(checked)
             state.addProperty(key, checked)
             send("settings.change", JsonObject().apply {
                 addProperty("key", key)
@@ -1485,6 +1524,32 @@ class ToolsPanel(
      * сохранённое намерение (подпись «состояние не подтверждено» остаётся).
      */
     private val lastKnownPos = HashMap<String, Boolean>()
+
+    /**
+     * iter52 §8.2: «последнее известное положение» ЖИВЁТ НА ДИСКЕ, а не в памяти панели.
+     *
+     * Раньше `lastKnownPos` был обычным `HashMap`: после холодного старта при `unknown` из
+     * снимка положение тумблера падало в backend-default (у 17 из 19 ключей это `false`), и
+     * выглядело как сохранённый выбор владельца. Теперь последнее ПОДТВЕРЖДЁННОЕ положение
+     * читается из Prefs2 при холодном старте и показывается с подписью «не подтверждено»;
+     * никакая из этих веток ничего не ПИШЕТ в настройки.
+     */
+    private fun lastKnownKey(key: String) = "tools_lastknown_$key"
+
+    private fun lastKnownOf(key: String): Boolean? =
+        lastKnownPos[key] ?: runCatching { Prefs2.getBooleanOrNull(activity, lastKnownKey(key)) }
+            .getOrNull()?.also { lastKnownPos[key] = it }
+
+    private fun rememberKnown(key: String, value: Boolean) {
+        lastKnownPos[key] = value
+        runCatching { Prefs2.putBoolean(activity, lastKnownKey(key), value) }
+    }
+
+    /**
+     * iter52 §8.2: выбор владельца, ещё не подтверждённый снимком. Пока он здесь, поздний
+     * снимок НЕ перетирает тумблер (см. [Toggles45.holdAfterSnapshot]).
+     */
+    private val clickHold = HashMap<String, com.example.voiceapp3.tools.Toggles45.ClickHold>()
 
     private fun boolState(key: String): Boolean? {
         // §6.2 iter47: ключа нет в ПОСЛЕДНЕМ снимке → «не прочитано» (даже если старое значение

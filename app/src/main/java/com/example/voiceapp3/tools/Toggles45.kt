@@ -251,4 +251,44 @@ object Toggles45 {
         }
         return n
     }
+
+    /**
+     * iter52 §8.2 — «поздний снимок не перетирает клик».
+     *
+     * Клик владельца и асинхронный снимок состояния идут разными путями. Снимок, посчитанный
+     * ДО клика (или до того, как изменение доехало до backend), приходил позже и откатывал
+     * тумблер назад — владелец видел, что его выбор «не приняли», хотя запись могла быть в пути.
+     *
+     * Правило: после клика по ключу показываем ВЫБОР ВЛАДЕЛЬЦА, пока снимок с этим выбором не
+     * согласится. Несогласие снимка НЕ перетирает клик сразу: первый такой снимок может быть
+     * ещё старым. Но если снимок не подтверждает выбор и во второй раз — это уже факт, и UI
+     * показывает фактическое состояние (и отдельно говорит, что выбор не подтверждён).
+     *
+     * `unknown` в снимке клик не отменяет никогда: неизвестность не является фактом.
+     */
+    data class ClickHold(val value: Boolean, val disagreements: Int = 0)
+
+    enum class HoldOutcome {
+        /** Снимок применяется как обычно (клика нет). */
+        APPLY_SNAPSHOT,
+        /** Снимок подтвердил выбор владельца — удержание снимается, применяем снимок. */
+        CLEAR_CONFIRMED,
+        /** Снимок старее клика или неизвестен — держим выбор владельца. */
+        KEEP_CLICK,
+        /** Снимок второй раз противоречит выбору — показываем факт (и это надо сказать в UI). */
+        APPLY_SNAPSHOT_CONFLICT
+    }
+
+    fun holdAfterSnapshot(
+        hold: ClickHold?,
+        snapshotValue: Boolean?,
+        /** Предел противоречий, после которого верим снимку (1 — «второй раз»). */
+        maxDisagreements: Int = 1
+    ): HoldOutcome {
+        if (hold == null) return HoldOutcome.APPLY_SNAPSHOT
+        if (snapshotValue == null) return HoldOutcome.KEEP_CLICK
+        if (snapshotValue == hold.value) return HoldOutcome.CLEAR_CONFIRMED
+        return if (hold.disagreements >= maxDisagreements) HoldOutcome.APPLY_SNAPSHOT_CONFLICT
+        else HoldOutcome.KEEP_CLICK
+    }
 }
