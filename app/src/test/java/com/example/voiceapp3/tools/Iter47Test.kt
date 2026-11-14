@@ -282,6 +282,63 @@ class Iter47Test {
         assertFalse(r.isRunning())
     }
 
+    @Test
+    fun offDuringNetworkApplyIsNotLost() {
+        val t = FakeTransport(confirmed = true)
+        val s = FakeStore(want = true)
+        val (r, _) = runner(t, s)
+        // Сеть вернулась (применение ON по сети), владелец в это время выключил TTL.
+        t.onApply = { want -> if (want) s.beginIntent(false) }
+        r.onBackgroundTrigger("network")
+        assertEquals("последним применён OFF", false, t.applied.last())
+        assertEquals("намерение OFF сохранено", false, s.desired())
+    }
+
+    @Test
+    fun rootReadyWithoutNetworkEventAlsoReapplies() {
+        val t = FakeTransport(confirmed = true)
+        val s = FakeStore(want = true)
+        val (r, _) = runner(t, s)
+        // Канал root вернулся БЕЗ broadcast сети: повод должен сработать.
+        val res = r.onBackgroundTrigger("root_ready")
+        assertNotNull(res)
+        assertEquals(listOf(true), t.applied)
+        assertTrue("факт подтверждён", res!!.confirmed)
+    }
+
+    @Test
+    fun processDeathKeepsIntentAndResumesWithoutClaimingApplied() {
+        val s = FakeStore(want = true)
+        val t1 = FakeTransport(confirmed = true)
+        val (r1, _) = runner(t1, s)
+        r1.request(true, "click")
+        // «Смерть процесса»: новое состояние раннера над тем же хранилищем.
+        val t2 = FakeTransport(confirmed = false)   // канал ещё не готов
+        val (r2, _) = runner(t2, s)
+        assertNull("до проверки факт не заявляется", r2.last())
+        val res = r2.onBackgroundTrigger("boot")
+        assertNotNull(res)
+        assertFalse("канал не готов → не «применено»", res!!.confirmed)
+        assertEquals("намерение владельца сохранено", true, s.desired())
+        // Канал вернулся — добираем тем же путём, без перезапуска и без потери намерения.
+        t2.confirmed = true
+        val again = r2.onBackgroundTrigger("root_ready")
+        assertTrue("после возврата канала применено", again!!.confirmed)
+    }
+
+    @Test
+    fun supersededResultIsNeverRecordedAsAppliedForNewIntent() {
+        val t = FakeTransport(confirmed = true)
+        val s = FakeStore(want = true)
+        val (r, _) = runner(t, s)
+        t.onApply = { want -> if (want) s.beginIntent(false) }
+        r.request(true, "click")
+        assertTrue("результат старого ON помечен как вытесненный: ${s.facts}",
+            s.facts.any { it.contains("current=false") || it.contains("superseded") })
+        assertEquals("факт записан только для актуального поколения", false,
+            r.appliedOk() && s.desired() == true)
+    }
+
     // ───────────────────────── §6.1: правила CPS/DPS ─────────────────────────
 
     @Test
