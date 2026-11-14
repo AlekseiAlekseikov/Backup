@@ -231,9 +231,16 @@ object FileLogCore {
      * межпроцессного лока (общий файл без лока как раз и давал «дыры»).
      */
     fun spillFor(active: File): File {
-        val pid = runCatching { java.lang.management.ManagementFactory.getRuntimeMXBean().name }
-            .getOrDefault("p")
-        return File(active.parentFile, active.name + "." + pid + ".spill")
+        // Идентификатор ПРОЦЕССА без Android/Java-management API (на Android
+        // `java.lang.management` отсутствует): `/proc/self` есть и на JVM, и на устройстве.
+        return File(active.parentFile, active.name + "." + processTag + ".spill")
+    }
+
+    /** Стабильный в пределах процесса тег (pid из `/proc/self`, иначе — случайный). */
+    private val processTag: String by lazy {
+        runCatching { File("/proc/self").canonicalFile.name }.getOrNull()
+            ?.takeIf { it.isNotEmpty() && it.all { ch -> ch.isDigit() } }
+            ?: ("p" + Integer.toHexString(System.identityHashCode(Any())))
     }
 
     /**

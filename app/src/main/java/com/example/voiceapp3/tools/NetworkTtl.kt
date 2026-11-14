@@ -105,21 +105,7 @@ object NetworkTtl {
     }
 
     fun pendingReason(context: Context): String =
-        getPrefs(context).getString(PREF_TTL_65_PENDING_REASON, "") ?: ""
-
-    private fun markApplied(context: Context, applied: Boolean, reason: String) {
-        // §5 iter45: решение «applied|pending|off» — в чистых правилах Toggles45 (покрыты тестами).
-        Prefs2.putString(context, PREF_TTL_65_APPLIED,
-            Toggles45.appliedOutcome(isTtl65Active(context), applied))
-        Prefs2.putString(context, PREF_TTL_65_PENDING_REASON, if (applied) "" else reason)
-        if (applied) {
-            Prefs2.putLong(context, PREF_TTL_65_APPLIED_AT, System.currentTimeMillis())
-            // §5.3 iter46: вместе с фактом фиксируется загрузка, в которой он подтверждён.
-            Prefs2.putLong(context, PREF_TTL_65_APPLIED_BOOT, bootCount(context).toLong())
-        }
-        AppLog.i(TAG, "TTL_STATE desired=${desired(context)} applied=${appliedState(context)} " +
-            "reason=«${pendingReason(context)}» (намерение владельца не меняется автоматикой)")
-    }
+        Prefs2.getString(context, PREF_TTL_65_PENDING_REASON, "") ?: ""
 
     private const val IPT  = "iptables"
     private const val IPT6 = "ip6tables"
