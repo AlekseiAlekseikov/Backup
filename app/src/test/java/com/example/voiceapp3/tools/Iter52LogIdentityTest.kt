@@ -36,6 +36,10 @@ class Iter52LogIdentityTest {
         dir.mkdirs()
         FileLogCore.clock = { 10_000_000_000_000L }
         FileLogCore.procRoot = File(dir, "proc").apply { mkdirs() }
+        // iter53 §10.1: доступность `/proc` доказывается чтением `self/stat`.
+        File(FileLogCore.procRoot, "self").mkdirs()
+        File(FileLogCore.procRoot, "self/stat")
+            .writeText("1 (test) " + (3..21).joinToString(" ") + " 1\n")
         return dir
     }
 

@@ -116,6 +116,14 @@ object FileLogCore {
                     else
                         Result(false, active, "process_lock_busy_spill_failed", false, 0, false)
                 }
+                // iter53 §10.2: существование файла лока проверяется ПОСЛЕ захвата. Проверка
+                // «до» ничего не гарантирует: другой процесс мог удалить/пересоздать файл, и лок
+                // тогда относится к другому inode. Сам лок-файл не удаляется никогда (стабильный
+                // замок), поэтому пропажа файла — повод сказать это в журнале, а не молчать.
+                if (!lockFile.isFile) {
+                    return writeUnderLock(dir, active, name, line, maxBytes, false,
+                        locked = false, unlockedReason = "lock_file_vanished_after_acquire")
+                }
                 return writeUnderLock(dir, active, name, line, maxBytes, false, locked = true)
             } catch (t: Throwable) {
                 return Result(false, active, "io:${t.javaClass.simpleName}:${t.message?.take(60) ?: ""}",
@@ -142,6 +150,44 @@ object FileLogCore {
             spin++
             Thread.sleep(if (spin > 5) 20L else 5L)
         }
+    }
+
+    /**
+     * iter53 §10.2(3) — восстановление «повисшего» `.new` при ЖИВОМ активном файле.
+     *
+     * Покрытые ранее точки падения: (а) `.new` записан, но активный ещё не переименован —
+     * следующая ротация дописывает в непустой `.new` (без дублей) и повышает его; (б) активный
+     * переименован в `.1`, а `.new` не повышен — активного нет, `.new` повышается на следующей
+     * записи. Оставался случай: падение ПОСЛЕ записи `.new`, но при ЖИВОМ активном файле и без
+     * последующей ротации — строки лежали в `.new` и не попадали в журнал никогда.
+     *
+     * Здесь содержимое `.new` переносится в активный файл ПОСТРОЧНО, с проверкой, что такой
+     * строки ещё нет в хвосте активного файла (частый случай — строка была записана и в `.new`,
+     * и в активный при отказе). Что именно произошло, возвращается строкой-заметкой.
+     */
+    internal fun recoverPendingNew(dir: File, name: String, tailLines: Int = 500): String {
+        val pending = File(dir, "$name.new")
+        val active = File(dir, name)
+        if (!pending.isFile || pending.length() == 0L) return ""
+        if (!active.isFile) return "new_promoted_by_caller"
+        val text = runCatching { pending.readText() }.getOrNull() ?: return "new_unreadable_kept"
+        val tail = runCatching { active.readLines().takeLast(tailLines).toSet() }.getOrDefault(emptySet())
+        val lines = text.split('\n').filter { it.isNotEmpty() }
+        var dup = 0
+        val toAdd = lines.filter { if (tail.contains(it)) { dup++; false } else true }
+        if (toAdd.isNotEmpty()) {
+            val ok = runCatching {
+                java.io.FileOutputStream(active, true).use { out ->
+                    out.write((toAdd.joinToString("\n") + "\n").toByteArray(Charsets.UTF_8))
+                    runCatching { out.fd.sync() }
+                }
+                true
+            }.getOrDefault(false)
+            if (!ok) return "new_merge_failed_kept"
+        }
+        // Удаляем `.new` только после успешного переноса ВСЕХ строк.
+        val deleted = deleteVerified(pending)
+        return "new_merged=${toAdd.size} dup_skipped=$dup deleted=$deleted"
     }
 
     private fun writeUnderLock(
@@ -397,6 +443,10 @@ object FileLogCore {
         return fields.getOrNull(19)?.takeIf { it.all { c -> c.isDigit() } }
     }
 
+    /** iter53 §10.2(3): что произошло с «повисшим» `.new` при последней записи (пусто — ничего). */
+    @Volatile
+    internal var lastNewRecoveryNote: String = ""
+
     /** §8.1 iter50: честная заметка о последнем слиянии (пусто — всё прошло штатно). */
     @Volatile
     private var drainNote: String = ""
@@ -418,8 +468,29 @@ object FileLogCore {
      * разрешающих замену, МОЛЧА заменял уже сохранённый work-файл (например, оставшийся от
      * процесса, умершего между rename и слиянием) — сохранённые строки исчезали вместе с ним.
      */
-    private fun uniqueWork(spill: File): File =
-        File(spill.parentFile, "${spill.name}.drain.${processTag}-${drainSeq.incrementAndGet()}")
+    /** Тестовый доступ к резервированию имени work-файла (§10.2). */
+    internal fun reserveWorkForTest(spill: File): File = uniqueWork(spill)
+
+    private fun uniqueWork(spill: File): File {
+        // iter53 §10.2: имя work-файла — это РЕЗЕРВИРОВАНИЕ, а не вычисление.
+        // `createNewFile()` атомарен: он либо создаёт файл, либо сообщает, что имя занято
+        // (в т.ч. другим процессом или файлом, оставшимся от прошлой инкарнации). Раньше имя
+        // просто вычислялось (`pid-N`), и совпадение с уже лежащим файлом означало молчаливую
+        // перезапись при `renameTo` — сохранённые строки исчезали.
+        val base = "${spill.name}.drain.${processTag}"
+        repeat(64) {
+            val cand = File(spill.parentFile, "$base-${drainSeq.incrementAndGet()}")
+            if (runCatching { cand.createNewFile() }.getOrDefault(false)) return cand
+        }
+        // Резерв не удался (нет места/прав/64 занятых имён): имя всё равно должно быть
+        // уникальным, но такой файл НЕ перезаписывает чужой (nanoTime + попытки).
+        var n = 0
+        while (n++ < 8) {
+            val cand = File(spill.parentFile, "$base-n${System.nanoTime()}")
+            if (!cand.exists()) return cand
+        }
+        return File(spill.parentFile, "$base-f${System.identityHashCode(spill)}")
+    }
 
     /**
      * §7 iter51: сколько времени после последней записи pid считается живым.
@@ -443,29 +514,101 @@ object FileLogCore {
      * пока процесс жив и ЕЩЁ может дописать, забирать его spill нельзя (получим дубли и гонку),
      * поэтому «не уверены → не трогаем».
      */
-    private fun pidLooksAlive(pid: String, files: List<File>): Boolean {
-        if (pid == processTag) return true
-        // Тег с идентичностью (`pid-boot-start`) — сравниваем ФАКТЫ, а не возраст.
+    /**
+     * iter53 §10.1 — ТРИ состояния живости вместо «жив/мёртв».
+     *
+     * Прежний код смешивал три разных факта в одном булеве:
+     *  • `readStartTime(...) == null` (нет прав/`/proc` недоступен) трактовалось как «жив» —
+     *    мёртвый процесс и нечитаемый `/proc` были неотличимы, и spill мёртвого владельца мог
+     *    не забираться никогда;
+     *  • для старых тегов (`<pid>` без идентичности) живой, но молчащий >30 минут процесс
+     *    считался мёртвым по возрасту файла — и его spill забирали из-под живого писателя.
+     */
+    enum class Liveness {
+        /** Доказано: тот же процесс (совпали boot_id и starttime) — файл его, забирать нельзя. */
+        LIVE_SAME_PROCESS,
+        /** Доказано: другая загрузка/другой starttime, либо процесса нет при доступном `/proc`. */
+        DEAD_OR_DIFFERENT_PROCESS,
+        /** Доказать нельзя (`/proc` недоступен, идентичности нет, процесс молчит) — не трогаем. */
+        UNKNOWN
+    }
+
+    /**
+     * Доступен ли `/proc` ДОКАЗУЕМО: читается `self/stat`. Просто `isDirectory` недостаточно —
+     * смонтированный, но закрытый политикой proc выглядит как существующий каталог.
+     */
+    internal fun procAccessible(): Boolean =
+        runCatching { File(procRoot, "self/stat").isFile && File(procRoot, "self/stat").canRead() }
+            .getOrDefault(false)
+
+    /**
+     * Живость владельца файлов журнала.
+     *
+     * Порядок проверок: идентичность (boot+starttime) → доступность `/proc` → наличие процесса.
+     * «Не уверены» — это [Liveness.UNKNOWN], а не «жив» и не «мёртв»: только доказанная смерть
+     * даёт право забрать файлы, потому что забрать файл живого писателя = дубли и потеря строк.
+     */
+    internal fun livenessOf(pid: String, files: List<File>): Liveness {
+        if (pid == processTag) return Liveness.LIVE_SAME_PROCESS
         val parts = pid.split('-')
-        if (parts.size >= 3 && parts[0].all { it.isDigit() }) {
+        val hasIdentity = parts.size >= 3 && parts[0].all { it.isDigit() }
+        if (hasIdentity) {
             val boot = parts[1]
             val start = parts[2]
             val myBoot = readBootId()
-            // Другая загрузка системы: процесс из прошлой загрузки мёртв, даже если /proc/<pid> есть.
-            if (myBoot != null && !myBoot.startsWith(boot)) return false
+            // Другая загрузка системы (доказано): процесса из прошлой загрузки быть не может.
+            if (myBoot != null && !myBoot.startsWith(boot)) return Liveness.DEAD_OR_DIFFERENT_PROCESS
+            val accessible = procAccessible()
+            // starttime читается только из /proc: без доступа доказать нечего.
             val nowStart = readStartTime(parts[0])
+            if (nowStart == null) {
+                // Нет доступа к /proc — «неизвестно». Доступ есть, а процесса нет — доказано мёртв.
+                if (!accessible) return Liveness.UNKNOWN
+                val exists = File(procRoot, parts[0]).exists()
+                return if (exists) Liveness.UNKNOWN else Liveness.DEAD_OR_DIFFERENT_PROCESS
+            }
             // pid переиспользован: starttime другой → это ДРУГОЙ процесс.
-            if (nowStart != null && nowStart != start) return false
-            if (nowStart != null && nowStart == start && File(procRoot, parts[0]).exists()) return true
-            // Прочитать /proc не удалось — «не уверены»: не трогаем (лучше не забрать живое).
-            return true
+            if (nowStart != start) return Liveness.DEAD_OR_DIFFERENT_PROCESS
+            return Liveness.LIVE_SAME_PROCESS
         }
-        // Старый формат (`<pid>` без identity): pid есть, но доказать принадлежность нельзя.
-        // Живым считаем, только если id-файла нет и возраст в пределах окна.
-        if (!pid.all { it.isDigit() }) return true   // `p<hash>` без pid — своим не считаем
-        if (!File(procRoot, pid).exists()) return false
+        // Старый формат (`<pid>` без идентичности) и теги без pid (`p<hash>`).
+        if (!pid.all { it.isDigit() }) return Liveness.UNKNOWN
+        if (!procAccessible()) return Liveness.UNKNOWN
+        if (!File(procRoot, pid).exists()) return Liveness.DEAD_OR_DIFFERENT_PROCESS
+        // Процесс с этим pid есть, но принадлежность не доказана. Молчание — НЕ смерть:
+        // свежая запись говорит лишь о вероятной живости, долгое молчание — «неизвестно».
+        val start = readStartTime(pid)
+        if (start == null) return Liveness.UNKNOWN
         val newest = files.maxOfOrNull { it.lastModified() } ?: 0L
-        return clock() - newest <= ORPHAN_GRACE_MS
+        return if (clock() - newest <= ORPHAN_GRACE_MS) Liveness.LIVE_SAME_PROCESS else Liveness.UNKNOWN
+    }
+
+    /** Совместимость: «жив» = доказанно тот же процесс (UNKNOWN тоже не забираем). */
+    private fun pidLooksAlive(pid: String, files: List<File>): Boolean =
+        livenessOf(pid, files) != Liveness.DEAD_OR_DIFFERENT_PROCESS
+
+    /**
+     * iter53 §10.1/§10.2 — журнал отложенных «неизвестных» владельцев.
+     *
+     * «Не уверены» не должно означать «потеряли навсегда»: файл остаётся на диске, а факт
+     * откладывания записывается в индекс `<журнал>.orphans` (одна строка на файл, с причиной и
+     * временем). При каждом следующем слиянии файлы пересканируются: как только живость станет
+     * ДОКАЗАННО мёртвой (доступный `/proc`, отсутствие процесса, другой starttime/загрузка) —
+     * они забираются штатным путём. Индекс — только для наблюдаемости, решения по нему не
+     * принимаются.
+     */
+    internal fun orphanIndexFile(dir: File, name: String): File = File(dir, "$name.orphans")
+
+    private fun noteDeferredOrphan(dir: File, name: String, pid: String, reason: String) {
+        runCatching {
+            val f = orphanIndexFile(dir, name)
+            // Не раздуваем индекс: держим последние 200 строк.
+            val prev = if (f.isFile) f.readLines().takeLast(200) else emptyList()
+            val line = "ts=${clock()} pid=$pid liveness=unknown action=defer reason=$reason"
+            (prev + line).distinct().takeLast(200).forEachIndexed { i, l ->
+                if (i == 0) f.writeText(l + "\n") else f.appendText(l + "\n")
+            }
+        }
     }
 
     /**
@@ -495,11 +638,19 @@ object FileLogCore {
         val out = mutableListOf<Pair<File, String>>()
         for ((pid, files) in byPid) {
             if (pid == processTag) continue               // свой — штатным путём ниже
-            if (pidLooksAlive(pid, files)) {
-                // Живой (или неотличимый от живого) — не трогаем; факт виден в заметке.
-                continue
+            when (livenessOf(pid, files)) {
+                // Доказанно мёртв/другой процесс — забираем.
+                Liveness.DEAD_OR_DIFFERENT_PROCESS ->
+                    files.sortedBy { it.name }.forEach { out.add(it to pid) }
+                // Жив — не трогаем (файл его).
+                Liveness.LIVE_SAME_PROCESS -> Unit
+                // Неизвестно — тоже не трогаем, но факт фиксируем: файл остаётся и будет
+                // пересканирован при следующем слиянии (см. [orphanIndexFile]).
+                Liveness.UNKNOWN -> noteDeferredOrphan(
+                    dir, name, pid,
+                    if (procAccessible()) "owner_unproven" else "proc_unavailable"
+                )
             }
-            files.sortedBy { it.name }.forEach { out.add(it to pid) }
         }
         return out
     }
@@ -527,7 +678,19 @@ object FileLogCore {
         var skipped = 0
         val notes = mutableListOf<String>()
 
-        // 0) §7 iter51: сначала забираем файлы УМЕРШИХ наших процессов (свои — ниже, штатно).
+        // 0) iter53 §10.2(3): «повисший» `.new` при ЖИВОМ активном файле.
+        // Это восстановление, а не горячий путь записи: решение принимается в контексте
+        // восстановления журнала (drain) и построчно дедуплицируется по хвосту активного файла.
+        // Раньше такой `.new` (падение после записи `.new`, но до переименования активного)
+        // не забирал никто и никогда — строки оставались на диске навсегда.
+        if (active.isFile) {
+            val note = runCatching { recoverPendingNew(dir, name) }.getOrDefault("")
+            if (note.isNotEmpty()) {
+                notes += "new_pending:$note"
+            }
+        }
+
+        // 0b) §7 iter51: сначала забираем файлы УМЕРШИХ наших процессов (свои — ниже, штатно).
         var orphans = 0
         for ((f, pid) in orphanFilesOf(dir, name)) {
             val w: File
@@ -691,6 +854,12 @@ object FileLogCore {
         if (!work.isFile) return 0
         val lockFile = File(work.parentFile, work.name + ".lock")
         val outcome = ProcLock.withLock(lockFile, timeoutMs = 500L) {
+            // iter53 §10.2: файл лока НЕ удаляется и проверяется ПОСЛЕ захвата. Удаление лока
+            // под локом давало другому процессу шанс создать новый файл с тем же именем и войти
+            // в критическую секцию параллельно (лок терял исключительность). Сам по себе
+            // `File.exists()` до захвата ничего не гарантирует; после захвата — подтверждает, что
+            // мы держим лок именно этого файла.
+            if (!lockFile.isFile) notes += "lock_vanished_after_acquire:«${lockFile.name}»"
             // iter52 §9.4: ОШИБКА ЧТЕНИЯ ≠ ПУСТОЙ ФАЙЛ. Раньше `readText()` под `runCatching`
             // отдавал null и это считалось «файл пуст»: work-файл удалялся, а строки журнала
             // исчезали. Теперь нечитаемый файл остаётся на диске и это видно в заметке.

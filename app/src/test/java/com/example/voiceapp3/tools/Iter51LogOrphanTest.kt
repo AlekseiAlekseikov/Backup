@@ -24,9 +24,13 @@ class Iter51LogOrphanTest {
 
     private fun setup(): File {
         dir.mkdirs()
-        // «Старые» файлы: часы теста далеко впереди, поэтому любой pid без /proc считается мёртвым.
+        // «Старые» файлы: часы теста далеко впереди.
         FileLogCore.clock = { 10_000_000_000_000L }
         FileLogCore.procRoot = File(dir, "proc")
+        // iter53 §10.1: `/proc` считается ДОСТУПНЫМ только если читается `self/stat`. Без этого
+        // «процесса нет» недоказуемо, и осиротевшие файлы не забираются (см. Liveness).
+        File(FileLogCore.procRoot, "self").mkdirs()
+        File(FileLogCore.procRoot, "self/stat").writeText("1 (test) " + (3..21).joinToString(" ") + " 1\n")
         return dir
     }
 
@@ -102,18 +106,65 @@ class Iter51LogOrphanTest {
     }
 
     @Test
-    fun pidReuseIsHandledByFreshness() {
+    fun silentOwnerIsNotDeclaredDeadByAge() {
         val d = setup()
         val active = File(d, "app.log").apply { writeText("") }
-        // /proc/777 существует, но файл spill СТАРЫЙ (за пределами окна) — pid переиспользован.
+        // /proc/777 существует, файл spill СТАРЫЙ. Раньше это считалось «pid переиспользован ⇒
+        // мёртв» и строки забирали из-под возможно живого писателя. iter53 §10.1: молчание
+        // >30 минут — НЕ смерть, а UNKNOWN: файл не трогаем, факт откладывания фиксируем.
         File(d, "proc/777").mkdirs()
         val spill = File(d, "app.log.777.spill").apply { writeText("stale\n") }
-        spill.setLastModified(1_000L)               // древний
+        spill.setLastModified(1_000L)
         FileLogCore.clock = { spill.lastModified() + 31L * 60L * 1000L }
 
         val n = FileLogCore.drainSpill(d, "app.log")
-        assertEquals(1, n)
-        assertTrue("переиспользованный pid: старые строки восстановлены", active.readText().contains("stale"))
+
+        assertEquals("неизвестная живость — не забираем", 0, n)
+        assertTrue("spill на месте", spill.exists())
+        assertFalse("строки не перенесены", active.readText().contains("stale"))
+        val index = FileLogCore.orphanIndexFile(d, "app.log")
+        assertTrue("отложенный владелец назван: $index", index.isFile)
+        assertTrue("причина и pid видны: ${index.readText()}",
+            index.readText().contains("pid=777") && index.readText().contains("liveness=unknown"))
+    }
+
+    @Test
+    fun reusedPidWithDifferentStartTimeIsDeadAndRecovered() {
+        val d = setup()
+        val active = File(d, "app.log").apply { writeText("") }
+        // Доказательство смерти: под pid 777 СЕЙЧАС другой процесс (другой starttime).
+        // Тег с идентичностью (`<pid>-<boot8>-<starttime>`) — только он позволяет сравнивать
+        // starttime; старый числовой тег доказуемо мёртвым по starttime сделать нельзя (в нём
+        // нет сохранённого starttime) — он остаётся UNKNOWN, если процесс существует.
+        val boot = FileLogCore.readBootId()?.take(8) ?: return
+        val proc = File(d, "proc/777").apply { mkdirs() }
+        File(proc, "stat").writeText("777 (other) " + (3..21).joinToString(" ") + " 555000\n")
+        File(d, "app.log.777-$boot-111000.spill").writeText("reused\n")
+
+        val n = FileLogCore.drainSpill(d, "app.log")
+
+        assertEquals("доказанный другой процесс — забираем", 1, n)
+        assertTrue(active.readText().contains("reused"))
+        assertFalse(File(d, "app.log.777-$boot-111000.spill").exists())
+    }
+
+    @Test
+    fun livenessHasThreeDistinctStates() {
+        val d = setup()
+        val spill = File(d, "app.log.900.spill").apply { writeText("x\n") }
+        // Доказанно жив: /proc/900/stat с совпадающим starttime и boot-частью тега.
+        val boot = FileLogCore.readBootId()?.take(8) ?: return
+        val proc = File(d, "proc/900").apply { mkdirs() }
+        File(proc, "stat").writeText("900 (p) " + (3..21).joinToString(" ") + " 4242\n")
+        assertEquals(FileLogCore.Liveness.LIVE_SAME_PROCESS,
+            FileLogCore.livenessOf("900-$boot-4242", listOf(spill)))
+        // Доказанно другой процесс.
+        assertEquals(FileLogCore.Liveness.DEAD_OR_DIFFERENT_PROCESS,
+            FileLogCore.livenessOf("900-$boot-9999", listOf(spill)))
+        // Доказать нельзя: /proc недоступен (в подставленном корне нет self/stat).
+        val broken = File(d, "proc_broken").apply { mkdirs() }
+        FileLogCore.procRoot = broken
+        assertEquals(FileLogCore.Liveness.UNKNOWN, FileLogCore.livenessOf("900-$boot-4242", listOf(spill)))
     }
 
     @Test
