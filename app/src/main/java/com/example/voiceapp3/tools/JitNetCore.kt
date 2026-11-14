@@ -1969,7 +1969,10 @@ object JitOp {
             // terminal-файл ЭТОЙ операции — доказательство (START/END/refused). Ошибка чтения
             // terminal'а не «додумывается»: тогда исход остаётся неизвестным.
             val myTerm = probeTerminal(shell, opId, log)
-            val phase = JitOwn.classify(outcome == JitRef.ChainOutcome.REPLY_RECEIVED, myTerm)
+            // iter52 §7.3: если terminal прочитать не удалось, но в РЕАЛЬНОМ stdout есть отказ
+            // ИМЕННО нашей операции — это доказанный no-op, а не неизвестность.
+            val phase = if (myTerm == null && JitOwn.refusedInOutput(opId, out)) JitOwn.State.REFUSED
+                        else JitOwn.classify(outcome == JitRef.ChainOutcome.REPLY_RECEIVED, myTerm)
             // §7: «ответ транспорта есть, terminal не прочитан» — это SENT, как и на HEAD
             // (исход не доказан, но и канал не потерян). Неопределённость — только UNKNOWN и
             // STARTED (payload начался и не оставил END).
@@ -2244,7 +2247,9 @@ object JitOp {
         store: JitRef.JitStore,
         netState: JitRef.JitNetState,
         scheduler: JitRef.JitScheduler,
-        log: (String) -> Unit = {}
+        log: (String) -> Unit = {},
+        /** iter52 §7.4: проверка владения перед включением Wi-Fi (по opId операции). */
+        claimGuardFor: ((String) -> Pair<Boolean, String>)? = null
     ): StartOutcome {
         synchronized(INTENT_LOCK) {
             // §2.4: старт не планирует задачу, пока идёт клик — иначе два пути к сети.
@@ -2344,7 +2349,10 @@ object JitOp {
             scheduledTask = token
             val scheduled = try {
                 scheduler.postDelayed(JitRef.RESTORE_DELAY_MS) {
-                    runScheduledRestore(store, netState, restore.snap, mark.op, persistedUndefined, token, log)
+                    runScheduledRestore(
+                        store, netState, restore.snap, mark.op, persistedUndefined, token, log,
+                        claimGuard = claimGuardFor?.let { f -> { f(mark.op) } }
+                    )
                 }
                 true
             } catch (t: Throwable) {
@@ -2398,7 +2406,8 @@ object JitOp {
         opId: String,
         wasUndefined: Boolean,
         token: Any,
-        log: (String) -> Unit
+        log: (String) -> Unit,
+        claimGuard: (() -> Pair<Boolean, String>)? = null
     ) {
         var claimed = false
         var skip: String? = null
@@ -2439,7 +2448,9 @@ object JitOp {
                         "(возврат выполняется без включения Wi-Fi; см. WIFI_ENABLE_MAX_AGE_MS)"
                 )
             }
-            report = runCatching { restoreWifi(netState, snap, log, allowEnable, enableWhy) }.getOrElse { t ->
+            report = runCatching {
+                restoreWifi(netState, snap, log, allowEnable, enableWhy, claimGuard)
+            }.getOrElse { t ->
                 log(
                     "JIT_NET_RESTORE exception=${t.javaClass.simpleName} action=none op=$opId " +
                         "(как e2: возврат прерван; снимок оставлен, следующий запуск попробует снова)"
@@ -2556,7 +2567,13 @@ object JitOp {
         snap: JitRef.WifiSnapshot,
         log: (String) -> Unit = {},
         allowEnable: Boolean = true,
-        enableWhy: String = "click_continuation"
+        enableWhy: String = "click_continuation",
+        /**
+         * iter52 §7.4: ПРОВЕРКА ВЛАДЕНИЯ перед включением Wi-Fi. Возвращает `(true, why)` —
+         * можно; `(false, why)` — нельзя (владелец уже принял новое решение). Передаётся с
+         * реального пути: JitNet → JitOwn.claimAllowsRestore по claim с устройства.
+         */
+        claimGuard: (() -> Pair<Boolean, String>)? = null
     ): WifiRestoreReport {
         if (!snap.wifi) {
             val addr = runCatching { netState.wifiAddress() }.getOrNull()
@@ -2606,6 +2623,25 @@ object JitOp {
             )
             log(r.log + " (Wi-Fi уже включён: запрос не нужен)")
             return r
+        }
+        // iter52 §7.4: «снимок говорит был включён, сейчас выключен» — самое опасное место:
+        // включение перебивает независимое решение владельца. Спрашиваем принадлежность ДО вызова.
+        if (claimGuard != null) {
+            val (allowed, why) = runCatching { claimGuard() }
+                .getOrElse { t -> false to "claim_check_failed:${t.javaClass.simpleName}" }
+            if (!allowed) {
+                val r = WifiRestoreReport(
+                    snap, false, null, false, null, "claim:$why",
+                    JitRef.RestoreCompletion.PENDING
+                )
+                log(
+                    r.log + " (⛔ Wi-Fi НЕ включаем: $why — владение операцией не наше/не доказано. " +
+                        "Снимок сохранён, запрос setWifiEnabled(true) не отправлялся: иначе мы бы " +
+                        "затёрли более новое решение владельца)"
+                )
+                return r
+            }
+            log("JIT_NET_RESTORE claim_gate allowed=1 why=$why (проверка ДО setWifiEnabled(true))")
         }
         var outcome: JitRef.SetWifiOutcome? = null
         var failure: String? = null

@@ -612,7 +612,20 @@ object JitNet {
             store = AndroidStore(app),
             netState = AndroidNetState(app),
             scheduler = AndroidScheduler,
-            log = { log("source=$source $it") }
+            log = { log("source=$source $it") },
+            claimGuardFor = { opId ->
+                // iter52 §7.4: реальный путь — читаем claim С УСТРОЙСТВА и спрашиваем JitOwn.
+                // Ошибка чтения = «не знаю» → включение Wi-Fi не выполняется (неизвестность
+                // нельзя превращать в «конкурирующих операций нет»).
+                val raw = runCatching { AdbClient.execute(JitOwn.readCmd(opId), 6_000).second }
+                    .getOrElse { t -> "ERR_${t.javaClass.simpleName}" }
+                if (raw.contains("ERR_")) {
+                    false to "claim_read_failed"
+                } else {
+                    val claim = Regex("CLAIM=\"?([^\"\\n]*)\"").find(raw)?.groupValues?.get(1)
+                    JitOwn.claimAllowsRestore(opId, claim)
+                }
+            }
         )
 
     /** Сверка `w0/bb` + `w0/r7` (getprop + `/proc/self/maps` + `jit_pedido`). Фоновый поток. */

@@ -111,7 +111,9 @@ class Iter51JitOwnershipTest {
         assertTrue("честно: уже начавшийся рестарт не отменить", running.why.contains("не отменит"))
 
         val done = JitOwn.clickDecision(prev,
-            JitOwn.parseTerminal("op-x", "CLAIM=op=op-x;ts=1;want=1\nTERM=START ts=1|END rc=1|"))
+            // iter52 §7.2: строки terminal'а несут op=<id> — теперь это проверяется строго,
+            // поэтому в тесте id указан так же, как его пишет production-payload.
+            JitOwn.parseTerminal("op-x", "CLAIM=op=op-x;ts=1;want=1\nTERM=START ts=1 op=op-x|END rc=1 op=op-x|"))
         assertEquals("none", done.risk)
     }
 

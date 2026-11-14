@@ -36,13 +36,34 @@ package com.example.voiceapp3.tools
  */
 internal object JitOwn {
 
-    /** Единственная точка сериализации: владелец JIT на устройстве. */
-    const val CLAIM = "/data/local/tmp/voiceapp3_jit.claim"
+    /** Каталог на устройстве (в тестах подменяется на временный). */
+    const val BASE = "/data/local/tmp"
+
+    /** Единственная точка сериализации: владелец JIT на устройстве (намерение). */
+    const val CLAIM = "$BASE/voiceapp3_jit.claim"
+
+    /**
+     * iter52 §7.1 — БЛОКИРОВКА ИСПОЛНЕНИЯ (не намерения).
+     *
+     * Claim отвечает на вопрос «чья операция последняя», но не даёт взаимного исключения:
+     * две операции могли записать claim по очереди и обе дойти до первого опасного действия
+     * (claim пишется ОТДЕЛЬНОЙ командой, между записью и запуском payload есть окно).
+     * Здесь — атомарный захват файла через noclobber (`set -C`): файл либо создаём мы (тогда
+     * владеем), либо он уже чей-то (тогда payload отказывается работать ДО side effect).
+     */
+    const val LOCK = "$BASE/voiceapp3_jit.lock"
+
+    /** Через сколько секунд брошенная блокировка считается мёртвой (и это ПИШЕТСЯ в лог). */
+    const val LOCK_STALE_S = 180
 
     /** Стабильный префикс terminal-файлов. */
-    const val TERM_PREFIX = "/data/local/tmp/voiceapp3_jit_"
+    const val TERM_PREFIX = "$BASE/voiceapp3_jit_"
 
-    fun termPath(opId: String): String = TERM_PREFIX + opId + ".term"
+    fun termPath(opId: String, base: String = BASE): String = "$base/voiceapp3_jit_$opId.term"
+
+    fun claimPath(base: String = BASE): String = "$base/voiceapp3_jit.claim"
+
+    fun lockPath(base: String = BASE): String = "$base/voiceapp3_jit.lock"
 
     /**
      * Состояние операции. Различаем ровно то, что можно доказать:
@@ -107,20 +128,21 @@ internal object JitOwn {
     }
 
     /** Короткая команда записи claim (много меньше 4096 байт — идёт обычным `execute`). */
-    fun claimCmd(op: Op): String {
+    fun claimCmd(op: Op, base: String = BASE): String {
         val line = op.claimLine()
         // `umask`-безопасно: файл в /data/local/tmp, читается только нашей цепочкой.
-        return "printf '%s\\n' '" + line.replace("'", "") + "' > " + CLAIM +
-            " 2>/dev/null && cat " + CLAIM + " 2>/dev/null"
+        val target = claimPath(base)
+        return "printf '%s\\n' '" + line.replace("'", "") + "' > " + target +
+            " 2>/dev/null && cat " + target + " 2>/dev/null"
     }
 
     /**
      * Короткая команда чтения «claim + terminal» одной операцией. Печатает две секции:
      * `CLAIM=<строка>` и `TERM=<строки через | >`.
      */
-    fun readCmd(opId: String): String =
-        "echo CLAIM=\"\$(cat $CLAIM 2>/dev/null)\"; " +
-            "echo TERM=\"\$(cat ${termPath(opId)} 2>/dev/null | tr '\\n' '|')\""
+    fun readCmd(opId: String, base: String = BASE): String =
+        "echo CLAIM=\"\$(cat ${claimPath(base)} 2>/dev/null)\"; " +
+            "echo TERM=\"\$(cat ${termPath(opId, base)} 2>/dev/null | tr '\\n' '|')\""
 
     /**
      * Гвардия payload: доказанная защита от позднего СТАРТА устаревшей операции.
@@ -128,23 +150,58 @@ internal object JitOwn {
      * Вставляется в самое начало скрипта, до любых side effect. При чужом claim печатает
      * `JIT_REFUSED` и выходит — `svc wifi disable`, `setprop`, `ctl.restart zygote` не выполняются.
      */
-    fun guard(op: Op): String {
+    fun guard(op: Op, base: String = BASE): String {
         val id = op.id
-        val term = termPath(id)
+        val term = termPath(id, base)
+        val claim = claimPath(base)
+        val lock = lockPath(base)
+        val claimLine = "op=$id;ts=${op.ts}"
         return buildString {
-            append("_vc=\$(cat ").append(CLAIM).append(" 2>/dev/null)\n")
+            append("_vc=\$(cat ").append(claim).append(" 2>/dev/null)\n")
+            // Отказ ОБЯЗАН оставить след в terminal-файле: иначе «payload отказался» виден только
+            // по stdout, а stdout мог не доехать — и мы снова гадаем.
+            append("_refuse() {\n")
+            append("  echo \"REFUSED op=").append(id)
+            append(" reason=\$1 detail=\$2 claim=\${_vc:-none}\" >> ").append(term).append(" 2>/dev/null\n")
+            append("  echo \"END rc=0 op=").append(id).append("\" >> ").append(term).append(" 2>/dev/null\n")
+            append("  echo \"JIT_REFUSED op=").append(id)
+            append(" reason=\$1 claim=\${_vc:-none} lock=\${_lo:-none}\"\n")
+            append("  exit 0\n}\n")
+            // 1) поздний СТАРТ устаревшей операции: claim уже чужой.
             append("case \"\$_vc\" in\n")
             append("  \"op=").append(id).append(";\"*|op=").append(id).append(") : ;;\n")
-            append("  *) echo \"JIT_REFUSED op=").append(id)
-            append(" reason=superseded claim=\${_vc:-none}\"; exit 0 ;;\n")
+            append("  *) _refuse superseded claim_foreign ;;\n")
             append("esac\n")
-            // Начало операции — сразу после гвардии, до side effect.
+            // 2) ВЗАИМНОЕ ИСКЛЮЧЕНИЕ: атомарный захват lock ДО первого опасного действия.
+            append("_lk_ours=0; _lo=\"\"\n")
+            append("if [ -f ").append(lock).append(" ]; then\n")
+            append("  _lo=\$(cat ").append(lock).append(" 2>/dev/null)\n")
+            append("  case \"\$_lo\" in\n")
+            append("    \"").append(claimLine).append("\"|\"").append(id).append("\") _lk_ours=1 ;;\n")
+            append("    *)\n")
+            append("      _lts=\$(printf '%s' \"\$_lo\" | sed -n 's/.*ts=\\([0-9][0-9]*\\).*/\\1/p')\n")
+            append("      _now=\$(date +%s 2>/dev/null)\n")
+            append("      if [ -n \"\$_lts\" ] && [ -n \"\$_now\" ] && \\\n")
+            append("         [ \$((_now - _lts)) -gt ").append(LOCK_STALE_S).append(" ] 2>/dev/null; then\n")
+            append("        echo \"JIT_LOCK_STALE owner=\\u00ab\$_lo\\u00bb age_s=\$((_now - _lts)) action=takeover\"\n")
+            append("        printf '%s\\n' '").append(claimLine)
+            append("' > ").append(lock).append(" 2>/dev/null && _lk_ours=1\n")
+            append("      fi ;;\n")
+            append("  esac\n")
+            append("else\n")
+            append("  ( set -C; printf '%s\\n' '").append(claimLine).append("' > ").append(lock)
+            append(" ) 2>/dev/null && _lk_ours=1\n")
+            append("fi\n")
+            append("if [ \"\$_lk_ours\" != \"1\" ]; then _refuse lock_held; fi\n")
+            // 3) Начало операции — только после полученной блокировки.
             append("echo \"START ts=\$(date +%s) op=").append(id).append("\" > ").append(term)
             append(" 2>/dev/null\n")
-            // Пометка о завершении: EXIT-trap срабатывает и после `setprop ctl.restart zygote`
-            // (убивается zygote, а не наш shell), и после обычного выхода.
+            // 4) END + освобождение ТОЛЬКО своей блокировки.
             append("trap 'echo \"END rc=\$? op=").append(id).append("\" >> ").append(term)
-            append(" 2>/dev/null' EXIT\n")
+            append(" 2>/dev/null; ")
+            append("_lo2=\$(cat ").append(lock).append(" 2>/dev/null); ")
+            append("case \"\$_lo2\" in \"").append(claimLine).append("\"|\"").append(id)
+            append("\") rm -f ").append(lock).append(" 2>/dev/null ;; esac' EXIT\n")
         }
     }
 
@@ -179,14 +236,24 @@ internal object JitOwn {
         if (claimLine == null && termRaw.isEmpty()) return null
         val claim = Op.parseClaim(claimLine)
         val lines = termRaw.split('|').map { it.trim() }.filter { it.isNotEmpty() }
-        val started = lines.any { it.startsWith("START") }
-        val endLine = lines.firstOrNull { it.startsWith("END") }
+        // iter52 §7.2: строки terminal'а принимаются ТОЛЬКО со своим `op=<id>`. Файл назван по id,
+        // но id мог быть переиспользован (перезапуск/повтор клика), а на устройстве мог остаться
+        // файл прошлой операции: считать чужой `END rc=0` своим завершением нельзя.
+        val mine = lines.filter { Regex("(^| )op=" + Regex.escape(opId) + "( |$)").containsMatchIn(it) }
+        val foreignCount = lines.size - mine.size
+        val startLine = mine.firstOrNull { it.startsWith("START") }
+        val endLine = mine.lastOrNull { it.startsWith("END") }
         val rcEnd = endLine?.let { Regex("rc=(-?\\d+)").find(it)?.groupValues?.get(1)?.toIntOrNull() }
-        val refused = out.contains("JIT_REFUSED") ||
-            termRaw.contains("JIT_REFUSED")
+        // Отказ считается доказанным, если он есть в terminal'е НАШЕЙ операции ИЛИ в stdout
+        // с нашим id (payload печатает `JIT_REFUSED op=<id> …`).
+        val refused = mine.any { it.startsWith("REFUSED") } ||
+            Regex("JIT_REFUSED op=" + Regex.escape(opId) + "( |$)").containsMatchIn(out) ||
+            Regex("JIT_REFUSED op=" + Regex.escape(opId) + "( |$)").containsMatchIn(termRaw)
+        val startOk = startLine != null
+        val finishOk = endLine != null && rcEnd != null
         return Terminal(
-            started = started,
-            finished = endLine != null,
+            started = startOk,
+            finished = finishOk,
             rc = rcEnd,
             refused = refused,
             claimOther = claim != null && claim.id != opId,
@@ -195,9 +262,17 @@ internal object JitOwn {
                 claim == null -> "claim_unparsable"
                 claim.id == opId -> "claim_ours"
                 else -> "claim_foreign"
-            }
+            } + (if (foreignCount > 0) ";term_lines_other_op=$foreignCount" else "") +
+                (if (lines.isNotEmpty() && mine.isEmpty()) ";term_only_foreign_op" else "")
         )
     }
+
+    /**
+     * Доказан ли отказ по РЕАЛЬНОМУ stdout — без чтения terminal'а. Нужно на случай, когда
+     * terminal прочитать не удалось, а payload всё же ответил.
+     */
+    fun refusedInOutput(opId: String, out: String): Boolean =
+        Regex("JIT_REFUSED op=" + Regex.escape(opId) + "( |$)").containsMatchIn(out)
 
     /**
      * Фаза операции ПО ФАКТАМ устройства (то, что можно заявить).
@@ -269,5 +344,25 @@ internal object JitOwn {
     fun mayRestoreWifi(opId: String, claimRaw: String?): Boolean {
         val claim = Op.parseClaim(claimRaw) ?: return false
         return claim.id == opId
+    }
+
+    /**
+     * iter52 §7.4 — можно ли ВКЛЮЧАТЬ Wi-Fi по сохранённому снимку.
+     *
+     * Возвращает решение И причину, потому что «нет» и «не знаю» — разные факты:
+     *  • claim принадлежит этой операции — да (`claim_ours`);
+     *  • claim принадлежит ДРУГОЙ операции — нет (`claim_foreign`): владелец уже нажал тумблер
+     *    снова, и включение Wi-Fi по старому снимку затирало бы его новое решение;
+     *  • claim отсутствует — да (`claim_absent`): конкурирующей операции нет (снимок всё равно
+     *    проверяется по своему opId выше);
+     *  • claim испорчен — НЕТ (`claim_unparsable`): это неизвестность, а не «конкурирующих нет».
+     *
+     * Что это НЕ даёт: защиты от того, что владелец включил Wi-Fi сам после клика (это состояние
+     * читается отдельно перед включением: «уже включён» → запрос не отправляется).
+     */
+    fun claimAllowsRestore(opId: String, claimRaw: String?): Pair<Boolean, String> {
+        if (claimRaw.isNullOrBlank()) return true to "claim_absent"
+        val claim = Op.parseClaim(claimRaw) ?: return false to "claim_unparsable"
+        return if (claim.id == opId) true to "claim_ours" else false to "claim_foreign"
     }
 }
