@@ -1786,3 +1786,48 @@ CI `43464916714` (`15dd3b2`) — success (сборка; unit-тестов в wor
   недоказуема доступными средствами; остаток и план испытания — в отчёте iter50.
 - **На ГУ не проверялось.** ⛔ слышимость звука, TTL на проводе, namespace init, факт JIT-компиляции,
   VHAL окон, реальный файловый стек прошивки.
+
+## iter52 — «довести до работы» (звук, TTL, JIT, тумблеры, логи, окна)
+
+Мандат: `uploads/ПРОМПТ_iter52_ДОВЕСТИ_ДО_РАБОТЫ_ЗВУК_TTL_JIT_ТУМБЛЕРЫ_ЛОГИ.md`.
+Полный отчёт: `docs/agent/REPORT_iter52_ДОВЕДЕНИЕ_ЗВУК_TTL_JIT_ТУМБЛЕРЫ_ЛОГИ.md`.
+Вход: `d12860c` (iter51). Локальный стенд: **OK (661 tests)** (было 609).
+
+### Коммиты (все в `fix/v2`, push без `--force`)
+- `42e6747` §4 доставка: фазы `NOT_SENT/UPLOAD_INCOMPLETE/RUN_SENT/RUN_CONFIRMED/RUN_UNKNOWN/
+  TOO_LARGE`, эксклюзивное создание `set -C`, сверка размера + POSIX `cksum` (CRC-32 в Kotlin),
+  terminal `$path.done` с `rc`, `rm`+`[ -e ]` вместо `;`+`echo`, nonce в имени.
+  Найдено на настоящем `sh`: `return@repeat` не прерывал `repeat(3)` → создавался второй файл.
+- `62dc762` §5.1 звук: `locksound_ops.log` (append, несколько операций), `appendOp` подтверждает
+  запись **чтением**, `reconcilePendingOps` из boot/watchdog, channel_ready, смены намерения и
+  перед bind; сверка исполняет настоящий restore-скрипт по целям/staging ИЗ ЖУРНАЛА
+  (`LockOp.reconcileVerdict`), исход `DONE`/`UNDEFINED(foreign_above_left|reconcile_unproven)`.
+- `c03bb72` §5.2 `mi_top` = max(`mount_id`), нечисловой id → `AMBIGUOUS` → «не доказано».
+- `d15b667` §5.3 `ioGate` (ReentrantLock) для bind/restore/reconcile (разные исполнители!),
+  OFF снимает свои слои сразу (`convergeAfterBind(true)`), без ожидания перезагрузки.
+- `5549335` §6 TTL: `ref_specs/ref_count/ref_other_count` (любая цепь mangle, `-j` и `-g`),
+  при ссылках `-F/-X` не выполняются (`TTL_REF_KEEP`), `VERIFY_*=OK` требует `refs_out=0`,
+  `VERDICT=REF_ELSEWHERE`; `TtlVerify`: `v6_supported=0` — единственное доказательство
+  отсутствия IPv6, `VERIFY_V6` отсутствует → «НЕ РАЗОБРАН» (PARTIAL), `refs_out=-1` — неизвестность.
+- `e6c702a` §7 JIT: `JitOwn.LOCK` через `noclobber` **до** первого опасного действия, перехват
+  брошенной блокировки с записью, отказ пишется в terminal (`REFUSED`+`END`), `parseTerminal`
+  строго по `op=<id>`, `refusedInOutput`, `claimAllowsRestore` + проброс `claimGuard`
+  `JitNet → onProcessStart → runScheduledRestore → restoreWifi` (перед `setWifiEnabled(true)`).
+- `c539c38` §9 логи: тег процесса `<pid>-<boot8>-<starttime>`, `pidLooksAlive` по boot/starttime,
+  `orphanFilesOf` принимает новый тег, `classifyWorkRead` (нечитаемый work не удаляется),
+  `.lock` не удаляется под локом.
+- `4d28c71` §10 окна: ABA по поколению в `ventRollbackOwners`, набор+поколение одним lock.
+- `01f684f` §8.2 тумблеры: `holdAfterSnapshot` (поздний снимок не перетирает клик),
+  последнее известное положение в Prefs2 (`tools_lastknown_<key>`), `unknown` ≠ OFF.
+
+### Проверено / не проверено
+- `bash runtests.sh` → **OK (661 tests)**; новые файлы: `Iter52DeliveryTest` (17),
+  `Iter52JournalTest` (11), `Iter52TtlTest` (9), `Iter52JitOwnTest` (11), `Iter52LogIdentityTest` (6),
+  `Iter52TogglesUiTest` (8). Все shell-тесты идут на настоящем `/bin/sh`.
+- Стенд `Iter50Stand`: подставной iptables теперь, как реальный, печатает `-S` по ВСЕМ цепям —
+  без этого ссылки из других цепей/`-g` нельзя было проверить в принципе.
+- **Не компилируются локально**: `LockSound.kt`, `JitNetCore.kt`, `JitNet.kt`, `ToolsPanel.kt`,
+  `WindowDoors.kt` — их проверяет CI (`Build APK`) на финальном SHA.
+- **Не проверено (⛔/❌)**: ГУ целиком (1.0.63 владельцем не проверялась), слышимость звука,
+  TTL на проводе, JIT-компиляция и рестарт zygote, VHAL окон, WebView-рендер тумблеров (E3),
+  приоритет слота «заряд/наружная» в SystemUI-плагине (🟡).
