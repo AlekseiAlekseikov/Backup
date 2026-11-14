@@ -360,6 +360,24 @@ class Iter49Test {
         )
     }
 
+    // ───────────────── §6: unknown доходит до видимого UI ─────────────────
+
+    @Test
+    fun backendUnknownReachesTheVisibleToggle() {
+        val panel = java.io.File("src/main/java/com/example/voiceapp3/ui/ToolsPanel.kt")
+            .takeIf { it.isFile }
+            ?: java.io.File("app/src/main/java/com/example/voiceapp3/ui/ToolsPanel.kt")
+        val p = panel.readText()
+        assertTrue("UI читает трёхзначный <key>State", p.contains("strState(key + \"State\")"))
+        assertTrue("unknown из снимка делает тумблер неизвестным",
+            p.contains("prefsUnknownByBackend"))
+        assertTrue("подпись объясняет состояние без красного текста",
+            p.contains("состояние не подтверждено"))
+        val backend = src("ToolsBackend.kt")
+        assertTrue("backend печатает State и prefsUnknown",
+            backend.contains("\"State\"") && backend.contains("prefsUnknown"))
+    }
+
     // ───────────────── §5: скрипт не выходит за свои границы ─────────────────
 
     @Test

@@ -1052,10 +1052,18 @@ class ToolsPanel(
         // §4 iter45: `null` здесь означает «значение ещё не прочитано» (снимка не было или
         // ключа нет), а НЕ «выключено». Раньше такое состояние рисовалось как OFF.
         val raw = boolState(key)
+        // iter49 §6: backend печатает трёхзначное `<key>State` (on|off|unknown) и список
+        // `prefsUnknown`. Раньше UI это НЕ использовал: при конфликте копий CPS/DPS тумблер
+        // показывал `t.key`=default как факт. Теперь «unknown» из снимка означает «состояние
+        // НЕ подтверждено» — подпись говорит об этом прямо, без красного текста и без новых кнопок.
+        val prefsState = strState(key + "State")
+        val prefsUnknownByBackend = prefsState == "unknown"
         // §4.1 iter46: «известность» теперь ПО КЛЮЧУ, а не по факту «хоть один снимок пришёл».
         // Раньше при частичном/повреждённом снимке отсутствующий ключ считался прочитанным и
         // подменялся дефолтом (у 17 из 19 тумблеров это false) — ложное «выключено».
-        val unknownToggle = raw == null
+        val unknownToggle = raw == null || prefsUnknownByBackend
+        // Положение при неизвестности берётся из сохранённого намерения (это НЕ факт — подпись
+        // выше говорит «не подтверждено»); выдумывать `def` вместо намерения нельзя.
         val on = if (key != "perfJit") (raw ?: def)
                  else JitRef.switchPosition(jitConfirmed ?: "unknown", raw ?: def)
         val row = LinearLayout(activity).apply {
@@ -1065,6 +1073,7 @@ class ToolsPanel(
         }
         val info = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
         val titleText = when {
+            prefsUnknownByBackend -> "$title · состояние не подтверждено"
             unknownToggle -> "$title · состояние ещё не прочитано"
             key == "perfJit" && jitConfirmed == "unknown" -> "$title · состояние неизвестно"
             else -> title
