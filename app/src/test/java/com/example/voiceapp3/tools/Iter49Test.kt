@@ -292,7 +292,9 @@ class Iter49Test {
     fun namespaceIsCheckedBeforeAnyMountAction() {
         val l = src("LockSound.kt")
         val pre = l.indexOf("NS_PRE")
-        val act = l.indexOf("AdbClient.execute(script, 20000)")
+        // iter51 §3.1: сам запуск переведён на executeScript (длинный скрипт), проверка NS
+        // по-прежнему обязана идти ДО него.
+        val act = l.indexOf("AdbClient.executeScript(\"lock_restore\"")
         assertTrue("есть проверка namespace", pre > 0)
         assertTrue("проверка идёт ДО снятия", pre in 1 until act)
         assertTrue("при несовпадении actions нет", l.contains("reason=namespace_differs"))

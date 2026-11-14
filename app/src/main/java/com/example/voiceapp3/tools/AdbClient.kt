@@ -557,56 +557,25 @@ object AdbClient {
      * Возвращает Pair<rc, out>, где out содержит stdout+stderr выполнения.
      */
     fun executeScript(name: String, script: String, timeoutMs: Int = 40000, expectRoot: Boolean = true): Pair<Int, String> {
+        // iter51 §3.1: логика доставки вынесена в [ScriptDelivery] и исполняется ЗДЕСЬ (production
+        // путь), а не только в тесте. Изменения против прежней версии:
+        //  • имя файла УНИКАЛЬНО на каждый вызов (было фиксированное `voiceapp3_<name>.sh`:
+        //    два процесса с одинаковым `name` затирали файл друг друга даже при сериализации
+        //    заливок внутри одного процесса);
+        //  • решение «прямо или чанками» принимается по ФАКТИЧЕСКОЙ длине UTF-8;
+        //  • при неудачной заливке/сверке размера скрипт НЕ запускается и это видно в rc.
         val bytes = ScriptChunker.bytesOf(script)
-        // Короткий скрипт — напрямую (никакой нарезки, значит и риска нет).
-        if (bytes.size <= 3500) return execute(script, timeoutMs, expectRoot)
-        val path = "/data/local/tmp/voiceapp3_${name}.sh"
-        // iter33l §3.4 — ДВЕ защиты, обе доказаны логом 07.11 (`SCRIPT_BYTES=12296 EXPECTED=6148`
-        // и `ERR_SCRIPT_UPLOAD expected=7408 actual=`):
-        //  (а) заливки СЕРИАЛИЗУЮТСЯ. Раньше два потока (hvac_enable в Bg-4 и ttl_script в Bg-2/Bg-3)
-        //      лили скрипты одновременно: `rm -f` одного стирал файл другого, а чанки шли в общий
-        //      файл — получалось ровно двойное содержимое и пустой файл. Транспорт тут не виноват;
-        //  (б) сверка размера с ПОВТОРОМ: при `SCRIPT_BYTES != EXPECTED` — полная перезаливка,
-        //      до 3 попыток, затем честный FAILED (а не молчаливое продолжение).
-        synchronized(scriptUploadLock) {
-            var lastRc = 1
-            var lastOut = ""
-            for (attempt in 1..SCRIPT_UPLOAD_TRIES) {
-                val (rcClear, outClear) = execute(ScriptChunker.clearCommand(path), 8000, expectRoot)
-                if (rcClear != 0) {
-                    lastRc = rcClear; lastOut = "ERR_SCRIPT_UPLOAD_CLEAR: $outClear"
-                    AppLog.w(TAG, "SCRIPT_UPLOAD name=$name attempt=$attempt clear failed rc=$rcClear")
-                    continue
-                }
-                var sent = 0
-                var chunkFailed = false
-                for (c in ScriptChunker.chunks(script)) {
-                    val (rcChunk, outChunk) = execute(ScriptChunker.chunkCommand(path, c), 15000, expectRoot)
-                    if (rcChunk != 0) {
-                        lastRc = rcChunk; lastOut = "ERR_SCRIPT_UPLOAD_CHUNK #$sent: $outChunk"; chunkFailed = true
-                        break
-                    }
-                    sent++
-                }
-                if (chunkFailed) {
-                    AppLog.w(TAG, "SCRIPT_UPLOAD name=$name attempt=$attempt chunk=$sent failed — перезалью")
-                    continue
-                }
-                val (rc, out) = execute(ScriptChunker.verifyAndRunCommand(path, bytes.size), timeoutMs + 10000, expectRoot)
-                lastRc = rc; lastOut = out
-                val badSize = out.contains("ERR_SCRIPT_UPLOAD")
-                if (!badSize) {
-                    AppLog.i(TAG, "SCRIPT_UPLOAD name=$name bytes=${bytes.size} chunks=$sent rc=$rc " +
-                        "attempt=$attempt size_check=ok")
-                    return Pair(rc, out)
-                }
-                // Предохранитель сработал — это ФАКТ, его надо доставить наверх (A0.2), а не глотать.
-                AppLog.e(TAG, "SCRIPT_UPLOAD FAIL name=$name attempt=$attempt expect=${bytes.size} rc=$rc " +
-                    "out=${LogKit.redactCmd(out.replace('\n', ' '), 300)}")
-            }
-            AppLog.e(TAG, "SCRIPT_UPLOAD GIVEUP name=$name bytes=${bytes.size} tries=$SCRIPT_UPLOAD_TRIES rc=$lastRc")
-            return Pair(lastRc, lastOut)
+        if (bytes.size <= ScriptDelivery.DIRECT_LIMIT) return execute(script, timeoutMs, expectRoot)
+        val res = synchronized(scriptUploadLock) {
+            ScriptDelivery.deliver(name, script, timeoutMs, expectRoot, ::execute)
         }
+        if (res.delivered && res.sizeChecked) {
+            AppLog.i(TAG, "SCRIPT_UPLOAD name=$name ${res.wire()}")
+        } else {
+            AppLog.e(TAG, "SCRIPT_UPLOAD FAIL name=$name ${res.wire()} " +
+                "out=${LogKit.redactCmd(res.out.replace('\n', ' '), 300)}")
+        }
+        return Pair(res.rc, res.out)
     }
 
     /**

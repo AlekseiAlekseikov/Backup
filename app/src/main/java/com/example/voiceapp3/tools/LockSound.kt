@@ -931,9 +931,23 @@ object LockSound {
                 val bindScript = LockMountScripts.bindScript(stagePath)
                 // iter33h A1.5: перед любой записью маунта — проверка пути. Скрипт трогает только
                 // /vendor/etc/carlock/*.wav; если глоб вдруг вернёт что-то другое, это отсекается здесь.
-                val glideTargets = runCatching {
-                    AdbClient.execute("ls -1 /vendor/etc/carlock/*.wav 2>/dev/null", 6000, expectRoot = false).second
-                }.getOrDefault("").lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.toList()
+                // iter51 §3.2: список целей читается ДО монтирования и с проверкой rc. Раньше
+                // любой отказ `ls` давал пустой список, из которого нельзя ни доказать полноту,
+                // ни отличить «целей нет» от «прочитать нельзя» — bind продолжался «вслепую».
+                val lsRes = runCatching {
+                    AdbClient.execute("ls -1 /vendor/etc/carlock/*.wav 2>/dev/null", 6000, expectRoot = false)
+                }.getOrNull()
+                val glideTargets = lsRes?.second.orEmpty().lineSequence()
+                    .map { it.trim() }.filter { it.isNotEmpty() && !it.contains(": ") }.toList()
+                val targetsReadable = lsRes != null && lsRes.first == 0 && glideTargets.isNotEmpty()
+                if (!targetsReadable) {
+                    AppLog.w(ctx, TAG, "LOCKSOUND_BIND SKIP reason=targets_unreadable " +
+                        "rc=${lsRes?.first ?: "none"} parsed=${glideTargets.size} action=none " +
+                        "(набор целей не доказан — монтировать вслепую нельзя)")
+                    recordBindFailure("targets_unreadable rc=${lsRes?.first ?: "none"}", appCtx,
+                        deterministic = false)
+                    return@post
+                }
                 val notOurs = glideTargets.filter { !isOurLockPath(it) }
                 if (notOurs.isNotEmpty()) {
                     AppLog.i(ctx, TAG, "LOCKSOUND_BIND SKIP reason=path_not_ours paths=${notOurs.joinToString(",")}")
@@ -949,7 +963,33 @@ object LockSound {
                         "(решение владельца изменилось во время копирования)")
                     return@post
                 }
-                val bindRes = AdbClient.execute(bindScript, 20000)
+                // iter51 §3.1: bind-скрипт ~8.9 КБ. Прежний `AdbClient.execute(bindScript, …)` в
+                // ветке ROOT_5555 отклонял payload > 4096 (`ERR_ADB_TOO_LONG`) ДО отправки —
+                // звук не мог включиться в принципе, а снаружи это выглядело как «mount не удался».
+                // Теперь скрипт доставляется через executeScript (чанки + сверка размера + `sh`),
+                // и при неудачной заливке mount не запускается вовсе.
+                // iter51 §3.3: ЖУРНАЛ ОПЕРАЦИИ ДО side effect. Раньше запись появлялась только
+                // после ответа: потеря ответа/смерть процесса оставляла реально созданные слои
+                // без учёта, и снять их было нечем. Если запись не подтверждена чтением —
+                // bind не отправляется (иначе возможно необратимое неучтённое монтирование).
+                val opId = "bind_" + gen + "_" + LockOp.Stage0.hash(stagePath)
+                val op = LockOp.BindOp(
+                    id = opId, gen = gen, desired = true, stage = stagePath,
+                    targets = glideTargets, state = LockOp.State.PLANNED
+                )
+                val journalOk = writeOpJournal(appCtx, op)
+                if (!journalOk) {
+                    AppLog.e(ctx, TAG, "LOCKSOUND_BIND SKIP reason=journal_not_confirmed " +
+                        "op=$opId action=none (учёт не записан — необратимый bind не отправляем)")
+                    recordBindFailure("journal_not_confirmed", appCtx, deterministic = false)
+                    return@post
+                }
+                AppLog.i(ctx, TAG, "LOCKSOUND_OP planned ${op.wire()} " +
+                    "(запись журнала подтверждена чтением ДО mount; fsync не заявляется)")
+                val bindPlan = ScriptDelivery.plan("lock_bind", bindScript)
+                AppLog.i(ctx, TAG, "LOCKSOUND_BIND TRANSPORT ${bindPlan.wire()} " +
+                    "(длина измерена по фактическим UTF-8 байтам, не по оценке)")
+                val bindRes = AdbClient.executeScript("lock_bind", bindScript, 30000)
                 AppLog.i(ctx, TAG, "lockSound bind rc=${bindRes.first}: ${bindRes.second.replace('\n', ' ').take(500)}")
 
                 // §6.2 iter46: `ERR_ROOT_CHANNEL_UNAVAILABLE` и `Permission denied` — ВРЕМЕННЫЕ
@@ -1007,10 +1047,17 @@ object LockSound {
                             f.wire())
                     }
                 }
-                if (ok && (genChanged || desiredOff)) {
+                // iter51 §3.3(3): сходимость выполняется и при НЕИЗВЕСТНОМ/частичном результате
+                // bind, если владелец за это время изменил решение. Раньше она была только при
+                // `ok`: выключение звука во время неудачного/неизвестного прохода могло оставить
+                // включённым то, что владелец уже выключил.
+                if (genChanged || desiredOff) {
                     // Факт для ЭТОГО поколения не публикуем: он относится к устаревшему выбору.
                     markApplied(appCtx, false, if (desiredOff) "desired_off_after_bind" else "superseded")
+                    finishOpJournal(appCtx, op, LockOp.State.UNDEFINED,
+                        if (desiredOff) "desired_off_during_run" else "superseded_during_run")
                     AppLog.i(ctx, TAG, "LOCKSOUND_BIND_STALE gen=$gen now=$bindGen desired=${!desiredOff} " +
+                        "own_state=${if (ok) "ok" else "unknown"} " +
                         "result=converge (намерение изменилось, пока скрипт выполнялся; applied для " +
                         "устаревшего выбора не заявляется; реестр пополнен фактами)")
                     cleanupStage(ctx, stagePath)
@@ -1021,14 +1068,23 @@ object LockSound {
                     bindFailCount = 0
                     lastBindFailReason = null
                     val mounted = mountedFacts
-                    val expectedTargets = glideTargets.size
                     writeOwnMounts(ctx, mergeOwnMounts(readOwnMounts(ctx), mounted))
-                    // §5.4 iter47: `applied` — только когда смонтированы ВСЕ цели, которые есть
-                    // на устройстве, и каждая проверена readback (inode источника = цель).
-                    val complete = mounted.isNotEmpty() && mounted.size == expectedTargets
-                    markApplied(ctx, complete, if (complete) "" else "partial_mounts:${mounted.size}/$expectedTargets")
+                    // iter51 §3.2: доказательство ПО КАЖДОЙ цели. Раньше `complete` сравнивал
+                    // число ФАКТОВ (в т.ч. unverified/unknown) с числом целей, поэтому
+                    // «одна verified + одна unknown» давала applied=true. Теперь applied только
+                    // когда на каждую ожидаемую цель есть ровно один VERIFIED-факт, а лишних и
+                    // дублированных целей нет.
+                    val ev = LockOp.evidence(glideTargets, allFacts, targetsReadable)
+                    AppLog.i(ctx, TAG, LockOp.evidenceLine("bind", ev))
+                    val complete = ev.complete
+                    finishOpJournal(appCtx, op,
+                        if (complete) LockOp.State.DONE else LockOp.State.UNDEFINED,
+                        if (complete) "" else ev.reason)
+                    markApplied(ctx, complete, if (complete) "" else
+                        "partial:${ev.reason} verified=${ev.verified}/${ev.expected}")
                     AppLog.i(ctx, TAG, "VERIFY lockSound: ${if (complete) "SUCCESS" else "PARTIAL"} " +
-                        "mounted=${mounted.size} expected=$expectedTargets " +
+                        "verified=${ev.verified}/${ev.expected} unverified=${ev.unverified} " +
+                        "unknown=${ev.unknown} missing=${ev.missing.size} extra=${ev.extra.size} " +
                         "paths=${mounted.joinToString(",") { it.target }} " +
                         "(наличие файла, Settings и mount readback — разные факты; слышимость " +
                         "подтверждает только владелец)")
@@ -1036,6 +1092,15 @@ object LockSound {
                     val reason = if (bindRes.second.contains("ERR_ROOT_CHANNEL_UNAVAILABLE")) "root unavailable"
                                  else if (bindRes.second.contains("Permission denied")) "Permission denied"
                                  else "rc=${bindRes.first}: ${bindRes.second.take(200)}"
+                    // iter51 §3.1/§3.3: если скрипт НЕ доехал (ошибка заливки) — операции не было;
+                    // если доехал, но ответ неуспешный/потерян — состояние НЕИЗВЕСТНО, а не «не
+                    // выполнялось»: часть слоёв могла встать, и они уже записаны фактами выше.
+                    val uploadFailed = bindRes.second.contains("ERR_SCRIPT_UPLOAD") ||
+                        bindRes.second.contains("ERR_SCRIPT_TOO_LARGE") ||
+                        bindRes.second.contains("ERR_ADB_TOO_LONG")
+                    finishOpJournal(appCtx, op,
+                        if (uploadFailed) LockOp.State.FAILED else LockOp.State.UNDEFINED,
+                        if (uploadFailed) "upload_failed" else "outcome_unknown")
                     recordBindFailure(reason, appCtx, deterministic = failDeterm)
                 }
                 cleanupStage(ctx, stagePath)
@@ -1231,7 +1296,11 @@ object LockSound {
                     return@execute
                 }
                 val script = LockMountScripts.restoreScript(entries.map { it.target to it.source })
-                val res = AdbClient.execute(script, 20000)
+                // iter51 §3.1: restore тоже длиннее 4096 (5593 байта уже на ОДНУ цель) —
+                // отправляем через executeScript, иначе на ROOT_5555 он не доезжает.
+                val restorePlan = ScriptDelivery.plan("lock_restore", script)
+                AppLog.i(ctx, TAG, "LOCKSOUND_UNMOUNT TRANSPORT ${restorePlan.wire()} targets=${entries.size}")
+                val res = AdbClient.executeScript("lock_restore", script, 30000)
                 AppLog.i(ctx, TAG, "LOCKSOUND_UNMOUNT [exitCode=${res.first}]: " + res.second.trim().take(800))
                 val parsed = MountInfo.parseRestore(res.second)
                 val nsMismatch = res.second.contains("MOUNT_NS_MISMATCH") ||
@@ -1308,6 +1377,39 @@ object LockSound {
     }
 
     private fun mountsFile(ctx: Context): File = File(ctx.applicationContext.filesDir, "locksound_mounts.txt")
+
+    /** Файл журнала операций звука (iter51 §3.3). */
+    private fun opFile(ctx: Context): File = File(ctx.applicationContext.filesDir, "locksound_op.txt")
+
+    /**
+     * Записать операцию ДО side effect и ПРОВЕРИТЬ запись чтением.
+     *
+     * Честная граница: `writeText` без `fsync` не гарантирует сохранность при отключении питания;
+     * проверка чтением ловит отказ записи (нет места/прав), но не потерю питания.
+     */
+    internal fun writeOpJournal(ctx: Context, op: LockOp.BindOp): Boolean {
+        val ok = runCatching { opFile(ctx).writeText(op.encode()) }.isSuccess
+        if (!ok) return false
+        val back = runCatching { LockOp.decode(opFile(ctx).readText()) }.getOrNull()
+        return back?.id == op.id && back.state == op.state
+    }
+
+    /** Обновить состояние операции после ответа (или оставить `UNDEFINED`). */
+    internal fun finishOpJournal(ctx: Context, op: LockOp.BindOp, state: LockOp.State, reason: String) {
+        val now = op.copy(state = state, reason = reason)
+        runCatching { opFile(ctx).writeText(now.encode()) }
+        AppLog.i(ctx, TAG, "LOCKSOUND_OP ${state.name.lowercase()} ${now.wire()}")
+    }
+
+    /** Текущая запись журнала (для сверки при следующем реальном событии). */
+    internal fun readOpJournal(ctx: Context): LockOp.BindOp? =
+        runCatching { LockOp.decode(opFile(ctx).readText()) }.getOrNull()
+
+    /** Хэш пути staging: короткая детерминированная метка, без содержимого WAV. */
+    internal object Stage0 {
+        fun hash(s: String): String =
+            String.format("%08x", s.hashCode().toLong() and 0xffffffffL)
+    }
 
     /**
      * §5.3 iter47 — слой владения: ЦЕЛЬ + ИСТОЧНИК + поколение, которым он смонтирован.
