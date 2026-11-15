@@ -525,7 +525,11 @@ elif [ "${D}ENABLE" = "1" ]; then
       rc_a=${D}?; echo "TTL_ADD family=v4 chain=${D}OUR marker=${D}COMMENT_OK rc=${D}rc_a"
       iptables -w 5 -t mangle -A POSTROUTING -o "${D}UPLINK" -j "${D}OUR" 2>&1
       rc_j=${D}?; echo "TTL_ADD family=v4 jump scope=\"-o ${D}UPLINK\" rc=${D}rc_j"
-      [ "${D}rc_n" = "0" ] && TOUCHED_v4=yes
+      # iter56 §8: учёт КАЖДОГО успешного действия, а не только создания цепи. Раньше
+      # TOUCHED_v4 поднимался лишь при `-N` rc=0: правило, добавленное в УЖЕ СУЩЕСТВУЮЩУЮ свою
+      # цепь (rc_n≠0, -A rc=0), считалось «ничего не меняли», и откат при последующем сбое не
+      # выполнялся — на устройстве оставалось живое правило при отчёте «не изменяли».
+      if [ "${D}rc_n" = "0" ] || [ "${D}rc_a" = "0" ] || [ "${D}rc_j" = "0" ]; then TOUCHED_v4=yes; fi
       fi
       fi
       # --- v6 ---
@@ -553,7 +557,8 @@ elif [ "${D}ENABLE" = "1" ]; then
         rc_a6=${D}?; echo "TTL_ADD family=v6 chain=${D}OUR marker=${D}COMMENT_OK rc=${D}rc_a6"
         ip6tables -w 5 -t mangle -A POSTROUTING -o "${D}UPLINK" -j "${D}OUR" 2>&1
         rc_j6=${D}?; echo "TTL_ADD family=v6 jump scope=\"-o ${D}UPLINK\" rc=${D}rc_j6"
-        [ "${D}rc_n6" = "0" ] && TOUCHED_v6=yes
+        # iter56 §8: то же для v6 — учитывается любое состоявшееся добавление, не только `-N`.
+        if [ "${D}rc_n6" = "0" ] || [ "${D}rc_a6" = "0" ] || [ "${D}rc_j6" = "0" ]; then TOUCHED_v6=yes; fi
         fi
       fi
       # iter53 §8.2: откат решается по ФАКТУ изменения, а не по значениям rc.

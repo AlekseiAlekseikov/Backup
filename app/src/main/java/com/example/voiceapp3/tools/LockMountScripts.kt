@@ -327,10 +327,12 @@ drop_own_layers() {
     if [ -n "${'$'}exp" ]; then
       [ "${'$'}ROOT" = "${'$'}exp" ] || { echo "FOREIGN_MOUNT:${'$'}t mid=${'$'}MID root=${'$'}ROOT expected=${'$'}exp reason=ownership_not_proven"; return 3; }
     else
-      case "${'$'}ROOT" in
-        ${'$'}{STAGE_PREFIX}*) echo "OWN_PROOF:${'$'}t method=prefix root=${'$'}ROOT expected=unknown reason=root_expected_uncomputable" ;;
-        *) echo "FOREIGN_MOUNT:${'$'}t mid=${'$'}MID root=${'$'}ROOT reason=ownership_not_proven"; return 3 ;;
-      esac
+      # iter56 §7: совпадение ПРЕФИКСА — не доказательство владения. Чужой bind может иметь
+      # похожий корень (`…/carlock_other`), и снятие такого слоя уносит чужую точку монтирования.
+      # Если ожидаемый root источника не вычисляется, слой НЕ снимается: недо-снятие безопасно
+      # (слой остаётся и о нём сказано прямо), чужая потеря — нет.
+      echo "FOREIGN_MOUNT:${'$'}t mid=${'$'}MID root=${'$'}ROOT reason=root_expected_uncomputable action=keep_layer"
+      return 3
     fi
     before=${'$'}(mi_count "${'$'}t")
     umount "${'$'}t" 2>/dev/null; rc=${'$'}?
