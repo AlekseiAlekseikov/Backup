@@ -1043,7 +1043,7 @@ enum class Choice(
             } else {
                 ToggleIntent.intentOfSteps(persistReportedOk)
             }
-            val applied = ToggleIntent.Applied.ofStatus(res.status)
+            val applied = ToggleIntent.Applied.ofWire(res.statusWire)
             AppLog.i(
                 TAG,
                 "TOGGLE_INTENT key=" + key + " click_id=" + clickId + " want=" + want +

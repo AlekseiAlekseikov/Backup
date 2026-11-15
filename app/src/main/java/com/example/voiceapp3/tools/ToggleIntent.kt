@@ -59,6 +59,18 @@ object ToggleIntent {
 
         companion object {
             fun of(wire: String?): Applied? = values().firstOrNull { it.wire == wire }
+            /**
+             * Сводный статус действия строкой (`ToolsResult.statusWire`): `ok|partial|blocked|failed`.
+             * Неизвестная/пустая строка — [UNKNOWN], а не «применено»: недоказанное не выдаётся
+             * за факт.
+             */
+            fun ofWire(wire: String?): Applied = when (wire?.trim()?.lowercase()) {
+                "ok" -> APPLIED
+                "partial", "blocked" -> PENDING
+                "failed" -> FAILED
+                else -> UNKNOWN
+            }
+
             fun ofStatus(status: ToolsStep.Status?): Applied = when (status) {
                 ToolsStep.Status.OK -> APPLIED
                 // PARTIAL/BLOCKED — «не подтверждено», а не «сломано»: ждём сеть/канал/зависимость.

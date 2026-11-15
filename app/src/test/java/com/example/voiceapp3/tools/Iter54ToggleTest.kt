@@ -81,6 +81,17 @@ class Iter54ToggleTest {
     }
 
     @Test
+    fun summaryWireStatusIsNotAWriteVerdict() {
+        // production берёт факт применения из `ToolsResult.statusWire`
+        assertEquals(ToggleIntent.Applied.APPLIED, ToggleIntent.Applied.ofWire("ok"))
+        assertEquals(ToggleIntent.Applied.PENDING, ToggleIntent.Applied.ofWire("partial"))
+        assertEquals(ToggleIntent.Applied.PENDING, ToggleIntent.Applied.ofWire("blocked"))
+        assertEquals(ToggleIntent.Applied.FAILED, ToggleIntent.Applied.ofWire("failed"))
+        assertEquals(ToggleIntent.Applied.UNKNOWN, ToggleIntent.Applied.ofWire(null))
+        assertEquals(ToggleIntent.Applied.UNKNOWN, ToggleIntent.Applied.ofWire("нечто"))
+    }
+
+    @Test
     fun neutralNoteNeverCallsSavedIntentOff() {
         val pendingNote = ToggleIntent.note(ToggleIntent.Intent.WRITTEN, ToggleIntent.Applied.PENDING)
         assertEquals("сохранено, ждёт применения", pendingNote)
