@@ -197,18 +197,33 @@ internal object JitOwn {
          * выглядел как «A завершилась успешно». Теперь владелец — это opId+экземпляр+загрузка+
          * процесс, и terminal читается ПО ЭКЗЕМПЛЯРУ.
          */
-        val identity: ClaimIdentity? = null
+        val identity: ClaimIdentity? = null,
+        /**
+         * iter56 §4.3 — МОНОТОННОЕ ПОКОЛЕНИЕ НАМЕРЕНИЯ (порядок кликов), а не время.
+         *
+         * `tsMs` — показание часов клиента: его можно перевести назад, два клика могут попасть в
+         * одну миллисекунду, а после перезапуска процесса старое значение ничем не отличается от
+         * нового. Поэтому порядок намерений на устройстве сравнивается по `seq` (счётчик,
+         * сохраняемый до записи снимка), а `ts_ms` остаётся ТОЛЬКО fallback'ом для записей прежних
+         * версий без `seq` и для наблюдения. `0` — поколение неизвестно (legacy), порядок по
+         * времени с явным правилом `rule=ts_legacy`.
+         */
+        val seq: Long = 0L
     ) {
         /** Секунды (только для сравнения с `date +%s`, см. [msToS]). */
         val tsS: Long get() = msToS(tsMs)
 
         fun wire(): String =
-            "op=$id;ts_ms=$tsMs;ts_s=$tsS;want=${if (want) 1 else 0};state=${state.name.lowercase()}" +
+            "op=$id;ts_ms=$tsMs;ts_s=$tsS;want=${if (want) 1 else 0};" +
+                "state=${state.name.lowercase()}" +
+                (if (seq > 0L) ";seq=$seq" else "") +
                 (if (owner.isEmpty()) "" else ";owner=$owner")
 
         /** Строка для claim-файла: без состояния (оно локальное) — только владение. */
         fun claimLine(): String =
-            "op=$id;ts_ms=$tsMs;want=${if (want) 1 else 0}" + (identity?.wire() ?: "")
+            "op=$id;ts_ms=$tsMs;want=${if (want) 1 else 0}" +
+                (if (seq > 0L) ";seq=$seq" else "") +
+                (identity?.wire() ?: "")
 
         /** Тот же opId и то же намерение, но ДРУГОЙ экземпляр исполнения. */
         fun sameIntent(otherOp: Op): Boolean = id == otherOp.id && tsMs == otherOp.tsMs
@@ -260,16 +275,24 @@ internal object JitOwn {
             fun parseClaim(raw: String?): Op? {
                 if (raw == null) return null
                 val line = raw.trim()
-                val m = Regex(
-                    "^op=([A-Za-z0-9_.-]{1,64});(?:ts_(?:ms|s)|ts)=\\d{1,19};want=([01])" +
-                        "(?:;inst=.*)?$"
-                ).matchEntire(line) ?: return null
+                // iter56 §4.3: строка claim теперь содержит `ts_ms` И `ts_s` (единица видна из
+                // имени поля) и необязательное `seq=`. Разбор идёт ПО ПОЛЯМ, а не одной жёсткой
+                // склейкой: иначе добавление поля в запись делало её «нечитаемой» на клиенте.
+                // Обязательны ровно два факта: `op` и `want`; время — необязательное наблюдение.
+                val fields = line.split(';').mapNotNull { part ->
+                    val k = part.substringBefore('=', "")
+                    if (k.isEmpty()) null else k to part.substringAfter('=', "")
+                }.toMap()
+                val id = fields["op"]?.takeIf { Regex("[A-Za-z0-9_.-]{1,64}").matches(it) }
+                    ?: return null
+                val wantRaw = fields["want"]?.takeIf { it == "0" || it == "1" } ?: return null
                 return Op(
-                    id = m.groupValues[1],
+                    id = id,
                     tsMs = parseTsMs(line) ?: 0L,
-                    want = m.groupValues[2] == "1",
+                    want = wantRaw == "1",
                     state = State.CLAIMED,
-                    identity = ClaimIdentity.parse(line)
+                    identity = ClaimIdentity.parse(line),
+                    seq = fields["seq"]?.toLongOrNull()?.takeIf { it >= 0L } ?: 0L
                 )
             }
         }
@@ -304,10 +327,28 @@ _jit_owner_dead() {
   # принимал REFUSED/END ДРУГОГО экземпляра той же операции за смерть владельца и
   # разрешал takeover живого lock. Identity сравнивается целиком; без inst — не доказано.
   _loinst=${'$'}(printf '%s' "${'$'}_lo" | sed -n 's/.*inst=\([^;]*\).*/\1/p')
-  if [ -n "${'$'}_loop" ] && [ -n "${'$'}_loinst" ]; then
+  # iter56 §4.1: `REFUSED` — НЕ доказательство конца владельца. Отказ пишет ДРУГОЙ shell (в том
+  # числе повторная доставка того же payload с ТЕМ ЖЕ inst): раньше эта строка объявляла живого
+  # владельца мёртвым и разрешала перехват его lock. Теперь конец доказывает только `END`,
+  # записанный САМИМ владельцем: совпадают op, inst, pid и (если известен) pstart из lock-строки.
+  if [ -n "${'$'}_loop" ] && [ -n "${'$'}_loinst" ] && [ -n "${'$'}_lopid" ]; then
     _loterm="${termPrefix}${'$'}_loop.term"
-    if grep -q "^END rc=[-0-9]* op=${'$'}_loop inst=${'$'}_loinst${'$'}" "${'$'}_loterm" 2>/dev/null; then return 1; fi
-    if grep -q "^REFUSED op=${'$'}_loop inst=${'$'}_loinst " "${'$'}_loterm" 2>/dev/null; then return 1; fi
+    _loneed=3
+    case "${'$'}_lopst" in ""|"?") : ;; *) _loneed=4 ;; esac
+    if awk -v o="${'$'}_loop" -v i="${'$'}_loinst" -v p="${'$'}_lopid" -v s="${'$'}_lopst" \
+         -v need="${'$'}_loneed" '
+        ${'$'}1=="END" {
+          ok_o=0; ok_i=0; ok_p=0; ok_s=0
+          for (n=2; n<=NF; n++) {
+            split(${'$'}n, kv, "=")
+            if (kv[1]=="op" && kv[2]==o) ok_o=1
+            else if (kv[1]=="inst" && kv[2]==i) ok_i=1
+            else if (kv[1]=="pid" && kv[2]==p) ok_p=1
+            else if (kv[1]=="pstart" && kv[2]==s) ok_s=1
+          }
+          if (ok_o && ok_i && ok_p && (ok_o+ok_i+ok_p+ok_s)>=need) found=1
+        }
+        END { exit (found ? 0 : 1) }' "${'$'}_loterm" 2>/dev/null; then return 1; fi
   fi
   [ -z "${'$'}_lopid" ] && return 0
   if [ -n "${'$'}_loboot" ] && [ -n "${'$'}_me_boot" ] && [ "${'$'}_loboot" != "${'$'}_me_boot" ]; then return 1; fi
@@ -337,16 +378,119 @@ _jit_take_lock() {
 # rc 2 = подмена: lock принадлежал другому, возвращён/не тронут;
 # rc 1 = mv не удался (lock остался на месте).
 _jit_steal_dead() {
-  _sd_lock=${'$'}1; _sd_expect=${'$'}2; _sd_tmp="${'$'}{_sd_lock}.dead.${'$'}${'$'}"
-  rm -f "${'$'}_sd_tmp" 2>/dev/null
-  mv "${'$'}_sd_lock" "${'$'}_sd_tmp" 2>/dev/null || return 1
-  _sd_got=${'$'}(cat "${'$'}_sd_tmp" 2>/dev/null)
-  if [ "${'$'}_sd_got" != "${'$'}_sd_expect" ]; then
-    # Вернуть чужой lock: `ln` не перезаписывает уже существующее имя.
-    ln "${'$'}_sd_tmp" "${'$'}_sd_lock" 2>/dev/null || true
-    rm -f "${'$'}_sd_tmp" 2>/dev/null
+  _sd_lock=${'$'}1; _sd_expect=${'$'}2
+  _sd_tmp="${'$'}{_sd_lock}.dead.${'$'}${'$'}"; _sd_pin="${'$'}{_sd_lock}.pin.${'$'}${'$'}"
+  rm -f "${'$'}_sd_tmp" "${'$'}_sd_pin" 2>/dev/null
+  # 1) ПРИШПИЛИТЬ объект: `ln` даёт второе имя того же inode и НЕ создаёт его, если lock исчез.
+  ln "${'$'}_sd_lock" "${'$'}_sd_pin" 2>/dev/null || return 1
+  _sd_pin_c=${'$'}(cat "${'$'}_sd_pin" 2>/dev/null)
+  if [ "${'$'}_sd_pin_c" != "${'$'}_sd_expect" ]; then
+    # Пришпилен ДРУГОЙ объект: ничего не перемещаем и не удаляем.
+    rm -f "${'$'}_sd_pin" 2>/dev/null
     return 2
   fi
+  # 2) Снять ИМЯ (mv) и доказать, что снят ИМЕННО пришпиленный объект (тот же inode).
+  mv "${'$'}_sd_lock" "${'$'}_sd_tmp" 2>/dev/null || { rm -f "${'$'}_sd_pin" 2>/dev/null; return 1; }
+  _sd_i1=${'$'}(ls -i "${'$'}_sd_pin" 2>/dev/null | awk '{print ${'$'}1}')
+  _sd_i2=${'$'}(ls -i "${'$'}_sd_tmp" 2>/dev/null | awk '{print ${'$'}1}')
+  _sd_same=0
+  if [ -n "${'$'}_sd_i1" ] && [ "${'$'}_sd_i1" = "${'$'}_sd_i2" ]; then
+    _sd_same=1
+  else
+    # `ls -i` недоступен: сравниваем содержимое (слабее, но объект с той же identity).
+    _sd_c1=${'$'}(cat "${'$'}_sd_pin" 2>/dev/null)
+    _sd_c2=${'$'}(cat "${'$'}_sd_tmp" 2>/dev/null)
+    [ -n "${'$'}_sd_c1" ] && [ "${'$'}_sd_c1" = "${'$'}_sd_c2" ] && _sd_same=1
+  fi
+  if [ "${'$'}_sd_same" != "1" ]; then
+    # Между пришпиливанием и `mv` имя заменили: перехвачен ЧУЖОЙ (возможно живой) lock.
+    # Возврат — ТОЛЬКО `ln` (не перезапись): если имя уже занято, объект сохраняется на диске.
+    if ln "${'$'}_sd_tmp" "${'$'}_sd_lock" 2>/dev/null; then
+      rm -f "${'$'}_sd_tmp" 2>/dev/null
+    else
+      echo "CL_TAKEOVER_KEPT file=${'$'}_sd_tmp reason=name_busy (объект сохранён, имя занято)"
+    fi
+    rm -f "${'$'}_sd_pin" 2>/dev/null
+    return 2
+  fi
+  rm -f "${'$'}_sd_pin" 2>/dev/null
+  return 0
+}
+# ── вернуть перемещённый объект на имя, НЕ перезаписывая появившийся ───────
+_jit_restore_dead() {
+  _rd_src=${'$'}1; _rd_lock=${'$'}2
+  if ln "${'$'}_rd_src" "${'$'}_rd_lock" 2>/dev/null; then
+    rm -f "${'$'}_rd_src" 2>/dev/null
+    return 0
+  fi
+  echo "CL_TAKEOVER_KEPT file=${'$'}_rd_src reason=name_busy (объект сохранён, имя занято)"
+  return 1
+}
+# ── завершилось ли НАМЕРЕНИЕ строки claim ──────────────────────────────────
+# `END` с тем же op и inst в terminal-файле этой операции. Именно этот набор (op+inst) носит
+# намерение: claim и payload используют один `inst`, а `pid` у них РАЗНЫЙ по построению.
+_jit_intent_ended() {
+  _ie_line=${'$'}1
+  _ie_op=${'$'}(printf '%s' "${'$'}_ie_line" | sed -n 's/^op=\([A-Za-z0-9_.-]*\).*/\1/p')
+  _ie_inst=${'$'}(printf '%s' "${'$'}_ie_line" | sed -n 's/.*inst=\([^;]*\).*/\1/p')
+  [ -z "${'$'}_ie_op" ] && return 1
+  _ie_term="${termPrefix}${'$'}_ie_op.term"
+  [ -f "${'$'}_ie_term" ] || return 1
+  awk -v o="${'$'}_ie_op" -v i="${'$'}_ie_inst" '
+    ${'$'}1=="END" {
+      ok_o=0; ok_i=0
+      for (n=2; n<=NF; n++) { split(${'$'}n, kv, "=")
+        if (kv[1]=="op" && kv[2]==o) ok_o=1
+        else if (kv[1]=="inst" && kv[2]==i) ok_i=1 }
+      if (ok_o && ok_i) found=1
+    }
+    END { exit (found ? 0 : 1) }' "${'$'}_ie_term" 2>/dev/null
+}
+
+# ── ПОРЯДОК НАМЕРЕНИЙ (iter56 §4.3) ───────────────────────────────────────
+# Результат — в переменных _ord_verdict/_ord_rule (shell-функция не может вернуть строку).
+# Правила, в порядке силы доказательства:
+#  1. поколение (seq) с ОБЕИХ сторон → сравниваем числа: больше = новее;
+#  2. наш счётчик не больше, но владелец claim'а доказанно ЗАВЕРШИЛСЯ (его END/смерть) →
+#     его намерение уже не «последнее», счётчики относятся к разным поколениям установки
+#     (`rule=seq_owner_finished`); иначе — жив более новый владелец (`older_intent`/`seq_tie`);
+#  3. поколения нет (записи прежних версий) → время, с ЯВНЫМ правилом `ts_legacy`.
+# Время нигде не выдаётся за доказанный порядок: оно только fallback и наблюдение.
+_jit_intent_order() {
+  _ord_line=${'$'}1; _ord_meseq=${'$'}2; _ord_mets=${'$'}3; _ord_myop=${'$'}4
+  _ord_verdict=free; _ord_rule=none
+  _ord_op=${'$'}(printf '%s' "${'$'}_ord_line" | sed -n 's/^op=\([A-Za-z0-9_.-]*\).*/\1/p')
+  [ -z "${'$'}_ord_op" ] && { _ord_verdict=free; return 0; }
+  [ "${'$'}_ord_op" = "${'$'}_ord_myop" ] && { _ord_verdict=same; return 0; }
+  _ord_seq=${'$'}(printf '%s' "${'$'}_ord_line" | sed -n 's/.*seq=\([0-9][0-9]*\).*/\1/p')
+  _ord_ts=${'$'}(printf '%s' "${'$'}_ord_line" | sed -n 's/.*ts_ms=\([0-9][0-9]*\).*/\1/p')
+  if [ -n "${'$'}_ord_seq" ] && [ "${'$'}_ord_meseq" != "0" ] && [ "${'$'}_ord_seq" != "0" ]; then
+    _ord_rule=seq
+    if [ "${'$'}_ord_meseq" -gt "${'$'}_ord_seq" ]; then _ord_verdict=newer_intent; return 0; fi
+    # Наш номер НЕ больше. Единственное основание не уступать — ДОКАЗАННЫЙ конец того
+    # намерения (его собственный `END` с тем же op+inst в его terminal): тогда оно уже не
+    # «последнее», а номера относятся к разным поколениям установки.
+    # СМЕРТЬ ПРОЦЕССА, ЗАПИСАВШЕГО CLAIM, здесь НЕ основание: этот процесс завершается сразу
+    # после записи, а payload исполняет ДРУГОЙ shell — «claim-процесс мёртв» ничего не говорит
+    # о том, закончилось ли намерение.
+    if _jit_intent_ended "${'$'}_ord_line"; then
+      _ord_rule=seq_owner_ended
+      _ord_verdict=newer_intent
+      return 0
+    fi
+    if [ "${'$'}_ord_meseq" -eq "${'$'}_ord_seq" ]; then _ord_verdict=seq_tie
+    else _ord_verdict=older_intent; fi
+    return 0
+  fi
+  if [ -n "${'$'}_ord_ts" ]; then
+    _ord_rule=ts_legacy
+    if [ "${'$'}_ord_ts" -gt "${'$'}_ord_mets" ]; then _ord_verdict=older_intent
+    elif [ "${'$'}_ord_ts" -eq "${'$'}_ord_mets" ]; then _ord_verdict=ts_tie
+    else _ord_verdict=newer_intent; fi
+    return 0
+  fi
+  _ord_rule=unprovable
+  _ord_verdict=older_intent
   return 0
 }
 # ── освободить ТОЛЬКО свою блокировку ─────────────────────────────────────
@@ -385,33 +529,30 @@ set +e
 echo CL_BEGIN
 _me_inst=${inst}
 ${ownHelpers(base)}
-_me_line="op=${op.id};ts_ms=${op.tsMs};ts_s=${op.tsS};want=${if (op.want) 1 else 0};inst=${'$'}_me_inst;pid=${'$'}_me_pid;pstart=${'$'}{_me_pstart:-?};boot=${'$'}{_me_boot:-?}"
+_me_line="op=${op.id};ts_ms=${op.tsMs};ts_s=${op.tsS};want=${if (op.want) 1 else 0};seq=${op.seq};inst=${'$'}_me_inst;pid=${'$'}_me_pid;pstart=${'$'}{_me_pstart:-?};boot=${'$'}{_me_boot:-?}"
 _cl_status=failed; _cl_owner=""; _cl_why=""
 # ── порядок НАМЕРЕНИЙ: поздний claim не отменяет более новое намерение ────────
 # `ts_ms` — время клика владельца, а не время выполнения команды. Если в claim уже лежит
 # БОЛЕЕ НОВОЕ намерение, эта (устаревшая) операция не имеет права его перезаписать: иначе
 # «догоняющий» устаревший payload снимал бы решение, которое владелец принял позже.
-# Перезапись чужого claim допускается только если новее МЫ или владелец доказанно мёртв И
-# его terminal показывает завершение (END/REFUSED).
+# Перезапись чужого claim допускается только если новее МЫ (по поколению) или владелец
+# намерения доказанно завершился (его собственный END/смерть) — тогда его намерение уже не
+# «последнее», а счётчики относятся к разным поколениям установки.
 _cm_seen=$(cat ${claim} 2>/dev/null)
 _cm_ts=$(printf '%s' "${'$'}_cm_seen" | sed -n 's/.*ts_ms=\([0-9][0-9]*\).*/\1/p')
+_cm_seq=$(printf '%s' "${'$'}_cm_seen" | sed -n 's/.*seq=\([0-9][0-9]*\).*/\1/p')
 _cm_op=$(printf '%s' "${'$'}_cm_seen" | sed -n 's/^op=\([A-Za-z0-9_.-]*\).*/\1/p')
-_cm_verdict=free
-if [ -n "${'$'}_cm_op" ] && [ "${'$'}_cm_op" != "${op.id}" ] && [ -n "${'$'}_cm_ts" ]; then
-  if [ "${'$'}_cm_ts" -gt ${op.tsMs} ]; then
-    _cm_verdict=older_intent
-  elif [ "${'$'}_cm_ts" -eq ${op.tsMs} ]; then
-    _cm_verdict=ts_tie
-  else
-    _cm_verdict=newer_intent
-  fi
+_cm_verdict=free; _cm_rule=none
+if [ -n "${'$'}_cm_op" ] && [ "${'$'}_cm_op" != "${op.id}" ]; then
+  _jit_intent_order "${'$'}_cm_seen" ${op.seq} ${op.tsMs} ${op.id}
+  _cm_verdict=${'$'}_ord_verdict; _cm_rule=${'$'}_ord_rule
 fi
 # iter55 §4.3: НИКАКОГО `newer_finished`. То, что более новое намерение завершилось,
 # не делает старое намерение актуальным: владелец уже выбрал другое. Устаревшая операция
 # уступает навсегда, иначе «догоняющий» старый payload снимал бы последнее решение.
-echo "CL_ORDER seen_op=${'$'}{_cm_op:-none} seen_ts_ms=${'$'}{_cm_ts:-none} verdict=${'$'}_cm_verdict"
+echo "CL_ORDER seen_op=${'$'}{_cm_op:-none} seen_seq=${'$'}{_cm_seq:-none} seen_ts_ms=${'$'}{_cm_ts:-none} me_seq=${op.seq} rule=${'$'}_cm_rule verdict=${'$'}_cm_verdict"
 case "${'$'}_cm_verdict" in
-  older_intent|ts_tie)
+  older_intent|ts_tie|seq_tie)
     _cl_status=stale; _cl_owner="${'$'}_cm_seen"
     _cl_why="newer_intent_${'$'}{_cm_verdict}" ;;
   *)
@@ -421,7 +562,9 @@ if [ -f ${lock} ]; then
     _jit_steal_dead ${lock} "${'$'}_lo"
     case ${'$'}? in
       0) _jit_take_lock "${'$'}_me_line" || {
-           mv ${lock}.dead.${'$'}${'$'} ${lock} 2>/dev/null; _cl_owner="${'$'}_lo"; _cl_status=busy; }
+           _jit_restore_dead "${lock}.dead.${'$'}${'$'}" ${lock}
+           _cl_owner="${'$'}_lo"; _cl_status=busy; }
+         rm -f "${lock}.dead.${'$'}${'$'}" 2>/dev/null
          echo "CL_TAKEOVER proof=owner_dead_exact_inst owner=${'$'}_lo" ;;
       2) _cl_status=busy; _cl_owner="race_object_replaced"
          echo "CL_TAKEOVER proof=refused reason=object_replaced (перехвачен уже ЧУЖОЙ lock)" ;;
@@ -441,13 +584,19 @@ if [ "${'$'}_cl_status" != "busy" ]; then
   _v2=${'$'}(cat ${claim} 2>/dev/null)
   _v2_op=${'$'}(printf '%s' "${'$'}_v2" | sed -n 's/^op=\([A-Za-z0-9_.-]*\).*/\1/p')
   _v2_ts=${'$'}(printf '%s' "${'$'}_v2" | sed -n 's/.*ts_ms=\([0-9][0-9]*\).*/\1/p')
-  _v2_verdict=free
-  if [ -n "${'$'}_v2_op" ] && [ -n "${'$'}_v2_ts" ]; then
-    if [ "${'$'}_v2_op" != "${op.id}" ]; then
-      if [ "${'$'}_v2_ts" -ge ${op.tsMs} ]; then _v2_verdict=newer_intent; fi
-    fi
+  _v2_seq=${'$'}(printf '%s' "${'$'}_v2" | sed -n 's/.*seq=\([0-9][0-9]*\).*/\1/p')
+  _v2_verdict=free; _v2_rule=none
+  # Под lock порядок пересчитывается ТЕМ ЖЕ правилом, что и до него (ноль расхождений
+  # между ранней и авторитетной проверкой). «Не новее» здесь означает уступку.
+  if [ -n "${'$'}_v2_op" ] && [ "${'$'}_v2_op" != "${op.id}" ]; then
+    _jit_intent_order "${'$'}_v2" ${op.seq} ${op.tsMs} ${op.id}
+    _v2_rule=${'$'}_ord_rule
+    case "${'$'}_ord_verdict" in
+      older_intent|seq_tie|ts_tie) _v2_verdict=newer_intent ;;
+      *) _v2_verdict=free ;;
+    esac
   fi
-  echo "CL_ORDER_UNDER_LOCK seen_op=${'$'}{_v2_op:-none} seen_ts_ms=${'$'}{_v2_ts:-none} verdict=${'$'}_v2_verdict"
+  echo "CL_ORDER_UNDER_LOCK seen_op=${'$'}{_v2_op:-none} seen_seq=${'$'}{_v2_seq:-none} seen_ts_ms=${'$'}{_v2_ts:-none} me_seq=${op.seq} rule=${'$'}_v2_rule verdict=${'$'}_v2_verdict"
   if [ "${'$'}_v2_verdict" = "newer_intent" ]; then
     _jit_release
     _cl_status=stale; _cl_owner="${'$'}_v2"; _cl_why="newer_intent_under_lock"
@@ -594,14 +743,36 @@ echo CS_END
     data class ReadReply(val claim: ClaimRead, val term: TermRead?)
 
     /**
-     * iter54 §4: claim теперь несёт ПОЛНУЮ идентичность владельца, поэтому хвост
-     * `;inst=…;pid=…;pstart=…;boot=…` — часть допустимого формата (необязательная: старые
-     * записи без него читаются, но тогда владение по экземпляру не доказано).
+     * iter56 §4.3 — ПРОВЕРКА ФОРМАТА значения claim ПО ПОЛЯМ.
+     *
+     * Жёсткая склейка regex'ом ломалась от любого нового поля (`seq=`): запись становилась
+     * «нечитаемой» на клиенте, хотя на устройстве была валидной. Здесь проверяется структура:
+     * ключ=значение, известный набор ключей, обязательные `op` и `want`, ровно одно поле времени.
      */
-    private val CLAIM_VALUE_RE = Regex(
-        "^op=([A-Za-z0-9_.-]{1,64});(?:ts_(?:ms|s)|ts)=(\\d{1,19})(?:;ts_s=\\d{1,19})?;" +
-            "want=([01])(?:;inst=.*)?${'$'}"
-    )
+    private fun validClaimValue(raw: String): Boolean {
+        val parts = raw.split(';')
+        if (parts.any { it.isEmpty() || !it.contains('=') }) return false
+        val known = setOf("op", "ts", "ts_ms", "ts_s", "want", "seq", "inst", "pid", "pstart", "boot")
+        val fields = LinkedHashMap<String, String>()
+        for (part in parts) {
+            val k = part.substringBefore('=')
+            if (k !in known) return false
+            if (fields.containsKey(k)) return false
+            fields[k] = part.substringAfter('=')
+        }
+        val op = fields["op"] ?: return false
+        if (!Regex("[A-Za-z0-9_.-]{1,64}").matches(op)) return false
+        if (fields["want"] !in setOf("0", "1")) return false
+        // Время: либо старое `ts=` (одно поле), либо `ts_ms=` и НЕОБЯЗАТЕЛЬНОЕ `ts_s=`
+        // (production пишет оба: миллисекунды для порядка, секунды для читаемости).
+        if (fields.containsKey("ts")) {
+            if (fields.containsKey("ts_ms") || fields.containsKey("ts_s")) return false
+        } else if (!fields.containsKey("ts_ms")) return false
+        for (k in listOf("ts", "ts_ms", "ts_s", "seq")) {
+            fields[k]?.let { if (!Regex("\\d{1,19}").matches(it)) return false }
+        }
+        return true
+    }
 
     /**
      * Строгий разбор stdout [readCmd].
@@ -642,15 +813,19 @@ echo CS_END
                 val values = body.filter { it.startsWith("CLAIM_VALUE=") }.map { it.removePrefix("CLAIM_VALUE=") }
                 if (values.size != 1) return ReadReply(ClaimRead.Unknown("claim_value_lines=${values.size}"), term)
                 val raw = values.first().trim()
-                val m = CLAIM_VALUE_RE.matchEntire(raw) ?: return ReadReply(ClaimRead.Unknown("claim_value_invalid"), term)
+                // iter56 §4.3: формат проверяется ПО ПОЛЯМ — новое поле записи не делает
+                // валидный claim «нечитаемым» на клиенте.
+                if (!validClaimValue(raw)) return ReadReply(ClaimRead.Unknown("claim_value_invalid"), term)
+                // Поля читаются по имени (формат уже проверен [validClaimValue]).
+                val f = raw.split(';').associate { it.substringBefore('=') to it.substringAfter('=') }
                 // Время вне диапазона — НЕ повод объявить claim «испорченным»: владение
                 // определяется id, а не часами. Неизвестное время остаётся 0.
                 val tsMs = Op.parseTsMs(raw) ?: 0L
                 ClaimRead.Present(
                     Op(
-                        id = m.groupValues[1],
+                        id = f.getValue("op"),
                         tsMs = tsMs,
-                        want = m.groupValues[3] == "1",
+                        want = f["want"] == "1",
                         state = State.CLAIMED,
                         identity = ClaimIdentity.parse(raw)
                     )
@@ -749,9 +924,12 @@ echo CS_END
 _me_inst=${inst}
 _vc=${'$'}(cat ${claim} 2>/dev/null)
 _lo=""
+# iter56 §4.1: отказ НЕ пишет `END`. Прежняя строка `END rc=0 … refused=1` выглядела как
+# завершение операции и вместе с совпадающими op+inst (повторная доставка того же payload)
+# служила ложным доказательством смерти ДЕЙСТВУЮЩЕГО владельца — по ней разрешался перехват
+# живого lock. Отказ — это след экземпляра (`REFUSED`), а не конец намерения.
 _refuse() {
   echo "REFUSED op=${id} inst=${'$'}{_me_inst:-?} reason=${'$'}1 detail=${'$'}2 claim=${'$'}{_vc:-none}" >> ${term} 2>/dev/null
-  echo "END rc=0 op=${id} inst=${'$'}{_me_inst:-?} refused=1" >> ${term} 2>/dev/null
   echo "JIT_REFUSED op=${id} reason=${'$'}1 claim=${'$'}{_vc:-none} lock=${'$'}{_lo:-none}"
   exit 0
 }
@@ -786,9 +964,12 @@ if [ -f ${lock} ]; then
     case ${'$'}? in
       0) _jit_take_lock "${'$'}_me_line" && _lk=1
          if [ "${'$'}_lk" != "1" ]; then
-           mv ${lock}.dead.${'$'}${'$'} ${lock} 2>/dev/null
+           # Возврат перемещённого объекта — только атомарной ссылкой на СВОБОДНОЕ имя
+           # (`_jit_restore_dead`), а не `mv` поверх: имя мог занять живой владелец.
+           _jit_restore_dead "${lock}.dead.${'$'}${'$'}" ${lock}
            _refuse lock_race "${'$'}_lo"
          fi
+         rm -f "${lock}.dead.${'$'}${'$'}" 2>/dev/null
          echo "JIT_LOCK_TAKEOVER proof=owner_dead_exact_inst owner=${'$'}_lo" ;;
       2) _refuse lock_object_replaced "${'$'}_lo" ;;
       *) _refuse lock_race "${'$'}_lo" ;;
@@ -827,7 +1008,10 @@ esac
 # `inst` обязателен: по нему terminal отличается «этот экземпляр» от «тот же opId, другой shell».
 # ДОЗАПИСЬ, а не усечение: отказ другого экземпляра мог быть записан раньше, и `>` его терял.
 echo "START ts=${'$'}(date +%s) op=${id} inst=${'$'}_me_inst" >> ${term} 2>/dev/null
-trap 'echo "END rc=$? op=${id} inst=${'$'}_me_inst" >> ${term} 2>/dev/null; _jit_release; rm -f ${lock}.dead.* 2>/dev/null' EXIT
+# iter56 §5: конец намерения доказывается ТОЧНОЙ identity — END пишет op, inst, pid, pstart и
+# boot того же shell, что записал lock. Иначе конец «намерения» доказывался бы любым END с тем же
+# op+inst (повторная доставка) — и lock живого владельца считался бы брошенным.
+trap 'echo "END rc=$? op=${id} inst=${'$'}_me_inst pid=${'$'}{_me_pid:-?} pstart=${'$'}{_me_pstart:-?} boot=${'$'}{_me_boot:-?}" >> ${term} 2>/dev/null; _jit_release; rm -f ${lock}.dead.* 2>/dev/null' EXIT
 """.trimIndent()
     }
 

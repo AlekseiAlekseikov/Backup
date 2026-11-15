@@ -120,6 +120,38 @@ object JitNet {
         private fun dps(): SharedPreferences? = runCatching { dpsProvider() }.getOrNull()
 
         /**
+         * iter56 §4.3 — монотонное поколение намерения JIT.
+         *
+         * Читаем максимум обеих копий (ревизии не важны: нам нужно НЕ УМЕНЬШИТЬ счётчик),
+         * прибавляем 1, пишем в обе копии и ЧИТАЕМ ОБРАТНО. Поколение выдаётся только если
+         * хотя бы одна копия вернула ровно записанное значение — иначе `null`, и вызывающий
+         * обязан назвать порядок «по времени», а не выдать это за монотонный номер.
+         *
+         * Граница честно: два процесса, читающих счётчик одновременно, могут получить одно
+         * значение (гонка чтения до записи). Именно поэтому совпадение номеров на устройстве
+         * трактуется как `seq_tie` и уступает, а не «побеждает по случайности».
+         */
+        override fun bumpIntentSeq(): Long? {
+            val a = cps()
+            val b = dps()
+            fun read(p: SharedPreferences?): Long? = runCatching {
+                p?.let {
+                    if (it.contains(JitRef.KEY_INTENT_SEQ)) it.getLong(JitRef.KEY_INTENT_SEQ, 0L)
+                    else null
+                }
+            }.getOrNull()
+            val cur = maxOf(read(a) ?: 0L, read(b) ?: 0L)
+            val next = if (cur <= 0L || cur == Long.MAX_VALUE) 1L else cur + 1L
+            for (p in listOf(a, b)) {
+                if (p == null) continue
+                runCatching { p.edit().putLong(JitRef.KEY_INTENT_SEQ, next).commit() }
+            }
+            val ra = read(a)
+            val rb = read(b)
+            return if (ra == next || rb == next) next else null
+        }
+
+        /**
          * §4.2 iter41 — ПОЛУЧЕНИЕ хранилищ с отчётом о сбоях.
          *
          * Раньше исключение провайдера превращалось в `null`, хранилище просто исчезало из

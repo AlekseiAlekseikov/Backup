@@ -72,6 +72,12 @@ object JitRef {
      */
     internal const val KEY_MARK = "jit_restore_marker"
 
+    /**
+     * iter56 §4.3: монотонное поколение намерения JIT (порядок кликов, а не показание часов).
+     * Собственный ключ; в референсе его нет и на его ключи он не влияет.
+     */
+    internal const val KEY_INTENT_SEQ = "jit_intent_seq"
+
     /** Все три ключа одной операции — проверяются вместе (согласованность записи). */
     internal val SNAPSHOT_KEYS = listOf(KEY_PEDIDO, KEY_AUTO, KEY_RESTORE)
 
@@ -291,6 +297,17 @@ object JitRef {
     }
 
     interface JitStore {
+        /**
+         * iter56 §4.3 — ВЫДАТЬ СЛЕДУЮЩЕЕ МОНОТОННОЕ ПОКОЛЕНИЕ НАМЕРЕНИЯ.
+         *
+         * Зачем отдельный счётчик, а не `System.currentTimeMillis()`: часы можно перевести назад,
+         * два клика могут попасть в одну миллисекунду, а номер, сохранённый ДО отправки, переживает
+         * restart процесса. Значение читается обратно; `null` — выдать и подтвердить не удалось
+         * (тогда порядок честно считается по времени с правилом `ts_legacy`, а не выдаётся за
+         * доказанный).
+         */
+        fun bumpIntentSeq(): Long? = null
+
         fun getString(key: String): String?
         fun getBool(key: String): Boolean?
         fun contains(key: String): Boolean
@@ -394,10 +411,22 @@ object JitRef {
         /** iter53 §5.1: ВСЕГДА миллисекунды — единица видна из имени поля. */
         val tsMs: Long,
         val want: Boolean,
-        val state: String
+        val state: String,
+        /**
+         * iter56 §4.3 — монотонное поколение намерения (порядок кликов).
+         *
+         * Пишется в ТОМ ЖЕ `commit()`, что и снимок, то есть ДО записи claim и ДО отправки
+         * payload; значение выдаёт [JitStore.bumpIntentSeq] с подтверждением чтением. `0` —
+         * поколение не выдано (легаси-отметка/счётчик недоступен): порядок тогда сравнивается
+         * по времени с явным правилом `rule=ts_legacy`.
+         */
+        val seq: Long = 0L
     ) {
         fun wire(): String =
-            "op=$op;ts_ms=$tsMs;ts_s=${JitOwn.msToS(tsMs)};want=${if (want) 1 else 0};state=$state"
+            "op=$op;ts_ms=$tsMs;ts_s=${JitOwn.msToS(tsMs)};want=${if (want) 1 else 0};state=$state" +
+                // iter56 §4.3: поколение дописывается ТОЛЬКО когда оно есть — отметки прежних
+                // версий и тестовые записи остаются байт-в-байт теми же (совместимость чтения).
+                (if (seq > 0L) ";seq=$seq" else "")
 
         companion object {
             const val SENDING = "sending"
@@ -409,7 +438,8 @@ object JitRef {
             private val RE = Regex(
                 "^op=([A-Za-z0-9_.-]{1,48});" +
                     "(?:ts_ms=\\d{1,19};ts_s=\\d{1,19}|ts_ms=\\d{1,19}|ts_s=\\d{1,19}|ts=\\d{1,19})" +
-                    ";want=([01]);state=(sending|replied|undefined)$"
+                    ";want=([01]);state=(sending|replied|undefined)" +
+                    "(?:;seq=\\d{1,19})?$"
             )
 
             /**
@@ -427,7 +457,9 @@ object JitRef {
                     op = m.groupValues[1],
                     tsMs = ts,
                     want = m.groupValues[2] == "1",
-                    state = m.groupValues[3]
+                    state = m.groupValues[3],
+                    seq = Regex("(?:^|;)seq=(\\d{1,19})(?=;|$)")
+                        .find(raw.trim())?.groupValues?.get(1)?.toLongOrNull() ?: 0L
                 )
             }
 
@@ -1812,7 +1844,22 @@ object JitOp {
             }
             val snap = JitRef.WifiSnapshot(wifi)
             val opId = newOpId()
-            val mark = JitRef.OpMark(opId, System.currentTimeMillis(), want, JitRef.OpMark.SENDING)
+            // iter56 §4.3: ПОРЯДОК НАМЕРЕНИЙ — монотонное поколение, выданное и подтверждённое
+            // чтением ДО записи снимка/claim. Время (часы) порядок больше не задаёт: оно может
+            // быть переведено назад, совпасть у двух кликов и ничего не говорит после restart.
+            val intentSeq = runCatching { store.bumpIntentSeq() }.getOrNull() ?: 0L
+            log(
+                "JIT_INTENT_SEQ op=$opId seq=$intentSeq " +
+                    "rule=${if (intentSeq > 0L) "seq" else "ts_legacy"} " +
+                    if (intentSeq > 0L)
+                        "(поколение намерения записано и подтверждено чтением ДО отправки)"
+                    else
+                        "(поколение намерения выдать не удалось: порядок сравнивается по времени " +
+                            "с явным правилом ts_legacy — это слабее seq, и так и названо)"
+            )
+            val mark = JitRef.OpMark(
+                opId, System.currentTimeMillis(), want, JitRef.OpMark.SENDING, seq = intentSeq
+            )
             var prev: List<JitRef.StorePrev> = emptyList()
             var prevUnknown = false
             val write: JitRef.SnapshotWrite
@@ -1988,7 +2035,8 @@ object JitOp {
             val opInst = JitOwn.newInstance(opId, mark.tsMs)
             val opState = JitOwn.Op(
                 opId, mark.tsMs, want, JitOwn.State.CREATED,
-                identity = JitOwn.ClaimIdentity(opInst, "", "", "")
+                identity = JitOwn.ClaimIdentity(opInst, "", "", ""),
+                seq = intentSeq
             )
             val claimRes = runCatching { shell.exec(JitOwn.claimCmd(opState), 8_000) }
                 .getOrElse { t -> Pair(-1, "ERR_${'$'}{t.javaClass.simpleName}") }

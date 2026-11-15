@@ -100,7 +100,11 @@ class Iter52JitOwnTest {
         // проверяются её обязательные части, а не точная склейка.
         assertTrue("отказ записан в terminal: «$t»",
             t.contains("REFUSED op=a") && t.contains("reason=lock_held"))
-        assertTrue("и закрыт END, чтобы фаза не осталась «идёт»", t.contains("END rc=0 op=a"))
+        // iter56 §4.1: отказ БОЛЬШЕ НЕ пишет `END`. Прежняя строка `END rc=0 … refused=1` означала
+        // «какой-то shell завершился» и вместе с совпадающими op+inst (повторная доставка того же
+        // payload) служила ложным доказательством смерти ДЕЙСТВУЮЩЕГО владельца. Фаза при отказе
+        // определяется флагом `refused` (см. `parseTerminal`), а не выдуманным завершением.
+        assertFalse("отказ не выдаёт себя за завершение операции", t.contains("END "))
         assertFalse("START не писался (опасных действий не было)", t.contains("START"))
     }
 
@@ -166,8 +170,21 @@ class Iter52JitOwnTest {
         // Раньше проверялся только opId, и END/REFUSED другого экземпляра объявлял живого
         // владельца мёртвым.
         claim().writeText("op=a;ts_ms=1700000000000;want=1")
-        lock().writeText("op=prev;ts_ms=1700000000000;ts_s=1700000000;inst=prev-inst")
-        term("prev").writeText("START ts=1 op=prev inst=prev-inst\nEND rc=0 op=prev inst=prev-inst\n")
+        // iter56 §4.1: конец доказывается ТОЧНОЙ identity владельца — в lock и в его `END` должны
+        // совпасть op, inst, pid и pstart. Совпадение только `op`+`inst` повторяется при повторной
+        // доставке того же payload, поэтому доказательством смерти служить не может.
+        val mePid = ProcessHandle.current().pid()
+        val myStart = File("/proc/$mePid/stat").readText().substringAfterLast(')').trim()
+            .split(' ')[19]
+        val boot = bootId() ?: "-"
+        lock().writeText(
+            "op=prev;ts_ms=1700000000000;ts_s=1700000000;inst=prev-inst;" +
+                "pid=$mePid;pstart=$myStart;boot=$boot"
+        )
+        term("prev").writeText(
+            "START ts=1 op=prev inst=prev-inst\n" +
+                "END rc=0 op=prev inst=prev-inst pid=$mePid pstart=$myStart boot=$boot\n"
+        )
         val effect = File(base, "EFFECT_END")
         val (rc, out) = run(payload("a", effect))
         assertEquals(0, rc)

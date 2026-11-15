@@ -57,23 +57,38 @@ internal object JitDev {
             // iter54 §4: запись claim теперь несёт ПОЛНУЮ идентичность экземпляра
             // (`inst/pid/pstart/boot`) и выполняется атомарной заменой (tmp+mv). Fake обязан
             // отвечать тем же протоколом, иначе он проверяет формат, которого нет на устройстве.
-            val head = Regex("op=([A-Za-z0-9_.-]{1,64});ts_ms=(\\d{1,19});ts_s=\\d{1,19};want=([01])")
-                .find(command)
+            val head = Regex(
+                "op=([A-Za-z0-9_.-]{1,64});ts_ms=(\\d{1,19});ts_s=\\d{1,19};want=([01])" +
+                    "(?:;seq=(\\d{1,19}))?"
+            ).find(command)
                 ?: return 0 to "CL_BEGIN\nCL_STATUS=failed\nCL_END"
             val op = head.groupValues[1]
             val ts = head.groupValues[2].toLong()
             val w = head.groupValues[3]
             val inst = Regex(";inst=([A-Za-z0-9_.:\\-]{1,96});")
                 .find(command)?.groupValues?.get(1) ?: "$op-$ts-fake"
+            val seq = head.groupValues[4].toLongOrNull() ?: 0L
             val cur = claim
             val curOp = cur?.let { Regex("^op=([A-Za-z0-9_.-]{1,64})").find(it)?.groupValues?.get(1) }
             val curTs = cur?.let { Regex("ts_ms=(\\d{1,19})").find(it)?.groupValues?.get(1)?.toLongOrNull() }
-            // Порядок намерений: более старое намерение не перезаписывает более новое.
-            if (curOp != null && curOp != op && curTs != null && curTs >= ts) {
-                return 0 to "CL_BEGIN\nCL_ORDER seen_op=$curOp seen_ts_ms=$curTs verdict=older_intent\n" +
-                    "CL_STATUS=stale\nCL_WHY=newer_intent_older_intent\nCL_OWNER=$cur\nCL_END"
+            val curSeq = cur?.let { Regex("(?:^|;)seq=(\\d{1,19})").find(it)?.groupValues?.get(1)?.toLongOrNull() }
+            // iter56 §4.3: порядок намерений — по МОНОТОННОМУ поколению; время только как
+            // легаси-правило, если поколения нет хотя бы с одной стороны.
+            val newerExists = when {
+                seq > 0L && curSeq != null && curSeq > 0L -> curSeq >= seq
+                curTs != null -> curTs >= ts
+                else -> false
             }
-            val line = "op=$op;ts_ms=$ts;ts_s=${ts / 1000};want=$w;inst=$inst;pid=1;pstart=0;boot=fake"
+            val rule = if (seq > 0L && curSeq != null && curSeq > 0L) "seq" else "ts_legacy"
+            if (curOp != null && curOp != op && newerExists) {
+                val verdict = if (rule == "seq" && curSeq == seq) "seq_tie" else "older_intent"
+                return 0 to "CL_BEGIN\nCL_ORDER seen_op=$curOp seen_seq=$curSeq seen_ts_ms=$curTs " +
+                    "me_seq=$seq rule=$rule verdict=$verdict\n" +
+                    "CL_STATUS=stale\nCL_WHY=newer_intent_$verdict\nCL_OWNER=$cur\nCL_END"
+            }
+            val line = "op=$op;ts_ms=$ts;ts_s=${ts / 1000};want=$w" +
+                (if (seq > 0L) ";seq=$seq" else "") +
+                ";inst=$inst;pid=1;pstart=0;boot=fake"
             claim = line
             return 0 to "CL_BEGIN\nCL_STATUS=taken\nCL_VALUE=$line\nCL_END"
         }
