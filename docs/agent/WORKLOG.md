@@ -1873,3 +1873,13 @@ CI `43464916714` (`15dd3b2`) — success (сборка; unit-тестов в wor
 - **Не проверено (⛔/🟡)**: ГУ 1.0.63 владельцем, слышимость звука, TTL на проводе, JIT-компиляция и
   `ctl.restart zygote`, VHAL окон, рендер/слушатели панели, слот «заряд/наружная» в SystemUI-плагине,
   межпроцессная корректность lock на f2fs/ext4 ГУ. `assembleRelease` локально невозможен (нет Android SDK).
+- `9f57f5b` §8.3 добор (по второй самопроверке §13(3)): `continuationScheduler` был задан ТОЛЬКО в тестах —
+  в production продолжение после бюджета оставалось обещанием. Теперь `NetworkTtl` (единственная точка
+  создания runner) внедряет `BgWorker.postDelayed("ttlContinuation", …)`; инвариант закреплён тестом.
+- `172f90c` §13: отчёт, WORKLOG, U3-инвариант; `889233d` handoff: `SOURCE_SHA=9f57f5b`.
+
+### Итог CI
+- CI `Build APK` на `889233d`: **run `43656436771` — success** (job `build`, `Gradle build (debug)` ✔,
+  `Upload APK` ✔). Ранее `89e8c3e`: run `43654517930` — success. Промежуточные run'ы на
+  `cde61c4`/`172f90c`/`9f57f5b` — `cancelled` из-за `concurrency/cancel-in-progress` (не падения).
+- Тесты в CI **не запускаются** (шага нет; токен без scope `workflow`), число тестов — локальный прогон.

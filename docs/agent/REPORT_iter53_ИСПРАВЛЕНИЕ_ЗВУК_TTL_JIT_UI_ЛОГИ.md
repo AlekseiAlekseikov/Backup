@@ -1,8 +1,9 @@
 # iter53 — сквозное исправление: звук, TTL, JIT, UI, логи
 
 **Ветка:** `fix/v2` · **versionCode 63 / versionName 1.0.63** · **`main` не пушился, `--force` не применялся**
-**Код-SHA этой итерации:** `cde61c4` (последний коммит с production-кодом; плюс docs/handoff-коммит, см. §13)
-**Прогон JVM-тестов:** `bash runtests.sh` → **`OK (747 tests)`** (лог `/home/user/diag/run53_57.log`)
+**Код-SHA этой итерации:** `9f57f5b` (последний коммит с production-кодом), handoff/маркер — `889233d`, `SOURCE_SHA=9f57f5b`
+**Прогон JVM-тестов:** `bash runtests.sh` → **`OK (748 tests)`** (лог `/home/user/diag/run53_58.log`)
+**CI `Build APK` на `889233d`:** run **`43656436771`** — **success** (job `build`, шаг 11 `Gradle build (debug)` ✔)
 
 ---
 
@@ -17,7 +18,8 @@
 | §8 TTL (маркер владения, откат по факту, продолжение) | `0dad31d` | `OK (714)` |
 | §9 UI (причинная свежесть снимка) | `89e8c3e` | `OK (733)` |
 | §10 логи/окна (Liveness, резервирование имён, `.new`) | `cde61c4` | `OK (746)` → `OK (747)` |
-| §9.2 U3-инвариант (выбор наружной не стирается) | в docs/handoff | `OK (747)` |
+| §8.3 (добор) — планировщик продолжения TTL внедрён в production | `9f57f5b` | `OK (748)` |
+| §9.2 U3-инвариант (выбор наружной не стирается) | `172f90c` | `OK (747)` |
 
 Тесты идут **отдельной** командой; `assembleDebug/Release` к тестам **не привязаны** (требование владельца, iter42 §6 — привязка не возвращалась).
 
@@ -183,11 +185,20 @@ ToolsStateCausality.decide: KEEP_CLICK | CLEAR_CONFIRMED | SNAPSHOT_CONTRADICTS_
    - `recoverPendingNew` → `drainSpill` + тесты; в горячем `writeUnderLock` вызова **нет** (специально);
    - `livenessOf` → `orphanFilesOf` (и совместимый `pidLooksAlive`);
    - `uniqueWork` → `mergeWork`/orphan-путь; `reserveWorkForTest` — только тест;
-   - `armContinuation` → ветка `reason=budget` в `drainLoop`;
+   - `armContinuation` → ветка `reason=budget` в `drainLoop`; `continuationScheduler` — **внедряется в
+  production** `NetworkTtl.kt` (единственная точка создания runner): `BgWorker.postDelayed("ttlContinuation", …)`,
+  проверяется `Iter53TtlTest.productionInjectsARealContinuationScheduler`. Эта проверка нашла реальное
+  расхождение (планировщик был только в тестах) — исправлено `9f57f5b`;
    - `TTL_MIGRATE`/`ours_unmarked`/`KEEP_V4|V6` → `chain_state` + `drop_family` + apply-путь.
    Таймауты и «воображаемое позднее исполнение» проверены тестами на обратный порядок ответов и на поздний readback окон.
-4. **Тесты отдельно:** `bash runtests.sh` → `OK (747 tests)`. **`assembleRelease` отдельно:** в этой среде нет Android SDK (в `toolchains/android-sdk` только `LICENSE/NOTICE/README`), JDK 17 — заглушки, поэтому Gradle-сборка локально **не выполнялась**; сборку компилирует CI `Build APK` (`assembleDebug`) на точном финальном SHA — см. §13. Заявить локальный `assembleRelease` было бы неправдой.
-5. **CI:** workflow `Build APK` (`.github/workflows/build.yml`) на push в `fix/**`: шаги Flutter AAR → Android SDK → `./gradlew --no-daemon --stacktrace assembleDebug` → upload APK. **Шага тестов в workflow нет** (у токена нет scope `workflow`, добавлять его в этом задании запрещено), поэтому авторитетное число тестов — это локальный прогон выше, а CI доказывает **компиляцию** всех production-файлов (в т.ч. `ToolsPanel.kt`/`UiBridge.kt`, которые локальный JVM-стенд не компилирует).
+4. **Тесты отдельно:** `bash runtests.sh` → `OK (748 tests)`. **`assembleRelease` отдельно:** в этой среде нет Android SDK (в `toolchains/android-sdk` только `LICENSE/NOTICE/README`), JDK 17 — заглушки, поэтому Gradle-сборка локально **не выполнялась**; сборку компилирует CI `Build APK` (`assembleDebug`) на точном финальном SHA — см. §13. Заявить локальный `assembleRelease` было бы неправдой.
+5. **CI (факт):** run **`43656436771`**, SHA `889233d` (`status=completed`, `conclusion=success`),
+   job `build` 00:05:40Z → 00:15:03Z, шаги: `Checkout`, `JDK 21`, `Flutter build AAR`, `Android SDK packages`,
+   `local.properties`, `Sanity check`, **`Gradle build (debug)` — success**, `Upload APK` — success.
+   Предыдущий код-SHA `89e8c3e` также собрался успешно (run `43654517930`); промежуточные run'ы на
+   `cde61c4`/`172f90c`/`9f57f5b` помечены `cancelled` — их вытеснил push следующего коммита (`concurrency`,
+   `cancel-in-progress`), это не падения сборки. Шага тестов в workflow нет.
+   **Workflow:** workflow `Build APK` (`.github/workflows/build.yml`) на push в `fix/**`: шаги Flutter AAR → Android SDK → `./gradlew --no-daemon --stacktrace assembleDebug` → upload APK. **Шага тестов в workflow нет** (у токена нет scope `workflow`, добавлять его в этом задании запрещено), поэтому авторитетное число тестов — это локальный прогон выше, а CI доказывает **компиляцию** всех production-файлов (в т.ч. `ToolsPanel.kt`/`UiBridge.kt`, которые локальный JVM-стенд не компилирует).
 6. **Отчёт и WORKLOG** — этот файл и `docs/agent/WORKLOG.md`.
 7. **Неудачные/непроверенные сценарии** перечислены явно: §12 (⛔/🟡) и §13 ниже.
 8. **Безопасная проверка владельцем** — §14 ниже.
@@ -210,9 +221,11 @@ base (iter52)        01f684f
 §8                   0dad31d
 §9                   89e8c3e
 §10                  cde61c4
-handoff (docs+marker) см. коммит с этим отчётом и SOURCE_SHA=<код-SHA>
+§13 отчёт+WORKLOG+U3 172f90c
+§8.3 добор (prod-планировщик) 9f57f5b   ← код-SHA
+handoff (SOURCE_SHA) 889233d             ← на нём прогон CI 43656436771 = success
 ```
-`versionCode = 63`, `versionName = "1.0.63"`, `app/buildinfo.properties: SOURCE_SHA=<код-SHA>` (Gradle читает маркер, `git rev-parse` не используется).
+`versionCode = 63`, `versionName = "1.0.63"`, `app/buildinfo.properties: SOURCE_SHA=9f57f5b` (Gradle читает маркер, `git rev-parse` не используется).
 
 ---
 
@@ -220,7 +233,7 @@ handoff (docs+marker) см. коммит с этим отчётом и SOURCE_SH
 
 | Что | Причина | Следующий шаг |
 |---|---|---|
-| CI на финальном SHA | запускается push'ем handoff-коммита | проверить run `Build APK` на этом SHA, job `build`, фактический шаг `Gradle build (debug)` |
+| CI на финальном SHA | — | **проверено:** run `43656436771` на `889233d` = success, `Gradle build (debug)` ✔ (это `assembleDebug`, не `assembleRelease`) |
 | `assembleRelease` локально | нет Android SDK/JDK 17 в песочнице | выполнять у владельца/в CI; тесты к сборке не привязывать |
 | TTL на проводе | нужен ГУ и `tcpdump` | после включения тумблера — `TTL_CHECK real=…` и замер на проводе |
 | Слышимость звука замка/открытия | нужен ГУ и ухо | включить оба тумблера, послушать, снять лог `STOCK_OK:` |
