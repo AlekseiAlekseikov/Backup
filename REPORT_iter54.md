@@ -1,10 +1,11 @@
 # iter54 — JIT, TTL, звук замка, логи, окна и тумблеры: что реально исправлено
 
 **Ветка:** `fix/v2` (единственная, куда шла запись) · **`--force` не применялся, `main` не пушился**
-**HEAD на момент отчёта:** `789f8f6` · **Кодовый SHA итерации:** `789f8f6` (`SOURCE_SHA` указывает на него)
+**HEAD на момент отчёта:** `e4f22ec` · **Кодовый SHA итерации:** `789f8f6` (`SOURCE_SHA` указывает на него)
 **versionCode 63 / versionName 1.0.63 — не менялись**
 **Локальный прогон:** `bash /home/user/runtests.sh` → **`OK (806 tests)`**, ~55 с
 **CI `Build APK`:** run **`43707141785`** на `789f8f6` — **success** (job `build`, шаг 11 `Gradle build (debug)` ✔, шаг 12 `Upload APK` ✔) · https://github.com/AlekseiAlekseikov/Backup/actions/runs/43707141785
+Handoff-коммит `e4f22ec` — CI run **`43708022868`** — **success** (тот же `build`, debug).
 Предыдущий ран `43705256662` на `d270a2d` — **failure**: `:app:compileDebugKotlin`, `ToolsBackend.kt:1046 Unresolved reference 'status'` (у `ToolsResult` нет поля `status`, сводный статус — `statusWire`). Исправлено в `789f8f6`: добавлен `ToggleIntent.Applied.ofWire(...)`, production переведён на него, добавлен тест. Раньше (iter53/ранние iter54) раны отменялись: `43701879127`, `43702393826`, `43703150481`, `43704050617`, `43704534919`, `43706748051`.
 
 > Терминология отчёта: ✅ — исправлено и покрыто исполняемым тестом; 🟡 — исправлено, но проверка ограничена fake/JVM и/или требует ГУ; ❌ — не сделано/не доказано; ⛔ — проверено быть не может в этой среде.

@@ -15,7 +15,7 @@
 | §9 логи | убрана content-дедупликация (`recoverPendingNew`), позиционная граница (`boundary_dup=N`), слияние `.new` под общим `<name>.lock`, при занятом локе `.new` сохраняется | `Iter54LogTest` (6) | `74ebdac` `OK (789)` |
 | §10 тумблеры | `ToggleIntent` (intent по readback хранилища, applied по статусу действия), `WriteAck{intent, applied}` + `note()`, `decide()` не путает PARTIAL с отказом записи, подписи «сохранено, ждёт применения», `perfJit` показывает последнее известное, а не default | `Iter54ToggleTest` (15) | `d270a2d` `OK (805)` |
 | §10 fix | сводный статус действия — `statusWire` (находка CI: `Unresolved reference 'status'`), `ToggleIntent.Applied.ofWire()` | `Iter54ToggleTest` (16) | `789f8f6` `OK (806)` · CI `43707141785` **success** |
-| handoff | `REPORT_iter54.md`, `WORKLOG.md`, `SOURCE_SHA=789f8f6` | CI на handoff-коммите | этот коммит |
+| handoff | `REPORT_iter54.md`, `WORKLOG.md`, `SOURCE_SHA=789f8f6` | CI `43708022868` на `e4f22ec` — **success** | `e4f22ec` |
 
 ## Инцидент среды
 
