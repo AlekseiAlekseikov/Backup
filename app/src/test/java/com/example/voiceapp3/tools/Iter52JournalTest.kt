@@ -234,33 +234,51 @@ class Iter52JournalTest {
     // ─────────── §5.2: верхний слой определяется по mount_id, а не по порядку строк ───────────
 
     @Test
-    fun topLayerIsChosenByMountIdNotByFileOrder() {
+    fun disagreeingMountIdAndFileOrderIsUnprovenAndTouchesNothing() {
         val (st, targets, env) = stand()
         val stage = env.getValue("STAGE")
         val t = wav(targets)
         st.exec(LockMountScripts.bindScript(stage), "bind.sh", env)
 
-        // Наш слой в таблице, но строка с МЕНЬШИМ id (чужой слой) стоит ПОСЛЕ неё.
+        // Таблица, которую ядро напечатать НЕ МОЖЕТ: наша строка (id=1002) стоит ВЫШЕ, а после
+        // неё идёт строка с id=3. Значит, «порядок наложения» и «значение mount_id» дают разные
+        // ответы о верхнем слое.
+        //
+        // iter54 §7.4: в этом случае НИЧЕГО не снимается. Прежнее правило `max(mount_id)`
+        // выбирало наш слой по id, но настоящий верх определяет порядок таблицы, и угадывать
+        // здесь нельзя: ошибка означает umount ЧУЖОГО слоя.
         val ours = st.mountinfo.readLines().first { it.contains(" ${t.absolutePath} ") }
         val rest = st.mountinfo.readLines().filter { it != ours }
         st.mountinfo.writeText(
             (listOf(ours) + rest + "3 1 8:1 /other/place ${t.absolutePath} rw - ext4 /dev/block/sda1 rw").joinToString("\n") + "\n"
         )
-        val before = st.mountinfo.readText()
-        assertTrue("наша строка выше чужой", before.indexOf(ours) < before.indexOf("/other/place"))
 
         val (rc, out) = st.exec(
             LockMountScripts.restoreScript(listOf(t.absolutePath to stage)), "restore.sh", env
         )
 
-        // Доказательство выбора: снят слой с mid=1002 (наша строка, больший mount_id), а не
-        // нижний с id=3, который стоит последним в файле. Со «последней строкой» скрипт
-        // увидел бы чужой root и не снял ничего.
-        assertTrue("снят именно наш (больший mount_id): $out", out.contains("UMOUNTED_OK:${t.absolutePath}") && out.contains("mid=1002"))
-        assertFalse("нижний слой не принят за наш по порядку строк: $out", out.contains("FOREIGN_MOUNT:${t.absolutePath}"))
-        assertEquals("снятие ровно одно: ${st.mountCalls()}", 1, st.mountCalls().count { it.startsWith("umount") })
-        assertFalse("нашей строки в таблице больше нет", st.mountinfo.readText().contains(ours))
-        assertEquals("исход назван по факту", LockOp.Reconcile.STOCK_RESTORED,
+        assertTrue("расхождение названо, а не сглажено: $out", out.contains("AMBIGUOUS"))
+        assertTrue("исход — «не доказано»: $out", out.contains("STOCK_UNPROVEN"))
+        assertTrue("ни одного umount: ${st.mountCalls()}", st.mountCalls().none { it.startsWith("umount") })
+        assertTrue("наша строка осталась", st.mountinfo.readText().contains(ours))
+        assertFalse("успех не заявлен", LockOp.reconcileVerdict(rc, out, listOf(t.absolutePath)) ==
+            LockOp.Reconcile.STOCK_RESTORED)
+    }
+
+    @Test
+    fun agreeingOrderAndMountIdRemovesTheTopOwnLayer() {
+        val (st, targets, env) = stand()
+        val stage = env.getValue("STAGE")
+        val t = wav(targets)
+        st.exec(LockMountScripts.bindScript(stage), "bind.sh", env)
+        // Согласованная таблица: наш слой последний и с большим id — как печатает ядро.
+        val (rc, out) = st.exec(
+            LockMountScripts.restoreScript(listOf(t.absolutePath to stage)), "restore.sh", env
+        )
+        assertTrue("верх выбран и снят: $out",
+            out.contains("UMOUNTED_OK:${t.absolutePath}") && out.contains("mid="))
+        assertEquals("снятие ровно одно", 1, st.mountCalls().count { it.startsWith("umount") })
+        assertEquals("исход по факту", LockOp.Reconcile.STOCK_RESTORED,
             LockOp.reconcileVerdict(rc, out, listOf(t.absolutePath)))
     }
 

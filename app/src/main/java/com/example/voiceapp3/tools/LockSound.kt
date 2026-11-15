@@ -1564,6 +1564,22 @@ object LockSound {
                 reason = "legacy_corrupt:${read.why}"
             )
         }
+        // iter54 §7.3: ИДЕМПОТЕНТНОСТЬ. Если такая же запись уже перенесена (сбой между
+        // append и переименованием), повтор НЕ добавляет вторую строку: журнал не «пухнет» и
+        // сверка не получает дубль операции.
+        val alreadyThere = when (val cur = LockOp.readJournal(opFile(ctx))) {
+            is LockOp.JournalRead.Readable -> cur.value.ops[op.id]?.encode() == op.encode()
+            else -> false
+        }
+        if (alreadyThere) {
+            AppLog.i(ctx, TAG, "LOCKSOUND_MIGRATE ${op.wire()} appended=0 action=rename_only " +
+                "(запись уже перенесена ранее: перенос идемпотентен)")
+            val dst = File(legacy.parentFile, legacy.name + ".migrated")
+            val ok = runCatching { legacy.renameTo(dst) }.getOrDefault(false)
+            AppLog.i(ctx, TAG, "LOCKSOUND_MIGRATE rename_only dst=${dst.name} ok=$ok " +
+                "(повторного добавления в журнал не было)")
+            return
+        }
         val appended = appendOp(ctx, op, "migrate_legacy")
         when (LockOp.migrationStep(read, appended)) {
             LockOp.MigrationAction.RenameLegacy -> {
@@ -1583,12 +1599,30 @@ object LockSound {
         }
     }
 
-    /** Текущий журнал (все операции с последним состоянием). */
-    internal fun readOpJournal(ctx: Context): LockOp.Journal {
+    /**
+     * Текущий журнал (все операции с последним состоянием).
+     *
+     * iter54 §7.2: результат ТРЁХЗНАЧНЫЙ ([LockOp.JournalRead]). Раньше любая ошибка чтения
+     * превращалась в пустой журнал, и «прочитать нельзя» было неотличимо от «операций не было»:
+     * при недоступном файле сверка молча объявляла «всё в порядке».
+     */
+    internal fun readOpJournal(ctx: Context): LockOp.JournalRead {
         // Читаем журнал ТОЛЬКО после попытки переноса старой записи: иначе незавершённая операция
         // прошлой версии останется невидимой для сверки.
         migrateLegacyOp(ctx)
-        return LockOp.parseJournal(runCatching { opFile(ctx).readText() }.getOrNull())
+        val r = LockOp.readJournal(opFile(ctx))
+        when (r) {
+            is LockOp.JournalRead.Unknown ->
+                AppLog.w(ctx, TAG, "LOCKSOUND_JOURNAL ${r.wire()} action=none " +
+                    "(журнал НЕ пуст и НЕ пуст-доказанно: сверка по нему не объявляет «всё снято»)")
+            is LockOp.JournalRead.Absent ->
+                AppLog.i(ctx, TAG, "LOCKSOUND_JOURNAL ${r.wire()}")
+            is LockOp.JournalRead.Readable -> if (r.value.broken > 0) {
+                AppLog.w(ctx, TAG, "LOCKSOUND_JOURNAL ${r.wire()} " +
+                    "(повреждённые строки = «неизвестно», а не «операции не было»)")
+            }
+        }
+        return r
     }
 
     /**
@@ -1615,10 +1649,19 @@ object LockSound {
 
     /** Тело сверки — выполняется под [ioGate] (см. [reconcilePendingOps]). */
     private fun reconcileLocked(ctx: Context, source: String): Boolean {
-        val journal = readOpJournal(ctx)
+        val read = readOpJournal(ctx)
+        if (read is LockOp.JournalRead.Unknown) {
+            // «Прочитать нельзя» — это НЕ «операций не было»: объявлять «всё снято» и
+            // сходиться к намерению нельзя, пока неизвестно, что в журнале.
+            AppLog.e(ctx, TAG, "LOCKSOUND_RECONCILE source=$source action=stop ${read.wire()} " +
+                "(сверка невозможна: неизвестно, есть ли незавершённые операции)")
+            return true
+        }
+        val journal = read.journal
         val pending = journal.unresolved()
         if (pending.isEmpty()) {
-            AppLog.i(ctx, TAG, "LOCKSOUND_RECONCILE source=$source action=none journal=«${journal.wire()}»")
+            AppLog.i(ctx, TAG, "LOCKSOUND_RECONCILE source=$source action=none journal=«${journal.wire()}» " +
+                "read=${if (read is LockOp.JournalRead.Absent) "absent" else "readable"}")
             return false
         }
         AppLog.i(ctx, TAG, "LOCKSOUND_RECONCILE source=$source pending=${pending.size} " +

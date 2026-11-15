@@ -123,6 +123,66 @@ internal object LockOp {
         return Journal(out, broken, lines)
     }
 
+    /**
+     * iter54 §7.2 — РЕЗУЛЬТАТ ЧТЕНИЯ ЖУРНАЛА: три различимых факта вместо «журнала нет».
+     *
+     * Дефект: `readOpJournal` читал файл и на ЛЮБУЮ ошибку возвращал пустой журнал. «Файла нет»
+     * (ENOENT — операций не было) и «прочитать нельзя» (EACCES/ошибка ввода-вывода) выглядели
+     * одинаково, поэтому при недоступном журнале незавершённая операция просто исчезала из
+     * сверки, а `unresolved().isEmpty()` объявляло «всё в порядке».
+     *
+     * Теперь:
+     *  • [Absent] — файла действительно НЕТ (ENOENT): операций не было;
+     *  • [Unknown] — файл есть, но не читается (EACCES/EIO/исключение): НЕЛЬЗЯ считать пустым;
+     *  • [Readable] — прочитан; `broken > 0` означает повреждённые строки (это тоже не «пусто»).
+     */
+    sealed interface JournalRead {
+        val journal: Journal get() = Journal(emptyMap(), 0, 0)
+
+        data object Absent : JournalRead
+        data class Unknown(val why: String) : JournalRead
+        data class Readable(val value: Journal) : JournalRead {
+            override val journal: Journal get() = value
+        }
+
+        fun wire(): String = when (this) {
+            is Absent -> "journal=absent (ENOENT: операций не было)"
+            is Unknown -> "journal=unknown why=$why (читать нельзя — «пусто» не заявляется)"
+            is Readable -> "journal=readable ${value.wire()}" +
+                (if (value.broken > 0) " corrupt_lines=${value.broken}" else "")
+        }
+    }
+
+    /**
+     * Прочитать журнал, различая «нет файла»/«не читается»/«прочитан».
+     *
+     * @param read выполняет фактическое чтение (в production — файл, в тестах — подставное).
+     */
+    fun readJournal(file: java.io.File?): JournalRead {
+        if (file == null) return JournalRead.Unknown("no_path")
+        if (!file.exists()) {
+            // Каталога нет — это не «журнал пуст», а «среда не та»: сюда писать и читать нельзя.
+            return if (file.parentFile?.exists() == false) JournalRead.Unknown("parent_missing")
+            else JournalRead.Absent
+        }
+        val text = try {
+            file.readText()
+        } catch (t: Throwable) {
+            // Linux отдаёт EACCES как FileNotFoundException("… (Permission denied)"): по одному
+            // типу исключения «нет прав» и «нет файла» не различить, поэтому смотрим текст.
+            val msg = t.message.orEmpty()
+            return JournalRead.Unknown(
+                when {
+                    t is SecurityException -> "eacces"
+                    msg.contains("Permission denied", true) -> "eacces"
+                    t is java.io.FileNotFoundException -> "enoent_race"
+                    else -> "io:" + t.javaClass.simpleName
+                }
+            )
+        }
+        return JournalRead.Readable(parseJournal(text))
+    }
+
     /** Строка журнала для добавления: время + закодированное состояние. */
     fun journalLine(op: BindOp, now: Long): String = "$now|${op.encode()}"
 

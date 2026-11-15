@@ -284,9 +284,13 @@ class Iter49Test {
         assertTrue("несовпадение root — не наше", b.contains("vwhy=\"root_mismatch\""))
         assertTrue("несовпадение инода — не подтверждено", b.contains("dev_ino_mismatch"))
         assertTrue("факт печатается даже при неудачной проверке", b.contains("MOUNT_FACT:"))
-        // iter52 §5.2: верхний слой выбирается по максимальному mount_id, а не по последней
-        // строке файла — порядок строк mountinfo не порядок вложения слоёв.
-        assertTrue("верх выбирается по mount_id", b.contains("method=max_mount_id"))
+        // iter54 §7.4: верхний слой — ПОСЛЕДНЯЯ строка таблицы (порядок наложения даёт ядро),
+        // а mount_id служит сверкой. Ответ «max(mount_id)» ошибался, когда порядок таблицы и
+        // значения id расходились (после `umount -l`/повторного bind) — тогда выбирался слой,
+        // который ядро верхним не считает.
+        assertTrue("метод назван честно",
+            b.contains("method=mountinfo_order_with_mount_id_corroboration"))
+        assertTrue("при расхождении порядка и id — «не доказано»", b.contains("AMBIGUOUS||"))
         assertTrue("при нечисловом id — «не доказано», а не «слоя нет»", b.contains("AMBIGUOUS||"))
         assertFalse("последняя строка файла не используется как «верхний слой»",
             b.contains("mi_layers \"\${'$'}1\" | tail -1"))
