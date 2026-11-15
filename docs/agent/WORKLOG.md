@@ -1839,3 +1839,37 @@ CI `43464916714` (`15dd3b2`) — success (сборка; unit-тестов в wor
 - CI `Build APK` на `0d375ad`: **run `43642156111` — success**. Это и есть точный финальный
   код-SHA, на котором собран APK 1.0.63 (versionCode 63).
 - CI `Build APK` на финальном SHA `829a1a5` (docs-only поверх `0d375ad`): **run `43643297073` — success**.
+
+---
+
+## iter53 — сквозное исправление JIT/TTL/звук/UI/логи
+
+Ветка `fix/v2`, versionCode 63 / 1.0.63. Отчёт: `docs/agent/REPORT_iter53_ИСПРАВЛЕНИЕ_ЗВУК_TTL_JIT_UI_ЛОГИ.md`.
+
+### Коммиты
+- `52a3852` §4 JIT: claim — типизированное чтение (`CS_BEGIN/CLAIM_STATUS={present|absent|empty|unreadable}`,
+  `TERM_STATUS/TERM_VALUE`), `internet=not_checked`, `cmd package compile` как изменяющая команда.
+- `51aa7c0` §5 JIT: `ts_ms`/`ts_s` с проверкой диапазона, claim под тем же device-lock (TOCTOU),
+  takeover только по доказанной смерти владельца (`pid+pstart+boot`), клик блокируется при живом владельце.
+- `d5ef133` §6 доставка: типизированный `State` (`RUN_UNKNOWN` и др.), evidence (`.sh`/`.done`, `.started`)
+  при неизвестном результате, сверка содержимого `cksum→md5sum→od|awk`, `exit 97` без инструментов.
+- `2b2ae31` §7 звук: сверка по КАЖДОЙ цели (rc первым, дубли/extra/lazy detach), идемпотентная crash-safe
+  миграция `locksound_op.txt`, `JournalRead{NotFound,Parsed,Unknown}`, ownership mount, «не снимать чужое».
+- `0dad31d` §8 TTL: маркер владения (`-m comment`, проба `VAPP_TTLPROBE`, `TTL_MIGRATE`, `ours_unmarked`),
+  разделение «владение правилом» и «чужие ссылки» (`TTL_REF_KEEP`, OFF `referenced_elsewhere`), откат по
+  факту изменения (`TOUCHED_*`, `partial_after_stop`), реальное продолжение после бюджета + coalescing.
+- `89e8c3e` §9 UI: причинная свежесть снимка (`clickId` + ревизия записи + `$acks`), эвристика «два ответа =
+  факт» удалена; разбор настоящего `tools.state` вынесен в production `ToolsSnapshotFold`.
+- `cde61c4` §10 логи: `Liveness{LIVE_SAME_PROCESS,DEAD_OR_DIFFERENT_PROCESS,UNKNOWN}`, доступность `/proc`
+  через `self/stat`, отложенные владельцы в `<журнал>.orphans`, атомарное резервирование имени work-файла,
+  lock после захвата, восстановление «повисшего» `.new` в контексте drain.
+
+### Проверено / не проверено
+- `bash runtests.sh` → **OK (747 tests)** (последний лог `/home/user/diag/run53_57.log`).
+- Новые файлы тестов: `Iter53TtlTest` (13), `Iter53UiTest` (15), `Iter53LogTest` (11); обновлены
+  `Iter48Test`, `Iter50TtlArgvTest`, `Iter51LogOrphanTest`, `Iter52TogglesUiTest`, `Iter52LogIdentityTest`.
+- **Не компилируются локально** (`ToolsPanel.kt`, `UiBridge.kt`, `ToolsBackend.kt`, `LockSound.kt`,
+  `JitNet.kt`, `WindowDoors.kt`, `AdbClient.kt`) — проверяет CI `Build APK` на финальном SHA.
+- **Не проверено (⛔/🟡)**: ГУ 1.0.63 владельцем, слышимость звука, TTL на проводе, JIT-компиляция и
+  `ctl.restart zygote`, VHAL окон, рендер/слушатели панели, слот «заряд/наружная» в SystemUI-плагине,
+  межпроцессная корректность lock на f2fs/ext4 ГУ. `assembleRelease` локально невозможен (нет Android SDK).

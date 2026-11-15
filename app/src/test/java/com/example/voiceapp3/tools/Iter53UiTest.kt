@@ -251,4 +251,22 @@ class Iter53UiTest {
             code("src/main/java/com/example/voiceapp3/tools/ToolsBackend.kt")
                 .contains("val revAfter = writeRevision.incrementAndGet()"))
     }
+
+    // ───────────────── §9.2 (U3): заряд OFF не стирает выбор наружной ─────────────────
+
+    @Test
+    fun batteryOffKeepsTheSavedOutsideTemperatureChoice() {
+        val backend = code("src/main/java/com/example/voiceapp3/tools/ToolsBackend.kt")
+        // Запись тумблера меняет ТОЛЬКО свой ключ: клик по заряду не пишет и не сбрасывает
+        // ключ наружной температуры (её выбор сохраняется).
+        assertTrue("пишется ровно ключ тумблера",
+            backend.contains("Prefs2.putBooleanEx(appContext, toggle.pref, value)"))
+        val setImpl = backend.substringAfter("private fun setImpl(")
+        assertFalse("в записи тумблера нет сброса наружной",
+            setImpl.contains("putBoolean") && setImpl.contains("HVAC_DIGITAL_EXT_TEMP)") &&
+                setImpl.contains("putBoolean(true)"))
+        val panel = code("src/main/java/com/example/voiceapp3/ui/ToolsPanel.kt")
+        assertFalse("панель не стирает выбор наружной при выключении заряда",
+            panel.contains("hvacdigital_temp_ext\", false") || panel.contains("remove(\"hvacExtTemp"))
+    }
 }
