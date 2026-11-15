@@ -96,7 +96,10 @@ class Iter52JitOwnTest {
         assertTrue("чужую блокировку не сняли", lock().exists())
         assertTrue("чужую блокировку не перезаписали", lock().readText().startsWith("op=b;"))
         val t = term("a").readText()
-        assertTrue("отказ записан в terminal: «$t»", t.contains("REFUSED op=a reason=lock_held"))
+        // iter54 §4: в строке отказа появилась идентичность экземпляра (`inst=`), поэтому
+        // проверяются её обязательные части, а не точная склейка.
+        assertTrue("отказ записан в terminal: «$t»",
+            t.contains("REFUSED op=a") && t.contains("reason=lock_held"))
         assertTrue("и закрыт END, чтобы фаза не осталась «идёт»", t.contains("END rc=0 op=a"))
         assertFalse("START не писался (опасных действий не было)", t.contains("START"))
     }

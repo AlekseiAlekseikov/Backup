@@ -54,8 +54,26 @@ internal object JitDev {
         // 1) Запись claim: iter53 §5.2 — она идёт ПОД lock и отвечает протоколом CL_*.
         //    `printf '%s\n' '<строка>' > /data/local/tmp/voiceapp3_jit.claim`.
         if (command.contains("CL_BEGIN") && command.contains(JitOwn.CLAIM)) {
-            val line = Regex("printf '%s[^']*' '([^']*)'").find(command)?.groupValues?.get(1)
+            // iter54 §4: запись claim теперь несёт ПОЛНУЮ идентичность экземпляра
+            // (`inst/pid/pstart/boot`) и выполняется атомарной заменой (tmp+mv). Fake обязан
+            // отвечать тем же протоколом, иначе он проверяет формат, которого нет на устройстве.
+            val head = Regex("op=([A-Za-z0-9_.-]{1,64});ts_ms=(\\d{1,19});ts_s=\\d{1,19};want=([01])")
+                .find(command)
                 ?: return 0 to "CL_BEGIN\nCL_STATUS=failed\nCL_END"
+            val op = head.groupValues[1]
+            val ts = head.groupValues[2].toLong()
+            val w = head.groupValues[3]
+            val inst = Regex(";inst=([A-Za-z0-9_.:\\-]{1,96});")
+                .find(command)?.groupValues?.get(1) ?: "$op-$ts-fake"
+            val cur = claim
+            val curOp = cur?.let { Regex("^op=([A-Za-z0-9_.-]{1,64})").find(it)?.groupValues?.get(1) }
+            val curTs = cur?.let { Regex("ts_ms=(\\d{1,19})").find(it)?.groupValues?.get(1)?.toLongOrNull() }
+            // Порядок намерений: более старое намерение не перезаписывает более новое.
+            if (curOp != null && curOp != op && curTs != null && curTs >= ts) {
+                return 0 to "CL_BEGIN\nCL_ORDER seen_op=$curOp seen_ts_ms=$curTs verdict=older_intent\n" +
+                    "CL_STATUS=stale\nCL_WHY=newer_intent_older_intent\nCL_OWNER=$cur\nCL_END"
+            }
+            val line = "op=$op;ts_ms=$ts;ts_s=${ts / 1000};want=$w;inst=$inst;pid=1;pstart=0;boot=fake"
             claim = line
             return 0 to "CL_BEGIN\nCL_STATUS=taken\nCL_VALUE=$line\nCL_END"
         }

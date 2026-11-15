@@ -105,6 +105,18 @@ internal object JitOwn {
     /** Миллисекунды → секунды (единственное место, где выполняется деление). */
     fun msToS(ms: Long): Long = ms / 1000L
 
+    /**
+     * iter54 §4 — идентификатор ЭКЗЕМПЛЯРА клика, один на всю цепочку.
+     *
+     * Почему он создаётся в Kotlin, а не в shell: claim пишет ОДИН процесс, а payload исполняет
+     * ДРУГОЙ (каждый `su -c` — новый shell со своим `$$`). Если бы экземпляр определялся по `$$`,
+     * гвардия всегда видела бы «другой экземпляр» и отказывалась бы работать. Поэтому `inst`
+     * выдаётся один раз на клик и передаётся и в запись claim, и в гвардию; `pid`/`pstart`/`boot`
+     * по-прежнему подставляет сам shell — это ДОКАЗАТЕЛЬСТВО того, кто именно исполнил.
+     */
+    fun newInstance(opId: String, tsMs: Long, nonce: Int = 0): String =
+        if (nonce == 0) "$opId-$tsMs" else "$opId-$tsMs-n$nonce"
+
     /** Стабильный префикс terminal-файлов. */
     const val TERM_PREFIX = "$BASE/voiceapp3_jit_"
 
@@ -127,6 +139,42 @@ internal object JitOwn {
     enum class State { CREATED, CLAIMED, SENT, STARTED, FINISHED, REFUSED, UNKNOWN }
 
     /**
+     * iter54 §4 — идентичность КОНКРЕТНОГО экземпляра исполнения.
+     *
+     * @param inst  `<opId>-<tsMs>-<pid>`: различает экземпляры ОДНОЙ операции;
+     * @param pid   pid shell, взявшего владение;
+     * @param pstart starttime pid'а (поле 22 `/proc/<pid>/stat`) — защита от переиспользования pid;
+     * @param boot  boot_id текущей загрузки: pid/pstart из другой загрузки ничего не доказывают.
+     */
+    data class ClaimIdentity(
+        val inst: String,
+        val pid: String,
+        val pstart: String,
+        val boot: String
+    ) {
+        fun wire(): String = ";inst=$inst;pid=$pid;pstart=$pstart;boot=$boot"
+
+        /** Разбор хвоста записи. `null` — поля нет/испорчено (тогда это НЕ идентичность). */
+        companion object {
+            private val RE = Regex(
+                ";inst=([A-Za-z0-9_.:\\-]{1,96});pid=(\\d{1,10});pstart=(\\d{1,20}|\\?);" +
+                    "boot=([A-Za-z0-9\\-]{0,64})$"
+            )
+
+            fun parse(raw: String?): ClaimIdentity? {
+                if (raw == null) return null
+                val m = RE.find(raw) ?: return null
+                return ClaimIdentity(
+                    inst = m.groupValues[1],
+                    pid = m.groupValues[2],
+                    pstart = m.groupValues[3],
+                    boot = m.groupValues[4]
+                )
+            }
+        }
+    }
+
+    /**
      * Запись операции: id, время, желаемое состояние, фаза.
      *
      * iter53 §5.1: [tsMs] — ВСЕГДА миллисекунды, и это видно из имени поля. Раньше поле `ts`
@@ -139,7 +187,17 @@ internal object JitOwn {
         val want: Boolean,
         val state: State,
         /** Кто владеет: обычно идентификатор процесса/сессии, чтобы не приписать чужое. */
-        val owner: String = ""
+        val owner: String = "",
+        /**
+         * iter54 §4: ПОЛНАЯ идентичность владельца (`inst` + `pid` + `pstart` + `boot`).
+         *
+         * Один `operationId` может исполняться НЕСКОЛЬКИМИ экземплярами shell (повторный клик,
+         * повторная отправка, ретрай транспорта). Раньше владение сводилось к `opId`, поэтому
+         * отказ экземпляра B записывался как факт про операцию A: `END rc=0` после `START` A
+         * выглядел как «A завершилась успешно». Теперь владелец — это opId+экземпляр+загрузка+
+         * процесс, и terminal читается ПО ЭКЗЕМПЛЯРУ.
+         */
+        val identity: ClaimIdentity? = null
     ) {
         /** Секунды (только для сравнения с `date +%s`, см. [msToS]). */
         val tsS: Long get() = msToS(tsMs)
@@ -149,7 +207,11 @@ internal object JitOwn {
                 (if (owner.isEmpty()) "" else ";owner=$owner")
 
         /** Строка для claim-файла: без состояния (оно локальное) — только владение. */
-        fun claimLine(): String = "op=$id;ts_ms=$tsMs;want=${if (want) 1 else 0}"
+        fun claimLine(): String =
+            "op=$id;ts_ms=$tsMs;want=${if (want) 1 else 0}" + (identity?.wire() ?: "")
+
+        /** Тот же opId и то же намерение, но ДРУГОЙ экземпляр исполнения. */
+        fun sameIntent(otherOp: Op): Boolean = id == otherOp.id && tsMs == otherOp.tsMs
 
         companion object {
             /** Явное имя единицы в записи: `ts_ms=`, `ts_s=`; старое `ts=` — только чтение. */
@@ -189,17 +251,25 @@ internal object JitOwn {
                 )
             }
 
-            /** Разобрать claim-файл: `op=<id>;ts_ms=…;want=…` (старое `ts=` тоже принимается). */
+            /**
+             * Разобрать claim-файл: `op=<id>;ts_ms=…;want=…` c НЕОБЯЗАТЕЛЬНОЙ полной
+             * идентичностью экземпляра (`;inst=…;pid=…;pstart=…;boot=…`). Старое `ts=` и запись
+             * без идентичности принимаются (совместимость), но тогда владелец НЕ доказан
+             * по экземпляру — это видно по `identity == null`.
+             */
             fun parseClaim(raw: String?): Op? {
                 if (raw == null) return null
                 val line = raw.trim()
-                val m = Regex("^op=([A-Za-z0-9_.-]{1,64});(?:ts_(?:ms|s)|ts)=\\d{1,19};want=([01])$")
-                    .matchEntire(line) ?: return null
+                val m = Regex(
+                    "^op=([A-Za-z0-9_.-]{1,64});(?:ts_(?:ms|s)|ts)=\\d{1,19};want=([01])" +
+                        "(?:;inst=.*)?$"
+                ).matchEntire(line) ?: return null
                 return Op(
                     id = m.groupValues[1],
                     tsMs = parseTsMs(line) ?: 0L,
                     want = m.groupValues[2] == "1",
-                    state = State.CLAIMED
+                    state = State.CLAIMED,
+                    identity = ClaimIdentity.parse(line)
                 )
             }
         }
@@ -241,6 +311,17 @@ _jit_owner_dead() {
   if [ -n "${'$'}_cur" ] && [ -n "${'$'}_lopst" ] && [ "${'$'}_cur" != "${'$'}_lopst" ]; then return 1; fi
   return 0
 }
+# ── АТОМАРНЫЙ захват блокировки ────────────────────────────────────────────
+# Файл lock появляется СРАЗУ с содержимым: temp + `ln` (жёсткая ссылка). Прежняя схема
+# «set -C; printf > lock» создавала файл и лишь затем писала в него, поэтому конкурент мог
+# прочитать ПУСТОЙ lock и решить, что владельца нет (или что владелец недоказуем).
+_jit_take_lock() {
+  _tl=${lock}.tmp.${'$'}${'$'}
+  printf '%s\n' "${'$'}1" > "${'$'}_tl" 2>/dev/null || { rm -f "${'$'}_tl" 2>/dev/null; return 1; }
+  if ln "${'$'}_tl" ${lock} 2>/dev/null; then rm -f "${'$'}_tl" 2>/dev/null; return 0; fi
+  rm -f "${'$'}_tl" 2>/dev/null
+  return 1
+}
 # ── освободить ТОЛЬКО свою блокировку ─────────────────────────────────────
 _jit_release() {
   _cl=${'$'}(cat ${lock} 2>/dev/null)
@@ -268,34 +349,85 @@ _jit_release() {
     fun claimCmd(op: Op, base: String = BASE): String {
         val claim = claimPath(base)
         val lock = lockPath(base)
-        val line = op.claimLine()
-        val inst = "${op.id}-${op.tsMs}-\$\$"
+        val inst = op.identity?.inst ?: "${op.id}-${op.tsMs}-\$\$"
+        // Префикс terminal-файлов: нужен, чтобы уступить владение только ЗАВЕРШИВШЕМУСЯ
+        // более новому намерению (см. ниже), не собирая путь в shell из ненадёжной склейки.
+        val termPrefix = "$base/voiceapp3_jit_"
         return """
 set +e
 echo CL_BEGIN
 _me_inst=${inst}
 ${ownHelpers(base)}
-_me_line="op=${op.id};ts_ms=${op.tsMs};ts_s=${op.tsS};inst=${'$'}_me_inst;pid=${'$'}_me_pid;pstart=${'$'}{_me_pstart:-?};boot=${'$'}{_me_boot:-?}"
-_cl_status=failed; _cl_owner=""
+_me_line="op=${op.id};ts_ms=${op.tsMs};ts_s=${op.tsS};want=${if (op.want) 1 else 0};inst=${'$'}_me_inst;pid=${'$'}_me_pid;pstart=${'$'}{_me_pstart:-?};boot=${'$'}{_me_boot:-?}"
+_cl_status=failed; _cl_owner=""; _cl_why=""
+# ── порядок НАМЕРЕНИЙ: поздний claim не отменяет более новое намерение ────────
+# `ts_ms` — время клика владельца, а не время выполнения команды. Если в claim уже лежит
+# БОЛЕЕ НОВОЕ намерение, эта (устаревшая) операция не имеет права его перезаписать: иначе
+# «догоняющий» устаревший payload снимал бы решение, которое владелец принял позже.
+# Перезапись чужого claim допускается только если новее МЫ или владелец доказанно мёртв И
+# его terminal показывает завершение (END/REFUSED).
+_cm_seen=$(cat ${claim} 2>/dev/null)
+_cm_ts=$(printf '%s' "${'$'}_cm_seen" | sed -n 's/.*ts_ms=\([0-9][0-9]*\).*/\1/p')
+_cm_op=$(printf '%s' "${'$'}_cm_seen" | sed -n 's/^op=\([A-Za-z0-9_.-]*\).*/\1/p')
+_cm_verdict=free
+if [ -n "${'$'}_cm_op" ] && [ "${'$'}_cm_op" != "${op.id}" ] && [ -n "${'$'}_cm_ts" ]; then
+  if [ "${'$'}_cm_ts" -gt ${op.tsMs} ]; then
+    _cm_verdict=older_intent
+  elif [ "${'$'}_cm_ts" -eq ${op.tsMs} ]; then
+    _cm_verdict=ts_tie
+  else
+    _cm_verdict=newer_intent
+  fi
+fi
+if [ "${'$'}_cm_verdict" = "older_intent" ]; then
+  # Чужое намерение новее. Уступаем, НО: если его экземпляр доказанно мёртв и он уже
+  # завершился (END/REFUSED) — владение свободно.
+  _cm_term="${termPrefix}${'$'}{_cm_op}.term"
+  # `_jit_owner_dead`: rc 0 = «жив ИЛИ смерть недоказуема» (перехватывать нельзя), rc 1 = смерть
+  # доказана. Уступаем владение только во ВТОРОМ случае и только при доказанном завершении.
+  if ! _jit_owner_dead "${'$'}_cm_seen" && \
+     { grep -q "END rc=" "${'$'}_cm_term" 2>/dev/null || grep -q "REFUSED op=" "${'$'}_cm_term" 2>/dev/null; }; then
+    _cm_verdict=newer_finished
+  fi
+fi
+echo "CL_ORDER seen_op=${'$'}{_cm_op:-none} seen_ts_ms=${'$'}{_cm_ts:-none} verdict=${'$'}_cm_verdict"
+case "${'$'}_cm_verdict" in
+  older_intent|ts_tie)
+    _cl_status=stale; _cl_owner="${'$'}_cm_seen"
+    _cl_why="newer_intent_${'$'}{_cm_verdict}" ;;
+  *)
 if [ -f ${lock} ]; then
   _lo=${'$'}(cat ${lock} 2>/dev/null)
   if ! _jit_owner_dead "${'$'}_lo"; then
     mv ${lock} ${lock}.dead.${'$'}${'$'} 2>/dev/null
-    ( set -C; printf '%s\n' "${'$'}_me_line" > ${lock} ) 2>/dev/null || {
+    _jit_take_lock "${'$'}_me_line" || {
       mv ${lock}.dead.${'$'}${'$'} ${lock} 2>/dev/null; _cl_owner="${'$'}_lo"; _cl_status=busy; }
   else
     _cl_status=busy; _cl_owner="${'$'}_lo"
   fi
 else
-  ( set -C; printf '%s\n' "${'$'}_me_line" > ${lock} ) 2>/dev/null || { _cl_owner="race"; _cl_status=busy; }
+  _jit_take_lock "${'$'}_me_line" || { _cl_owner="race"; _cl_status=busy; }
 fi
+# ── ПОД lock: замена claim АТОМАРНА (tmp + mv), а не «exists + запись по месту» ──
 if [ "${'$'}_cl_status" != "busy" ]; then
-  printf '%s\n' '${line}' > ${claim} 2>/dev/null
+  _tmp="${claim}.tmp.${'$'}${'$'}"
+  printf '%s\n' "${'$'}_me_line" > "${'$'}_tmp" 2>/dev/null
+  _wr=${'$'}?
+  if [ "${'$'}_wr" = "0" ] && mv "${'$'}_tmp" ${claim} 2>/dev/null; then
+    _cl_status=written
+  else
+    rm -f "${'$'}_tmp" 2>/dev/null; _cl_status=failed
+  fi
   _rb=${'$'}(cat ${claim} 2>/dev/null)
-  if [ "${'$'}_rb" = '${line}' ]; then _cl_status=taken; else _cl_status=failed; fi
+  # «записано» и «подтверждено чтением» — разные факты: taken ставится ТОЛЬКО после readback.
+  if [ "${'$'}_cl_status" = "written" ]; then
+    if [ "${'$'}_rb" = "${'$'}_me_line" ]; then _cl_status=taken; else _cl_status=failed; fi
+  fi
   _jit_release
-fi
+fi ;;
+esac
 echo "CL_STATUS=${'$'}_cl_status"
+[ -n "${'$'}_cl_why" ] && echo "CL_WHY=${'$'}_cl_why"
 [ "${'$'}_cl_status" = "taken" ] && echo "CL_VALUE=${'$'}_rb"
 [ -n "${'$'}_cl_owner" ] && echo "CL_OWNER=${'$'}_cl_owner"
 echo CL_END
@@ -306,6 +438,13 @@ echo CL_END
     sealed interface ClaimWrite {
         data class Taken(val line: String) : ClaimWrite
         data class Busy(val owner: String) : ClaimWrite
+
+        /**
+         * iter54 §4: на устройстве уже лежит БОЛЕЕ НОВОЕ намерение. Это не «занято на время»:
+         * уступающий обязан остановиться насовсем (его решение отменено владельцем позже).
+         */
+        data class Stale(val newer: String) : ClaimWrite
+
         data class Failed(val why: String) : ClaimWrite
     }
 
@@ -323,6 +462,7 @@ echo CL_END
         return when (status.first()) {
             "taken" -> if (value.size == 1) ClaimWrite.Taken(value.first()) else ClaimWrite.Failed("value_missing")
             "busy" -> ClaimWrite.Busy(owner.firstOrNull() ?: "unknown")
+            "stale" -> ClaimWrite.Stale(owner.firstOrNull() ?: "unknown")
             "failed" -> ClaimWrite.Failed("device_failed")
             else -> ClaimWrite.Failed("status_unknown=${status.first()}")
         }
@@ -408,8 +548,14 @@ echo CS_END
     /** Полный разбор ответа [readCmd]: владение + terminal одной командой. */
     data class ReadReply(val claim: ClaimRead, val term: TermRead?)
 
+    /**
+     * iter54 §4: claim теперь несёт ПОЛНУЮ идентичность владельца, поэтому хвост
+     * `;inst=…;pid=…;pstart=…;boot=…` — часть допустимого формата (необязательная: старые
+     * записи без него читаются, но тогда владение по экземпляру не доказано).
+     */
     private val CLAIM_VALUE_RE = Regex(
-        "^op=([A-Za-z0-9_.-]{1,64});(?:ts_(?:ms|s)|ts)=(\\d{1,19});want=([01])${'$'}"
+        "^op=([A-Za-z0-9_.-]{1,64});(?:ts_(?:ms|s)|ts)=(\\d{1,19})(?:;ts_s=\\d{1,19})?;" +
+            "want=([01])(?:;inst=.*)?${'$'}"
     )
 
     /**
@@ -460,7 +606,8 @@ echo CS_END
                         id = m.groupValues[1],
                         tsMs = tsMs,
                         want = m.groupValues[3] == "1",
-                        state = State.CLAIMED
+                        state = State.CLAIMED,
+                        identity = ClaimIdentity.parse(raw)
                     )
                 )
             }
@@ -491,6 +638,39 @@ echo CS_END
     }
 
     /**
+     * iter54 §4 — РЕШЕНИЕ ОБ ОТПРАВКЕ PAYLOAD по исходу захвата владения.
+     *
+     * Это единственное место, где «claim не записан» превращается в «payload не отправляется».
+     * Раньше `ClaimWrite.Failed` логировался как `action=proceed`, и скрипт всё равно уходил на
+     * устройство: гвардия, прочитав НЕ наш claim, отказывалась работать, и клик гарантированно
+     * ничего не делал — но в журнале это было «отправлено», то есть исход подменялся намерением.
+     *
+     * Правила:
+     *  • `Taken` → можно отправлять (владелец записан и проверен чтением);
+     *  • `Busy` → нельзя: владелец жив или его смерть не доказана;
+     *  • `Stale` → нельзя и повторять не нужно: намерение отменено более НОВЫМ решением;
+     *  • `Failed` → нельзя: граница записи намерения не установлена, fencing отсутствует.
+     *    Это честный pending: намерение владельца сохранено, но применять его «вслепую» нельзя.
+     */
+    data class Gate(val send: Boolean, val code: String, val why: String)
+
+    fun claimGate(write: ClaimWrite): Gate = when (write) {
+        is ClaimWrite.Taken -> Gate(true, "claimed", "владение записано и проверено чтением")
+        is ClaimWrite.Busy -> Gate(
+            false, "op_in_flight",
+            "на устройстве владеет другая JIT-операция, её завершение не доказано"
+        )
+        is ClaimWrite.Stale -> Gate(
+            false, "superseded_by_newer_intent",
+            "на устройстве более НОВОЕ намерение: устаревшая операция не имеет права его снять"
+        )
+        is ClaimWrite.Failed -> Gate(
+            false, "claim_unproven",
+            "запись/чтение claim не подтверждены (${write.why}): fencing нет, payload не отправляется"
+        )
+    }
+
+    /**
      * Гвардия payload: доказанная защита от ПОЗДНЕГО и ОДНОВРЕМЕННОГО исполнения.
      *
      * Вставляется в самое начало скрипта, до любых side effect. Модель (iter53 §5.2):
@@ -515,14 +695,18 @@ echo CS_END
         val tsMs = op.tsMs
         val tsS = op.tsS
         // `inst` различает ЭКЗЕМПЛЯРЫ одной операции: тот же opId в другом процессе — не владелец.
-        val inst = "$id-$tsMs-\$\$"
+        // Значение приходит из Kotlin (один экземпляр на клик) и совпадает с записанным в claim;
+        // без него — `$$` этого shell (совместимость/тесты).
+        val inst = op.identity?.inst ?: "$id-$tsMs-\$\$"
         return """
 # ── iter53 §5: lock, ПОД lock актуальный claim, и только потом действие ────
+# Идентичность экземпляра объявляется ПЕРВОЙ: её пишут и отказ, и terminal.
+_me_inst=${inst}
 _vc=${'$'}(cat ${claim} 2>/dev/null)
 _lo=""
 _refuse() {
-  echo "REFUSED op=${id} reason=${'$'}1 detail=${'$'}2 claim=${'$'}{_vc:-none}" >> ${term} 2>/dev/null
-  echo "END rc=0 op=${id}" >> ${term} 2>/dev/null
+  echo "REFUSED op=${id} inst=${'$'}{_me_inst:-?} reason=${'$'}1 detail=${'$'}2 claim=${'$'}{_vc:-none}" >> ${term} 2>/dev/null
+  echo "END rc=0 op=${id} inst=${'$'}{_me_inst:-?} refused=1" >> ${term} 2>/dev/null
   echo "JIT_REFUSED op=${id} reason=${'$'}1 claim=${'$'}{_vc:-none} lock=${'$'}{_lo:-none}"
   exit 0
 }
@@ -533,7 +717,6 @@ case "${'$'}_vc" in
   "op=${id};"*|"op=${id}") : ;;
   *) _refuse superseded "claim=${'$'}{_vc:-none}" ;;
 esac
-_me_inst=${inst}
 ${ownHelpers(base)}
 _me_line="op=${id};ts_ms=${tsMs};ts_s=${tsS};inst=${'$'}_me_inst;pid=${'$'}_me_pid;pstart=${'$'}{_me_pstart:-?};boot=${'$'}{_me_boot:-?}"
 _lk=0
@@ -545,7 +728,7 @@ if [ -f ${lock} ]; then
   if ! _jit_owner_dead "${'$'}_lo"; then
     # смерть доказана — перехват, и это ПИШЕТСЯ с доказательством
     mv ${lock} ${lock}.dead.${'$'}${'$'} 2>/dev/null
-    ( set -C; printf '%s\n' "${'$'}_me_line" > ${lock} ) 2>/dev/null && _lk=1
+    _jit_take_lock "${'$'}_me_line" && _lk=1
     if [ "${'$'}_lk" != "1" ]; then
       mv ${lock}.dead.${'$'}${'$'} ${lock} 2>/dev/null
       _refuse lock_race "${'$'}_lo"
@@ -563,7 +746,8 @@ if [ -f ${lock} ]; then
     _refuse lock_held "${'$'}_lo"
   fi
 else
-  ( set -C; printf '%s\n' "${'$'}_me_line" > ${lock} ) 2>/dev/null && _lk=1
+  # Кто первый создал файл — тот и владелец; содержимое уже внутри (temp + ln).
+  _jit_take_lock "${'$'}_me_line" && _lk=1
   [ "${'$'}_lk" = "1" ] || _refuse lock_race ""
 fi
 # ── ПОД lock: актуальный claim (закрывает TOCTOU «прочитал до lock») ───────
@@ -572,9 +756,19 @@ case "${'$'}_vc2" in
   "op=${id};"*|"op=${id}") : ;;
   *) _jit_release; _refuse superseded_under_lock "claim=${'$'}_vc2" ;;
 esac
+# iter54 §4: владелец — это НЕ только opId. Если в claim записан ДРУГОЙ экземпляр той же
+# операции (повторная отправка/ретрай/другой shell), это чужое владение: опасное действие
+# выполнять нельзя, иначе два экземпляра одной операции подействуют дважды.
+_vc2_inst=${'$'}(printf '%s' "${'$'}_vc2" | sed -n 's/.*inst=\([^;]*\).*/\1/p')
+case "${'$'}_vc2_inst" in
+  ""|"${'$'}_me_inst") : ;;
+  *) _jit_release; _refuse instance_mismatch "claim_inst=${'$'}_vc2_inst me=${'$'}_me_inst" ;;
+esac
 # ── начало операции видно на устройстве ───────────────────────────────────
-echo "START ts=${'$'}(date +%s) op=${id}" > ${term} 2>/dev/null
-trap 'echo "END rc=$? op=${id}" >> ${term} 2>/dev/null; _jit_release; rm -f ${lock}.dead.* 2>/dev/null' EXIT
+# `inst` обязателен: по нему terminal отличается «этот экземпляр» от «тот же opId, другой shell».
+# ДОЗАПИСЬ, а не усечение: отказ другого экземпляра мог быть записан раньше, и `>` его терял.
+echo "START ts=${'$'}(date +%s) op=${id} inst=${'$'}_me_inst" >> ${term} 2>/dev/null
+trap 'echo "END rc=$? op=${id} inst=${'$'}_me_inst" >> ${term} 2>/dev/null; _jit_release; rm -f ${lock}.dead.* 2>/dev/null' EXIT
 """.trimIndent()
     }
 
@@ -589,10 +783,21 @@ trap 'echo "END rc=$? op=${id}" >> ${term} 2>/dev/null; _jit_release; rm -f ${lo
         /** В claim лежит ДРУГАЯ операция. */
         val claimOther: Boolean,
         /** Claim чужой/испорчен — описание для журнала. */
-        val note: String = ""
+        val note: String = "",
+        /**
+         * iter54 §4: ЭКЗЕМПЛЯР, к которому относятся эти факты (`inst`), и сколько ДРУГИХ
+         * экземпляров той же операции оставили следы в том же terminal-файле.
+         *
+         * Раньше все строки файла смешивались: `END rc=0` экземпляра B (отказ) читался как
+         * завершение экземпляра A. Теперь факты берутся по ОДНОМУ экземпляру, а чужие только
+         * считаются — отказ B больше не подменяет terminal A.
+         */
+        val inst: String = "",
+        val otherInstances: Int = 0
     ) {
         fun wire(): String = "started=$started finished=$finished rc=${rc ?: "?"} " +
-            "refused=$refused claim_other=$claimOther"
+            "refused=$refused claim_other=$claimOther inst=${if (inst.isEmpty()) "?" else inst}" +
+            (if (otherInstances > 0) " other_inst=$otherInstances" else "")
     }
 
     /**
@@ -622,12 +827,21 @@ trap 'echo "END rc=$? op=${id}" >> ${term} 2>/dev/null; _jit_release; rm -f ${lo
         // iter52 §7.2: строки terminal'а принимаются ТОЛЬКО со своим `op=<id>`. Файл назван по id,
         // но id мог быть переиспользован (перезапуск/повтор клика), а на устройстве мог остаться
         // файл прошлой операции: считать чужой `END rc=0` своим завершением нельзя.
-        val mine = lines.filter { Regex("(^| )op=" + Regex.escape(opId) + "( |$)").containsMatchIn(it) }
-        val foreignCount = lines.size - mine.size
+        val mineAll = lines.filter { Regex("(^| )op=" + Regex.escape(opId) + "( |$)").containsMatchIn(it) }
+        val foreignCount = lines.size - mineAll.size
+        fun instOf(l: String): String =
+            Regex("(?:^| )inst=([^ ]+)").find(l)?.groupValues?.get(1) ?: ""
+        // Факты относятся к ОДНОМУ экземпляру: тому, чьё событие в файле ПОСЛЕДНЕЕ (START, END
+        // или REFUSED). Так отказ экземпляра B (он пишет END rc=0) не читается как завершение A.
+        val lastInst = mineAll.lastOrNull { it.startsWith("START") || it.startsWith("END") ||
+            it.startsWith("REFUSED") }?.let { instOf(it) } ?: ""
+        val mine = if (lastInst.isEmpty()) mineAll else mineAll.filter { instOf(it) == lastInst }
+        val otherInst = mineAll.map { instOf(it) }.filter { it.isNotEmpty() && it != lastInst }
+            .distinct().size
         val startLine = mine.firstOrNull { it.startsWith("START") }
         val endLine = mine.lastOrNull { it.startsWith("END") }
         val rcEnd = endLine?.let { Regex("rc=(-?\\d+)").find(it)?.groupValues?.get(1)?.toIntOrNull() }
-        // Отказ считается доказанным, если он есть в terminal'е НАШЕЙ операции ИЛИ в stdout
+        // Отказ считается доказанным, если он есть в terminal'е НАШЕГО экземпляра ИЛИ в stdout
         // с нашим id (payload печатает `JIT_REFUSED op=<id> …`).
         val refused = mine.any { it.startsWith("REFUSED") } ||
             Regex("JIT_REFUSED op=" + Regex.escape(opId) + "( |$)").containsMatchIn(out) ||
@@ -642,7 +856,10 @@ trap 'echo "END rc=$? op=${id}" >> ${term} 2>/dev/null; _jit_release; rm -f ${lo
             claimOther = claim != null && claim.id != opId,
             note = claimNote +
                 (if (foreignCount > 0) ";term_lines_other_op=$foreignCount" else "") +
-                (if (lines.isNotEmpty() && mine.isEmpty()) ";term_only_foreign_op" else "")
+                (if (lines.isNotEmpty() && mine.isEmpty()) ";term_only_foreign_op" else "") +
+                (if (otherInst > 0) ";term_other_instance=$otherInst" else ""),
+            inst = lastInst,
+            otherInstances = otherInst
         )
     }
 

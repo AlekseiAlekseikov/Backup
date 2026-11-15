@@ -1984,10 +1984,19 @@ object JitOp {
             //    отправлять нельзя «вслепую»: его гвардия прочитает claim и, если он не наш,
             //    откажется работать — то есть клик гарантированно ничего не сделает, а мы бы
             //    записали «отправлено». Поэтому клик останавливается здесь, честно.
-            val opState = JitOwn.Op(opId, mark.tsMs, want, JitOwn.State.CREATED)
+            // iter54 §4: ОДИН экземпляр на клик — его видят и запись claim, и гвардия payload.
+            val opInst = JitOwn.newInstance(opId, mark.tsMs)
+            val opState = JitOwn.Op(
+                opId, mark.tsMs, want, JitOwn.State.CREATED,
+                identity = JitOwn.ClaimIdentity(opInst, "", "", "")
+            )
             val claimRes = runCatching { shell.exec(JitOwn.claimCmd(opState), 8_000) }
                 .getOrElse { t -> Pair(-1, "ERR_${'$'}{t.javaClass.simpleName}") }
-            when (val cw = JitOwn.claimResult(claimRes.first, claimRes.second)) {
+            val claimWrite = JitOwn.claimResult(claimRes.first, claimRes.second)
+            // iter54 §4: ОДНО решающее правило для всех исходов захвата владения. Ни один
+            // исход, кроме `Taken`, не разрешает отправку payload.
+            val gate = JitOwn.claimGate(claimWrite)
+            when (val cw = claimWrite) {
                 is JitOwn.ClaimWrite.Taken -> log(
                     "JIT_CLAIM op=$opId taken=1 verified=1 path=${JitOwn.CLAIM} want=$want " +
                         "claim=«${cw.line}» " +
@@ -2012,13 +2021,45 @@ object JitOp {
                             "следующему ручному клику — время блокировку не снимает"
                     )
                 }
-                is JitOwn.ClaimWrite.Failed -> log(
-                    "JIT_CLAIM op=$opId taken=0 verified=0 failed=«${cw.why}» rc=${claimRes.first} " +
-                        "path=${JitOwn.CLAIM} action=proceed " +
-                        "(запись/чтение claim НЕ подтверждены — «владение получено» не заявляется. " +
-                        "Исход решит гвардия payload'а: если claim на устройстве не наш, скрипт " +
-                        "откажется работать ДО первого опасного действия и это будет видно как " +
-                        "JIT_REFUSED по terminal-файлу; настройки при этом возвращаются)"
+                is JitOwn.ClaimWrite.Stale -> {
+                    log(
+                        "JIT_CLAIM op=$opId taken=0 stale=1 newer=«${cw.newer}» " +
+                            "path=${JitOwn.CLAIM} action=stop " +
+                            "(на устройстве уже лежит БОЛЕЕ НОВОЕ намерение владельца: этот, более " +
+                            "старый, клик его не отменяет. Payload НЕ отправлен, настройки " +
+                            "возвращены по доказанной принадлежности — «${gate.why}»)"
+                    )
+                    return abortIntent(gate.code, gate.why)
+                }
+                is JitOwn.ClaimWrite.Failed -> {
+                    // iter54 §4: раньше здесь стояло `action=proceed`, и скрипт всё равно
+                    // уходил на устройство. Границы записи намерения нет — значит нет и fencing:
+                    // отправлять payload нельзя. Намерение владельца НЕ стирается и НЕ
+                    // переписывается: это честный pending, повтор возможен после восстановления
+                    // канала (он же — единственный способ установить владение).
+                    log(
+                        "JIT_CLAIM op=$opId taken=0 verified=0 failed=«${cw.why}» rc=${claimRes.first} " +
+                            "path=${JitOwn.CLAIM} action=stop pending=1 commands=0 " +
+                            "(запись/чтение claim НЕ подтверждены — владение не установлено, " +
+                            "payload НЕ отправлен: «${gate.why}». Настройки операции остаются " +
+                            "записанными, потому что это намерение владельца; эффекта на сеть, " +
+                            "свойства и zygote НЕТ — ни один байт скрипта не ушёл)"
+                    )
+                    return Click(
+                        want, snap, write, read, -1, "", gate.code, previousUndefined,
+                        attempt = 1, stored = stored
+                    )
+                }
+            }
+            // Страховка: любой исход, кроме `Taken`, не имеет права дойти до отправки.
+            if (!gate.send) {
+                log(
+                    "JIT_CLAIM_GATE op=$opId send=0 code=${gate.code} commands=0 " +
+                        "(«${gate.why}»: payload не отправлен)"
+                )
+                return Click(
+                    want, snap, write, read, -1, "", gate.code, previousUndefined,
+                    attempt = 1, stored = stored
                 )
             }
             log("dalvik.vm.usejit -> $want; reiniciando o framework")

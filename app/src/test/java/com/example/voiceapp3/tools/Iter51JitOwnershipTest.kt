@@ -198,7 +198,13 @@ class Iter51JitOwnershipTest {
                     // Устройство «подтверждает» запись протоколом, но фактически на диске остаётся
                     // claim другой операции (имитация недошедшей записи): принятое на веру
                     // подтверждение не должно превращаться в «владение наше».
-                    val mine = Regex("printf '%s[^']*' '([^']*)'").find(command)!!.groupValues[1]
+                    // iter54 §4: claim-строка теперь содержит идентичность экземпляра; вынимаем
+                    // её из текста команды (значение приходит из Kotlin, а не из shell).
+                    val head = Regex(
+                        "op=([A-Za-z0-9_.-]{1,64});ts_ms=(\\d{1,19});ts_s=\\d{1,19};want=([01])"
+                    ).find(command)!!
+                    val mine = "op=${head.groupValues[1]};ts_ms=${head.groupValues[2]};" +
+                        "want=${head.groupValues[3]}"
                     JitDev.claimForTest(JitOwn.Op("someone-else", 9L, false, JitOwn.State.CLAIMED).claimLine())
                     return 0 to "CL_BEGIN\nCL_STATUS=taken\nCL_VALUE=$mine\nCL_END"
                 }
