@@ -160,16 +160,41 @@ class Iter52JitOwnTest {
 
     @Test
     fun ownerEndInTerminalProvesCompletionAndAllowsTakeover() {
-        // Даже без pid: собственный END владельца в ЕГО terminal-файле — доказательство
-        // завершения (это не таймер), и путь к следующему клику открывается.
+        // Собственный END владельца в ЕГО terminal-файле — доказательство завершения (не таймер),
+        // и путь к следующему клику открывается.
+        // iter55 §4.2: END должен относиться к ТОЧНОЙ identity владельца из lock (`inst=`).
+        // Раньше проверялся только opId, и END/REFUSED другого экземпляра объявлял живого
+        // владельца мёртвым.
         claim().writeText("op=a;ts_ms=1700000000000;want=1")
-        lock().writeText("op=prev;ts_ms=1700000000000;ts_s=1700000000")
-        term("prev").writeText("START ts=1 op=prev\nEND rc=0 op=prev\n")
+        lock().writeText("op=prev;ts_ms=1700000000000;ts_s=1700000000;inst=prev-inst")
+        term("prev").writeText("START ts=1 op=prev inst=prev-inst\nEND rc=0 op=prev inst=prev-inst\n")
         val effect = File(base, "EFFECT_END")
         val (rc, out) = run(payload("a", effect))
         assertEquals(0, rc)
-        assertTrue("перехват по факту END: $out", out.contains("JIT_LOCK_TAKEOVER proof=owner_dead"))
+        assertTrue("перехват по факту END этого экземпляра: $out",
+            out.contains("JIT_LOCK_TAKEOVER proof=owner_dead_exact_inst"))
         assertTrue(effect.exists())
+    }
+
+    @Test
+    fun endOfAnotherInstanceOrOfAnotherOpDoesNotProveDeath() {
+        // iter55 §4.2: чужой END (другой экземпляр той же операции / другой opId) НЕ доказывает
+        // смерть владельца. Такой lock не перехватывается — вместо этого честный отказ.
+        org.junit.Assume.assumeTrue("нужен /proc для проверки живости", File("/proc/1").isDirectory)
+        claim().writeText("op=a;ts_ms=1700000000000;want=1")
+        val mePid = ProcessHandle.current().pid()
+        val pst = pstartOf(mePid) ?: run { org.junit.Assume.assumeTrue(false); return }
+        lock().writeText("op=prev;ts_ms=1700000000000;ts_s=1700000000;inst=owner-inst;" +
+            "pid=$mePid;pstart=$pst;boot=${bootId() ?: "-"}")
+        // END записан ДРУГИМ экземпляром (инстансом-отказником) той же операции.
+        term("prev").writeText("REFUSED op=prev inst=other-inst reason=lock_held\n" +
+            "END rc=0 op=prev inst=other-inst refused=1\n")
+        val effect = File(base, "EFFECT_FOREIGN_END")
+        val (rc, out) = run(payload("a", effect))
+        assertEquals(0, rc)
+        assertFalse("живой владелец не перехвачен: $out", effect.exists())
+        assertTrue("причина отказа: $out", out.contains("reason=lock_held"))
+        assertTrue("lock не тронут", lock().readText().startsWith("op=prev;"))
     }
 
     @Test

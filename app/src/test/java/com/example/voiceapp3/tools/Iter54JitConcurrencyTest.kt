@@ -137,22 +137,27 @@ class Iter54JitConcurrencyTest {
         assertEquals("claim остался за НОВЫМ намерением", afterNew, claimText())
     }
 
-    // ─────── 3. уступка только ДОКАЗАННО завершившемуся более новому намерению ───────
+    // ─── 3. iter55 §4.3: конец более нового намерения НЕ делает старое актуальным ───
 
     @Test
-    fun olderIntentTakesOverOnlyAfterNewerProvedFinished() {
+    fun finishedNewerIntentDoesNotMakeOlderIntentCurrent() {
         val newer = op("NEW", 1_700_000_009_000L)
         sh(JitOwn.claimCmd(newer, b), "new.sh")
-        // Новый владелец реально выполнился и написал END.
+        // Новый владелец реально выполнился и написал END (доказанное завершение).
         val (_, outRun) = sh(payload(newer, "NEW", holdMs = 10), "new_payload.sh")
         assertTrue("новый payload выполнился: $outRun", !outRun.contains("JIT_REFUSED"))
         val t = term("NEW").let { if (it.exists()) it.readText() else "" }
         assertTrue("END нового владельца записан: «$t»", t.contains("END rc="))
+        val afterNew = claimText()
 
+        // Устаревшее намерение приходит ПОСЛЕ завершения нового. Владелец уже выбрал другое:
+        // завершение чужой операции не возвращает старое решение в силу.
         val older = op("OLD", 1_700_000_000_000L)
         val (_, outOld) = sh(JitOwn.claimCmd(older, b), "old.sh")
-        assertTrue("после доказанного завершения владение свободно: $outOld",
-            outOld.contains("CL_STATUS=taken") || outOld.contains("verdict=newer_finished"))
+        assertTrue("устаревшее намерение уступает даже после завершения нового: $outOld",
+            outOld.contains("CL_STATUS=stale"))
+        assertFalse("ветка newer_finished удалена: $outOld", outOld.contains("newer_finished"))
+        assertEquals("claim остался за НОВЫМ намерением", afterNew, claimText())
     }
 
     // ─────────── 4. тот же opId, ДРУГОЙ экземпляр: отказ не подменяет terminal ───────────

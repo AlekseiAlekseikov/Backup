@@ -300,9 +300,14 @@ _jit_owner_dead() {
   _lopst=${'$'}(printf '%s' "${'$'}_lo" | sed -n 's/.*pstart=\([0-9][0-9]*\).*/\1/p')
   _loboot=${'$'}(printf '%s' "${'$'}_lo" | sed -n 's/.*boot=\([^;]*\).*/\1/p')
   _loop=${'$'}(printf '%s' "${'$'}_lo" | sed -n 's/^op=\([A-Za-z0-9_.-]*\).*/\1/p')
-  if [ -n "${'$'}_loop" ]; then
-    if grep -q "END rc=[-0-9]* op=${'$'}_loop${'$'}" "${termPrefix}${'$'}_loop.term" 2>/dev/null; then return 1; fi
-    if grep -q "REFUSED op=${'$'}_loop " "${termPrefix}${'$'}_loop.term" 2>/dev/null; then return 1; fi
+  # iter55 §4.2: terminal ЭКЗЕМПЛЯРА, а не «opId вообще». Прежний grep по одному opId
+  # принимал REFUSED/END ДРУГОГО экземпляра той же операции за смерть владельца и
+  # разрешал takeover живого lock. Identity сравнивается целиком; без inst — не доказано.
+  _loinst=${'$'}(printf '%s' "${'$'}_lo" | sed -n 's/.*inst=\([^;]*\).*/\1/p')
+  if [ -n "${'$'}_loop" ] && [ -n "${'$'}_loinst" ]; then
+    _loterm="${termPrefix}${'$'}_loop.term"
+    if grep -q "^END rc=[-0-9]* op=${'$'}_loop inst=${'$'}_loinst${'$'}" "${'$'}_loterm" 2>/dev/null; then return 1; fi
+    if grep -q "^REFUSED op=${'$'}_loop inst=${'$'}_loinst " "${'$'}_loterm" 2>/dev/null; then return 1; fi
   fi
   [ -z "${'$'}_lopid" ] && return 0
   if [ -n "${'$'}_loboot" ] && [ -n "${'$'}_me_boot" ] && [ "${'$'}_loboot" != "${'$'}_me_boot" ]; then return 1; fi
@@ -321,6 +326,28 @@ _jit_take_lock() {
   if ln "${'$'}_tl" ${lock} 2>/dev/null; then rm -f "${'$'}_tl" 2>/dev/null; return 0; fi
   rm -f "${'$'}_tl" 2>/dev/null
   return 1
+}
+# ── перехват брошенного lock БЕЗ TOCTOU ────────────────────────────────────
+# `read → доказать смерть → mv → взятие` не атомарно: пока претендент проверял старый
+# lock, другой мог перехватить его и создать НОВЫЙ — и второй `mv` унёс бы уже чужой,
+# живой lock. Поэтому после `mv` сравнивается СОДЕРЖИМОЕ перемещённого файла с той
+# строкой, смерть которой доказана. Не совпало — это чужой lock: возвращаем его на место
+# (через `ln`, чтобы не перезаписать появившийся) и сообщаем конфликт.
+# rc 0 = перехватили именно доказанно мёртвый объект (файл лежит в ${'$'}2);
+# rc 2 = подмена: lock принадлежал другому, возвращён/не тронут;
+# rc 1 = mv не удался (lock остался на месте).
+_jit_steal_dead() {
+  _sd_lock=${'$'}1; _sd_expect=${'$'}2; _sd_tmp="${'$'}{_sd_lock}.dead.${'$'}${'$'}"
+  rm -f "${'$'}_sd_tmp" 2>/dev/null
+  mv "${'$'}_sd_lock" "${'$'}_sd_tmp" 2>/dev/null || return 1
+  _sd_got=${'$'}(cat "${'$'}_sd_tmp" 2>/dev/null)
+  if [ "${'$'}_sd_got" != "${'$'}_sd_expect" ]; then
+    # Вернуть чужой lock: `ln` не перезаписывает уже существующее имя.
+    ln "${'$'}_sd_tmp" "${'$'}_sd_lock" 2>/dev/null || true
+    rm -f "${'$'}_sd_tmp" 2>/dev/null
+    return 2
+  fi
+  return 0
 }
 # ── освободить ТОЛЬКО свою блокировку ─────────────────────────────────────
 _jit_release() {
@@ -379,17 +406,9 @@ if [ -n "${'$'}_cm_op" ] && [ "${'$'}_cm_op" != "${op.id}" ] && [ -n "${'$'}_cm_
     _cm_verdict=newer_intent
   fi
 fi
-if [ "${'$'}_cm_verdict" = "older_intent" ]; then
-  # Чужое намерение новее. Уступаем, НО: если его экземпляр доказанно мёртв и он уже
-  # завершился (END/REFUSED) — владение свободно.
-  _cm_term="${termPrefix}${'$'}{_cm_op}.term"
-  # `_jit_owner_dead`: rc 0 = «жив ИЛИ смерть недоказуема» (перехватывать нельзя), rc 1 = смерть
-  # доказана. Уступаем владение только во ВТОРОМ случае и только при доказанном завершении.
-  if ! _jit_owner_dead "${'$'}_cm_seen" && \
-     { grep -q "END rc=" "${'$'}_cm_term" 2>/dev/null || grep -q "REFUSED op=" "${'$'}_cm_term" 2>/dev/null; }; then
-    _cm_verdict=newer_finished
-  fi
-fi
+# iter55 §4.3: НИКАКОГО `newer_finished`. То, что более новое намерение завершилось,
+# не делает старое намерение актуальным: владелец уже выбрал другое. Устаревшая операция
+# уступает навсегда, иначе «догоняющий» старый payload снимал бы последнее решение.
 echo "CL_ORDER seen_op=${'$'}{_cm_op:-none} seen_ts_ms=${'$'}{_cm_ts:-none} verdict=${'$'}_cm_verdict"
 case "${'$'}_cm_verdict" in
   older_intent|ts_tie)
@@ -399,17 +418,43 @@ case "${'$'}_cm_verdict" in
 if [ -f ${lock} ]; then
   _lo=${'$'}(cat ${lock} 2>/dev/null)
   if ! _jit_owner_dead "${'$'}_lo"; then
-    mv ${lock} ${lock}.dead.${'$'}${'$'} 2>/dev/null
-    _jit_take_lock "${'$'}_me_line" || {
-      mv ${lock}.dead.${'$'}${'$'} ${lock} 2>/dev/null; _cl_owner="${'$'}_lo"; _cl_status=busy; }
+    _jit_steal_dead ${lock} "${'$'}_lo"
+    case ${'$'}? in
+      0) _jit_take_lock "${'$'}_me_line" || {
+           mv ${lock}.dead.${'$'}${'$'} ${lock} 2>/dev/null; _cl_owner="${'$'}_lo"; _cl_status=busy; }
+         echo "CL_TAKEOVER proof=owner_dead_exact_inst owner=${'$'}_lo" ;;
+      2) _cl_status=busy; _cl_owner="race_object_replaced"
+         echo "CL_TAKEOVER proof=refused reason=object_replaced (перехвачен уже ЧУЖОЙ lock)" ;;
+      *) _cl_status=busy; _cl_owner="${'$'}_lo" ;;
+    esac
   else
     _cl_status=busy; _cl_owner="${'$'}_lo"
   fi
 else
   _jit_take_lock "${'$'}_me_line" || { _cl_owner="race"; _cl_status=busy; }
 fi
-# ── ПОД lock: замена claim АТОМАРНА (tmp + mv), а не «exists + запись по месту» ──
+# ── ПОД lock: ПОРЯДОК НАМЕРЕНИЙ ПРОВЕРЯЕТСЯ ЗАНОВО ────────────────────────────
+# Решение выше принято ДО захвата и могло устареть за время ожидания. Здесь claim
+# перечитывается уже под lock'ом, и если конкурент успел записать БОЛЕЕ НОВОЕ намерение,
+# наш claim не перезаписывает его. Решение и запись происходят в одной критической секции.
 if [ "${'$'}_cl_status" != "busy" ]; then
+  _v2=${'$'}(cat ${claim} 2>/dev/null)
+  _v2_op=${'$'}(printf '%s' "${'$'}_v2" | sed -n 's/^op=\([A-Za-z0-9_.-]*\).*/\1/p')
+  _v2_ts=${'$'}(printf '%s' "${'$'}_v2" | sed -n 's/.*ts_ms=\([0-9][0-9]*\).*/\1/p')
+  _v2_verdict=free
+  if [ -n "${'$'}_v2_op" ] && [ -n "${'$'}_v2_ts" ]; then
+    if [ "${'$'}_v2_op" != "${op.id}" ]; then
+      if [ "${'$'}_v2_ts" -ge ${op.tsMs} ]; then _v2_verdict=newer_intent; fi
+    fi
+  fi
+  echo "CL_ORDER_UNDER_LOCK seen_op=${'$'}{_v2_op:-none} seen_ts_ms=${'$'}{_v2_ts:-none} verdict=${'$'}_v2_verdict"
+  if [ "${'$'}_v2_verdict" = "newer_intent" ]; then
+    _jit_release
+    _cl_status=stale; _cl_owner="${'$'}_v2"; _cl_why="newer_intent_under_lock"
+  fi
+fi
+# ── ПОД lock: замена claim АТОМАРНА (tmp + mv), а не «exists + запись по месту» ──
+if [ "${'$'}_cl_status" != "busy" ] && [ "${'$'}_cl_status" != "stale" ]; then
   _tmp="${claim}.tmp.${'$'}${'$'}"
   printf '%s\n' "${'$'}_me_line" > "${'$'}_tmp" 2>/dev/null
   _wr=${'$'}?
@@ -717,6 +762,15 @@ case "${'$'}_vc" in
   "op=${id};"*|"op=${id}") : ;;
   *) _refuse superseded "claim=${'$'}{_vc:-none}" ;;
 esac
+# iter55 §4.2: ЭКЗЕМПЛЯР проверяется ДО захвата lock. Иначе повтор той же операции (второй
+# shell с тем же opId) мог занять lock, обнаружить несовпадение inst ПОД lock и отказаться,
+# оставив настоящего владельца без владения — операция не выполнялась никем. Отказ по inst
+# теперь не касается lock вовсе, поэтому актуальный экземпляр проходит свободно.
+_vc_inst0=${'$'}(printf '%s' "${'$'}_vc" | sed -n 's/.*inst=\([^;]*\).*/\1/p')
+case "${'$'}_vc_inst0" in
+  ""|"${'$'}_me_inst") : ;;
+  *) _refuse instance_mismatch "claim_inst=${'$'}_vc_inst0 me=${'$'}_me_inst (до lock)" ;;
+esac
 ${ownHelpers(base)}
 _me_line="op=${id};ts_ms=${tsMs};ts_s=${tsS};inst=${'$'}_me_inst;pid=${'$'}_me_pid;pstart=${'$'}{_me_pstart:-?};boot=${'$'}{_me_boot:-?}"
 _lk=0
@@ -726,14 +780,19 @@ if [ -f ${lock} ]; then
     *"inst=${'$'}_me_inst"*) _refuse duplicate_instance "${'$'}_lo" ;;
   esac
   if ! _jit_owner_dead "${'$'}_lo"; then
-    # смерть доказана — перехват, и это ПИШЕТСЯ с доказательством
-    mv ${lock} ${lock}.dead.${'$'}${'$'} 2>/dev/null
-    _jit_take_lock "${'$'}_me_line" && _lk=1
-    if [ "${'$'}_lk" != "1" ]; then
-      mv ${lock}.dead.${'$'}${'$'} ${lock} 2>/dev/null
-      _refuse lock_race "${'$'}_lo"
-    fi
-    echo "JIT_LOCK_TAKEOVER proof=owner_dead owner=${'$'}_lo"
+    # Смерть доказана. Перехват — только того объекта, который проверен (см. _jit_steal_dead):
+    # между чтением и mv lock мог быть заменён живым владельцем.
+    _jit_steal_dead ${lock} "${'$'}_lo"
+    case ${'$'}? in
+      0) _jit_take_lock "${'$'}_me_line" && _lk=1
+         if [ "${'$'}_lk" != "1" ]; then
+           mv ${lock}.dead.${'$'}${'$'} ${lock} 2>/dev/null
+           _refuse lock_race "${'$'}_lo"
+         fi
+         echo "JIT_LOCK_TAKEOVER proof=owner_dead_exact_inst owner=${'$'}_lo" ;;
+      2) _refuse lock_object_replaced "${'$'}_lo" ;;
+      *) _refuse lock_race "${'$'}_lo" ;;
+    esac
   else
     case "${'$'}_lo" in
       "op=${id};"*|"op=${id}") _refuse same_op_live "${'$'}_lo" ;;
