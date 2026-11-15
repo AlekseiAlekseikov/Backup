@@ -26,6 +26,72 @@ internal object LockOp {
     /** Состояния операции. `UNDEFINED` — ответ потерян/процесс умер: нужна сверка, не успех. */
     enum class State { PLANNED, DONE, UNDEFINED, FAILED }
 
+    /** Факты, прочитанные из свидетельства доставки (read-only, без мутаций). */
+    data class EvidenceFacts(
+        val started: String,
+        val done: String,
+        val scriptPresent: Boolean,
+        /** `done` содержит `rc=<число>` → запуск ДОКАЗАННО завершился. */
+        val terminalProven: Boolean
+    ) {
+        fun wire(): String = "started=$started done=$done script=$scriptPresent " +
+            "terminal=$terminalProven"
+    }
+
+    /**
+     * iter55 §5.2: РАЗБОР read-only свидетельства ([com.example.voiceapp3.tools.ScriptDelivery.evidenceCommand]).
+     *
+     * `null` — свидетельство не прочитано (нет полей/нет файлов-ответов): тогда исход остаётся
+     * `Unknown`, а не превращается в «всё в порядке». `terminalProven` — только при `rc=<число>`
+     * в `.done`: пустой/битый `.done` терминалом не считается.
+     */
+    fun parseEvidence(out: String?): EvidenceFacts? {
+        if (out.isNullOrBlank()) return null
+        if (!out.contains("STARTED=") && !out.contains("DONE=")) return null
+        val started = Regex("STARTED=(\\S*)").find(out)?.groupValues?.get(1).orEmpty()
+        val done = Regex("DONE=(.*)").find(out)?.groupValues?.get(1)?.trim().orEmpty()
+        val present = Regex("PRESENT=(\\d)").find(out)?.groupValues?.get(1) == "1"
+        return EvidenceFacts(
+            started = started.ifEmpty { "unknown" },
+            done = done.ifEmpty { "none" },
+            scriptPresent = present,
+            terminalProven = Regex("rc=-?\\d+").containsMatchIn(done)
+        )
+    }
+
+    /**
+     * iter55 §7.1 — МОЖНО ЛИ ОТПРАВЛЯТЬ НОВЫЙ bind.
+     *
+     * iter54 возвращала из сверки `Boolean` «была ли незавершённая операция», и вызывающий код
+     * (production!) этот результат игнорировал. Из-за этого несовместимый bind отправлялся даже
+     * при нечитаемом/повреждённом журнале и при неизвестном исходе прошлой операции: старый
+     * shell мог выполниться позже и наложить свой слой поверх нового.
+     *
+     * Три состояния вместо булева флага:
+     *  • [Ready]    — история прочитана, незавершённых/конфликтующих операций нет;
+     *  • [Pending]  — исход прошлой операции ещё не доказан: bind НЕ отправляется, нужна
+     *                 повторная read-only сверка (событие/повтор), свидетельство сохраняется;
+     *  • [Conflict] — прочитать/разрешить нельзя (журнал недоступен/повреждён, чужой слой):
+     *                 bind НЕ отправляется, намерение владельца сохраняется и сообщается причина.
+     */
+    sealed interface SoundRecovery {
+        data object Ready : SoundRecovery
+
+        data class Pending(val reason: String, val evidence: String = "") : SoundRecovery
+
+        data class Conflict(val reason: String) : SoundRecovery
+
+        fun wire(): String = when (this) {
+            is Ready -> "recovery=ready"
+            is Pending -> "recovery=pending reason=$reason" +
+                (if (evidence.isEmpty()) "" else " evidence=$evidence")
+            is Conflict -> "recovery=conflict reason=$reason"
+        }
+
+        /** Отправлять ли bind/restore прямо сейчас. */
+        val mayBind: Boolean get() = this is Ready
+    }
+
     /**
      * Запись операции.
      *
@@ -38,9 +104,17 @@ internal object LockOp {
         val stage: String,
         val targets: List<String>,
         val state: State,
-        val reason: String = ""
+        val reason: String = "",
+        /**
+         * iter55 §5.2/§7.1: путь-свидетельство доставки (`VAPP_*` скрипт и его `.started`/`.done`).
+         *
+         * Нужен, чтобы после рестарта процесса исход `Unknown` можно было дочитать read-only, а
+         * не «забыть»: раньше свидетельство упоминалось только в строке лога и в журнале не
+         * сохранялось вовсе.
+         */
+        val evidence: String = ""
     ) {
-        fun encode(): String = listOf(
+        fun encode(): String = (listOf(
             "id=$id",
             "gen=$gen",
             "desired=${if (desired) 1 else 0}",
@@ -48,7 +122,7 @@ internal object LockOp {
             "stage=$stage",
             "targets=${targets.joinToString(",")}",
             "reason=$reason"
-        ).joinToString(";")
+        ) + (if (evidence.isEmpty()) emptyList() else listOf("ev=$evidence"))).joinToString(";")
 
         fun wire(): String =
             "id=$id gen=$gen desired=$desired state=${state.name.lowercase()} " +
@@ -72,7 +146,8 @@ internal object LockOp {
         val targets = map["targets"].orEmpty().split(',').map { it.trim() }.filter { it.isNotEmpty() }
         return BindOp(
             id = id, gen = gen, desired = desired == "1", stage = map["stage"].orEmpty(),
-            targets = targets, state = state, reason = map["reason"].orEmpty()
+            targets = targets, state = state, reason = map["reason"].orEmpty(),
+            evidence = map["ev"].orEmpty()
         )
     }
 

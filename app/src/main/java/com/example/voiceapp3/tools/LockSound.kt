@@ -63,6 +63,18 @@ object LockSound {
     fun pendingReason(ctx: Context): String =
         Prefs2.getString(ctx, PREF_LOCK_SOUND_PENDING_REASON, "") ?: ""
 
+    /**
+     * iter55 §9/§7.1: сохранить «применение неизвестно» вместе с причиной, НЕ меняя намерение
+     * владельца. Раньше в такой ситуации писался `pending` («ждёт готовности») либо вообще ничего,
+     * и UI показывал состояние, которого на устройстве не доказано.
+     */
+    private fun markUnknown(ctx: Context, reason: String) {
+        Prefs2.putString(ctx, PREF_LOCK_SOUND_APPLIED, Toggles45.APPLIED_UNKNOWN)
+        Prefs2.putString(ctx, PREF_LOCK_SOUND_PENDING_REASON, reason)
+        AppLog.w(ctx, TAG, "LOCK_SOUND_STATE desired=${isEnabled(ctx)} applied=${appliedState(ctx)} " +
+            "reason=«$reason» (исход не доказан; намерение владельца сохранено)")
+    }
+
     private fun markApplied(ctx: Context, applied: Boolean, reason: String) {
         Prefs2.putString(ctx, PREF_LOCK_SOUND_APPLIED,
             Toggles45.appliedOutcome(isEnabled(ctx), applied))
@@ -893,6 +905,13 @@ object LockSound {
      *  3. setenforce 0 убран (P5).
      *  4. VERIFY по SRC_INODE/TGT_INODE и по /proc/mounts.
      */
+    /**
+     * iter55 §7.1: причина, по которой последний bind не был отправлен (сверка не разрешила).
+     * Показывается владельцу как нейтральный статус «ждёт сверки», без красного и без ложного ON.
+     */
+    @Volatile
+    internal var lastReconcilePendingReason: String? = null
+
     private fun applySystemLockSoundBind(ctx: Context, soundFile: File, reconcileFirst: Boolean = true) {
         // §6.2 iter46: «до boot» больше не блокирует бессрочно — только до подходящего события;
         // флаг оставлен для совместимости и снимается в onConditionsRestored/смене выбора.
@@ -916,7 +935,36 @@ object LockSound {
             // зацикливается на записи, которую снять нельзя (чужой слой).
             gateEnter("bind")
             try {
-                if (reconcileFirst) runCatching { reconcilePendingOps(appCtx, "before_bind") }
+                if (reconcileFirst) {
+                    // iter55 §7.1: результат сверки УПРАВЛЯЕТ отправкой. Раньше он (и исключение)
+                    // игнорировался `runCatching`: bind уходил даже при нечитаемом/повреждённом
+                    // журнале и недоказанном исходе прошлой операции, а старый shell мог
+                    // выполниться позже и наложить свой слой поверх нового.
+                    val recovery = runCatching { reconcilePendingOps(appCtx, "before_bind") }
+                        .getOrElse { t ->
+                            LockOp.SoundRecovery.Conflict("reconcile_threw:" + t.javaClass.simpleName)
+                        }
+                    when (recovery) {
+                        is LockOp.SoundRecovery.Ready -> Unit
+                        is LockOp.SoundRecovery.Pending -> {
+                            AppLog.w(appCtx, TAG, "LOCKSOUND_BIND DEFERRED op=… ${recovery.wire()} " +
+                                "action=no_send (исход прошлой операции не доказан: " +
+                                "свидетельство ${recovery.evidence.ifEmpty { "none" }}, повтор после сверки)")
+                            recordBindFailure("reconcile_pending:" + recovery.reason, appCtx, deterministic = false)
+                            lastReconcilePendingReason = recovery.reason
+                            return@post
+                        }
+                        is LockOp.SoundRecovery.Conflict -> {
+                            AppLog.e(appCtx, TAG, "LOCKSOUND_BIND BLOCKED ${recovery.wire()} " +
+                                "action=no_send (журнал/слой не разрешён: намерение сохранено, " +
+                                "новый bind не отправляется)")
+                            recordBindFailure("reconcile_conflict:" + recovery.reason, appCtx, deterministic = false)
+                            markUnknown(appCtx, "recovery_conflict:" + recovery.reason)
+                            lastReconcilePendingReason = recovery.reason
+                            return@post
+                        }
+                    }
+                }
                 // §5.2 iter47: staging-файл УНИКАЛЕН для (поколение + содержимое). Раньше все
                 // задачи писали в один и тот же путь: параллельная задача могла подменить файл
                 // между копированием и bind, и на цель монтировался ЧУЖОЙ звук.
@@ -1065,8 +1113,12 @@ object LockSound {
                         // сохраняется в журнале, поздняя сверка дочитает факт.
                         // Состояние UNDEFINED — «исход не установлен»: сверка по свидетельству
                         // (evidence) дочитает факт, а не «не выполнено».
-                        finishOpJournal(ctx, op, LockOp.State.UNDEFINED,
-                            "bind_outcome_unknown:" + bindOutcome.why)
+                        // iter55 §5.2: путь-свидетельство СОХРАНЯЕТСЯ в журнале (durable), а не
+                        // только в строке лога: после рестарта процесса именно по нему идёт
+                        // read-only сверка, а не «забыли про операцию».
+                        val ev = (bindOutcome as ScriptDelivery.DeliveryOutcome.Unknown).evidence.path
+                        finishOpJournal(ctx, op.copy(evidence = ev), LockOp.State.UNDEFINED,
+                            "bind_outcome_unknown:" + bindOutcome.why + " ev=" + ev.ifEmpty { "none" })
                         AppLog.w(ctx, TAG, "LOCKSOUND_BIND UNKNOWN op=$opId ${bindOutcome.wire()} " +
                             "action=pending_no_retry (исход станет известен из свидетельства)")
                         recordBindFailure("outcome_unknown:" + bindOutcome.why, appCtx, deterministic = false)
@@ -1542,20 +1594,31 @@ object LockSound {
      *
      * Повторный перенос безопасен: журнал хранит последнюю строку по `id`.
      */
-    internal fun migrateLegacyOp(ctx: Context) {
+    internal fun migrateLegacyOp(ctx: Context): String? {
         val legacy = legacyOpFile(ctx)
-        if (!legacy.exists()) return
+        // `exists()==false` не доказывает отсутствие при проблеме доступа: различаем явно.
+        if (!legacy.exists()) {
+            return if (legacy.parentFile?.canRead() != true) "legacy_dir_unreadable" else null
+        }
         val raw = runCatching { legacy.readText() }.getOrNull()
+        if (raw == null) {
+            // iter55 §7.2: ошибка чтения старого журнала БОЛЬШЕ НЕ теряется в логе. Раньше
+            // метод возвращал Unit, и вызывающий читал новый журнал как будто старого нет.
+            AppLog.w(ctx, TAG, "LOCKSOUND_MIGRATE file=present_read=none action=unknown " +
+                "(файл есть, но прочитать его не удалось: это НЕ «записи не было»)")
+            return "legacy_unreadable"
+        }
         val read = LockOp.parseLegacyOp(raw)
         val op: LockOp.BindOp = when (read) {
             is LockOp.LegacyRead.Absent -> {
-                AppLog.w(ctx, TAG, "LOCKSOUND_MIGRATE file=present_read=none action=none " +
-                    "(файл есть, но прочитать его не удалось: считаем неизвестностью, не «пусто»)")
-                return
+                AppLog.w(ctx, TAG, "LOCKSOUND_MIGRATE file=present_read=none action=unknown")
+                return "legacy_unreadable"
             }
             is LockOp.LegacyRead.Parsed -> read.op
             is LockOp.LegacyRead.Unknown -> LockOp.BindOp(
-                id = "legacy-" + System.currentTimeMillis(),
+                // iter55 §7.2: id ДЕТЕРМИНИРОВАН содержимым. Прежний `legacy-<currentTimeMillis>`
+                // при повторе после сбоя давал новую операцию на каждый перенос.
+                id = "legacy-corrupt-" + Integer.toHexString(raw.hashCode()),
                 gen = 0L,
                 desired = false,
                 stage = "",
@@ -1578,7 +1641,7 @@ object LockSound {
             val ok = runCatching { legacy.renameTo(dst) }.getOrDefault(false)
             AppLog.i(ctx, TAG, "LOCKSOUND_MIGRATE rename_only dst=${dst.name} ok=$ok " +
                 "(повторного добавления в журнал не было)")
-            return
+            return null
         }
         val appended = appendOp(ctx, op, "migrate_legacy")
         when (LockOp.migrationStep(read, appended)) {
@@ -1591,12 +1654,15 @@ object LockSound {
                         if (ok) "*.migrated" else "исходный файл (переименование не удалось)"
                     })")
             }
-            LockOp.MigrationAction.KeepLegacy ->
+            LockOp.MigrationAction.KeepLegacy -> {
                 AppLog.e(ctx, TAG, "LOCKSOUND_MIGRATE ${op.wire()} appended=0 action=keep " +
                     "(журнал не подтвердил запись: оригинал НЕ переименован и НЕ удалён — " +
                     "повторная попытка на следующем событии)")
+                return "legacy_migration_unconfirmed"
+            }
             LockOp.MigrationAction.Nothing -> Unit
         }
+        return null
     }
 
     /**
@@ -1609,7 +1675,14 @@ object LockSound {
     internal fun readOpJournal(ctx: Context): LockOp.JournalRead {
         // Читаем журнал ТОЛЬКО после попытки переноса старой записи: иначе незавершённая операция
         // прошлой версии останется невидимой для сверки.
-        migrateLegacyOp(ctx)
+        val migration = migrateLegacyOp(ctx)
+        if (migration != null) {
+            // Старый журнал не прочитан/не перенесён: его содержимое неизвестно, поэтому и новый
+            // журнал нельзя объявлять полным описанием истории.
+            AppLog.e(ctx, TAG, "LOCKSOUND_JOURNAL legacy=$migration action=unknown " +
+                "(старая запись не разрешена: сверка не заявляет «всё снято»)")
+            return LockOp.JournalRead.Unknown("legacy:$migration")
+        }
         val r = LockOp.readJournal(opFile(ctx))
         when (r) {
             is LockOp.JournalRead.Unknown ->
@@ -1626,6 +1699,31 @@ object LockSound {
     }
 
     /**
+     * iter55 §5.2: РАЗРЕШЕНИЕ `Unknown` ПО СВИДЕТЕЛЬСТВУ, а не по догадке.
+     *
+     * Читает `<path>`, `<path>.started`, `<path>.done` через [ScriptDelivery.evidenceCommand]
+     * (только чтение). Возвращает `null`, если свидетельства нет в записи или прочитать его не
+     * удалось — тогда исход остаётся `Unknown`, а не «всё в порядке».
+     */
+    internal fun readEvidence(ctx: Context, op: LockOp.BindOp): LockOp.EvidenceFacts? {
+        if (op.evidence.isEmpty()) return null
+        val r = runCatching {
+            AdbClient.execute(ScriptDelivery.evidenceCommand(op.evidence), 8000, expectRoot = false)
+        }.getOrNull()
+        if (r == null) {
+            AppLog.w(ctx, TAG, "LOCKSOUND_EVIDENCE op=${op.id} path=${op.evidence} action=unreadable " +
+                "(прочитать свидетельство не удалось: исход остаётся неизвестным)")
+            return null
+        }
+        val facts = LockOp.parseEvidence(r.second)
+        if (facts == null) {
+            AppLog.w(ctx, TAG, "LOCKSOUND_EVIDENCE op=${op.id} path=${op.evidence} rc=${r.first} " +
+                "action=no_fields out=${r.second.replace('\n', ' ').take(200)}")
+        }
+        return facts
+    }
+
+    /**
      * iter52 §5.1(3): СВЕРКА НЕЗАВЕРШЁННЫХ ОПЕРАЦИЙ ИЗ ЖУРНАЛА — на реальном пути.
      *
      * Вызывается из событий: старт/сторожевая проверка, возврат root-канала, смена намерения
@@ -1636,9 +1734,11 @@ object LockSound {
      *     UNDEFINED с причиной (`foreign_above`/`unproven`) — чужое не трогаем;
      *  3. после сверки состояние доводится до ПОСЛЕДНЕГО сохранённого намерения владельца.
      *
-     * @return true — была хотя бы одна незавершённая операция (значит, нужна сходимость).
+     * @return [LockOp.SoundRecovery]: можно ли отправлять новый bind. iter55 §7.1 — раньше здесь
+     *   был `Boolean`, и production его ИГНОРИРОВАЛ: несовместимый bind уходил даже при
+     *   неизвестном/повреждённом журнале.
      */
-    internal fun reconcilePendingOps(ctx: Context, source: String): Boolean {
+    internal fun reconcilePendingOps(ctx: Context, source: String): LockOp.SoundRecovery {
         gateEnter("reconcile")
         try {
             return reconcileLocked(ctx, source)
@@ -1648,22 +1748,34 @@ object LockSound {
     }
 
     /** Тело сверки — выполняется под [ioGate] (см. [reconcilePendingOps]). */
-    private fun reconcileLocked(ctx: Context, source: String): Boolean {
+    private fun reconcileLocked(ctx: Context, source: String): LockOp.SoundRecovery {
         val read = readOpJournal(ctx)
         if (read is LockOp.JournalRead.Unknown) {
             // «Прочитать нельзя» — это НЕ «операций не было»: объявлять «всё снято» и
             // сходиться к намерению нельзя, пока неизвестно, что в журнале.
             AppLog.e(ctx, TAG, "LOCKSOUND_RECONCILE source=$source action=stop ${read.wire()} " +
                 "(сверка невозможна: неизвестно, есть ли незавершённые операции)")
-            return true
+            return LockOp.SoundRecovery.Conflict("journal_unknown:" + read.wire())
         }
         val journal = read.journal
+        if (journal.broken > 0) {
+            // iter55 §7.2: повреждённая строка — это возможная НЕИЗВЕСТНАЯ операция. Пустой
+            // `unresolved()` после этого не доказывает сток.
+            AppLog.e(ctx, TAG, "LOCKSOUND_RECONCILE source=$source action=stop " +
+                "journal_broken=${journal.broken} journal=«${journal.wire()}» " +
+                "(часть журнала не разобрана: неизвестные операции не исключены)")
+            return LockOp.SoundRecovery.Conflict("journal_corrupt:broken=${journal.broken}")
+        }
         val pending = journal.unresolved()
         if (pending.isEmpty()) {
             AppLog.i(ctx, TAG, "LOCKSOUND_RECONCILE source=$source action=none journal=«${journal.wire()}» " +
                 "read=${if (read is LockOp.JournalRead.Absent) "absent" else "readable"}")
-            return false
+            return LockOp.SoundRecovery.Ready
         }
+        val unresolvedNow = ArrayList<String>()
+        val lateShell = ArrayList<String>()
+        var evidencePath = ""
+        var conflictReason: String? = null
         AppLog.i(ctx, TAG, "LOCKSOUND_RECONCILE source=$source pending=${pending.size} " +
             "journal=«${journal.wire()}» ops=${pending.joinToString(",") { it.id }} " +
             "(незавершённые операции будут сверены по фактической таблице монтирований)")
@@ -1675,6 +1787,26 @@ object LockSound {
                 AppLog.e(appCtx, TAG, "LOCKSOUND_RECONCILE op=${op.id} action=none reason=no_targets " +
                     "(в записи нет целей/staging: снять наугад нельзя, запись сохранена)")
                 continue
+            }
+            // iter55 §5.2/§7.1: ПЕРЕД любой мутацией — read-only чтение свидетельства доставки
+            // этой операции (`<path>`, `<path>.started`, `<path>.done`). Раньше путь-свидетельство
+            // жил только в строке лога: «Unknown» нельзя было разрешить после рестарта, и решение
+            // принималось по одному лишь ответу restore-скрипта.
+            val ev = readEvidence(appCtx, op)
+            if (ev != null) {
+                AppLog.i(appCtx, TAG, "LOCKSOUND_EVIDENCE op=${op.id} path=${op.evidence} " +
+                    "${ev.wire()}")
+                // Пишем факт в журнал ДО мутации: если процесс умрёт во время restore, следующая
+                // сверка увидит уже прочитанное свидетельство, а не начнёт с нуля.
+                writeOpJournal(appCtx, op.copy(
+                    reason = "evidence_started=${ev.started} done=${ev.done} " +
+                        "script=${ev.scriptPresent}"
+                ))
+                if (!ev.terminalProven && ev.scriptPresent) {
+                    // Скрипт лежит на устройстве, terminal не доказан → поздний shell ещё может
+                    // выполниться. Убираем наш слой (restore ниже), но новый bind не разрешаем.
+                    lateShell.add(op.id)
+                }
             }
             val script = LockMountScripts.restoreScript(entries)
             val (rc, out) = AdbClient.executeScript("lock_reconcile_restore", script, 30000)
@@ -1692,6 +1824,38 @@ object LockSound {
             AppLog.i(appCtx, TAG, "LOCKSOUND_RECONCILE op=${op.id} rc=$rc " +
                 "verdict=${verdict.name.lowercase()} ${detail.wire()} state=${state.name.lowercase()} " +
                 "out=${out.replace('\n', ' ').take(300)}")
+            if (state == LockOp.State.UNDEFINED) {
+                unresolvedNow += op.id
+                if (evidencePath.isEmpty()) evidencePath = op.evidence
+            }
+            if (verdict == LockOp.Reconcile.UNPROVEN || verdict == LockOp.Reconcile.FOREIGN_LEFT) {
+                conflictReason = "${verdict.name.lowercase()}:${op.id}"
+            }
+        }
+        if (lateShell.isNotEmpty()) {
+            // iter55 §5.2: свидетельство показывает, что скрипт ещё лежит на устройстве без
+            // terminal → он может стартовать ПОЗЖЕ. Наш слой уже снят, но объявлять «сходимость»
+            // и монтировать новый поверх нельзя: получилось бы два слоя и «звук не тот».
+            AppLog.e(appCtx, TAG, "LOCKSOUND_RECONCILE source=$source action=stop " +
+                "late_shell_possible=${lateShell.joinToString(",")} " +
+                "(удалённый запуск не доказал завершение: bind не отправляется)")
+            conflictReason = conflictReason ?: ("late_shell_possible:" + lateShell.first())
+        }
+        // Сверка не «доказала сток», если хоть одна операция осталась недоказанной или поверх
+        // оказался чужой слой. Тогда новый bind НЕ отправляется: старый shell мог не завершиться.
+        if (conflictReason != null) {
+            AppLog.e(appCtx, TAG, "LOCKSOUND_RECONCILE source=$source action=stop " +
+                "conflict=$conflictReason unresolved=${unresolvedNow.size} " +
+                "(намерение владельца сохраняется; bind не отправляется)")
+            return LockOp.SoundRecovery.Conflict(conflictReason)
+        }
+        if (unresolvedNow.isNotEmpty()) {
+            AppLog.w(appCtx, TAG, "LOCKSOUND_RECONCILE source=$source action=defer " +
+                "unresolved=${unresolvedNow.size} evidence=${evidencePath.ifEmpty { "none" }} " +
+                "(исход не доказан: нужен повторный read-only проход, новый bind не отправляется)")
+            return LockOp.SoundRecovery.Pending(
+                "unresolved_ops=${unresolvedNow.size}", evidencePath
+            )
         }
         // Сходимость к последнему сохранённому намерению (не к «состоянию до»).
         if (isEnabled(appCtx)) {
@@ -1704,7 +1868,7 @@ object LockSound {
         } else {
             markApplied(appCtx, false, "reconciled_off")
         }
-        return true
+        return LockOp.SoundRecovery.Ready
     }
 
     /** Хэш пути staging: короткая детерминированная метка, без содержимого WAV. */

@@ -177,12 +177,11 @@ object ScriptDelivery {
      */
     fun outcome(result: Result, operationId: String): DeliveryOutcome = when (result.state) {
         State.RUN_CONFIRMED -> DeliveryOutcome.Finished(operationId, result.rc)
-        State.RUN_SENT ->
-            if (result.plan.transport == Transport.DIRECT) DeliveryOutcome.Finished(operationId, result.rc)
-            else DeliveryOutcome.Unknown(
-                operationId, EvidenceRef(result.evidencePath.ifEmpty { result.plan.path }),
-                "run_sent_done_not_read"
-            )
+        // iter55 §5.1: «отправлено» ≠ «завершено». Terminal есть только у RUN_CONFIRMED.
+        State.RUN_SENT -> DeliveryOutcome.Unknown(
+            operationId, EvidenceRef(result.evidencePath.ifEmpty { result.plan.path }),
+            "run_sent_terminal_not_proven"
+        )
         State.RUN_UNKNOWN -> DeliveryOutcome.Unknown(
             operationId, EvidenceRef(result.evidencePath.ifEmpty { result.plan.path }),
             if (result.mayHaveRun) "stdout_lost_may_have_run" else "state_unknown"
@@ -270,29 +269,48 @@ object ScriptDelivery {
      * Маркер `VAPP_DIRECT_DONE rc=…` делает завершение фактом, а его отсутствие при потерянном
      * ответе — честной неизвестностью (iter54 §5).
      */
-    fun directScript(script: String): String =
+    fun directScript(script: String, nonce: String = newNonce()): String =
         // ПОДОБОЛОЧКА обязательна: `exit N` внутри скрипта иначе завершит весь shell и маркер
         // завершения не напечатается — «ответ есть, а маркера нет» снова стало бы догадкой.
-        "( echo VAPP_DIRECT_STARTED; " + script + "\n) ; echo " +
-            "\"VAPP_DIRECT_DONE rc=\$?\""
+        //
+        // iter55 §5.1: маркер несёт НОМЕР ПОПЫТКИ. Без него строка `VAPP_DIRECT_DONE` в теле
+        // самого payload (эхо, сообщение об ошибке, чужой вывод) могла быть принята за
+        // завершение — terminal должен принадлежать ИМЕННО этой попытке.
+        "( echo VAPP_DIRECT_STARTED_" + sanitize(nonce) + "; " + script + "\n) ; echo " +
+            "\"VAPP_DIRECT_DONE_" + sanitize(nonce) + " rc=\$?\""
 
-    /** Разбор прямой отправки по фактам её вывода. */
-    fun directResult(name: String, script: String, rc: Int, out: String): Result {
+    /**
+     * Разбор прямой отправки по фактам её вывода.
+     *
+     * iter55 §5.1: отсутствие маркера завершения — это `RUN_UNKNOWN`, а НЕ «отправлено и
+     * выполнено». Прежний код возвращал `RUN_SENT`, и `outcome` превращал его в `Finished`:
+     * пустой/обрезанный ответ без единого `ERR_ADB_*` (другой код ошибки, потеря вывода,
+     * завершение канала) объявлялся успешным выполнением скрипта.
+     *
+     * Маркер ищется вместе с НОМЕРОМ ПОПЫТКИ ([nonce]), поэтому строка маркера, напечатанная
+     * самим payload или предыдущей попыткой, за terminal не принимается.
+     */
+    fun directResult(
+        name: String,
+        script: String,
+        rc: Int,
+        out: String,
+        nonce: String = ""
+    ): Result {
         val plan = plan(name, script)
         val lost = out.contains("ERR_ADB_TIMEOUT") || out.contains("ERR_ADB_")
-        val done = Regex("VAPP_DIRECT_DONE rc=(-?\\d+)").find(out)
+        val marker = if (nonce.isEmpty()) Regex("VAPP_DIRECT_DONE rc=(-?\\d+)")
+        else Regex("VAPP_DIRECT_DONE_" + Regex.escape(sanitize(nonce)) + " rc=(-?\\d+)")
+        val doneLines = marker.findAll(out).toList()
         return when {
-            done != null -> Result(
-                done.groupValues[1].toIntOrNull() ?: rc, out, plan, 1,
+            // Ровно один маркер этой попытки: два и больше — не terminal, а мусор/подделка.
+            doneLines.size == 1 -> Result(
+                doneLines.first().groupValues[1].toIntOrNull() ?: rc, out, plan, 1,
                 State.RUN_CONFIRMED, true, false, "", false, contentKind = "direct_marker"
             )
-            lost -> Result(
-                rc, out, plan, 1, State.RUN_UNKNOWN, false, false, "", true,
-                contentKind = "direct_none"
-            )
             else -> Result(
-                rc, out, plan, 1, State.RUN_SENT, true, false, "", false,
-                contentKind = "direct_none"
+                rc, out, plan, 1, State.RUN_UNKNOWN, false, false, "", true,
+                contentKind = if (lost) "direct_none" else "direct_no_terminal"
             )
         }
     }
@@ -425,8 +443,9 @@ object ScriptDelivery {
         if (plan.transport == Transport.DIRECT) {
             // iter54 §5: прямая отправка тоже несёт маркеры начала/завершения — иначе
             // «ответ есть» выдавалось за «скрипт выполнился».
-            val (rc, out) = exec(directScript(script), timeoutMs, expectRoot)
-            return directResult(name, script, rc, out)
+            // Один номер попытки и для маркера, и для разбора: terminal принадлежит ИМЕННО ей.
+            val (rc, out) = exec(directScript(script, nonce), timeoutMs, expectRoot)
+            return directResult(name, script, rc, out, nonce)
         }
 
         var lastRc = 1

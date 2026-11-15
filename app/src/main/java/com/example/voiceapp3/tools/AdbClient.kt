@@ -585,8 +585,10 @@ object AdbClient {
             // iter54 §5: прямая отправка разбирается ТОЙ ЖЕ функцией, что и заливка
             // ([ScriptDelivery.directResult]): маркеры `VAPP_DIRECT_STARTED/DONE` делают
             // завершение фактом, а потерянный ответ — честной неизвестностью.
-            val (rc, out) = execute(ScriptDelivery.directScript(script), timeoutMs, expectRoot)
-            return ScriptDelivery.directResult(name, script, rc, out)
+            // iter55 §5.1: номер попытки входит и в маркер, и в разбор.
+            val nonce = ScriptDelivery.newNonce()
+            val (rc, out) = execute(ScriptDelivery.directScript(script, nonce), timeoutMs, expectRoot)
+            return ScriptDelivery.directResult(name, script, rc, out, nonce)
         }
         val res = synchronized(scriptUploadLock) {
             ScriptDelivery.deliver(name, script, timeoutMs, expectRoot, ::execute)

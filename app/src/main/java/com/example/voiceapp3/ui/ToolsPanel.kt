@@ -1239,6 +1239,10 @@ class ToolsPanel(
             "pending" -> "$what: ждёт готовности" + (if (reason.isNotEmpty()) " · причина: $reason" else "") +
                 " · настройка остаётся включённой"
             "off" -> "$what: выключено"
+            // iter55 §9: исход не доказан. Не «выключено» и не «ждите»: настройка сохранена,
+            // применение неизвестно; текст нейтральный (не красный), с причиной.
+            "unknown" -> "$what: состояние неизвестно · настройка сохранена" +
+                (if (reason.isNotEmpty()) " · причина: $reason" else "")
             else -> return
         }
         page.addView(text(text, 11.5f, palette.muted, bold = false).apply {

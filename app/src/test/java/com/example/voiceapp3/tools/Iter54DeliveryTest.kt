@@ -62,10 +62,12 @@ class Iter54DeliveryTest {
         assertTrue("terminal прочитан — Finished: ${finished.wire()}",
             finished is ScriptDelivery.DeliveryOutcome.Finished)
 
-        // Прямая отправка: ответ транспорта содержит rc самого скрипта → это Finished.
+        // iter55 §5.1: RUN_SENT — это «передано на исполнение», а НЕ terminal. Раньше прямой
+        // RUN_SENT превращался в Finished, и ответ без маркера завершения (пустой/обрезанный, с
+        // другим кодом ошибки) объявлялся успешным выполнением скрипта.
         val directSent = res(ScriptDelivery.State.RUN_SENT, planDirect).let { ScriptDelivery.outcome(it, "op4") }
-        assertTrue("прямая отправка завершена: ${directSent.wire()}",
-            directSent is ScriptDelivery.DeliveryOutcome.Finished)
+        assertTrue("RUN_SENT без terminal — Unknown: ${directSent.wire()}",
+            directSent is ScriptDelivery.DeliveryOutcome.Unknown)
         // Заливка: «запуск передан», но `.done` не прочитан → Unknown, а НЕ успех.
         val uploadSent = res(ScriptDelivery.State.RUN_SENT, planUpload).let { ScriptDelivery.outcome(it, "op5") }
         assertTrue("заливка без .done — Unknown: ${uploadSent.wire()}",
