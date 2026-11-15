@@ -93,15 +93,103 @@ object ScriptDelivery {
          */
         val evidencePath: String = ""
     ) {
+        /**
+         * iter54 §5: `cksum`/CRC — проверка ЦЕЛОСТНОСТИ заливки, а НЕ криптографическое
+         * доказательство. Это поле печатается рядом с `content_checked`, чтобы в журнале не
+         * возникало впечатления «содержимое доказано криптографически».
+         */
+        val contentProof: String get() = when (contentKind) {
+            "cksum", "odsum", "md5" -> "integrity_only_not_crypto"
+            "direct_marker" -> "no_upload"
+            else -> "none"
+        }
+
         val delivered: Boolean get() = state == State.RUN_SENT || state == State.RUN_CONFIRMED
         fun wire(): String =
             "rc=$rc state=${state.name.lowercase()} ${plan.wire()} attempts=$attempts " +
                 "size_checked=${if (sizeChecked) 1 else 0} " +
                 "content_checked=${if (contentChecked) 1 else 0} " +
                 "may_have_run=${if (mayHaveRun) 1 else 0} " +
-                "content_kind=$contentKind " +
+                "content_kind=$contentKind content_proof=$contentProof " +
                 "leftover=${leftoverPath.ifEmpty { "none" }} " +
                 "evidence=${evidencePath.ifEmpty { "none" }}"
+    }
+
+    /**
+     * iter54 §5 — ССЫЛКА НА СВИДЕТЕЛЬСТВО НА УСТРОЙСТВЕ.
+     *
+     * Это не «доказательство выполнения», а указание, ГДЕ искать факт: путь скрипта и его
+     * служебные файлы `.started`/`.done`. Поздняя сверка ([evidenceCommand]) читает их без
+     * повторного side effect.
+     */
+    data class EvidenceRef(
+        val path: String,
+        val started: String = "unknown",
+        val done: String = "unknown",
+        val note: String = ""
+    ) {
+        fun wire(): String = "evidence_path=${path.ifEmpty { "none" }} " +
+            "started=${started.ifEmpty { "unknown" }} done=${done.ifEmpty { "unknown" }}" +
+            (if (note.isEmpty()) "" else " note=$note")
+    }
+
+    /**
+     * iter54 §5 — ИСХОД ДОСТАВКИ В ТЕРМИНАХ, КОТОРЫЕ ДОХОДЯТ ДО ПОТРЕБИТЕЛЯ.
+     *
+     * Проблема, которую это закрывает: `Result` жил только в `AdbClient`, а потребители
+     * (звук замка, TTL) получали `Pair<rc, out>`. `RUN_UNKNOWN` при этом исчезал: «ответ
+     * потерян» и «команда не выполнена» выглядели одинаково (`rc != 0`), и вызывающий код
+     * мог либо повторять опасную операцию, либо заявить успех.
+     *
+     * Теперь у каждого потребителя есть ТРИ различимых исхода:
+     *  • [NotSent] — доказано, что ни один байт не исполнялся (заливка неполна/не создана);
+     *  • [Unknown] — могло исполниться, но факта нет: нужна сверка по [EvidenceRef];
+     *  • [Finished] — факт завершения есть (`rc`), это НЕ доказательство нужного эффекта.
+     */
+    sealed interface DeliveryOutcome {
+        data class NotSent(val why: String) : DeliveryOutcome
+
+        data class Unknown(
+            val operationId: String,
+            val evidence: EvidenceRef,
+            val why: String
+        ) : DeliveryOutcome
+
+        data class Finished(val operationId: String, val rc: Int) : DeliveryOutcome
+
+        fun wire(): String = when (this) {
+            is NotSent -> "outcome=not_sent why=$why"
+            is Unknown -> "outcome=unknown op=$operationId why=$why ${evidence.wire()}"
+            is Finished -> "outcome=finished op=$operationId rc=$rc"
+        }
+    }
+
+    /**
+     * Отображение фактов доставки в исход для потребителя.
+     *
+     * Правила намеренно консервативны:
+     *  • `RUN_CONFIRMED` → [DeliveryOutcome.Finished] (есть rc — и только это);
+     *  • `RUN_SENT` при ПРЯМОЙ отправке → тоже `Finished`: ответ транспорта в этом режиме
+     *    содержит rc самого скрипта; при заливке — `Unknown` (запуск передан, но `.done` не
+     *    прочитан);
+     *  • `RUN_UNKNOWN` → `Unknown` с путём-свидетельством, даже если путь пуст;
+     *  • всё остальное — `NotSent` (доказанное «не исполнялось»).
+     */
+    fun outcome(result: Result, operationId: String): DeliveryOutcome = when (result.state) {
+        State.RUN_CONFIRMED -> DeliveryOutcome.Finished(operationId, result.rc)
+        State.RUN_SENT ->
+            if (result.plan.transport == Transport.DIRECT) DeliveryOutcome.Finished(operationId, result.rc)
+            else DeliveryOutcome.Unknown(
+                operationId, EvidenceRef(result.evidencePath.ifEmpty { result.plan.path }),
+                "run_sent_done_not_read"
+            )
+        State.RUN_UNKNOWN -> DeliveryOutcome.Unknown(
+            operationId, EvidenceRef(result.evidencePath.ifEmpty { result.plan.path }),
+            if (result.mayHaveRun) "stdout_lost_may_have_run" else "state_unknown"
+        )
+        State.UPLOAD_INCOMPLETE -> DeliveryOutcome.NotSent("upload_incomplete")
+        State.TOO_LARGE -> DeliveryOutcome.NotSent("script_too_large")
+        State.NOT_SENT -> DeliveryOutcome.NotSent("not_sent")
     }
 
     // ─────────────────────────── имена и содержимое ───────────────────────────
@@ -173,6 +261,40 @@ object ScriptDelivery {
             s = (s * 131L + (b.toLong() and 0xffL)) % 4294967296L
         }
         return s
+    }
+
+    /**
+     * Обёртка ПРЯМОЙ отправки: маркеры до и после скрипта.
+     *
+     * Зачем: без них «ответ транспорта есть» приходилось трактовать как «скрипт выполнился».
+     * Маркер `VAPP_DIRECT_DONE rc=…` делает завершение фактом, а его отсутствие при потерянном
+     * ответе — честной неизвестностью (iter54 §5).
+     */
+    fun directScript(script: String): String =
+        // ПОДОБОЛОЧКА обязательна: `exit N` внутри скрипта иначе завершит весь shell и маркер
+        // завершения не напечатается — «ответ есть, а маркера нет» снова стало бы догадкой.
+        "( echo VAPP_DIRECT_STARTED; " + script + "\n) ; echo " +
+            "\"VAPP_DIRECT_DONE rc=\$?\""
+
+    /** Разбор прямой отправки по фактам её вывода. */
+    fun directResult(name: String, script: String, rc: Int, out: String): Result {
+        val plan = plan(name, script)
+        val lost = out.contains("ERR_ADB_TIMEOUT") || out.contains("ERR_ADB_")
+        val done = Regex("VAPP_DIRECT_DONE rc=(-?\\d+)").find(out)
+        return when {
+            done != null -> Result(
+                done.groupValues[1].toIntOrNull() ?: rc, out, plan, 1,
+                State.RUN_CONFIRMED, true, false, "", false, contentKind = "direct_marker"
+            )
+            lost -> Result(
+                rc, out, plan, 1, State.RUN_UNKNOWN, false, false, "", true,
+                contentKind = "direct_none"
+            )
+            else -> Result(
+                rc, out, plan, 1, State.RUN_SENT, true, false, "", false,
+                contentKind = "direct_none"
+            )
+        }
     }
 
     /** Выбор транспорта по ФАКТИЧЕСКОЙ длине UTF-8. */
@@ -301,11 +423,10 @@ object ScriptDelivery {
                 plan, 0, State.TOO_LARGE, false, false, "", false)
         }
         if (plan.transport == Transport.DIRECT) {
-            val (rc, out) = exec(script, timeoutMs, expectRoot)
-            val lost = out.contains("ERR_ADB_TIMEOUT") || out.contains("ERR_ADB_")
-            return Result(rc, out, plan, 1,
-                if (lost) State.RUN_UNKNOWN else State.RUN_SENT,
-                true, false, "", lost)
+            // iter54 §5: прямая отправка тоже несёт маркеры начала/завершения — иначе
+            // «ответ есть» выдавалось за «скрипт выполнился».
+            val (rc, out) = exec(directScript(script), timeoutMs, expectRoot)
+            return directResult(name, script, rc, out)
         }
 
         var lastRc = 1

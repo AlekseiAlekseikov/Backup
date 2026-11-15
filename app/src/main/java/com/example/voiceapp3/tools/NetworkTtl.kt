@@ -348,7 +348,27 @@ private fun buildScript(enable: Boolean, reg: TtlOwnership.Registry?): String {
             AppLog.i(TAG, "TTL_OWNERSHIP_REGISTRY ${reg.wire()}")
         }
         val script = buildScript(want, reg)
-        var (exitCode, output) = AdbClient.executeScript("ttl_script", script, 40000)
+        // iter54 §5: исход доставки различает «не отправлено», «неизвестно» и «завершено».
+        // Раньше TTL видел только `rc`/`out`, поэтому «ответ потерян» и «не выполнено» были
+        // неразличимы — и `VERIFY_*` мог быть построен на выводе, которого не было.
+        val opId = "ttl_" + (if (want) "on" else "off") + "_" + t0
+        // ОДНА доставка: тот же результат используется и для исхода, и для разбора вывода.
+        val detailed = AdbClient.executeScriptDetailed("ttl_script", script, 40000)
+        val delivery = ScriptDelivery.outcome(detailed, opId)
+        val firstOutcome = delivery
+        if (firstOutcome is ScriptDelivery.DeliveryOutcome.NotSent) {
+            AppLog.w(TAG, "TTL_DELIVERY op=$opId ${firstOutcome.wire()} source=$source " +
+                "action=stop (ни один байт скрипта не исполнялся: таблица не менялась)")
+            return TtlRunner.Outcome(false, "not_sent:" + firstOutcome.why, firstOutcome.wire())
+        }
+        if (firstOutcome is ScriptDelivery.DeliveryOutcome.Unknown) {
+            AppLog.w(TAG, "TTL_DELIVERY op=$opId ${firstOutcome.wire()} source=$source " +
+                "action=pending (исход применения неизвестен: «применено» не заявляется, " +
+                "факт даст readback/следующий проход)")
+            return TtlRunner.Outcome(false, "unknown:${firstOutcome.why}", firstOutcome.wire())
+        }
+        var exitCode = detailed.rc
+        var output = detailed.out
         if (want) {
             var attempt = 1
             while (attempt <= TTL_UPLINK_RETRIES && isNoUplink(output)) {

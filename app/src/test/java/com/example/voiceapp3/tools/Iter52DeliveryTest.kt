@@ -246,7 +246,10 @@ class Iter52DeliveryTest {
         val small = "echo hello"
         val res = run(small, "tiny")
         assertEquals(ScriptDelivery.Transport.DIRECT, res.plan.transport)
-        assertEquals(ScriptDelivery.State.RUN_SENT, res.state)
+        // iter54 §5: прямая отправка несёт маркер `VAPP_DIRECT_DONE rc=…`, поэтому завершение
+        // стало ФАКТОМ, а не выводом из «ответ транспорта есть».
+        assertEquals(ScriptDelivery.State.RUN_CONFIRMED, res.state)
+        assertEquals("rc скрипта", 0, res.rc)
         assertEquals("прямая команда выполнена", 1, dev.executed.size)
     }
 

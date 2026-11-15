@@ -582,14 +582,11 @@ object AdbClient {
     ): ScriptDelivery.Result {
         val bytes = ScriptChunker.bytesOf(script)
         if (bytes.size <= ScriptDelivery.DIRECT_LIMIT) {
-            val (rc, out) = execute(script, timeoutMs, expectRoot)
-            val lost = out.contains("ERR_ADB_TIMEOUT") || out.contains("ERR_ADB_")
-            val plan = ScriptDelivery.plan(name, script)
-            return ScriptDelivery.Result(
-                rc, out, plan, 1,
-                if (lost) ScriptDelivery.State.RUN_UNKNOWN else ScriptDelivery.State.RUN_SENT,
-                true, false, "", lost
-            )
+            // iter54 §5: прямая отправка разбирается ТОЙ ЖЕ функцией, что и заливка
+            // ([ScriptDelivery.directResult]): маркеры `VAPP_DIRECT_STARTED/DONE` делают
+            // завершение фактом, а потерянный ответ — честной неизвестностью.
+            val (rc, out) = execute(ScriptDelivery.directScript(script), timeoutMs, expectRoot)
+            return ScriptDelivery.directResult(name, script, rc, out)
         }
         val res = synchronized(scriptUploadLock) {
             ScriptDelivery.deliver(name, script, timeoutMs, expectRoot, ::execute)
@@ -608,6 +605,38 @@ object AdbClient {
                 AppLog.w(TAG, "SCRIPT_UPLOAD NOT_SENT name=$name ${res.wire()}")
         }
         return res
+    }
+
+    /**
+     * iter54 §5 — доставка с ИСХОДОМ в терминах потребителя: [ScriptDelivery.DeliveryOutcome].
+     *
+     * Это единственная точка, которую обязаны использовать потребители с side effect
+     * (звук замка, TTL): `NotSent`/`Unknown`/`Finished` различимы, а «rc != 0» больше нельзя
+     * трактовать как «не выполнено» (ответ мог просто потеряться).
+     *
+     * @param operationId идентификатор операции, к которой будет привязано свидетельство —
+     *        он попадает в журнал и в ссылку на evidence, чтобы поздняя сверка не искала
+     *        «какой-то» файл.
+     */
+    fun executeScriptOutcome(
+        name: String,
+        script: String,
+        operationId: String,
+        timeoutMs: Int = 40000,
+        expectRoot: Boolean = true
+    ): ScriptDelivery.DeliveryOutcome {
+        val res = executeScriptDetailed(name, script, timeoutMs, expectRoot)
+        val outcome = ScriptDelivery.outcome(res, operationId)
+        when (outcome) {
+            is ScriptDelivery.DeliveryOutcome.NotSent ->
+                AppLog.w(TAG, "SCRIPT_OUTCOME name=$name ${outcome.wire()} ${res.wire()}")
+            is ScriptDelivery.DeliveryOutcome.Unknown ->
+                AppLog.e(TAG, "SCRIPT_OUTCOME name=$name ${outcome.wire()} ${res.wire()} " +
+                    "(исход НЕИЗВЕСТЕН: повторять опасную операцию вслепую нельзя)")
+            is ScriptDelivery.DeliveryOutcome.Finished ->
+                AppLog.i(TAG, "SCRIPT_OUTCOME name=$name ${outcome.wire()} ${res.wire()}")
+        }
+        return outcome
     }
 
     /**

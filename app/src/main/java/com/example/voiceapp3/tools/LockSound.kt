@@ -1037,8 +1037,43 @@ object LockSound {
                 val bindPlan = ScriptDelivery.plan("lock_bind", bindScript)
                 AppLog.i(ctx, TAG, "LOCKSOUND_BIND TRANSPORT ${bindPlan.wire()} " +
                     "(длина измерена по фактическим UTF-8 байтам, не по оценке)")
-                val bindRes = AdbClient.executeScript("lock_bind", bindScript, 30000)
+                // iter54 §5: bind — операция с НЕОБРАТИМЫМ side effect (mount), поэтому её
+                // исход обязан доходить сюда тремя различимыми состояниями, а не `rc`.
+                // Раньше `RUN_UNKNOWN` терялся: «ответ потерян» и «не выполнено» выглядели
+                // одинаково, и вызывающий код мог либо повторить bind, либо заявить успех.
+                val bindDetailed = AdbClient.executeScriptDetailed("lock_bind", bindScript, 30000)
+                val bindRes = Pair(bindDetailed.rc, bindDetailed.out)
+                val bindOutcome = ScriptDelivery.outcome(bindDetailed, opId)
                 AppLog.i(ctx, TAG, "lockSound bind rc=${bindRes.first}: ${bindRes.second.replace('\n', ' ').take(500)}")
+                AppLog.i(ctx, TAG, "LOCKSOUND_BIND_OUTCOME op=$opId ${bindOutcome.wire()} " +
+                    "(finished ≠ «слой встал»: факт даёт MOUNT_FACT/MOUNTED_OK, а не ответ канала)")
+                when (bindOutcome) {
+                    is ScriptDelivery.DeliveryOutcome.NotSent -> {
+                        // Доказано: ни один байт скрипта не исполнялся. Учёт операции закрываем
+                        // как НЕ применённый (это не «ошибка mount»), и только здесь retry
+                        // безопасен — но и он решается владельцем/следующим проходом.
+                        finishOpJournal(ctx, op, LockOp.State.FAILED,
+                            "bind_not_sent:" + bindOutcome.why)
+                        AppLog.w(ctx, TAG, "LOCKSOUND_BIND NOT_SENT op=$opId why=${bindOutcome.why} " +
+                            "action=no_effect_retry_safe (слои не создавались)")
+                        recordBindFailure("not_sent:" + bindOutcome.why, appCtx, deterministic = false)
+                        return@post
+                    }
+                    is ScriptDelivery.DeliveryOutcome.Unknown -> {
+                        // Могло исполниться: НЕ заявляем ни успех, ни «не выполнено», НЕ
+                        // повторяем вслепую. Свидетельство (путь скрипта и .started/.done)
+                        // сохраняется в журнале, поздняя сверка дочитает факт.
+                        // Состояние UNDEFINED — «исход не установлен»: сверка по свидетельству
+                        // (evidence) дочитает факт, а не «не выполнено».
+                        finishOpJournal(ctx, op, LockOp.State.UNDEFINED,
+                            "bind_outcome_unknown:" + bindOutcome.why)
+                        AppLog.w(ctx, TAG, "LOCKSOUND_BIND UNKNOWN op=$opId ${bindOutcome.wire()} " +
+                            "action=pending_no_retry (исход станет известен из свидетельства)")
+                        recordBindFailure("outcome_unknown:" + bindOutcome.why, appCtx, deterministic = false)
+                        return@post
+                    }
+                    is ScriptDelivery.DeliveryOutcome.Finished -> Unit
+                }
 
                 // §6.2 iter46: `ERR_ROOT_CHANNEL_UNAVAILABLE` и `Permission denied` — ВРЕМЕННЫЕ
                 // (канал/права могут вернуться без перезагрузки: в логе владельца 13.11 это
