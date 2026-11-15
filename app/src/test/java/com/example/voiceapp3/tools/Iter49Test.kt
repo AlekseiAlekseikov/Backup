@@ -361,11 +361,14 @@ class Iter49Test {
     @Test
     fun lateReadbackChecksOwnersGenerationNotOnlyContent() {
         val w = src("WindowDoors.kt")
-        assertTrue("поколение набора владельцев есть", w.contains("ventGen"))
+        // iter54 §8: поколение принадлежит VentOwnerTx (один lock на набор и поколение);
+        // в WindowDoors остались только обращения через него.
+        assertTrue("поколение набора владельцев есть",
+            w.contains("ventTx.generation()") || w.contains("ventGen"))
         // iter50 §9.1: проверка вынесена в чистую функцию ventLateReadbackMayDropOwners
         // (поведение — в Iter50VentTest), здесь остаётся факт её вызова с поколением.
         assertTrue("сверяется содержимое И поколение",
-            w.contains("ventLateReadbackMayDropOwners") && w.contains("ventGen.get()"))
+            w.contains("ventLateReadbackMayDropOwners") && w.contains("ventTx.generation()"))
         assertTrue("ABA-проверка видна в журнале", w.contains("aba_checked=yes"))
         assertFalse(
             "одного сравнения содержимого недостаточно",
