@@ -420,10 +420,20 @@ object JitRef {
          * поколение не выдано (легаси-отметка/счётчик недоступен): порядок тогда сравнивается
          * по времени с явным правилом `rule=ts_legacy`.
          */
-        val seq: Long = 0L
+        val seq: Long = 0L,
+        /**
+         * iter56 §5 — ЭКЗЕМПЛЯР исполнения (`inst`), записанный ДО отправки payload.
+         *
+         * Без него после перезапуска процесса нельзя сказать, чьё именно исполнение читается в
+         * terminal'е: файл назван по opId, а opId переиспользуется. Тогда `END` повторной доставки
+         * того же payload выглядел как завершение текущего исполнения. `null` — отметка прежних
+         * версий; тогда факты берутся только при однозначной атрибуции (см. JitOwn.parseTerminal).
+         */
+        val inst: String? = null
     ) {
         fun wire(): String =
             "op=$op;ts_ms=$tsMs;ts_s=${JitOwn.msToS(tsMs)};want=${if (want) 1 else 0};state=$state" +
+                (inst?.takeIf { it.isNotBlank() }?.let { ";inst=$it" } ?: "") +
                 // iter56 §4.3: поколение дописывается ТОЛЬКО когда оно есть — отметки прежних
                 // версий и тестовые записи остаются байт-в-байт теми же (совместимость чтения).
                 (if (seq > 0L) ";seq=$seq" else "")
@@ -439,6 +449,8 @@ object JitRef {
                 "^op=([A-Za-z0-9_.-]{1,48});" +
                     "(?:ts_ms=\\d{1,19};ts_s=\\d{1,19}|ts_ms=\\d{1,19}|ts_s=\\d{1,19}|ts=\\d{1,19})" +
                     ";want=([01]);state=(sending|replied|undefined)" +
+                    // порядок полей фиксирован; оба хвоста необязательны (совместимость чтения)
+                    "(?:;inst=[A-Za-z0-9_.-]{1,80})?" +
                     "(?:;seq=\\d{1,19})?$"
             )
 
@@ -455,6 +467,8 @@ object JitRef {
                 val ts = JitOwn.Op.parseTsMs(raw) ?: return null
                 return OpMark(
                     op = m.groupValues[1],
+                    inst = Regex("(?:^|;)inst=([A-Za-z0-9_.-]{1,80})(?:;|$)")
+                        .find(raw.trim())?.groupValues?.get(1),
                     tsMs = ts,
                     want = m.groupValues[2] == "1",
                     state = m.groupValues[3],
@@ -1769,7 +1783,7 @@ object JitOp {
             val prevOpId = stored.mark?.op
             val prevTerm = if (prevOpId != null &&
                 (!staleOp || CHAIN_UNDEFINED.get() || stored.state == JitRef.StoredState.UNDEFINED)
-            ) probeTerminal(shell, prevOpId, log) else null
+            ) probeTerminal(shell, prevOpId, log, stored.mark?.inst) else null
             val prevResolved = prevTerm != null && (prevTerm.finished || prevTerm.refused)
             if (prevResolved && prevOpId != null) {
                 val dec = JitOwn.clickDecision(
@@ -1857,8 +1871,14 @@ object JitOp {
                         "(поколение намерения выдать не удалось: порядок сравнивается по времени " +
                             "с явным правилом ts_legacy — это слабее seq, и так и названо)"
             )
+            // iter56 §5: ЭКЗЕМПЛЯР исполнения известен ДО записи снимка/claim/отправки payload.
+            // Он попадает в durable-отметку (переживает перезапуск процесса), в claim и в гвардию,
+            // поэтому прочитанный позже terminal можно привязать к КОНКРЕТНОМУ исполнению, а не к
+            // opId, который переиспользуется повторными кликами.
+            val clickTs = System.currentTimeMillis()
+            val opInst = JitOwn.newInstance(opId, clickTs)
             val mark = JitRef.OpMark(
-                opId, System.currentTimeMillis(), want, JitRef.OpMark.SENDING, seq = intentSeq
+                opId, clickTs, want, JitRef.OpMark.SENDING, seq = intentSeq, inst = opInst
             )
             var prev: List<JitRef.StorePrev> = emptyList()
             var prevUnknown = false
@@ -2031,8 +2051,8 @@ object JitOp {
             //    отправлять нельзя «вслепую»: его гвардия прочитает claim и, если он не наш,
             //    откажется работать — то есть клик гарантированно ничего не сделает, а мы бы
             //    записали «отправлено». Поэтому клик останавливается здесь, честно.
-            // iter54 §4: ОДИН экземпляр на клик — его видят и запись claim, и гвардия payload.
-            val opInst = JitOwn.newInstance(opId, mark.tsMs)
+            // iter54 §4: ОДИН экземпляр на клик — тот же `opInst`, что записан в отметку выше:
+            // его видят и запись claim, и гвардия payload, и чтение terminal.
             val opState = JitOwn.Op(
                 opId, mark.tsMs, want, JitOwn.State.CREATED,
                 identity = JitOwn.ClaimIdentity(opInst, "", "", ""),
@@ -2121,7 +2141,7 @@ object JitOp {
             // §7 iter51: ФАЗА по фактам устройства. Ответ транспорта — не доказательство исхода;
             // terminal-файл ЭТОЙ операции — доказательство (START/END/refused). Ошибка чтения
             // terminal'а не «додумывается»: тогда исход остаётся неизвестным.
-            val myTerm = probeTerminal(shell, opId, log)
+            val myTerm = probeTerminal(shell, opId, log, opInst)
             // iter52 §7.3: если terminal прочитать не удалось, но в РЕАЛЬНОМ stdout есть отказ
             // ИМЕННО нашей операции — это доказанный no-op, а не неизвестность.
             val phase = if (myTerm == null && JitOwn.refusedInOutput(opId, out)) JitOwn.State.REFUSED
@@ -2199,7 +2219,8 @@ object JitOp {
     private fun probeTerminal(
         shell: JitRef.JitShell,
         opId: String,
-        log: (String) -> Unit
+        log: (String) -> Unit,
+        expectInst: String? = null
     ): JitOwn.Terminal? {
         val r = runCatching { shell.exec(JitOwn.readCmd(opId), 8_000) }.getOrElse { t ->
             log(
@@ -2208,7 +2229,10 @@ object JitOp {
             )
             return null
         }
-        val term = JitOwn.parseTerminal(opId, r.second, r.first)
+        // iter56 §5: факты читаются по СВОЕМУ исполнению (identity из durable-отметки).
+        // Если оно неизвестно (отметка прежней версии) — parseTerminal не заявляет ни `STARTED`,
+        // ни `FINISHED` при нескольких исполнениях в файле: неоднозначность остаётся названной.
+        val term = JitOwn.parseTerminal(opId, r.second, r.first, expectInst)
         if (term == null) {
             log(
                 "JIT_OP_PROBE op=$opId read=failed rc=${r.first} out=«${r.second.trim().take(120)}» " +

@@ -983,7 +983,20 @@ if [ -f ${lock} ]; then
     if [ -n "${'$'}_age" ] && [ -n "${'$'}_now" ]; then
       echo "JIT_LOCK_AGED owner=${'$'}_lo age_s=${'$'}(( _now - _age )) action=none (возраст НЕ доказательство)"
     fi
-    _refuse lock_held "${'$'}_lo"
+    # iter56 §5: lock мог держать КОРОТКИЙ претендент — команда записи claim другого намерения,
+    # которая ещё не успела уступить (она живёт миллисекунды). Отказ без ожидания отменял бы
+    # легитимный клик из-за чужой 30-байтовой команды: два одновременных клика давали НОЛЬ
+    # side effect'ов вместо одного. Ждём ОГРАНИЧЕННО (до 2 c), не выполняя никаких действий;
+    # если lock так и держат — отказ, как раньше. Взяли — идём к проверке claim ПОД lock.
+    _lw=0
+    while [ "${'$'}_lw" -lt 40 ]; do
+      if [ ! -f ${lock} ]; then
+        _jit_take_lock "${'$'}_me_line" && { _lk=1; break; }
+      fi
+      sleep 0.05
+      _lw=${'$'}(( _lw + 1 ))
+    done
+    [ "${'$'}_lk" = "1" ] || _refuse lock_held "${'$'}_lo"
   fi
 else
   # Кто первый создал файл — тот и владелец; содержимое уже внутри (temp + ln).
@@ -1050,7 +1063,12 @@ trap 'echo "END rc=$? op=${id} inst=${'$'}_me_inst pid=${'$'}{_me_pid:-?} pstart
      * @param out  вывод команды чтения (возможно, с ошибкой транспорта).
      * @return `null` — прочитать НЕ УДАЛОСЬ (неизвестность не снимается).
      */
-    fun parseTerminal(opId: String, out: String, rc: Int = 0): Terminal? {
+    fun parseTerminal(
+        opId: String,
+        out: String,
+        rc: Int = 0,
+        expectInst: String? = null
+    ): Terminal? {
         // iter53 §4.1: разбор идёт по протоколу `CLAIM_STATUS/CLAIM_VALUE/TERM_STATUS/TERM_VALUE`
         // внутри маркеров CS_BEGIN…CS_END. Прежние regex искали `CLAIM=`/`TERM=` и требовали
         // закрывающую кавычку, которой в stdout нет → terminal «не читался» даже когда читался.
@@ -1074,23 +1092,53 @@ trap 'echo "END rc=$? op=${id} inst=${'$'}_me_inst pid=${'$'}{_me_pid:-?} pstart
         val foreignCount = lines.size - mineAll.size
         fun instOf(l: String): String =
             Regex("(?:^| )inst=([^ ]+)").find(l)?.groupValues?.get(1) ?: ""
-        // Факты относятся к ОДНОМУ экземпляру: тому, чьё событие в файле ПОСЛЕДНЕЕ (START, END
-        // или REFUSED). Так отказ экземпляра B (он пишет END rc=0) не читается как завершение A.
-        val lastInst = mineAll.lastOrNull { it.startsWith("START") || it.startsWith("END") ||
-            it.startsWith("REFUSED") }?.let { instOf(it) } ?: ""
-        val mine = if (lastInst.isEmpty()) mineAll else mineAll.filter { instOf(it) == lastInst }
-        val otherInst = mineAll.map { instOf(it) }.filter { it.isNotEmpty() && it != lastInst }
+        // iter56 §5: terminal привязан к КОНКРЕТНОМУ ИСПОЛНЕНИЮ, а не к «последнему, что нашлось
+        // в файле». Прежний выбор `lastInst` делал факты зависимыми от порядка строк: любой
+        // поздний след (в том числе отказ повторной доставки того же payload) подменял предмет
+        // чтения, и его `END rc=0` становился «нашим завершением».
+        //
+        // Правило: исполнение опознаётся по START/END. Если клиент знает свой `inst`
+        // ([expectInst] — он записан в durable-отметке ДО отправки), факты берутся ТОЛЬКО его.
+        // Если не знает и исполнений несколько — атрибуция НЕВОЗМОЖНА: `started`/`finished`
+        // не заявляются (неизвестность не подменяется самой «удобной» строкой файла).
+        val pidOf = { l: String -> Regex("(?:^| )pid=([^ ]+)").find(l)?.groupValues?.get(1) }
+        val execInsts = mineAll.filter { it.startsWith("START") || it.startsWith("END") }
+            .map { instOf(it) }.distinct()
+        val refusedInsts = mineAll.filter { it.startsWith("REFUSED") }.map { instOf(it) }.distinct()
+        val wantInst = expectInst?.takeIf { it.isNotBlank() }
+        // Файл прежних версий: события есть, но НИ ОДНО не несёт identity. Тогда привязка к
+        // запрошенному исполнению не выдумывается, но и не отбрасывается: строки привязываются
+        // к исполнению БЕЗ identity, и это названо в note (`inst_unproven_legacy`).
+        val onlyUnidentified = execInsts.isNotEmpty() && execInsts.all { it.isEmpty() }
+        val chosen: String? = when {
+            wantInst != null -> if (onlyUnidentified) "" else wantInst
+            execInsts.size == 1 -> execInsts[0]
+            execInsts.size > 1 -> null
+            // START/END нет: занимать нечем — если клиент не сказал, чьё исполнение ему нужно,
+            // остаются только отказы, и они НЕ являются событиями исполнения.
+            else -> null
+        }
+        val ambiguous = chosen == null && execInsts.size > 1
+        val mine = if (chosen == null) emptyList() else mineAll.filter { instOf(it) == chosen }
+        val otherInst = mineAll.map { instOf(it) }.filter { it.isNotEmpty() && it != chosen }
             .distinct().size
         val startLine = mine.firstOrNull { it.startsWith("START") }
         val endLine = mine.lastOrNull { it.startsWith("END") }
-        val rcEnd = endLine?.let { Regex("rc=(-?\\d+)").find(it)?.groupValues?.get(1)?.toIntOrNull() }
-        // Отказ считается доказанным, если он есть в terminal'е НАШЕГО экземпляра ИЛИ в stdout
-        // с нашим id (payload печатает `JIT_REFUSED op=<id> …`).
-        val refused = mine.any { it.startsWith("REFUSED") } ||
-            Regex("JIT_REFUSED op=" + Regex.escape(opId) + "( |$)").containsMatchIn(out) ||
-            Regex("JIT_REFUSED op=" + Regex.escape(opId) + "( |$)").containsMatchIn(termRaw)
-        val startOk = startLine != null
-        val finishOk = endLine != null && rcEnd != null
+        // END принадлежит тому же исполнению, что и START: при известных pid они обязаны совпасть
+        // (END пишет полную identity; чужой END с тем же inst — не наше завершение).
+        val endPid = endLine?.let(pidOf)
+        val startPid = startLine?.let(pidOf)
+        val sameExec = endLine == null || startPid == null || endPid == null || startPid == endPid
+        val rcEnd = if (sameExec) endLine?.let {
+            Regex("rc=(-?\\d+)").find(it)?.groupValues?.get(1)?.toIntOrNull()
+        } else null
+        // Отказ доказывается ТОЛЬКО своим экземпляром (или живым stdout нашего payload'а).
+        // Отказ из файла от другого исполнения той же операции — не наш отказ: он не доказывает,
+        // что наша цепочка не выполнялась.
+        val refused = (chosen != null && refusedInsts.contains(chosen)) ||
+            Regex("JIT_REFUSED op=" + Regex.escape(opId) + "( |$)").containsMatchIn(out)
+        val startOk = !ambiguous && startLine != null
+        val finishOk = !ambiguous && endLine != null && rcEnd != null
         return Terminal(
             started = startOk,
             finished = finishOk,
@@ -1100,8 +1148,12 @@ trap 'echo "END rc=$? op=${id} inst=${'$'}_me_inst pid=${'$'}{_me_pid:-?} pstart
             note = claimNote +
                 (if (foreignCount > 0) ";term_lines_other_op=$foreignCount" else "") +
                 (if (lines.isNotEmpty() && mine.isEmpty()) ";term_only_foreign_op" else "") +
-                (if (otherInst > 0) ";term_other_instance=$otherInst" else ""),
-            inst = lastInst,
+                (if (otherInst > 0) ";term_other_instance=$otherInst" else "") +
+                (if (ambiguous) ";term_exec_ambiguous=${execInsts.size}" else "") +
+                (if (wantInst != null && chosen != null && !mine.any { it.startsWith("START") })
+                    ";term_no_own_execution" else "") +
+                (if (onlyUnidentified) ";inst_unproven_legacy" else ""),
+            inst = chosen ?: "",
             otherInstances = otherInst
         )
     }
