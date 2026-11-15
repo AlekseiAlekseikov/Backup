@@ -135,4 +135,14 @@ class Iter55SoundTest {
         assertFalse("неизвестность не выдаётся за «ждёт готовности»",
             Toggles45.APPLIED_UNKNOWN == Toggles45.appliedOutcome(want = true, applied = false))
     }
+
+    @Test
+    fun dependencyHidesRowButKeepsOwnerChoice() {
+        // §9: «наружная температура» скрывается вместе с «процентом заряда», но её выбор не стирается.
+        assertFalse("подтверждённый OFF владельца скрывает зависимую строку",
+            Toggles45.dependentVisible(false))
+        assertTrue("подтверждённый ON — строка видна", Toggles45.dependentVisible(true))
+        assertTrue("неизвестность НЕ выдаётся за выключение", Toggles45.dependentVisible(null))
+        assertFalse("скрытие не является записью выбора", Toggles45.dependentHidesChoice)
+    }
 }

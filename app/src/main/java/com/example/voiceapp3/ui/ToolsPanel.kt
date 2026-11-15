@@ -430,7 +430,10 @@ class ToolsPanel(
         addDiv()
         addToggle("hvacTemp", "Цифровой климат-контроль", "desc.hvacTemp", def = false)
         addDiv()
-        addToggle("hvacExtTemp", "Цифровая наружная температура", "desc.hvacExtTemp", def = false)
+        val extRow = addToggle("hvacExtTemp", "Цифровая наружная температура", "desc.hvacExtTemp", def = false)
+        // iter55 §9: наружная температура показывается только при включённом проценте заряда;
+        // её сохранённый выбор при этом сохраняется (см. [applyBattDependency]).
+        applyBattDependency("hvacBatt", extRow)
         addDiv()
         // iter22 §3 + §4: страховка на случай VIA=nenhum — снять битый bind-mount
         // плагина и перезапустить SystemUI. РЕФЕРЕНС: w0/o#c (umount в цикле + kill sysui).
@@ -1114,7 +1117,27 @@ class ToolsPanel(
         }, matchWrap())
     }
 
-    private fun addToggle(key: String, title: String, descKey: String?, def: Boolean) {
+    /**
+     * iter55 §9 — «Процент заряда» и «Цифровая наружная температура»: второе ПОКАЗЫВАЕТСЯ только
+     * при включённом первом (как в референсе), но ВЫБОР владельца при этом НЕ стирается.
+     *
+     * До правки строки были независимыми: при выключенном проценте заряда тумблер наружной
+     * температуры продолжал висеть в списке и его значение выглядело действующим. Скрытие — это
+     * только видимость строки: pref не читается, не пишется и не сбрасывается, поэтому включение
+     * «Процента заряда» возвращает прежний выбор владельца как есть.
+     */
+    private fun applyBattDependency(battKey: String, dependent: android.view.View?) {
+        if (dependent == null) return
+        // Скрываем только при ПОДТВЕРЖДЁННОМ «выключено»: неизвестность не выдаётся за выбор
+        // владельца (тогда его сохранённая настройка просто перестала бы быть видна).
+        val visible = Toggles45.dependentVisible(boolState(battKey))
+        dependent.visibility = if (visible) android.view.View.VISIBLE else android.view.View.GONE
+        AppLog.i("ToolsPanel", "UI_DEPENDENCY owner=$battKey dependent_visible=${if (visible) 1 else 0} " +
+            "pref_kept=yes " +
+            "(скрытие не меняет сохранённый выбор владельца)")
+    }
+
+    private fun addToggle(key: String, title: String, descKey: String?, def: Boolean): android.view.View? {
         // iter33p §0.0(5): у JIT тумблер показывает ПОДТВЕРЖДЁННЫЙ факт (`on`/`off`), а при
         // недоступном property — `unknown` с явной пометкой, а не ложное «выключено».
         val jitConfirmed = if (key == "perfJit") strState("perfJitConfirmed") else null
@@ -1222,6 +1245,7 @@ class ToolsPanel(
         }
         row.addView(sw, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
         page.addView(row, matchWrap())
+        return row
     }
 
     /**
