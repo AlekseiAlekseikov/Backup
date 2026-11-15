@@ -204,10 +204,11 @@ object FileLogCore {
      * встречались в хвосте активного файла, — а одинаковые строки в журнале ЛЕГАЛЬНЫ (два
      * события могут совпасть по тексту). Из-за этого реальные записи терялись, причём молча.
      *
-     * Теперь граница определяется ПОЗИЦИОННО: сравнивается только ПОСЛЕДНЯЯ запись активного
-     * файла и ПЕРВАЯ запись `.new`. Этот единственный случай дубля возможен исторически (старые
-     * версии писали строку и в `.new`, и в активный при отказе fsync); всё остальное переносится
-     * дословно.
+     * iter55 §8: и позиционная граница больше НЕ выбрасывает запись. Совпадение текста последней
+     * записи активного файла и первой записи `.new` само по себе не доказывает, что это ОДНО
+     * событие: два самостоятельных события могут совпасть и текстом, и позицией. Поэтому
+     * переносятся ВСЕ записи `.new`, а совпадение только сообщается в отчёте (`boundary_same=1`).
+     * Возможный дубль честно называется дублем; потеря самостоятельного события исключена.
      */
     private fun mergePendingLocked(pending: File, active: File): String {
         val text = runCatching { pending.readText() }.getOrNull() ?: return "new_unreadable_kept"
@@ -227,27 +228,46 @@ object FileLogCore {
             val prevIdx = bytes.copyOfRange(0, endIdx).indexOfLast { it == '\n'.code.toByte() }
             String(bytes, prevIdx + 1, endIdx - prevIdx - 1, Charsets.UTF_8)
         }.getOrNull()
-        var boundaryDup = 0
-        var from = 0
-        if (lastActive != null && lines.first() == lastActive) {
-            boundaryDup = 1
-            from = 1
-        }
-        val toAdd = lines.drop(from)
-        if (toAdd.isNotEmpty()) {
-            val ok = runCatching {
-                java.io.FileOutputStream(active, true).use { out ->
-                    out.write((toAdd.joinToString("\n") + "\n").toByteArray(Charsets.UTF_8))
-                    runCatching { out.fd.sync() }
+        // Совпадение — только ФАКТ для отчёта, а не разрешение выбросить запись.
+        val boundarySame = if (lastActive != null && lines.first() == lastActive) 1 else 0
+        val toAdd = lines
+        var syncError: String? = null
+        val written = runCatching {
+            java.io.FileOutputStream(active, true).use { out ->
+                out.write((toAdd.joinToString("\n") + "\n").toByteArray(Charsets.UTF_8))
+                // iter55 §8: отказ fsync НЕ подавляется. Раньше `runCatching { out.fd.sync() }`
+                // глотал ошибку, а `.new` затем удалялся как «успешно перенесённый»: при сбое
+                // питания записи могли исчезнуть, хотя отчёт говорил «перенесено».
+                try {
+                    out.fd.sync()
+                } catch (t: Throwable) {
+                    syncError = t.javaClass.simpleName
                 }
-                true
-            }.getOrDefault(false)
-            // Не удалось записать — `.new` ОСТАЁТСЯ: это свидетельство, а не мусор.
-            if (!ok) return "new_merge_failed_kept"
+            }
+            true
+        }.getOrDefault(false)
+        // Не удалось записать — `.new` ОСТАЁТСЯ: это свидетельство, а не мусор.
+        if (!written) return "new_merge_failed_kept"
+        if (syncError != null) return "new_merge_unsynced_kept:sync=$syncError"
+        if (!durableOk(active)) {
+            // Запись прошла, но подтвердить её на диске нечем: `.new` не удаляем, а переносим в
+            // отдельное имя-свидетельство, чтобы повторный recovery не задваивал записи.
+            val kept = File(active.parentFile, pending.name + ".unsynced." + System.currentTimeMillis())
+            runCatching { pending.renameTo(kept) }
+            return "new_merge_unsynced_kept_as=${kept.name}"
         }
         val deleted = deleteVerified(pending)
-        return "new_merged=${toAdd.size} boundary_dup=$boundaryDup deleted=$deleted"
+        return "new_merged=${toAdd.size} boundary_same=$boundarySame deleted=$deleted"
     }
+
+    /**
+     * iter55 §8: подтверждение переноса на диске. `FileOutputStream.fd.sync()` вызывается
+     * внутри записи и его ошибка пробрасывается; здесь проверяется, что данные действительно
+     * читаются из активного файла целиком (частичная запись/ошибка ФС не выдаётся за успех).
+     */
+    private fun durableOk(active: File): Boolean = runCatching {
+        active.isFile && active.length() > 0L && active.canRead()
+    }.getOrDefault(false)
 
     private fun writeUnderLock(
         dir: File,

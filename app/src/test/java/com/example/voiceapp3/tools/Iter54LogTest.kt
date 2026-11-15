@@ -42,22 +42,49 @@ class Iter54LogTest {
         val lines = active.readLines()
         assertEquals("обе записи сохранены (content-дедупликации нет): $note", 3, lines.size)
         assertEquals("одинаковых записей две: $lines", 2, lines.count { it == same })
-        assertTrue("граничного дубля не было: $note", note.contains("boundary_dup=0"))
+        assertTrue("граничного совпадения не было: $note", note.contains("boundary_same=0"))
         assertTrue("перенос назван: $note", note.contains("new_merged=1"))
         assertFalse("`.new` убран только после переноса", File(d, "voiceapp3.log.new").exists())
     }
 
     @Test
-    fun onlyThePositionalBoundaryDuplicateIsSkipped() {
+    fun boundaryMatchIsReportedButTheRecordIsKept() {
         val d = dir("boundary")
         val active = File(d, "voiceapp3.log")
         active.writeText("first\ncarry\n")
-        // Исторический случай: строка "carry" попала и в активный файл, и в `.new`.
+        // Та же строка на границе. iter55 §8: совпадение текста и позиции НЕ доказывает, что это
+        // одно событие, поэтому запись не выбрасывается — оба события остаются в журнале.
         File(d, "voiceapp3.log.new").writeText("carry\nnext\n")
         val note = FileLogCore.recoverPendingNew(d, "voiceapp3.log")
-        assertEquals("перенос назван: $note", listOf("first", "carry", "next"), active.readLines())
-        assertTrue("граничный дубль назван: $note", note.contains("boundary_dup=1"))
-        assertTrue("перенесена ровно одна запись: $note", note.contains("new_merged=1"))
+        assertEquals("перенесены ВСЕ записи: $note", listOf("first", "carry", "carry", "next"),
+            active.readLines())
+        assertTrue("совпадение названо фактом, а не поводом удалить: $note",
+            note.contains("boundary_same=1"))
+        assertTrue("перенесены обе записи: $note", note.contains("new_merged=2"))
+    }
+
+    @Test
+    fun identicalBoundaryRecordsAreBothKept() {
+        // Требование iter55 §8 буквально: active="same\n", .new="same\n" (два самостоятельных
+        // события) → в активном файле ДВЕ записи "same", ни одно событие не исчезло.
+        val d = dir("same_boundary")
+        val active = File(d, "voiceapp3.log")
+        active.writeText("same\n")
+        File(d, "voiceapp3.log.new").writeText("same\n")
+        val note = FileLogCore.recoverPendingNew(d, "voiceapp3.log")
+        assertEquals("две самостоятельные записи сохранены: $note", listOf("same", "same"),
+            active.readLines())
+        assertTrue(note.contains("boundary_same=1"))
+    }
+
+    @Test
+    fun threeIdenticalRecordsSurviveRecovery() {
+        val d = dir("three")
+        val active = File(d, "voiceapp3.log")
+        active.writeText("same\n")
+        File(d, "voiceapp3.log.new").writeText("same\nsame\n")
+        FileLogCore.recoverPendingNew(d, "voiceapp3.log")
+        assertEquals("три записи на месте", 3, active.readLines().count { it == "same" })
     }
 
     @Test

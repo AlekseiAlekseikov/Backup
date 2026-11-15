@@ -192,15 +192,17 @@ class Iter53LogTest {
     }
 
     @Test
-    fun alreadyWrittenLinesAreNotDuplicated() {
+    fun boundaryMatchKeepsBothRecordsInsteadOfDroppingOne() {
         val d = setup()
         val name = "app.log"
         val active = File(d, name).apply { writeText("a\nb\n") }
-        // Та же строка уже в активном файле (откат записи) — дубль не создаём.
+        // iter55 §8: совпадение текста на границе НЕ доказывает, что это одно событие. Раньше
+        // вторая "b" выбрасывалась (молча терялось самостоятельное событие). Теперь переносятся
+        // все записи, а совпадение только сообщается.
         File(d, "$name.new").writeText("b\ne\n")
         FileLogCore.drainSpill(d, name)
         val lines = active.readLines().filter { it.isNotEmpty() }
-        assertEquals("журнал: $lines", listOf("a", "b", "e"), lines)
+        assertEquals("журнал: $lines", listOf("a", "b", "b", "e"), lines)
     }
 
     @Test
