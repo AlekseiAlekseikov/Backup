@@ -29,3 +29,48 @@
 - Живой Android/UI-рендер (Robolectric/instrumentation) не исполнялся — проверены production-модели и JSON снимка, не listener/render.
 - На реальном ГУ не проверялись: VHAL окон, zygote-переходы, mount верхнего слоя, выживание TTL после reboot/update, плагин SystemUI.
 - Межпроцессность логов — потоки + реальный `FileLock`, без `fork`.
+
+---
+
+# iter56 — владение, terminal, mount, учёт TTL
+
+Ветка `fix/v2`. `main` не пушился, `--force` не применялся. Версия не менялась: `versionCode=63`,
+`versionName=1.0.63`. Подробный отчёт — `REPORT_iter56.md`.
+
+## Журнал итерации
+
+| Шаг | Что сделано | Проверка | Коммит |
+|---|---|---|---|
+| §4.1 отказ ≠ конец | `_refuse` не пишет `END`; `_jit_owner_dead` требует `END` с точной identity (`op`+`inst`+`pid`+`pstart`, при наличии `boot`), `REFUSED` не участвует | `Iter52JitOwnTest` (`guardDoesNotCreateLockForRefusedPayload`, `endOfAnotherInstanceOrOfAnotherOpDoesNotProveDeath`), `Iter56JitTest.replayRefusalOfTheSameInstanceNeverFreesTheLiveOwner` | `e83e264` |
+| §4.2 атомарный захват | `tmp`+`ln` (`_jit_take_lock`), перехват `_jit_steal_dead` (пин inode + сверка), возврат `_jit_restore_dead` через `ln`, `CL_TAKEOVER_KEPT` при занятом имени | `Iter56JitTest.takeoverNeverLosesOrReplacesTheObjectItDidNotProveDead`, `restoreOfAMovedForeignLockNeverOverwritesTheNewOne` | `e83e264` |
+| §4.3 порядок намерений | `seq` (монотонное поколение, `bumpIntentSeq` + подтверждение чтением) и единое правило `_jit_intent_order` (`seq` → `seq_owner_ended` → `ts_legacy` → `unprovable`); ранняя и подlock-проверки — один хелпер | `Iter54JitConcurrencyTest.lateClaimOfOlderIntentNeverCancelsNewerIntent`, `Iter56JitTest.newerIntentWinsEvenWhenTheClockWentBackwards`, `equalGenerationsAreATie…`, `legacyClaimWithoutSeq…` | `e83e264` |
+| §4.3 чтение claim | формат проверяется по полям (`validClaimValue`): новое поле `seq` не делает валидный claim «испорченным» | `Iter53ClaimTest.realClaimWrittenByClaimCommandIsReadAsPresent` | `e83e264` |
+| §5 terminal = исполнение | убран выбор «последнего `inst`»; факты только своего исполнения (`expectInst`), `END` учитывается при совпадении `pid` со `START`, при нескольких исполнениях без identity — `started`/`finished` не заявляются (`term_exec_ambiguous`), легаси-файл помечается `inst_unproven_legacy` | `Iter56JitTest`, `Iter51JitOwnershipTest.terminalParsingDistinguishesEveryProvablePhase` | `d58904b` |
+| §5 durable identity | `JitRef.OpMark.inst` пишется в отметку ДО claim/отправки и читается после перезапуска; один `opInst` на клик (отметка → claim → гвардия → чтение terminal) | `JitOrchestratorTest`, `JitPersistenceTest` | `d58904b` |
+| §5 гонка lock | ограниченное ожидание (до 2 c) занятого коротким претендентом lock: два одновременных клика больше не дают НОЛЬ side effect'ов | `Iter54JitConcurrencyTest.twoRealShellsAtTheSameMomentProduceExactlyOneSideEffect` (0/40 прогонов после правки; 1/50 до неё) | `d58904b` |
+| §7 mount | снятие слоя по литеральному префиксу запрещено: при невычислимом ожидаемом root слой сохраняется (`reason=root_expected_uncomputable action=keep_layer`) | `Iter56MountJitTest` (2 теста; на старом коде второй падает — проверено откатом файла) | `948e4ec` |
+| §8 TTL | `TOUCHED_v4/v6` поднимается при любом состоявшемся `-N`/`-A`/`-j`, а не только при создании цепи ⇒ откат покрывает правило, добавленное в существующую свою цепь | семейство `Iter55TtlTest`/`Iter54TtlOwnershipTest` (отдельного теста под reuse-путь не добавлено — см. отчёт §3) | `948e4ec` |
+
+## Прогоны
+
+- `bash /home/user/runtests.sh` → `OK (841 tests)` после `d58904b`, `OK (843 tests)` после `948e4ec`.
+- Прогон против старого кода (файл `LockMountScripts.kt` возвращён к `HEAD`): `Tests run: 843, Failures: 1` — падает ровно `Iter56MountJitTest.unprovableExpectedRootKeepsTheLayerInsteadOfGuessing`.
+
+## Инциденты итерации
+
+- Обрыв файла при in-place правке `JitOwn.kt` (срез в python-скрипте отрезал хвост ~250 строк).
+  Восстановлено: хвост взят из `git show HEAD:…/JitOwn.kt` и к нему заново применены правки
+  iter56 (`_refuse` без `END`, `_jit_restore_dead` вместо `mv`, полный `END` в `trap`).
+  После восстановления — полный прогон, `OK`.
+- `twoRealShellsAtTheSameMomentProduceExactlyOneSideEffect` был плавающим (1 сбой на ~50 прогонов);
+  причина найдена и устранена ограниченным ожиданием lock, подтверждено 40 прогонами без сбоев.
+
+## Открытые долги (iter56)
+
+- **§6 звук (`LockSound.kt`)** — не трогался: `PLANNED` без durable evidence до отправки,
+  no-target/corrupt не должны давать Ready, `DONE` не должен закрываться снимком mount,
+  поздний restore опасен.
+- **§8 `NetworkTtl`** — типизированные исходы вместо `Pair` не вводились.
+- **§9 окна** — `WindowDoors.kt` не менялся (все writers, физическое действие после плана).
+- **§9 логи** — `renameTo` уже проверяется (`FileLogCore.kt:256,381,403,783,825`), правки не требовалось.
+- На ГУ ничего не испытывалось; JIT-компиляция и слышимость WAV не измерялись.
