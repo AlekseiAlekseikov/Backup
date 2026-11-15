@@ -170,11 +170,70 @@ object FileLogCore {
         val active = File(dir, name)
         if (!pending.isFile || pending.length() == 0L) return ""
         if (!active.isFile) return "new_promoted_by_caller"
+        // ── iter54 §9: ТА ЖЕ межпроцессная дисциплина, что у append/ротации. ────────────────
+        // Раньше слияние `.new` шло БЕЗ лока: два процесса могли одновременно «переносить»
+        // одни и те же строки (дубли), а третий в это время писать в активный файл (потеря
+        // границы записи). Файл лока тот же и стабилен (`<name>.lock`), поэтому ротация его
+        // не ломает.
+        val jvmLock = jvmLocks.computeIfAbsent(active.absolutePath) {
+            java.util.concurrent.locks.ReentrantLock()
+        }
+        if (!runCatching { jvmLock.tryLock() }.getOrDefault(false)) return "new_locked_kept:jvm_busy"
+        try {
+            val lockFile = File(dir, "$name.lock")
+            val raf = runCatching { RandomAccessFile(lockFile, "rw") }.getOrNull()
+                ?: return "new_locked_kept:no_lock_file"
+            raf.use {
+                val fl = runCatching { acquire(it, 250L) }.getOrNull()
+                    ?: return "new_locked_kept:process_busy"
+                try {
+                    return mergePendingLocked(pending, active)
+                } finally {
+                    runCatching { fl.release() }
+                }
+            }
+        } finally {
+            runCatching { jvmLock.unlock() }
+        }
+    }
+
+    /**
+     * Слияние `.new` в активный файл ПОД локом.
+     *
+     * iter54 §9: content-based дедупликация УБРАНА. Прежний код выкидывал строки, которые уже
+     * встречались в хвосте активного файла, — а одинаковые строки в журнале ЛЕГАЛЬНЫ (два
+     * события могут совпасть по тексту). Из-за этого реальные записи терялись, причём молча.
+     *
+     * Теперь граница определяется ПОЗИЦИОННО: сравнивается только ПОСЛЕДНЯЯ запись активного
+     * файла и ПЕРВАЯ запись `.new`. Этот единственный случай дубля возможен исторически (старые
+     * версии писали строку и в `.new`, и в активный при отказе fsync); всё остальное переносится
+     * дословно.
+     */
+    private fun mergePendingLocked(pending: File, active: File): String {
         val text = runCatching { pending.readText() }.getOrNull() ?: return "new_unreadable_kept"
-        val tail = runCatching { active.readLines().takeLast(tailLines).toSet() }.getOrDefault(emptySet())
         val lines = text.split('\n').filter { it.isNotEmpty() }
-        var dup = 0
-        val toAdd = lines.filter { if (tail.contains(it)) { dup++; false } else true }
+        if (lines.isEmpty()) {
+            val deleted = deleteVerified(pending)
+            return "new_empty deleted=$deleted"
+        }
+        // Позиционная граница: последняя полная запись активного файла.
+        val lastActive = runCatching {
+            val bytes = active.readBytes()
+            if (bytes.isEmpty()) return@runCatching null
+            val endIdx = bytes.indexOfLast { it == '\n'.code.toByte() }
+            // Если файл не заканчивается переводом строки, последняя запись неполная —
+            // сравнивать её с целой записью `.new` нельзя (иначе потеряем запись).
+            if (endIdx <= 0) return@runCatching null
+            val prevIdx = bytes.copyOfRange(0, endIdx).indexOfLast { it == '\n'.code.toByte() }
+            String(bytes, prevIdx + 1, endIdx - prevIdx - 1, Charsets.UTF_8)
+        }.getOrNull()
+        var boundaryDup = 0
+        var from = 0
+        if (lastActive != null && lines.first() == lastActive) {
+            boundaryDup = 1
+            from = 1
+        }
+        val toAdd = lines.drop(from)
         if (toAdd.isNotEmpty()) {
             val ok = runCatching {
                 java.io.FileOutputStream(active, true).use { out ->
@@ -183,11 +242,11 @@ object FileLogCore {
                 }
                 true
             }.getOrDefault(false)
+            // Не удалось записать — `.new` ОСТАЁТСЯ: это свидетельство, а не мусор.
             if (!ok) return "new_merge_failed_kept"
         }
-        // Удаляем `.new` только после успешного переноса ВСЕХ строк.
         val deleted = deleteVerified(pending)
-        return "new_merged=${toAdd.size} dup_skipped=$dup deleted=$deleted"
+        return "new_merged=${toAdd.size} boundary_dup=$boundaryDup deleted=$deleted"
     }
 
     private fun writeUnderLock(
