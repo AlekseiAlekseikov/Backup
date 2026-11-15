@@ -77,6 +77,8 @@ object JitRef {
      * Собственный ключ; в референсе его нет и на его ключи он не влияет.
      */
     internal const val KEY_INTENT_SEQ = "jit_intent_seq"
+    /** iter57 §7.2: токен эпохи счётчика (только для честного лога, порядок не задаёт). */
+    internal const val KEY_INTENT_EPOCH = "jit_intent_epoch"
 
     /** Все три ключа одной операции — проверяются вместе (согласованность записи). */
     internal val SNAPSHOT_KEYS = listOf(KEY_PEDIDO, KEY_AUTO, KEY_RESTORE)
@@ -1861,10 +1863,13 @@ object JitOp {
             // iter56 §4.3: ПОРЯДОК НАМЕРЕНИЙ — монотонное поколение, выданное и подтверждённое
             // чтением ДО записи снимка/claim. Время (часы) порядок больше не задаёт: оно может
             // быть переведено назад, совпасть у двух кликов и ничего не говорит после restart.
+            var seqNote: String? = null
             val intentSeq = runCatching { store.bumpIntentSeq() }.getOrNull() ?: 0L
+            runCatching { seqNote = (store as? JitNet.AndroidStore)?.lastSeqNote }.getOrNull()
             log(
                 "JIT_INTENT_SEQ op=$opId seq=$intentSeq " +
                     "rule=${if (intentSeq > 0L) "seq" else "ts_legacy"} " +
+                    "issue=${seqNote ?: "unreported"} " +
                     if (intentSeq > 0L)
                         "(поколение намерения записано и подтверждено чтением ДО отправки)"
                     else

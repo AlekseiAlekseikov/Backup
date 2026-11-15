@@ -3,6 +3,9 @@ package com.example.voiceapp3.tools
 import android.content.Context
 import android.content.SharedPreferences
 import android.net.wifi.WifiManager
+import java.io.File
+import java.io.FileOutputStream
+import java.io.RandomAccessFile
 
 /**
  * Android-адаптеры для ядра [JitOp]. Решений здесь нет — только те вызовы, что есть в референсе:
@@ -16,6 +19,28 @@ import android.net.wifi.WifiManager
  * `ip rule` только читается; `ctl.restart zygote` — единственная команда рестарта.
  */
 object JitNet {
+
+    /**
+     * iter57 §7.2: замок уровня ПРОЦЕССА. `FileChannel.lock` в одной JVM нельзя взять дважды на
+     * один файл (Java бросает `OverlappingFileLockException`), поэтому потоки одного процесса
+     * сериализуются здесь, а межпроцессную эксклюзивность даёт `fcntl`-замок файла.
+     */
+    private val SEQ_MONITOR = Any()
+
+    /** Файлы счётчика поколения намерения (iter57 §7.2). */
+    private const val SEQ_LOCK = "jit_intent_seq.lock"
+    private const val SEQ_FILE = "jit_intent_seq.state"
+
+    /**
+     * Каталог состояния счётчика. Device-protected (`createDeviceProtectedStorageContext`) —
+     * чтобы нумерация не начиналась заново, когда обычное хранилище ещё недоступно; при отказе —
+     * `filesDir`. `null` означает «каталога нет»: тогда номер не выдаётся (см. `bumpIntentSeq`).
+     */
+    private fun seqDirFor(app: Context): File? {
+        val dp = runCatching { app.createDeviceProtectedStorageContext() }.getOrNull()
+        val dir = runCatching { (dp ?: app).filesDir }.getOrNull() ?: return null
+        return runCatching { File(dir, "jit").apply { mkdirs() } }.getOrNull() ?: dir
+    }
 
     private const val TAG = "CENTRAL_JitNet"
 
@@ -101,7 +126,8 @@ object JitNet {
      */
     internal class AndroidStore(
         private val cpsProvider: () -> SharedPreferences?,
-        private val dpsProvider: () -> SharedPreferences?
+        private val dpsProvider: () -> SharedPreferences?,
+        private val seqDirProvider: () -> File? = { null }
     ) : JitRef.JitStore {
 
         /**
@@ -113,42 +139,164 @@ object JitNet {
             { try { Prefs2.cps(app) } catch (t: Throwable) { null } },
             // iter43 §4: БЕЗ скрытого фоллбэка — иначе CPS выдавался бы за DPS и «две копии»
             // были бы фикцией. `null` честно означает «второй копии нет».
-            { try { Prefs2.dpsOrNull(app) } catch (t: Throwable) { null } }
+            { try { Prefs2.dpsOrNull(app) } catch (t: Throwable) { null } },
+            // iter57 §7.2: каталог счётчика намерения. Предпочитаем device-protected хранилище —
+            // оно доступно и после «прямой загрузки», когда обычный `filesDir` ещё зашифрован.
+            { seqDirFor(app) }
         )
 
         private fun cps(): SharedPreferences? = runCatching { cpsProvider() }.getOrNull()
         private fun dps(): SharedPreferences? = runCatching { dpsProvider() }.getOrNull()
 
+        /** Пояснение к последней выдаче [bumpIntentSeq] — для честного лога, не для логики. */
+        @Volatile
+        internal var lastSeqNote: String? = null
+
         /**
-         * iter56 §4.3 — монотонное поколение намерения JIT.
+         * iter57 §7.2 — ПОГОЛЕДНОЕ (атомарное) поколение намерения JIT между процессами.
          *
-         * Читаем максимум обеих копий (ревизии не важны: нам нужно НЕ УМЕНЬШИТЬ счётчик),
-         * прибавляем 1, пишем в обе копии и ЧИТАЕМ ОБРАТНО. Поколение выдаётся только если
-         * хотя бы одна копия вернула ровно записанное значение — иначе `null`, и вызывающий
-         * обязан назвать порядок «по времени», а не выдать это за монотонный номер.
+         * Что было не так (аудит iter56): `read → +1 → write` в двух `SharedPreferences` без
+         * блокировки. Два процесса читают одно значение и выдают ОДИН номер; чтение обратно
+         * этого не лечит, потому что оба прочитают «своё». Номер выдавался, хотя исключительности
+         * не было.
          *
-         * Граница честно: два процесса, читающих счётчик одновременно, могут получить одно
-         * значение (гонка чтения до записи). Именно поэтому совпадение номеров на устройстве
-         * трактуется как `seq_tie` и уступает, а не «побеждает по случайности».
+         * Теперь: выдача идёт под МЕЖПРОЦЕССНОЙ эксклюзивной блокировкой файла
+         * (`FileChannel.lock` = `fcntl`-блокировка ядра, а не `synchronized` внутри процесса) над
+         * отдельным файлом-замком. Внутри замка: прочитать максимум из файла-счётчика и из префов,
+         * прибавить 1, записать в файл (со `fsync`), затем в префы, затем прочитать обратно.
+         * Номер выдаётся только если обратное чтение вернуло ровно записанное.
+         *
+         * Часы (`System.currentTimeMillis()`) в номере НЕ участвуют: порядок не зависит от того,
+         * перевели ли время назад. `epoch` — случайный токен создания счётчика, только для лога:
+         * если состояние приложения вычистили, счётчик начинается с 1, и это НАЗВАНО
+         * (`epoch=new`), а не выдано за продолжение нумерации.
+         *
+         * Границы честно:
+         *  • `null` — номер не выдан (нет каталога для замка, переполнение, обратное чтение не
+         *    совпало). Вызывающий обязан назвать порядок `ts_legacy`; JIT при этом не
+         *    блокируется — «вечного отказа» из-за счётчика нет;
+         *  • переполнение `Long.MAX_VALUE` не переходит в отрицательные значения: выдаётся `null`;
+         *  • остаточный claim от ПРЕЖНЕЙ эпохи может иметь больший номер, и новый клик уступит
+         *    ему по порядку — это осознанно консервативно; разблокирует не порядок, а §7.3
+         *    (перехват при ДОКАЗАННОЙ смерти владельца).
          */
         override fun bumpIntentSeq(): Long? {
-            val a = cps()
-            val b = dps()
-            fun read(p: SharedPreferences?): Long? = runCatching {
-                p?.let {
-                    if (it.contains(JitRef.KEY_INTENT_SEQ)) it.getLong(JitRef.KEY_INTENT_SEQ, 0L)
-                    else null
+            lastSeqNote = null
+            val dir = runCatching { seqDir() }.getOrNull()
+            if (dir == null) {
+                lastSeqNote = "reason=no_state_dir"
+                return null
+            }
+            if (!dir.isDirectory && !dir.mkdirs() && !dir.isDirectory) {
+                lastSeqNote = "reason=no_state_dir(path=${dir.absolutePath})"
+                return null
+            }
+            val lockFile = File(dir, SEQ_LOCK)
+            val seqFile = File(dir, SEQ_FILE)
+            return runCatching {
+                synchronized(SEQ_MONITOR) {
+                RandomAccessFile(lockFile, "rw").use { raf ->
+                    // Межпроцессная эксклюзивность: ждём столько, сколько нужно, но не «вечно
+                    // молча» — если замок взять нельзя, номер не выдаётся (см. границы выше).
+                    raf.channel.lock().use {
+                        val a = cps()
+                        val b = dps()
+                        fun readPref(p: SharedPreferences?): Long? = runCatching {
+                            p?.let {
+                                if (it.contains(JitRef.KEY_INTENT_SEQ))
+                                    it.getLong(JitRef.KEY_INTENT_SEQ, 0L) else null
+                            }
+                        }.getOrNull()
+                        val fromPrefs = maxOf(readPref(a) ?: 0L, readPref(b) ?: 0L)
+                        val fileState = readSeqFile(seqFile)
+                        val fromFile = fileState?.second ?: 0L
+                        val epoch: String
+                        val note: String
+                        when {
+                            fileState != null -> { epoch = fileState.first; note = "epoch=kept" }
+                            fromPrefs > 0L -> {
+                                // Файл потерян, но префы помнят номер: продолжаем, а не начинаем.
+                                epoch = runCatching {
+                                    a?.getString(JitRef.KEY_INTENT_EPOCH, null)
+                                        ?: b?.getString(JitRef.KEY_INTENT_EPOCH, null)
+                                }.getOrNull() ?: newEpochToken()
+                                note = "epoch=from_prefs(file_lost)"
+                            }
+                            else -> { epoch = newEpochToken(); note = "epoch=new" }
+                        }
+                        val cur = maxOf(fromFile, fromPrefs)
+                        if (cur >= Long.MAX_VALUE) {
+                            lastSeqNote = "reason=overflow cur=$cur $note epoch=$epoch"
+                            return@use null
+                        }
+                        val next = if (cur <= 0L) 1L else cur + 1L
+                        val okFile = writeSeqFile(seqFile, epoch, next)
+                        for (p in listOf(a, b)) {
+                            if (p == null) continue
+                            runCatching {
+                                p.edit().putLong(JitRef.KEY_INTENT_SEQ, next)
+                                    .putString(JitRef.KEY_INTENT_EPOCH, epoch).commit()
+                            }
+                        }
+                        val backFile = readSeqFile(seqFile)?.second
+                        val backPref = maxOf(readPref(a) ?: 0L, readPref(b) ?: 0L)
+                        if (okFile && backFile == next && backPref >= next) {
+                            lastSeqNote = "$note epoch=$epoch src=file_lock"
+                            next
+                        } else {
+                            lastSeqNote = "reason=readback_mismatch file=$backFile " +
+                                "prefs=$backPref want=$next $note epoch=$epoch"
+                            null
+                        }
+                    }
+                }
                 }
             }.getOrNull()
-            val cur = maxOf(read(a) ?: 0L, read(b) ?: 0L)
-            val next = if (cur <= 0L || cur == Long.MAX_VALUE) 1L else cur + 1L
-            for (p in listOf(a, b)) {
-                if (p == null) continue
-                runCatching { p.edit().putLong(JitRef.KEY_INTENT_SEQ, next).commit() }
+        }
+
+        private fun seqDir(): File? = seqDirProvider()?.also { runCatching { it.mkdirs() } }
+
+        /** `epoch=<токен>` + `seq=<номер>`; `null` — файла нет/он испорчен (тогда читаем префы). */
+        private fun readSeqFile(f: File): Pair<String, Long>? {
+            val text = runCatching { if (f.isFile) f.readText() else null }.getOrNull() ?: return null
+            var ep: String? = null
+            var sq: Long? = null
+            for (line in text.lineSequence()) {
+                when {
+                    line.startsWith("epoch=") -> ep = line.removePrefix("epoch=").trim()
+                    line.startsWith("seq=") -> sq = line.removePrefix("seq=").trim().toLongOrNull()
+                }
             }
-            val ra = read(a)
-            val rb = read(b)
-            return if (ra == next || rb == next) next else null
+            val e = ep ?: return null
+            val v = sq ?: return null
+            if (v <= 0L) return null
+            return e to v
+        }
+
+        /** Запись через временный файл + `rename` + `fsync` каталога: не оставляет полу-строк. */
+        private fun writeSeqFile(f: File, epoch: String, seq: Long): Boolean = runCatching {
+            val tmp = File(f.parentFile, f.name + ".tmp")
+            FileOutputStream(tmp).use { out ->
+                out.write("epoch=$epoch\nseq=$seq\n".toByteArray())
+                out.flush()
+                out.fd.sync()
+            }
+            if (!tmp.renameTo(f)) {
+                tmp.delete()
+                return@runCatching false
+            }
+            true
+        }.getOrDefault(false)
+
+        private fun newEpochToken(): String = try {
+            val bytes = ByteArray(8)
+            java.security.SecureRandom().nextBytes(bytes)
+            val sb = StringBuilder(16)
+            for (x in bytes) sb.append(String.format("%02x", x))
+            sb.toString()
+        } catch (t: Throwable) {
+            // Без случайности: токен всё равно только для лога, но не выдаём его за «новый».
+            "unknown"
         }
 
         /**
