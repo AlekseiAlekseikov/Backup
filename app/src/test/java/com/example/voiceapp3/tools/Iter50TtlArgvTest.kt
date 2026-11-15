@@ -140,7 +140,9 @@ class Iter50TtlArgvTest {
     fun quotedForeignJumpIsRefusedAndOwnChainKept() {
         val st = Iter50Stand()
         seedBase(st)
-        st.seedRule("iptables", "VAPP_TTL", "-j TTL --ttl-set 65")
+        // iter54 §6.1: владение доказывается меткой в САМОМ правиле — иначе цепь «unproven» и
+        // не изменяется вовсе (проверка отказа по сложной спецификации до неё не доходит).
+        st.seedRule("iptables", "VAPP_TTL", "-m comment --comment voiceapp3:ttl:default -j TTL --ttl-set 65")
         st.seedRule("iptables", "POSTROUTING", "-o wlan0 -m comment --comment \"a b\" -j VAPP_TTL")
         val (_, out) = st.exec(off(), "off.sh")
         assertTrue(

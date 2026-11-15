@@ -39,23 +39,49 @@ package com.example.voiceapp3.tools
 internal object TtlScript {
     private const val D = "$"
 
-    /** Имя нашей цепочки. Оно же — часть метки владения (полное доказательство — содержимое). */
+    /**
+     * Имя цепи ПО УМОЛЧАНИЮ. Production подставляет своё уникальное имя установки
+     * ([TtlOwnership.chainFor]); перегрузка со значением по умолчанию нужна тестам и
+     * совместимости.
+     */
     internal const val OUR_CHAIN = "VAPP_TTL"
+
+    /** Историческое имя цепи до iter54: только для отчёта, никогда не изменяется. */
+    internal const val LEGACY_CHAIN = "VAPP_TTL"
 
     /** Ожидаемое содержимое нашей цепочки (тело правила после `-A <OUR> `). */
     internal const val RULE_V4 = "-j TTL --ttl-set 65"
     internal const val RULE_V6 = "-j HL --hl-set 65"
 
-    fun build(enable: Boolean, gen: String = "default"): String {
-        val enableBit = if (enable) "1" else "0"
-        // `gen` — не секрет и не «доказательство по себе»: он лишь делает владение проверяемым
-        // (метка в самом правиле). Если gen не задан, метка всё равно есть и постоянна.
+    fun build(
+        enable: Boolean,
+        gen: String = "default",
+        ownChain: String = OUR_CHAIN,
+        legacyChain: String = LEGACY_CHAIN,
+        /**
+         * iter54 §6.1: реестр собственной идентичности unknown ⇒ таблица НЕ изменяется вообще
+         * (ни ON, ни OFF). Это не «выключение функции навсегда»: причина и путь восстановления
+         * видны в отчёте, а выбор владельца остаётся сохранённым.
+         */
+        registryUnknown: Boolean = false
+    ): String {
+        val enableBit = if (registryUnknown) "2" else if (enable) "1" else "0"
+        // `gen` — токен УСТАНОВКИ (не константа): он делает владение проверяемым настолько,
+        // насколько это возможно для iptables — метка в самом правиле. Имя цепи тоже уникально
+        // для установки, поэтому «одноимённая чужая цепь» перестаёт быть неразрешимой коллизией.
         val safeGen = gen.filter { it.isLetterOrDigit() || it == '_' || it == '-' }.take(32)
             .ifEmpty { "default" }
+        // Имя цепи iptables ограничено 28 символами: гарантируем это здесь.
+        val safeChain = ownChain.filter { it.isLetterOrDigit() || it == '_' }.take(28)
+            .ifEmpty { OUR_CHAIN }
+        val safeLegacy = legacyChain.filter { it.isLetterOrDigit() || it == '_' }.take(28)
+            .ifEmpty { LEGACY_CHAIN }
         return """
 set +e
 ENABLE=@ENABLE_VALUE@
 OUR=@OUR_CHAIN@
+# Историческое имя цепи (только для отчёта; никогда не изменяется). iter54 §6.1.
+LEGACY=@LEGACY_CHAIN@
 # Метка владения: поколение операции приходит из production (стабильно в пределах применения).
 OWN_GEN=@OWN_GEN@
 RULE4='@RULE_V4@'
@@ -209,14 +235,11 @@ chain_state() {
     case "${D}body" in
       *"${D}OWN_TAG"*) : ;;
       *)
-        if [ "${D}body" = "${D}want" ]; then
-          # Точное совпадение содержимого — единственное доказательство для немаркированной
-          # цепочки. Различаем два случая: маркер ПОДДЕРЖИВАЕТСЯ (это наша цепочка, созданная
-          # до iter53 — её можно пересоздать уже с маркером) и маркер НЕ поддержан (тогда
-          # немаркированное правило и есть единственно достижимый вид нашего состояния).
-          if [ "${D}COMMENT_OK" = "1" ]; then echo legacy_unmarked; else echo ours_unmarked; fi
-          return
-        fi ;;
+        # iter54 §6.1: НЕМАРКИРОВАННАЯ цепочка с совпадающим телом — это КАНДИДАТ, а не наша
+        # цепочка. Совпадение текста правила не доказывает происхождение: точно такую же цепь
+        # могло создать другое приложение или прежний код. Никакого присвоения, никакой
+        # «миграции» и никакого -F/-X по этому признаку быть не может.
+        if [ "${D}body" = "${D}want" ]; then echo unproven; return; fi ;;
     esac
     body=${D}(printf '%s\n' "${D}body" | sed "s/-m comment --comment ${D}OWN_TAG //")
     # Владение — по МАРКЕРУ в самом правиле (см. OWN_TAG): имя цепи и содержимое могли
@@ -237,6 +260,37 @@ count_ttl_rules() {
 }
 
 # ---------- отчёт о чужом (read-only) ----------
+# iter54 §6.1: историческое имя цепи (до появления уникального имени установки) проверяется
+# ОТДЕЛЬНО и только для отчёта. Такая цепь НИКОГДА не чистится, не удаляется и не «мигрирует»:
+# происхождение по имени/содержимому не доказывается (её могло создать другое приложение или
+# прежняя версия), а сломать чужое правило нельзя.
+LEGACY_PRESENT=no
+legacy_chain_report() {
+  [ -z "${D}LEGACY" ] && return 0
+  if [ "${D}LEGACY" = "${D}OUR" ]; then
+    # Сборка с историческим именем в качестве текущего (совместимость/тесты): отчёт нужен
+    # ровно в том случае, когда владение этой цепью НЕ доказано. Доказанную свою цепь
+    # «исторической» не называем, иначе отчёт противоречил бы сам себе.
+    case "${D}(chain_state iptables "${D}RULE4")" in
+      ours|absent|empty) return 0 ;;
+    esac
+  fi
+  for lt in iptables ip6tables; do
+    [ "${D}lt" = "ip6tables" ] && [ "${D}V6_SUPPORTED" != "1" ] && continue
+    lout=${D}(${D}lt -t mangle -S "${D}LEGACY" 2>/dev/null) || continue
+    ln=${D}(printf '%s\n' "${D}lout" | grep -c '^-A ')
+    lj=${D}(${D}lt -t mangle -S POSTROUTING 2>/dev/null | awk -v lg="${D}LEGACY" \
+      '/^-A POSTROUTING / { for(i=1;i<=NF;i++) if(${D}i=="-j"||${D}i=="-g"){ if(${D}(i+1)==lg){c++; break} } } END{print c+0}')
+    if [ "${D}ln" != "0" ] || [ "${D}lj" != "0" ]; then
+      LEGACY_PRESENT=yes
+      echo "TTL_LEGACY_CHAIN family=${D}lt chain=${D}LEGACY rules=${D}ln jumps=${D}lj action=keep " \
+        "reason=ownership_unproven origin=unknown " \
+        "note=\"историческое имя цепи не доказывает владение: не изменяется; TTL может применяться и этой цепью\""
+    fi
+  done
+  return 0
+}
+
 report_foreign() {
   if iptables -t mangle -S POSTROUTING >/dev/null 2>&1; then
     iptables -t mangle -S POSTROUTING 2>/dev/null | grep 'ttl-set' | sed 's/^/TTL_FOREIGN v4 spec="/;s/${D}/"/'
@@ -271,13 +325,13 @@ drop_family() {
     absent)  echo "TTL_OWN family=${D}fam state=absent action=none"; echo "${D}fam:none"; return 0 ;;
     empty)   echo "TTL_OWN family=${D}fam state=empty action=keep reason=empty_chain_origin_unproven"; echo "${D}fam:skip"; return 0 ;;
     collision) echo "TTL_OWN family=${D}fam state=collision action=keep reason=chain_content_not_ours"; echo "${D}fam:collision"; return 0 ;;
-    # iter53 §8.1 — МИГРАЦИЯ. Цепочка старше iter53 маркера не несла, но её единственное
-    # правило совпадает с ожидаемым БАЙТ В БАЙТ, поэтому это доказуемо наше старое правило:
-    # его можно снять и пересоздать уже с маркером. Факт миграции называется явно.
-    legacy_unmarked)
-      echo "TTL_MIGRATE family=${D}fam from=legacy_unmarked to=marked supported=1 note=\"правило совпадает с ожидаемым, но без метки: снимаем и создаём с меткой\"" ;;
-    ours_unmarked)
-      [ "${D}COMMENT_OK" = "1" ] && { echo "TTL_OWN family=${D}fam state=ours_unmarked action=keep reason=marker_expected_but_absent"; echo "${D}fam:skip"; return 0; } ;;
+    # iter54 §6.1: тело совпало, но метки владения нет — происхождение НЕ доказано. Такую цепь
+    # нельзя ни чистить, ни удалять, ни «мигрировать»: это может быть чужая цепь с тем же именем.
+    # Возможные причины (в т.ч. отсутствие поддержки `-m comment`) перечисляются как факт.
+    unproven)
+      echo "TTL_OWN family=${D}fam state=unproven action=keep reason=ownership_unproven " \
+        "comment_supported=${D}COMMENT_OK note=\"совпадение тела не доказывает владение: цепь не изменяется\""
+      echo "${D}fam:skip"; return 0 ;;
     unknown) echo "TTL_OWN family=${D}fam state=unknown action=skip reason=read_failed"; echo "${D}fam:unknown"; return 0 ;;
   esac
   # состояние ours: снимаем ИМЕННО наши переходы (точное сравнение target), затем цепочку
@@ -360,7 +414,14 @@ TTL_STOP=0
 ROLLED_BACK=no
 TOUCHED_v4=no
 TOUCHED_v6=no
-if [ "${D}ENABLE" = "1" ]; then
+if [ "${D}ENABLE" = "2" ]; then
+  # Реестр идентичности неизвестен: НИ ОДНОГО изменения таблицы. Желание владельца не
+  # переписывается и не «выключается» — сообщается причина и что именно проверить.
+  VARIANT=none
+  echo "TTL_TRY action=skip_all reason=registry_unknown " \
+    "note=\"идентичность своей цепи не установлена (реестр неизвестен): таблица не изменяется; " \
+    "желание владельца сохранено, повтор — после восстановления реестра\""
+elif [ "${D}ENABLE" = "1" ]; then
   if [ -z "${D}UPLINK" ]; then
     echo "TTL_TRY variant=none scope=\"\" reason=no_uplink"
   else
@@ -383,17 +444,8 @@ if [ "${D}ENABLE" = "1" ]; then
     else
       VARIANT=uplink
       # --- v4 ---
-      # iter53 §8.1: маркер не поддержан ядром и правило уже ровно такое, как нужно —
-      # НЕ пересоздаём его на каждом проходе (иначе TTL мигает на каждом событии сети,
-      # а между -F и -A правило реально отсутствует).
-      KEEP_V4=no
-      if [ "${D}COMMENT_OK" = "0" ] && [ "${D}CS_V4" = "ours_unmarked" ] && \
-         [ "${D}(jump_count iptables)" = "1" ] && [ "${D}(jump_specs iptables | head -1)" = "${D}EXPECTED_JUMP" ]; then
-        KEEP_V4=yes
-      fi
-      if [ "${D}KEEP_V4" = "yes" ]; then
-        echo "TTL_KEEP family=v4 state=ours_unmarked reason=marker_unsupported note=\"правило уже совпадает с ожидаемым\""
-      else
+      # iter54 §6.1: «нашим» считается ТОЛЬКО доказанно помеченное состояние (`ours`).
+      # Немаркированная цепь — не наша: её не трогаем и НЕ считаем уже применённой.
       drop_out4=${D}(drop_family iptables "${D}RULE4" v4); echo "${D}drop_out4"
       # iter50 §5.1(3): если своё снять НЕ удалось (partial/unknown/collision/skip),
       # безусловно продолжать -N/-A нельзя — рядом со старым правилом появилось бы второе,
@@ -410,21 +462,14 @@ if [ "${D}ENABLE" = "1" ]; then
       rc_j=${D}?; echo "TTL_ADD family=v4 jump scope=\"-o ${D}UPLINK\" rc=${D}rc_j"
       TOUCHED_v4=yes
       fi
-      fi
       # --- v6 ---
-      KEEP_V6=no
-      if [ "${D}V6_SUPPORTED" = "1" ] && [ "${D}TTL_STOP" = "0" ] && [ "${D}COMMENT_OK" = "0" ] && \
-         [ "${D}CS_V6" = "ours_unmarked" ] && [ "${D}(jump_count ip6tables)" = "1" ] && \
-         [ "${D}(jump_specs ip6tables | head -1)" = "${D}EXPECTED_JUMP" ]; then
-        KEEP_V6=yes; echo "TTL_KEEP family=v6 state=ours_unmarked reason=marker_unsupported"
-      fi
-      if [ "${D}V6_SUPPORTED" = "1" ] && [ "${D}TTL_STOP" = "0" ] && [ "${D}KEEP_V6" != "yes" ]; then
+      if [ "${D}V6_SUPPORTED" = "1" ] && [ "${D}TTL_STOP" = "0" ]; then
         drop_out6=${D}(drop_family ip6tables "${D}RULE6" v6); echo "${D}drop_out6"
         case "${D}drop_out6" in
           *:partial*|*:unknown*|*:collision*|*:skip*) echo "TTL_TRY action=stop reason=v6_own_not_removed"; TTL_STOP=1 ;;
         esac
       fi
-      if [ "${D}V6_SUPPORTED" = "1" ] && [ "${D}TTL_STOP" = "0" ] && [ "${D}KEEP_V6" != "yes" ]; then
+      if [ "${D}V6_SUPPORTED" = "1" ] && [ "${D}TTL_STOP" = "0" ]; then
         ip6tables -w 5 -t mangle -N "${D}OUR" 2>/dev/null
         # shellcheck disable=SC2086
         ip6tables -w 5 -t mangle -A "${D}OUR" ${D}MARK_ARGS -j HL --hl-set 65 2>&1
@@ -473,8 +518,25 @@ if [ "${D}ENABLE" = "1" ]; then
           echo "TTL_ROLLBACK family=v4 jump_del_rc=${D}rj4 chain_flush_rc=${D}rf4 chain_del_rc=${D}rx4"
           TOUCHED_v4=no
         fi
-        VARIANT=none
-        ROLLED_BACK=yes
+        # iter54 §6.2: `ROLLED_BACK=yes` заявляется ТОЛЬКО после readback, доказывающего, что
+        # наших правил/переходов больше нет. Попытка `-D/-F/-X` (пусть и с rc=0) откатом не
+        # является: другой процесс мог успеть вернуть правило.
+        RB_V4=absent; RB_J4=${D}(jump_count iptables)
+        RB_V6=absent; RB_J6=0
+        [ "${D}V6_SUPPORTED" = "1" ] && { RB_V6=${D}(chain_state ip6tables "${D}RULE6"); RB_J6=${D}(jump_count ip6tables); }
+        echo "TTL_ROLLBACK_VERIFY v4_chain=${D}RB_V4 v4_jumps=${D}RB_J4 v6_chain=${D}RB_V6 v6_jumps=${D}RB_J6"
+        if [ "${D}RB_V4" = "absent" ] && [ "${D}RB_J4" = "0" ] && \
+           { [ "${D}V6_SUPPORTED" != "1" ] || { [ "${D}RB_V6" = "absent" ] || [ "${D}RB_V6" = "none" ]; }; } && \
+           { [ "${D}V6_SUPPORTED" != "1" ] || [ "${D}RB_J6" = "0" ]; }; then
+          VARIANT=none
+          ROLLED_BACK=yes
+          echo "TTL_ROLLBACK result=proved v4_chain=${D}RB_V4 v4_jumps=${D}RB_J4 v6_chain=${D}RB_V6 v6_jumps=${D}RB_J6"
+        else
+          VARIANT=none
+          ROLLED_BACK=no
+          echo "TTL_ROLLBACK result=unproven v4_chain=${D}RB_V4 v4_jumps=${D}RB_J4 v6_chain=${D}RB_V6 v6_jumps=${D}RB_J6 " \
+            "action=keep note=\"откат не доказан чтением: состояние названо частичным, повторных воздействий нет\""
+        fi
       fi
       # дедупликация: лишние НАШИ переходы снимаем (точное сравнение target)
       for fam_tool in "v4 iptables" "v6 ip6tables"; do
@@ -501,6 +563,7 @@ else
 fi
 
 report_foreign
+legacy_chain_report
 
 # ---------- итоговое состояние (перечитывается ПОСЛЕ действий) ----------
 CS2_V4=${D}(chain_state iptables "${D}RULE4")
@@ -525,18 +588,12 @@ ALL_V4=${D}(count_ttl_rules iptables 'ttl-set')
 ALL_V6=0; [ "${D}V6_SUPPORTED" = "1" ] && ALL_V6=${D}(count_ttl_rules ip6tables 'hl-set')
 FOREIGN_V4=${D}ALL_V4
 FOREIGN_V6=${D}ALL_V6
-# iter53 §8.1: «нашим» считается marked `ours`, либо `ours_unmarked` — но ТОЛЬКО когда маркер
-# не поддержан ядром: тогда иного доказуемого вида нашего состояния не существует.
+# iter54 §6.1: «нашим» считается ТОЛЬКО помеченное состояние `ours` (метка = наш токен
+# установки). Немаркированная цепь даже с совпадающим телом — не наша: не трогаем.
 OWN_OK_V4=no
-case "${D}CS2_V4" in
-  ours) OWN_OK_V4=yes ;;
-  ours_unmarked) [ "${D}COMMENT_OK" = "0" ] && OWN_OK_V4=yes ;;
-esac
+[ "${D}CS2_V4" = "ours" ] && OWN_OK_V4=yes
 OWN_OK_V6=no
-case "${D}CS2_V6" in
-  ours) OWN_OK_V6=yes ;;
-  ours_unmarked) [ "${D}COMMENT_OK" = "0" ] && OWN_OK_V6=yes ;;
-esac
+[ "${D}CS2_V6" = "ours" ] && OWN_OK_V6=yes
 
 OWN_V4=0; [ "${D}OWN_OK_V4" = "yes" ] && OWN_V4=1; [ "${D}CS2_V4" = "unknown" ] && OWN_V4=-1
 OWN_V6=0; [ "${D}OWN_OK_V6" = "yes" ] && OWN_V6=1; [ "${D}CS2_V6" = "unknown" ] && OWN_V6=-1
@@ -604,7 +661,9 @@ else
   echo "TTL_SCOPE result=${D}([ "${D}SCOPED" = "yes" ] && echo scoped || echo unscoped) scoped=${D}SCOPED uplink_only=${D}SCOPE_UPLINK_ONLY uplink=${D}{UPLINK:-none} rule=\"${D}{JS4_RAW:-none}\""
 fi
 
-if [ "${D}ENABLE" = "1" ]; then
+if [ "${D}ENABLE" = "2" ]; then
+  VERDICT=CHECK_OWNER
+elif [ "${D}ENABLE" = "1" ]; then
   if [ "${D}VERIFY_V4" = "UNKNOWN" ] || [ "${D}VERIFY_V6" = "UNKNOWN" ]; then VERDICT=READ_UNKNOWN
   elif [ "${D}VERIFY_V4" = "COLLISION" ] || [ "${D}VERIFY_V6" = "COLLISION" ]; then VERDICT=CHAIN_COLLISION
   # iter50 §5.1(3): остановка из-за неснятого своего правила — НЕ успех, даже если в таблице
@@ -631,7 +690,8 @@ echo '=== TTL_SCRIPT end ==='
 """.trimIndent()
             .replace("ARROW", "\u2192")
             .replace("@ENABLE_VALUE@", enableBit)
-            .replace("@OUR_CHAIN@", OUR_CHAIN)
+            .replace("@OUR_CHAIN@", safeChain)
+            .replace("@LEGACY_CHAIN@", safeLegacy)
             .replace("@OWN_GEN@", safeGen)
             .replace("@RULE_V4@", RULE_V4)
             .replace("@RULE_V6@", RULE_V6)

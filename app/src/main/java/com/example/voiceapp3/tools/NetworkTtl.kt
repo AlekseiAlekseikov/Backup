@@ -124,7 +124,34 @@ object NetworkTtl {
  *  — IPv6: счётчик правил `hl-set 65` в ip6tables (mangle/POSTROUTING), только со скоупом.
  *  — Замер производится на iface текущего дефолтного маршрута.
  */
-private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
+/**
+ * iter54 §6.1: скрипт строится с УНИКАЛЬНЫМ именем своей цепи и токеном установки.
+ *
+ * Реестр ([TtlOwnership]) — единственный источник идентичности. Если он неизвестен
+ * (конфликт копий / ошибка чтения / неудачная запись), таблица НЕ изменяется: скрипт получает
+ * `ENABLE=2` и печатает `TTL_TRY action=skip_all reason=registry_unknown`. Создавать «на всякий
+ * случай» новую цепь при неизвестном реестре нельзя — иначе каждое неудачное чтение плодило бы
+ * цепь, а прежняя оставалась бы висеть неуправляемой.
+ */
+private fun buildScript(enable: Boolean, reg: TtlOwnership.Registry?): String {
+    val known = reg != null && reg.state == TtlOwnership.RegistryState.PRESENT && reg.chain != null
+    if (!known) {
+        return TtlScript.build(
+            enable = enable,
+            gen = "unknown",
+            ownChain = TtlScript.OUR_CHAIN,
+            legacyChain = TtlOwnership.LEGACY_CHAIN,
+            registryUnknown = true
+        )
+    }
+    return TtlScript.build(
+        enable = enable,
+        gen = reg!!.token!!,
+        ownChain = reg.chain!!,
+        legacyChain = TtlOwnership.LEGACY_CHAIN
+    )
+}
+
 
     /**
      * §4.6 iter47: намерение читается ТОЛЬКО через согласование копий (`Prefs2.readBoolean`),
@@ -310,7 +337,17 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
      */
     private fun runTransport(want: Boolean, source: String): TtlRunner.Outcome {
         val t0 = SystemClock.uptimeMillis()
-        val script = buildScript(want)
+        // Реестр своей цепи: создаётся один раз с подтверждением записи и readback.
+        val reg = TtlOwnership.ensure(appCtxRef)
+        if (reg.state != TtlOwnership.RegistryState.PRESENT) {
+            // Идентичность не установлена ⇒ НИ ОДНОГО изменения таблицы. Это не «выключение»:
+            // желание владельца сохранено, причина названа, повтор — после восстановления реестра.
+            AppLog.w(TAG, "TTL_OWNERSHIP_REGISTRY ${reg.wire()} action=skip table=untouched " +
+                "(идентичность своей цепи не установлена: таблица остаётся как есть)")
+        } else {
+            AppLog.i(TAG, "TTL_OWNERSHIP_REGISTRY ${reg.wire()}")
+        }
+        val script = buildScript(want, reg)
         var (exitCode, output) = AdbClient.executeScript("ttl_script", script, 40000)
         if (want) {
             var attempt = 1

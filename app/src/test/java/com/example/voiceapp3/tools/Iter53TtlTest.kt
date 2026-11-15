@@ -118,28 +118,33 @@ class Iter53TtlTest {
         out.lineSequence().firstOrNull { it.startsWith(prefix) } ?: ""
 
     @Test
-    fun legacyUnmarkedChainIsMigratedNotBlindlyDeleted() {
-        // Цепочка, созданная ДО iter53: имя наше, правило совпадает байт в байт, метки нет.
+    fun legacyUnmarkedChainIsNeitherAdoptedNorChanged() {
+        // iter54 §6.1. Цепь, созданная ДО iter53: имя совпадает с историческим, тело правила
+        // совпадает байт в байт, метки владения нет. Совпадение имени+тела НЕ доказывает, что
+        // цепь наша: точно такую же могла создать чужая установка. Поэтому:
+        //   • состояние называется `unproven` (кандидат, а не собственность);
+        //   • цепь НЕ изменяется (ни метки, ни удаления, ни «миграции»);
+        //   • ON не заявляется применённым — честный отказ с причиной.
         val st = Iter50Stand(); seedBase(st)
         st.seedRule("iptables", "VAPP_TTL", "-j TTL --ttl-set 65")
         st.seedRule("iptables", "POSTROUTING", "-o wlan0 -j VAPP_TTL")
+        val before = st.rules("iptables")
         val (rc, out) = st.exec(on(), "on.sh")
         assertEquals("скрипт дошёл до конца: $out", 0, rc)
-        assertTrue("состояние названо: ${line(out, "TTL_OWNERSHIP")}",
-            line(out, "TTL_OWNERSHIP").contains("v4=legacy_unmarked"))
-        assertTrue("миграция названа: ${line(out, "TTL_MIGRATE")}",
-            line(out, "TTL_MIGRATE").contains("from=legacy_unmarked"))
-        assertTrue("итог: ${line(out, "TTL_CHECK")}",
-            line(out, "TTL_CHECK").contains("SCOPED_OK") || line(out, "TTL_CHECK").contains("SCOPED_V4_ONLY"))
-        // После прохода правило обязано нести метку владения — иначе владение недоказуемо.
-        assertEquals(
-            "ровно одно помеченное правило и один переход",
-            listOf(
-                "VAPP_TTL -m comment --comment voiceapp3:ttl:default -j TTL --ttl-set 65",
-                "POSTROUTING -o wlan0 -j VAPP_TTL"
-            ),
-            st.rules("iptables")
-        )
+        assertTrue("владение не доказано и это названо: ${line(out, "TTL_OWNERSHIP")}",
+            line(out, "TTL_OWNERSHIP").contains("v4=unproven"))
+        val own = out.lineSequence().firstOrNull { it.startsWith("TTL_OWN family=v4") } ?: ""
+        assertTrue("решение — сохранить, а не присвоить: $own",
+            own.contains("state=unproven") && own.contains("action=keep") &&
+                own.contains("reason=ownership_unproven"))
+        assertFalse("миграции/присвоения нет", out.contains("TTL_MIGRATE"))
+        val hist = out.lineSequence().firstOrNull { it.startsWith("TTL_LEGACY_CHAIN") } ?: ""
+        assertTrue("историческая цепь названа отдельно и не тронута: $hist",
+            hist.contains("action=keep") && hist.contains("reason=ownership_unproven"))
+        assertFalse("ON не выдан за применённый: ${line(out, "TTL_CHECK")}",
+            line(out, "TTL_CHECK").contains("SCOPED_OK"))
+        assertEquals("ни одного изменения таблицы (нет ни метки, ни удаления)", before,
+            st.rules("iptables"))
     }
 
     @Test

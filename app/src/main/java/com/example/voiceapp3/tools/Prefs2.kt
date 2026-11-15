@@ -355,6 +355,41 @@ object Prefs2 {
     }
 
     /**
+     * iter54 §6.1 — то же согласование, но для СТРОК (реестр собственной идентичности TTL и
+     * подобное). Отличие «ключа нет» и «прочитать нельзя» сохранено: по нему принимается
+     * решение, можно ли создавать новую идентичность или нужно остановиться.
+     */
+    fun readString(c: Context, key: String): Toggles45.Resolved<String> {
+        val app = c.applicationContext
+        val pc = runCatching { cps(app) }.getOrNull()
+        val pd = runCatching { dps(app) }.getOrNull()
+        val cv = runCatching { pc?.let { if (it.contains(key)) it.getString(key, null) else null } }
+            .getOrNull()
+        val dv = runCatching { pd?.let { if (it.contains(key)) it.getString(key, null) else null } }
+            .getOrNull()
+        return Toggles45.resolveString(
+            cv, readRev(pc, key), readDel(pc, key),
+            dv, readRev(pd, key), readDel(pd, key)
+        )
+    }
+
+    /**
+     * iter54 §6.1 — чтение строки по набору копий (ядро, без Android): то же согласование, что
+     * в [readString], но пригодное для проверки на подставных копиях.
+     */
+    internal fun readStringCore(copies: List<Copy>, key: String): Toggles45.Resolved<String> {
+        val vals = copies.map { cp ->
+            runCatching { cp.prefs?.let { if (it.contains(key)) it.getString(key, null) else null } }
+                .getOrNull()
+        }
+        fun v(i: Int) = vals.getOrNull(i)
+        return Toggles45.resolveString(
+            v(0), readRev(copies.getOrNull(0)?.prefs, key), readDel(copies.getOrNull(0)?.prefs, key),
+            v(1), readRev(copies.getOrNull(1)?.prefs, key), readDel(copies.getOrNull(1)?.prefs, key)
+        )
+    }
+
+    /**
      * iter48 §Г — ТРЁХЗНАЧНОЕ чтение тумблера: `null` = «неизвестно» (копии в конфликте или
      * значение прочитать нельзя). Именно это значение обязано доходить до UI и до логики
      * применения: подставлять `default` нельзя, иначе интерфейс показывает выдуманное
