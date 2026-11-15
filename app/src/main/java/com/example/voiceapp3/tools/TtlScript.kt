@@ -79,6 +79,7 @@ internal object TtlScript {
         return """
 set +e
 ENABLE=@ENABLE_VALUE@
+REGISTRY_UNKNOWN=@REGISTRY_UNKNOWN@
 OUR=@OUR_CHAIN@
 # Историческое имя цепи (только для отчёта; никогда не изменяется). iter54 §6.1.
 LEGACY=@LEGACY_CHAIN@
@@ -132,6 +133,23 @@ fi
 # Аргументы правила с маркером (если поддерживается).
 MARK_ARGS=""
 [ "${D}COMMENT_OK" = "1" ] && MARK_ARGS="-m comment --comment ${D}OWN_TAG"
+
+# iter55 §6.1 — ЧТО ДЕЛАТЬ, ЕСЛИ `-m comment` НЕ ПОДДЕРЖАН.
+# Прежний код в этом случае всё равно создавал правило БЕЗ маркера, а затем `chain_state`
+# называл его `unproven` и OFF отказывался его снимать: активный TTL, который приложение само
+# не умеет убрать. Теперь идентичность без маркера доказывается ИМЕНЕМ цепи установки:
+#   • имя уникально для установки (реестр дал токен) и НЕ историческое;
+#   • тело правила точно совпадает с ожидаемым;
+#   • реестр подтверждён (не unknown) — иначе имени верить нельзя.
+# Только при всех трёх условиях цепь считается своей (`ours_named`) и может быть снята. Иначе
+# (историческое имя, неизвестный реестр) — НИ ОДНОГО изменения таблицы: честный отказ до
+# первой мутации, желание владельца сохраняется.
+REGISTRY_UNKNOWN=@REGISTRY_UNKNOWN@
+NAMED_OWN=0
+if [ "${D}COMMENT_OK" = "0" ] && [ "${D}REGISTRY_UNKNOWN" = "0" ] && \
+   [ -n "${D}OUR" ] && [ "${D}OUR" != "${D}LEGACY" ]; then NAMED_OWN=1; fi
+echo "TTL_IDENTITY comment_supported=${D}COMMENT_OK registry_unknown=${D}REGISTRY_UNKNOWN " \
+  "named_ownership=${D}NAMED_OWN chain=${D}OUR"
 
 # ---------- владение: точные сравнения, а не подстроки ----------
 # Спецификации переходов POSTROUTING, у которых target — ТОЧНО наше имя.
@@ -239,7 +257,12 @@ chain_state() {
         # цепочка. Совпадение текста правила не доказывает происхождение: точно такую же цепь
         # могло создать другое приложение или прежний код. Никакого присвоения, никакой
         # «миграции» и никакого -F/-X по этому признаку быть не может.
-        if [ "${D}body" = "${D}want" ]; then echo unproven; return; fi ;;
+        if [ "${D}body" = "${D}want" ]; then
+          # iter55 §6.1: без маркера владение может доказываться ТОЛЬКО уникальным именем
+          # установки (см. NAMED_OWN). Иначе — unproven и никаких изменений.
+          if [ "${D}NAMED_OWN" = "1" ]; then echo ours_named; return; fi
+          echo unproven; return
+        fi ;;
     esac
     body=${D}(printf '%s\n' "${D}body" | sed "s/-m comment --comment ${D}OWN_TAG //")
     # Владение — по МАРКЕРУ в самом правиле (см. OWN_TAG): имя цепи и содержимое могли
@@ -334,6 +357,11 @@ drop_family() {
       echo "${D}fam:skip"; return 0 ;;
     unknown) echo "TTL_OWN family=${D}fam state=unknown action=skip reason=read_failed"; echo "${D}fam:unknown"; return 0 ;;
   esac
+  # iter55 §6.1: `ours_named` — своя цепь, доказанная уникальным именем установки при
+  # неподдержанном `-m comment`. Основание владения печатается, чтобы отчёт не путал его с
+  # маркером. Дальше путь тот же, что у `ours`.
+  [ "${D}st" = "ours_named" ] && echo "TTL_OWN family=${D}fam state=ours_named " \
+    "ownership=unique_install_chain_name comment_supported=0"
   # состояние ours: снимаем ИМЕННО наши переходы (точное сравнение target), затем цепочку
   # Список спецификаций разбирается ПОСТРОЧНО: спецификация содержит пробелы
   # (`-o wlan0 -j VAPP_TTL`), поэтому обычный `for ${D}spec in ${D}(...)` разбил бы её на слова
@@ -426,13 +454,22 @@ elif [ "${D}ENABLE" = "1" ]; then
     echo "TTL_TRY variant=none scope=\"\" reason=no_uplink"
   else
     echo "TTL_TRY variant=uplink scope=\"-o ${D}UPLINK\" carplay=${D}{CARPLAY:-none}"
+    # iter55 §6.1: если ни маркер, ни уникальное имя установки не дают доказанной идентичности,
+    # НИ ОДНОГО изменения таблицы не делается: иначе создаётся правило, которое приложение само
+    # затем не признает своим и не снимет (активный TTL после OFF).
+    if [ "${D}COMMENT_OK" = "0" ] && [ "${D}NAMED_OWN" = "0" ]; then
+      TTL_STOP=1
+      echo "TTL_TRY action=stop reason=no_safe_identity comment_supported=0 named_ownership=0 " \
+        "note=\"безопасная идентичность своей цепи не подтверждена (нет -m comment и нет " \
+        "подтверждённого имени установки): таблица не изменяется, желание владельца сохранено\""
+    fi
     # Если ХОТЬ ОДНА семья в неизвестном или не нашем состоянии — не применяем НИЧЕГО:
     # половинчатое состояние (только v6) выглядит как «TTL работает», хотя v4 не наш.
     NOT_OWNED=""
-    case "${D}CS_V4" in collision|empty|unknown) NOT_OWNED="v4=${D}CS_V4";; esac
+    case "${D}CS_V4" in collision|empty|unknown|unproven) NOT_OWNED="v4=${D}CS_V4";; esac
     if [ "${D}V6_SUPPORTED" = "1" ]; then
       case "${D}CS_V6" in
-        collision|empty|unknown)
+        collision|empty|unknown|unproven)
           if [ -n "${D}NOT_OWNED" ]; then NOT_OWNED="${D}NOT_OWNED v6=${D}CS_V6"
           else NOT_OWNED="v6=${D}CS_V6"; fi ;;
       esac
@@ -440,6 +477,19 @@ elif [ "${D}ENABLE" = "1" ]; then
     # POSIX: никаких ${D}{NOT_OWNED// /} — `//` это bashism, на #!/bin/sh (dash) это
     # «Bad substitution» и скрипт обрывается на середине.
     if [ -n "${D}NOT_OWNED" ]; then
+      # iter55 §6.1: состояние КАЖДОЙ семьи называется, даже когда изменять нельзя: отчёт не
+      # должен терять причину из-за того, что мы ничего не трогаем.
+      case "${D}CS_V4" in
+        unproven) echo "TTL_OWN family=v4 state=unproven action=keep reason=ownership_unproven " \
+          "comment_supported=${D}COMMENT_OK named_ownership=${D}NAMED_OWN note=\"совпадение имени/тела не доказывает владение\"" ;;
+        *) echo "TTL_OWN family=v4 state=${D}CS_V4 action=keep reason=chain_state_not_ours" ;;
+      esac
+      if [ "${D}V6_SUPPORTED" = "1" ]; then
+        case "${D}CS_V6" in
+          unproven) echo "TTL_OWN family=v6 state=unproven action=keep reason=ownership_unproven" ;;
+          *) echo "TTL_OWN family=v6 state=${D}CS_V6 action=keep reason=chain_state_not_ours" ;;
+        esac
+      fi
       echo "TTL_TRY action=skip_all reason=family_not_owned ${D}NOT_OWNED"
     else
       VARIANT=uplink
@@ -454,13 +504,29 @@ elif [ "${D}ENABLE" = "1" ]; then
         *:partial*|*:unknown*|*:collision*|*:skip*) echo "TTL_TRY action=stop reason=v4_own_not_removed"; TTL_STOP=1 ;;
       esac
       if [ "${D}TTL_STOP" = "0" ]; then
-      iptables -w 5 -t mangle -N "${D}OUR" 2>/dev/null
+      # iter55 §6.2: rc создания цепи ПРОВЕРЯЕТСЯ. Раньше `-N` игнорировался: если цепь уже
+      # существовала (конкурент создал одноимённую чужую), следующий `-A` дописывал правило в
+      # ЧУЖОЙ объект. Теперь дописывать можно только в СВОЮ доказанную цепь.
+      iptables -w 5 -t mangle -N "${D}OUR" 2>/dev/null; rc_n=${D}?
+      if [ "${D}rc_n" != "0" ]; then
+        st_n=${D}(chain_state iptables "${D}RULE4")
+        case "${D}st_n" in
+          ours|ours_named)
+            echo "TTL_ADD family=v4 chain=${D}OUR action=reuse reason=chain_exists_ours state=${D}st_n" ;;
+          *)
+            echo "TTL_TRY action=stop reason=chain_exists_not_ours family=v4 state=${D}st_n rc_n=${D}rc_n " \
+              "note=\"цепь с нашим именем уже существует и не доказана как наша: правило не дописывается\""
+            TTL_STOP=1 ;;
+        esac
+      fi
+      if [ "${D}TTL_STOP" = "0" ]; then
       # shellcheck disable=SC2086
       iptables -w 5 -t mangle -A "${D}OUR" ${D}MARK_ARGS -j TTL --ttl-set 65 2>&1
       rc_a=${D}?; echo "TTL_ADD family=v4 chain=${D}OUR marker=${D}COMMENT_OK rc=${D}rc_a"
       iptables -w 5 -t mangle -A POSTROUTING -o "${D}UPLINK" -j "${D}OUR" 2>&1
       rc_j=${D}?; echo "TTL_ADD family=v4 jump scope=\"-o ${D}UPLINK\" rc=${D}rc_j"
-      TOUCHED_v4=yes
+      [ "${D}rc_n" = "0" ] && TOUCHED_v4=yes
+      fi
       fi
       # --- v6 ---
       if [ "${D}V6_SUPPORTED" = "1" ] && [ "${D}TTL_STOP" = "0" ]; then
@@ -470,13 +536,25 @@ elif [ "${D}ENABLE" = "1" ]; then
         esac
       fi
       if [ "${D}V6_SUPPORTED" = "1" ] && [ "${D}TTL_STOP" = "0" ]; then
-        ip6tables -w 5 -t mangle -N "${D}OUR" 2>/dev/null
+        ip6tables -w 5 -t mangle -N "${D}OUR" 2>/dev/null; rc_n6=${D}?
+        if [ "${D}rc_n6" != "0" ]; then
+          st_n6=${D}(chain_state ip6tables "${D}RULE6")
+          case "${D}st_n6" in
+            ours|ours_named)
+              echo "TTL_ADD family=v6 chain=${D}OUR action=reuse reason=chain_exists_ours state=${D}st_n6" ;;
+            *)
+              echo "TTL_TRY action=stop reason=chain_exists_not_ours family=v6 state=${D}st_n6 rc_n=${D}rc_n6"
+              TTL_STOP=1 ;;
+          esac
+        fi
+        if [ "${D}TTL_STOP" = "0" ]; then
         # shellcheck disable=SC2086
         ip6tables -w 5 -t mangle -A "${D}OUR" ${D}MARK_ARGS -j HL --hl-set 65 2>&1
         rc_a6=${D}?; echo "TTL_ADD family=v6 chain=${D}OUR marker=${D}COMMENT_OK rc=${D}rc_a6"
         ip6tables -w 5 -t mangle -A POSTROUTING -o "${D}UPLINK" -j "${D}OUR" 2>&1
         rc_j6=${D}?; echo "TTL_ADD family=v6 jump scope=\"-o ${D}UPLINK\" rc=${D}rc_j6"
-        TOUCHED_v6=yes
+        [ "${D}rc_n6" = "0" ] && TOUCHED_v6=yes
+        fi
       fi
       # iter53 §8.2: откат решается по ФАКТУ изменения, а не по значениям rc.
       # Раньше при `TTL_STOP=1` (v6 отказалась после того, как v4 уже применена) rc обнулялись
@@ -521,12 +599,22 @@ elif [ "${D}ENABLE" = "1" ]; then
         # iter54 §6.2: `ROLLED_BACK=yes` заявляется ТОЛЬКО после readback, доказывающего, что
         # наших правил/переходов больше нет. Попытка `-D/-F/-X` (пусть и с rc=0) откатом не
         # является: другой процесс мог успеть вернуть правило.
-        RB_V4=absent; RB_J4=${D}(jump_count iptables)
-        RB_V6=absent; RB_J6=0
-        [ "${D}V6_SUPPORTED" = "1" ] && { RB_V6=${D}(chain_state ip6tables "${D}RULE6"); RB_J6=${D}(jump_count ip6tables); }
-        echo "TTL_ROLLBACK_VERIFY v4_chain=${D}RB_V4 v4_jumps=${D}RB_J4 v6_chain=${D}RB_V6 v6_jumps=${D}RB_J6"
-        if [ "${D}RB_V4" = "absent" ] && [ "${D}RB_J4" = "0" ] && \
-           { [ "${D}V6_SUPPORTED" != "1" ] || { [ "${D}RB_V6" = "absent" ] || [ "${D}RB_V6" = "none" ]; }; } && \
+        # iter55 §6.2: ФАКТИЧЕСКОЕ чтение, а не константа `absent`. Прежний код объявлял v4
+        # отсутствующей без чтения: отказ `-X` при уже снятом переходе давал ложный ROLLED_BACK=yes.
+        iptables -t mangle -S >/dev/null 2>&1; RB_V4_RC=${D}?
+        RB_V4=${D}(chain_state iptables "${D}RULE4"); RB_J4=${D}(jump_count iptables)
+        RB_V6=absent; RB_J6=0; RB_V6_RC=0
+        [ "${D}V6_SUPPORTED" = "1" ] && {
+          ip6tables -t mangle -S >/dev/null 2>&1; RB_V6_RC=${D}?
+          RB_V6=${D}(chain_state ip6tables "${D}RULE6"); RB_J6=${D}(jump_count ip6tables); }
+        echo "TTL_ROLLBACK_VERIFY v4_chain=${D}RB_V4 v4_jumps=${D}RB_J4 v4_read_rc=${D}RB_V4_RC " \
+          "v6_chain=${D}RB_V6 v6_jumps=${D}RB_J6 v6_read_rc=${D}{RB_V6_RC:-n}"
+        # Откат доказан только при УСПЕШНОМ чтении: `absent` при недоступном readback ничего
+        # не доказывает, а `-1` в jump_count — «неизвестно», а не «нет переходов».
+        if [ "${D}RB_V4_RC" = "0" ] && [ "${D}RB_J4" = "0" ] && \
+           { [ "${D}RB_V4" = "absent" ] || [ "${D}RB_V4" = "none" ]; } && \
+           { [ "${D}V6_SUPPORTED" != "1" ] || { [ "${D}RB_V6_RC" = "0" ] && \
+             { [ "${D}RB_V6" = "absent" ] || [ "${D}RB_V6" = "none" ]; }; }; } && \
            { [ "${D}V6_SUPPORTED" != "1" ] || [ "${D}RB_J6" = "0" ]; }; then
           VARIANT=none
           ROLLED_BACK=yes
@@ -692,6 +780,7 @@ echo '=== TTL_SCRIPT end ==='
             .replace("@ENABLE_VALUE@", enableBit)
             .replace("@OUR_CHAIN@", safeChain)
             .replace("@LEGACY_CHAIN@", safeLegacy)
+            .replace("@REGISTRY_UNKNOWN@", if (registryUnknown) "1" else "0")
             .replace("@OWN_GEN@", safeGen)
             .replace("@RULE_V4@", RULE_V4)
             .replace("@RULE_V6@", RULE_V6)

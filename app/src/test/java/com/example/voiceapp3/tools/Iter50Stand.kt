@@ -83,13 +83,16 @@ class Iter50Stand {
           -F) if [ -n "${'$'}chain" ]; then grep -qx "${'$'}chain" "${'$'}CHAINS" || exit 1
                 grep -v "^${'$'}chain " "${'$'}RULES" > "${'$'}RULES.t" 2>/dev/null; mv "${'$'}RULES.t" "${'$'}RULES"
               else : > "${'$'}RULES"; fi ;;
-          -X) if [ -n "${'$'}chain" ]; then grep -qx "${'$'}chain" "${'$'}CHAINS" || exit 1
+          -X) [ -f "${'$'}STATE/fail_x.${'$'}(basename "${'$'}0")" ] && { echo "Device or resource busy." >&2; exit 3; }
+              if [ -n "${'$'}chain" ]; then grep -qx "${'$'}chain" "${'$'}CHAINS" || exit 1
                 grep -qE -- "-(j|g) ${'$'}chain( |$)" "${'$'}RULES" && { echo "Too many links." >&2; exit 2; }
                 grep -v "^${'$'}chain$" "${'$'}CHAINS" > "${'$'}CHAINS.t"; mv "${'$'}CHAINS.t" "${'$'}CHAINS"
                 grep -v "^${'$'}chain " "${'$'}RULES" > "${'$'}RULES.t"; mv "${'$'}RULES.t" "${'$'}RULES"
               fi ;;
           -A|-I) if [ "${'$'}chain" != "POSTROUTING" ]; then grep -qx "${'$'}chain" "${'$'}CHAINS" || { echo "No chain" >&2; exit 1; }; fi
                  if [ -f "${'$'}STATE/fail_add.${'$'}(basename "${'$'}0")" ]; then echo "Resource temporarily unavailable" >&2; exit 4; fi
+                 # iter55 §6.1: ядро без `-m comment` — отказ ровно на этом матче.
+                 case " ${'$'}rest " in *" -m comment "*) [ -f "${'$'}STATE/no_comment.${'$'}(basename "${'$'}0")" ] && { echo "No chain/target/match by that name." >&2; exit 2; } ;; esac
                  echo "${'$'}chain ${'$'}rest" >> "${'$'}RULES" ;;
           -D) [ -f "${'$'}STATE/fail_del.${'$'}(basename "${'$'}0")" ] && { echo "Bad rule (does a matching rule exist in that chain?)." >&2; exit 1; }
               line="${'$'}chain ${'$'}rest"
@@ -237,8 +240,17 @@ class Iter50Stand {
             chainsOf(family).appendText("$chain\n")
     }
 
+    /** Смоделировать отказ добавления правила (`-A`). */
+    fun failAdd(family: String) { File(stateDir, "fail_add.$family").writeText("1") }
+
     /** Смоделировать отказ удаления правила (`-D`). */
     fun failDelete(family: String) { File(stateDir, "fail_del.$family").writeText("1") }
+
+    /** iter55 §6.2: отказ удаления ЦЕПИ (`-X`) — «цепь осталась». */
+    fun failChainDelete(family: String) { File(stateDir, "fail_x.$family").writeText("1") }
+
+    /** iter55 §6.1: ядро без поддержки `-m comment` (матч не поддерживается). */
+    fun failComment(family: String) { File(stateDir, "no_comment.$family").writeText("1") }
 
     /** Смоделировать отказ ЧТЕНИЯ таблицы (`-S`): «правил нет» ≠ «прочитать нельзя». */
     fun failRead(family: String) { File(stateDir, "fail_read.$family").writeText("1") }
