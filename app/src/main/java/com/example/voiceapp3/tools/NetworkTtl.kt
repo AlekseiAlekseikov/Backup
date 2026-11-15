@@ -189,7 +189,14 @@ private fun buildScript(enable: Boolean, reg: TtlOwnership.Registry?): String {
      * (`Iter48Test`), в отличие от этого объекта, который тянет Android-зависимости.
      * Здесь остаётся только отображение вердикта на `ToolsStep.Status`.
      */
-    private fun parseVerifyResult(expected: Boolean, out: String): Pair<ToolsStep.Status, String> {
+    /**
+     * iter57 §6: результат разбора — ТИПИЗИРОВАННЫЙ, а не `Pair<status, String>`. `Pair` из двух
+     * разнородных значений склеивает «вердикт» и «пояснение» и легко читается наоборот; здесь у
+     * полей есть имена, а конструктор один.
+     */
+    internal data class VerifyResult(val status: ToolsStep.Status, val detail: String)
+
+    private fun parseVerifyResult(expected: Boolean, out: String): VerifyResult {
         val p = TtlVerify.parse(expected, out)
         val status = when (p.verdict) {
             TtlVerify.Verdict.OK -> ToolsStep.Status.OK
@@ -197,7 +204,7 @@ private fun buildScript(enable: Boolean, reg: TtlOwnership.Registry?): String {
             TtlVerify.Verdict.FAILED -> ToolsStep.Status.FAILED
             TtlVerify.Verdict.BLOCKED -> ToolsStep.Status.BLOCKED
         }
-        return status to p.detail
+        return VerifyResult(status, p.detail)
     }
 
     @Volatile private var ttlLastRunAtMs: Long = 0L
@@ -381,7 +388,9 @@ private fun buildScript(enable: Boolean, reg: TtlOwnership.Registry?): String {
                 attempt++
             }
         }
-        val (status, reason) = parseVerifyResult(want, output)
+        val verify = parseVerifyResult(want, output)
+        val status = verify.status
+        val reason = verify.detail
         // iter48 §Б: OFF с `result=PARTIAL reason=foreign_rules_remain` — СВОИ правила сняты
         // (readback own=0), поэтому желаемое состояние OFF достигнуто; но полным «OK» это не
         // является и в журнале остаётся честная причина. Чужое не удаляли.
