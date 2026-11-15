@@ -44,15 +44,22 @@ class Iter55TtlTest {
         st.failComment("iptables")          // ядро без матча comment
         val before = st.rules("iptables")
 
+        // iter57 §8.1: владение НЕ выводится из имени установки (аудит: имя+тело не доказывают
+        // происхождение). Своя цепь — та, которую МЫ создали; факт создания пишется маркером на
+        // устройстве. Поэтому на первом проходе named_ownership=0, а появляется маркер.
+        val stateDir = File(st.dir, "ttlstate").apply { mkdirs() }
+        val env = mapOf("VAPP_TTL_STATE" to stateDir.absolutePath)
         val (rcOn, on) = st.exec(
             TtlScript.build(true, gen = "abcd1234", ownChain = "VAPP_TTL_abcd1234"),
-            "on.sh"
+            "on.sh", env
         )
         assertEquals("скрипт дошёл до конца: $on", 0, rcOn)
         assertTrue("поддержка comment отсутствует и это названо: ${line(on, "TTL_IDENTITY")}",
             line(on, "TTL_IDENTITY").contains("comment_supported=0"))
-        assertTrue("владение по имени установки включено: ${line(on, "TTL_IDENTITY")}",
-            line(on, "TTL_IDENTITY").contains("named_ownership=1"))
+        assertTrue("имя само по себе владением не считается: ${line(on, "TTL_IDENTITY")}",
+            line(on, "TTL_IDENTITY").contains("named_ownership=0"))
+        assertTrue("создание своей цепи зафиксировано маркером: $on",
+            has(on, "TTL_OWNMARK write=ok"))
         // Правило СОЗДАНО (иначе «рабочий TTL» превращается в вечный отказ) и помечено в отчёте.
         assertTrue("правило создано: $on", has(on, "TTL_ADD family=v4 chain=VAPP_TTL_abcd1234"))
         assertTrue("цепь и переход реально есть: ${st.rules("iptables")}",
@@ -62,11 +69,11 @@ class Iter55TtlTest {
         // OFF: своя цепь доказана ИМЕНЕМ установки (маркера нет) и снимается.
         val (rcOff, off) = st.exec(
             TtlScript.build(false, gen = "abcd1234", ownChain = "VAPP_TTL_abcd1234"),
-            "off.sh"
+            "off.sh", env
         )
         assertEquals("OFF дошёл до конца: $off", 0, rcOff)
         assertTrue("владение названо основанием, а не выдумкой: $off",
-            has(off, "state=ours_named") && has(off, "ownership=unique_install_chain_name"))
+            has(off, "state=ours_named") && has(off, "ownership=device_creation_marker"))
         assertTrue("своя цепь снята (readback): $off", has(off, "removed=ok"))
         assertEquals("таблица вернулась к исходному состоянию: ${st.rules("iptables")}",
             before, st.rules("iptables"))
@@ -85,7 +92,7 @@ class Iter55TtlTest {
             "on_named_off.sh"
         )
         assertEquals("скрипт дошёл до конца: $out", 0, rc)
-        assertTrue("отказ назван: $out", has(out, "action=stop reason=no_safe_identity"))
+        assertTrue("отказ назван: $out", has(out, "action=stop reason=legacy_name_not_owned"))
         // Проба `-m comment` использует собственную временную цепь VAPP_TTLPROBE — она не в счёт.
         assertFalse("ни одного -A в нашу цепь и ни одного -N нашей цепи: $out",
             st.argv().any { it.contains("<-A> <VAPP_TTL>") || it.contains("<-N> <VAPP_TTL>") })

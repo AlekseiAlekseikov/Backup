@@ -117,6 +117,20 @@ command -v ip6tables >/dev/null 2>&1 && V6_SUPPORTED=1
 #  • COMMENT_OK=0 — маркера нет; тогда владение НЕ заявляется по одному содержимому, и цепочка
 #    без маркера в чужом/неизвестном состоянии не удаляется (см. chain_state).
 OWN_TAG="voiceapp3:ttl:${D}OWN_GEN"
+# iter57 §8.1 — DEVICE-SIDE МАРКЕР СОЗДАНИЯ.
+# Совпадение ИМЕНИ и ТЕЛА немаркированной цепи владение НЕ доказывает: точно такую же цепь
+# могло создать другое приложение или прежняя версия (аудит iter56). Поэтому «своя без
+# комментария» — это только та, которую МЫ создали сами, и факт создания записан на устройстве
+# (`-N` вернул rc=0 → пишем маркер). Маркер переживает рестарт приложения и обновление, а при
+# удалении цепи удаляется. Потеря маркера = НЕДОКАЗАННОЕ владение (никаких -F/-X), а не «наша
+# цепь по имени».
+TTL_STATE_DIR=${D}{VAPP_TTL_STATE:-/data/local/tmp}
+OWNMARK=${D}TTL_STATE_DIR/voiceapp3_ttl_own_${D}OWN_GEN
+ownmark_ok() {
+  [ -f "${D}OWNMARK" ] || return 1
+  grep -q "^chain=${D}OUR${D}" "${D}OWNMARK" 2>/dev/null || return 1
+  return 0
+}
 COMMENT_OK=0
 if iptables -t mangle -N VAPP_TTLPROBE 2>/dev/null; then
   if iptables -w 5 -t mangle -A VAPP_TTLPROBE -m comment --comment "${D}OWN_TAG" -j RETURN 2>/dev/null; then
@@ -146,8 +160,11 @@ MARK_ARGS=""
 # первой мутации, желание владельца сохраняется.
 REGISTRY_UNKNOWN=@REGISTRY_UNKNOWN@
 NAMED_OWN=0
-if [ "${D}COMMENT_OK" = "0" ] && [ "${D}REGISTRY_UNKNOWN" = "0" ] && \
-   [ -n "${D}OUR" ] && [ "${D}OUR" != "${D}LEGACY" ]; then NAMED_OWN=1; fi
+# iter57 §8.1: имя установки больше НЕ доказательство. Своя немаркированная цепь — только та,
+# чьё создание записано маркером на устройстве (`ownmark_ok`).
+if [ "${D}COMMENT_OK" = "0" ] && [ -n "${D}OUR" ] && [ "${D}OUR" != "${D}LEGACY" ] && ownmark_ok; then
+  NAMED_OWN=1
+fi
 echo "TTL_IDENTITY comment_supported=${D}COMMENT_OK registry_unknown=${D}REGISTRY_UNKNOWN " \
   "named_ownership=${D}NAMED_OWN chain=${D}OUR"
 
@@ -361,7 +378,7 @@ drop_family() {
   # неподдержанном `-m comment`. Основание владения печатается, чтобы отчёт не путал его с
   # маркером. Дальше путь тот же, что у `ours`.
   [ "${D}st" = "ours_named" ] && echo "TTL_OWN family=${D}fam state=ours_named " \
-    "ownership=unique_install_chain_name comment_supported=0"
+    "ownership=device_creation_marker gen=${D}OWN_GEN comment_supported=0"
   # состояние ours: снимаем ИМЕННО наши переходы (точное сравнение target), затем цепочку
   # Список спецификаций разбирается ПОСТРОЧНО: спецификация содержит пробелы
   # (`-o wlan0 -j VAPP_TTL`), поэтому обычный `for ${D}spec in ${D}(...)` разбил бы её на слова
@@ -424,7 +441,11 @@ EOF_SPECS
     echo "TTL_OWN family=${D}fam state=unknown removed=unproven reason=readback_failed"; echo "${D}fam:unproven"; return 0
   fi
   if [ "${D}st2" = "absent" ] && [ "${D}jc2" = "0" ]; then
-    echo "TTL_OWN family=${D}fam state=absent removed=ok jumps_left=0 rules_left=0"; echo "${D}fam:ok"
+    echo "TTL_OWN family=${D}fam state=absent removed=ok jumps_left=0 rules_left=0"
+    # Цепи больше нет ⇒ маркер создания не должен пережить её: иначе следующая установка с тем же
+    # gen сочла бы «своей» цепь, которую создаст кто-то другой.
+    if [ "${D}fam" = "v4" ]; then rm -f "${D}OWNMARK" 2>/dev/null; echo "TTL_OWNMARK clear=ok path=${D}OWNMARK"; fi
+    echo "${D}fam:ok"
   else
     echo "TTL_OWN family=${D}fam state=${D}st2 removed=partial jumps_left=${D}jc2"; echo "${D}fam:partial"
   fi
@@ -454,14 +475,27 @@ elif [ "${D}ENABLE" = "1" ]; then
     echo "TTL_TRY variant=none scope=\"\" reason=no_uplink"
   else
     echo "TTL_TRY variant=uplink scope=\"-o ${D}UPLINK\" carplay=${D}{CARPLAY:-none}"
-    # iter55 §6.1: если ни маркер, ни уникальное имя установки не дают доказанной идентичности,
-    # НИ ОДНОГО изменения таблицы не делается: иначе создаётся правило, которое приложение само
-    # затем не признает своим и не снимет (активный TTL после OFF).
-    if [ "${D}COMMENT_OK" = "0" ] && [ "${D}NAMED_OWN" = "0" ]; then
+    # iter57 §8.1: РАБОЧИЙ путь без поддержки комментария.
+    # Раньше здесь стоял полный запрет любых изменений — то есть на прошивке без `-m comment`
+    # TTL не включался НИКОГДА («бессрочный отказ» вместо результата). Теперь запрет касается
+    # только ЧУЖИХ/неизвестных объектов: СВОЮ цепь мы вправе создать (создание доказуемо — `-N`
+    # вернул 0, и это записано маркером на устройстве). Опасная операция — не создание, а
+    # дописывание в уже существующую цепь неизвестного происхождения; она проверяется ниже
+    # (ветка `-N` rc≠0). Отдельного глобального стопа здесь больше нет.
+    # Историческое имя цепи (его использует прошлая версия приложения) НЕ создаётся и не
+    # изменяется: иначе «своя по маркеру» цепь могла бы оказаться цепью прежней версии, которую
+    # другой код считает своей. Это единственный безусловный стоп по имени.
+    if [ -n "${D}LEGACY" ] && [ "${D}OUR" = "${D}LEGACY" ] && \
+       [ "${D}COMMENT_OK" = "0" ] && ! ownmark_ok; then
       TTL_STOP=1
-      echo "TTL_TRY action=stop reason=no_safe_identity comment_supported=0 named_ownership=0 " \
-        "note=\"безопасная идентичность своей цепи не подтверждена (нет -m comment и нет " \
-        "подтверждённого имени установки): таблица не изменяется, желание владельца сохранено\""
+      echo "TTL_TRY action=stop reason=legacy_name_not_owned chain=${D}OUR " \
+        "note=\"историческое имя цепи не создаётся и не изменяется: владение по нему не " \
+        "доказывается (его использует прежняя версия приложения)\""
+    fi
+    if [ "${D}TTL_STOP" = "0" ] && [ "${D}COMMENT_OK" = "0" ] && [ "${D}NAMED_OWN" = "0" ]; then
+      echo "TTL_IDENTITY action=create_only comment_supported=0 " \
+        "note=\"маркера нет: разрешено только СОЗДАНИЕ своей цепи; существующая цепь без " \
+        "маркера не изменяется\""
     fi
     # Если ХОТЬ ОДНА семья в неизвестном или не нашем состоянии — не применяем НИЧЕГО:
     # половинчатое состояние (только v6) выглядит как «TTL работает», хотя v4 не наш.
@@ -508,6 +542,12 @@ elif [ "${D}ENABLE" = "1" ]; then
       # существовала (конкурент создал одноимённую чужую), следующий `-A` дописывал правило в
       # ЧУЖОЙ объект. Теперь дописывать можно только в СВОЮ доказанную цепь.
       iptables -w 5 -t mangle -N "${D}OUR" 2>/dev/null; rc_n=${D}?
+      # iter57 §8.1: цепь создана НАМИ (rc=0) — фиксируем это на устройстве.
+      if [ "${D}rc_n" = "0" ]; then
+        printf 'chain=%s\ngen=%s\ncreated=%s\n' "${D}OUR" "${D}OWN_GEN" "$(date +%s 2>/dev/null)" \
+          > "${D}OWNMARK" 2>/dev/null || echo "TTL_OWNMARK write=failed path=${D}OWNMARK"
+        echo "TTL_OWNMARK write=ok path=${D}OWNMARK chain=${D}OUR"
+      fi
       if [ "${D}rc_n" != "0" ]; then
         st_n=${D}(chain_state iptables "${D}RULE4")
         case "${D}st_n" in
@@ -541,6 +581,9 @@ elif [ "${D}ENABLE" = "1" ]; then
       fi
       if [ "${D}V6_SUPPORTED" = "1" ] && [ "${D}TTL_STOP" = "0" ]; then
         ip6tables -w 5 -t mangle -N "${D}OUR" 2>/dev/null; rc_n6=${D}?
+        if [ "${D}rc_n6" = "0" ] && [ -f "${D}OWNMARK" ]; then
+          echo "TTL_OWNMARK v6=created chain=${D}OUR (маркер уже записан v4)"
+        fi
         if [ "${D}rc_n6" != "0" ]; then
           st_n6=${D}(chain_state ip6tables "${D}RULE6")
           case "${D}st_n6" in
@@ -598,6 +641,9 @@ elif [ "${D}ENABLE" = "1" ]; then
           iptables -w 5 -t mangle -D POSTROUTING -o "${D}UPLINK" -j "${D}OUR" >/dev/null 2>&1; rj4=${D}?
           iptables -w 5 -t mangle -F "${D}OUR" >/dev/null 2>&1; rf4=${D}?
           iptables -w 5 -t mangle -X "${D}OUR" >/dev/null 2>&1; rx4=${D}?
+          # Цепь снята — маркер создания больше не нужен (иначе он «доказывал» бы владение
+          # несуществующей цепью и мог быть подхвачен чужой установкой с тем же gen).
+          [ "${D}rx4" = "0" ] && rm -f "${D}OWNMARK" 2>/dev/null
           echo "TTL_ROLLBACK family=v4 jump_del_rc=${D}rj4 chain_flush_rc=${D}rf4 chain_del_rc=${D}rx4"
           TOUCHED_v4=no
         fi
