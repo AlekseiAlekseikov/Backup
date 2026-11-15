@@ -1023,17 +1023,58 @@ enum class Choice(
             // старым значением. Снимок берёт ревизию ДО чтения, поэтому видит только
             // завершённые записи.
             val revAfter = writeRevision.incrementAndGet()
+            // iter54 §10: намерение и применение — РАЗНЫЕ факты.
+            //  • intent берётся из readback ХРАНИЛИЩА по ключу переключателя (единственный
+            //    авторитет по вопросу «что сохранено»), а не из статуса общего действия;
+            //  • applied — из статуса действия, и он никогда не переписывает intent.
+            val want = when (value) {
+                is Boolean -> value
+                is String -> value.toBooleanStrictOrNull()
+                is Number -> value.toInt() != 0
+                else -> null
+            }
+            val toggle = Toggle.fromKey(key)
+            val stored = toggle?.let {
+                runCatching { Prefs2.getBooleanOrNull(appContext, it.pref) }.getOrNull()
+            }
+            val persistReportedOk = persistReported(res.steps)
+            val intent = if (toggle != null) {
+                ToggleIntent.intentOf(want, stored, persistReportedOk ?: true)
+            } else {
+                ToggleIntent.intentOfSteps(persistReportedOk)
+            }
+            val applied = ToggleIntent.Applied.ofStatus(res.status)
+            AppLog.i(
+                TAG,
+                "TOGGLE_INTENT key=" + key + " click_id=" + clickId + " want=" + want +
+                    " stored=" + stored + " intent=" + intent.wire + " applied=" + applied.wire +
+                    " action=" + res.statusWire + " note=" + ToggleIntent.note(intent, applied)
+            )
             ToolsStateCausality.recordAck(
                 ToolsStateCausality.WriteAck(
                     key = key,
                     clickId = clickId,
-                    ok = res.ok,
+                    ok = intent == ToggleIntent.Intent.WRITTEN,
                     rev = revAfter,
-                    detail = res.summary
+                    detail = "intent=" + intent.wire + " applied=" + applied.wire,
+                    intent = intent,
+                    applied = applied
                 )
             )
         }
         return res
+    }
+
+    /**
+     * iter54 §10: отчёт шагов о СОХРАНЕНИИ намерения.
+     *
+     * `null` — в результате нет шага сохранения (значит, о записи намерения он ничего не
+     * говорит); `true` — шаги сохранения прошли; `false` — хотя бы один отказал.
+     */
+    private fun persistReported(steps: List<ToolsStep>): Boolean? {
+        val persist = steps.filter { it.step.startsWith("persist") }
+        if (persist.isEmpty()) return null
+        return persist.none { it.status == ToolsStep.Status.FAILED }
     }
 
     private fun applyFromUiImpl(key: String, value: Any?): ToolsResult? {

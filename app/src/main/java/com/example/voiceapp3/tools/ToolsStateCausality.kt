@@ -54,20 +54,36 @@ object ToolsStateCausality {
         val requestedAtMs: Long
     )
 
-    /** Результат конкретной записи. `rev` — ревизия ПОСЛЕ записи. */
+    /**
+     * Результат конкретной записи. `rev` — ревизия ПОСЛЕ записи.
+     *
+     * iter54 §10: `ok` — сводка «сохранение подтверждено», а рядом лежат ДВА независимых факта:
+     * [intent] (сохранилось ли намерение владельца) и [applied] (применился ли side effect).
+     * Раньше `ok` был статусом ОБЩЕГО действия, поэтому TTL с сохранённым ON и ожидающим
+     * uplink выглядел как «запись не удалась». Старые снимки без `intent`/`applied` читаются
+     * по `ok` (совместимость), новые — по фактам.
+     */
     data class WriteAck(
         val key: String,
         val clickId: Long,
         val ok: Boolean,
         val rev: Long,
-        val detail: String = ""
+        val detail: String = "",
+        val intent: ToggleIntent.Intent =
+            if (ok) ToggleIntent.Intent.WRITTEN else ToggleIntent.Intent.WRITE_FAILED,
+        val applied: ToggleIntent.Applied = ToggleIntent.Applied.UNKNOWN
     ) {
         fun toJson(): JsonObject = JsonObject().apply {
             addProperty("clickId", clickId)
             addProperty("ok", ok)
             addProperty("rev", rev)
+            addProperty("intent", intent.wire)
+            addProperty("applied", applied.wire)
             if (detail.isNotEmpty()) addProperty("detail", detail)
         }
+
+        /** Нейтральная подпись состояния для UI (см. [ToggleIntent.note]). */
+        fun note(): String = ToggleIntent.note(intent, applied)
     }
 
     enum class Decision {
@@ -113,7 +129,14 @@ object ToolsStateCausality {
             if (ack != null && ack.clickId > pending.clickId) return Decision.APPLY_SNAPSHOT
             return if (ageMs >= unconfirmedAfterMs) Decision.UNCONFIRMED else Decision.KEEP_CLICK
         }
-        if (!ack!!.ok) return Decision.WRITE_FAILED
+        // iter54 §10: решает факт СОХРАНЕНИЯ намерения, а не успех side effect.
+        when (ack!!.intent) {
+            ToggleIntent.Intent.WRITE_FAILED -> return Decision.WRITE_FAILED
+            // Неизвестность не опровергает выбор: держим его, пока не истечёт бюджет.
+            ToggleIntent.Intent.UNKNOWN ->
+                return if (ageMs >= unconfirmedAfterMs) Decision.UNCONFIRMED else Decision.KEEP_CLICK
+            ToggleIntent.Intent.WRITTEN -> Unit
+        }
         // Снимок без причины не доказывает, что он видел нашу запись.
         if (snapshotRev == null || snapshotRev < ack.rev) return Decision.KEEP_CLICK
         return if (snapshotValue == pending.value) Decision.CLEAR_CONFIRMED
@@ -154,8 +177,18 @@ object ToolsStateCausality {
             val rev = je.get("rev")?.takeIf { it.isJsonPrimitive }?.let {
                 runCatching { it.asLong }.getOrNull()
             } ?: continue
-            out[k] = WriteAck(k, clickId, ok, rev, je.get("detail")?.takeIf { it.isJsonPrimitive }
-                ?.let { runCatching { it.asString }.getOrNull() } ?: "")
+            val detail = je.get("detail")?.takeIf { it.isJsonPrimitive }
+                ?.let { runCatching { it.asString }.getOrNull() } ?: ""
+            // Новые снимки несут явные факты; старые — только `ok`, из него и выводим.
+            val intent = je.get("intent")?.takeIf { it.isJsonPrimitive }
+                ?.let { runCatching { it.asString }.getOrNull() }
+                ?.let { ToggleIntent.Intent.of(it) }
+                ?: (if (ok) ToggleIntent.Intent.WRITTEN else ToggleIntent.Intent.WRITE_FAILED)
+            val applied = je.get("applied")?.takeIf { it.isJsonPrimitive }
+                ?.let { runCatching { it.asString }.getOrNull() }
+                ?.let { ToggleIntent.Applied.of(it) }
+                ?: ToggleIntent.Applied.UNKNOWN
+            out[k] = WriteAck(k, clickId, ok, rev, detail, intent, applied)
         }
         return out
     }

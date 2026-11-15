@@ -247,6 +247,17 @@ class ToolsPanel(
                 state.add(k, v)
             }
         }
+        // iter54 §10: применение показывается отдельной нейтральной подписью и НЕ отменяет
+        // выбор владельца. Отсутствие доказательств применения — не «выключено».
+        for ((k, ack) in acks) {
+            if (k.startsWith("\$")) continue
+            applyNotes[k] = when {
+                ack.intent != com.example.voiceapp3.tools.ToggleIntent.Intent.WRITTEN -> ""
+                ack.applied == com.example.voiceapp3.tools.ToggleIntent.Applied.PENDING -> "pending"
+                ack.applied == com.example.voiceapp3.tools.ToggleIntent.Applied.FAILED -> "apply_failed"
+                else -> ""
+            }
+        }
         if (soundBusy) finishSoundIfDone()
         if (visible) rebuild()
     }
@@ -1137,7 +1148,9 @@ class ToolsPanel(
             // подписью честно говорим, что он не подтверждён), а не «старое» значение.
             pend != null -> pend.value
             key != "perfJit" -> Toggles45.switchPosition(triState, lastKnown, def)
-            else -> JitRef.switchPosition(jitConfirmed ?: "unknown", raw ?: def)
+            // iter54 §10: подтверждённый getprop — факт; при `unknown` показываем ПОСЛЕДНЕЕ
+            // ИЗВЕСТНОЕ положение, а не подставленный default (он выглядел как факт).
+            else -> JitRef.switchPosition(jitConfirmed ?: "unknown", lastKnown ?: raw ?: def)
         }
         Toggles45.knownPosition(triState)?.let { known ->
             // Последним известным считаем только то, что не перекрыто неподтверждённым выбором.
@@ -1154,9 +1167,16 @@ class ToolsPanel(
             unconfirmedKeys[key] == "write_failed" -> "$title · не применено (запись не удалась)"
             unconfirmedKeys[key] == "conflict" -> "$title · не применено (сохранено другое значение)"
             unconfirmedKeys[key] == "unconfirmed" -> "$title · запись не подтверждена"
+            // iter54 §10: намерение сохранено, применение ждёт/не удалось — нейтрально,
+            // без красного и без превращения в «выключено».
+            pend == null && applyNotes[key] == "pending" -> "$title · сохранено, ждёт применения"
+            pend == null && applyNotes[key] == "apply_failed" -> "$title · сохранено, применение не удалось"
             prefsUnknownByBackend -> "$title · состояние не подтверждено"
             unknownToggle -> "$title · состояние ещё не прочитано"
-            key == "perfJit" && jitConfirmed == "unknown" -> "$title · состояние неизвестно"
+            key == "perfJit" && jitConfirmed == "unknown" && lastKnown == null ->
+                "$title · состояние неизвестно"
+            key == "perfJit" && jitConfirmed == "unknown" ->
+                "$title · состояние не подтверждено (последнее известное)"
             else -> title
         }
         val titleView = text(titleText, 14.5f, palette.ink, bold = true)
@@ -1179,6 +1199,8 @@ class ToolsPanel(
                 requestedAtMs = android.os.SystemClock.uptimeMillis()
             )
             unconfirmedKeys.remove(key)
+            // iter54 §10: новый клик снимает подпись применения ПРОШЛОГО намерения.
+            applyNotes.remove(key)
             state.addProperty(key, checked)
             send("settings.change", JsonObject().apply {
                 addProperty("key", key)
@@ -1610,6 +1632,15 @@ class ToolsPanel(
      * Это видимая подпись, а не «ложный успех».
      */
     private val unconfirmedKeys = HashMap<String, String>()
+
+    /**
+     * iter54 §10: факт ПРИМЕНЕНИЯ отдельно от факта сохранения намерения.
+     *
+     * `pending` — намерение сохранено, side effect ждёт канала/сети (например TTL ON без
+     * uplink). Это НЕ «выключено» и не ошибка записи: подпись нейтральная.
+     * `apply_failed` — сохранено, но применение вернуло ошибку.
+     */
+    private val applyNotes = HashMap<String, String>()
 
     /** Ревизия записи из последнего снимка (`rev`). `null` — снимок без причины. */
     private var snapshotRev: Long? = null

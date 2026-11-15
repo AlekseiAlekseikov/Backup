@@ -66,7 +66,9 @@ class JitUiStateTest {
         // Положение при построении — из подтверждённого факта.
         // §4 iter45: значение берётся один раз в `raw` — и `null` («не прочитано») больше
         // НЕ выдаётся за OFF (в заголовке появляется «состояние ещё не прочитано»).
-        assertTrue(panel.contains("JitRef.switchPosition(jitConfirmed ?: \"unknown\", raw ?: def)"))
+        // iter54 §10: при `unknown` сначала ПОСЛЕДНЕЕ ИЗВЕСТНОЕ, и только затем значение из
+        // снимка/дефолт — иначе подставленный default выглядел как подтверждённый факт.
+        assertTrue(panel.contains("JitRef.switchPosition(jitConfirmed ?: \"unknown\", lastKnown ?: raw ?: def)"))
         assertTrue(panel.contains("val raw = boolState(key)"))
         assertTrue(panel.contains("состояние ещё не прочитано"))
         assertTrue("подпись про неизвестное состояние есть",
