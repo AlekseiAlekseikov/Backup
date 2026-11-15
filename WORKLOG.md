@@ -110,3 +110,51 @@ EFFECT_VERIFIED             → по каждой цели ровно один V
 инъецируемыми портами `evidence()`/`restore()`/`journal()`. Тесты гоняют РЕАЛЬНЫЙ журнал в файлах,
 реальные `BindOp` и тот же код, подменяя только устройство. Стенд записи/чтения — настоящая ФС.
 Границы: JVM + fake device, не ГУ.
+
+---
+
+# iter57 §6–§10: что сделано и чем проверено (итог итерации)
+
+Порядок §4 был: звук (готов, `f06e00a`) → остаточные дефекты JIT → TTL ownership и поздняя доставка
+→ логи/окна/UI → тесты, сборки, CI, отчёт.
+
+## §7.1 JIT: старое намерение не побеждает новое (`def5aef`)
+`seq` сравнивается только как номер намерения; `newer_intent` — лишь при `me_seq > seen_seq`;
+`END` более нового порядок не меняет; без `seq` — `rule=ts_legacy`; нечего сравнивать —
+`unprovable`. Удалены `seq_owner_ended` и `_jit_intent_ended` (они объявляли «намерение кончилось»
+по факту чужого завершения).
+
+## §7.3 JIT: takeover без окна потери (`def5aef`)
+Атомарное создание lock (`temp`+`ln`), смена объекта только под `<lock>.admin`, `_jit_lock_acquire`
+→ 0/1/2, перехват — только при точном совпадении с доказанно мёртвой строкой, payload пишет
+`ppid`/`ppstart`, `trap` не чистит `<lock>.dead.*`.
+
+## §8 TTL (`4454d04`)
+`OWNMARK=${TTL_STATE_DIR}/voiceapp3_ttl_own_<gen>` — device-side маркер создания; `NAMED_OWN`
+требует `ownmark_ok` (имя установки владением больше не считается). Стоп
+`reason=no_safe_identity` заменён на `TTL_IDENTITY action=create_only`: создание своей цепи
+разрешено, дописывание в существующую немаркированную — нет. Единственный безусловный стоп по
+имени — историческое имя цепи (`legacy_name_not_owned`). Маркер снимается вместе с цепью.
+
+## §7.2 JIT: атомарная выдача `seq` (`958fdea`)
+Файл-счётчик + `FileChannel.lock` (fcntl) + `rename`/`fsync`; префы — вторая копия; часы в номере
+не участвуют; `epoch` — случайный токен для лога; переполнение → `null` (порядок `ts_legacy`),
+а не отрицательное число; JIT не блокируется навсегда. Лог: `issue=… src=file_lock`.
+
+## §9 Логи (`01e847a`)
+Свидетельство `.new` называет полный путь и исходный каталог (`at=`, `origin=`, `moved=`); отказ
+`rename` не выдаётся за перенос; `LogFiles.lastDirChoice` называет `external` /
+`internal_fallback` с причиной.
+
+## §10 Окна (`40f292b`)
+`VentOwnerTx.read` отдаёт снимок (был mutable-set escape), `ownersOf` удалён; откат вынесен в
+единственную точку `WindowDoors.rollbackAfterFailedClose`; часы `awakeClock` — чтобы объект вообще
+загружался в JVM. `NetworkTtl.parseVerifyResult` → типизированный `VerifyResult` (`cf6373a`).
+
+## §7.4 JIT сквозной путь (`abf9f81`)
+Ручной ON/OFF через настоящую `JitOp.click`: один payload, `ctl.restart zygote` последней командой,
+возврат Wi‑Fi после рестарта фреймворка, вне клика — ни одной команды, без AP/AVAS/плагина.
+
+## Прогон
+`bash /home/user/runtests.sh` → `OK (890 tests)`. Стенд: JVM + fake shell (+ настоящий `/bin/sh` и
+подставные `iptables` для TTL). Release локально не собран: Gradle требует JVM 17, доступна 11.
