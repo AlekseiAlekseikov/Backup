@@ -45,8 +45,6 @@ internal class VentOwnerTx {
 
     fun contains(window: Int): Boolean = synchronized(lock) { owners.containsKey(window) }
 
-    fun ownersOf(window: Int): MutableSet<Int> =
-        synchronized(lock) { owners.getOrPut(window) { HashSet() } }
 
     /** Единственная точка мутации: блок выполняется под lock, затем двигается поколение. */
     fun mutate(block: (MutableMap<Int, MutableSet<Int>>) -> Unit): Long = synchronized(lock) {
@@ -54,8 +52,17 @@ internal class VentOwnerTx {
         gen.incrementAndGet()
     }
 
-    /** Выполнить произвольное чтение под тем же lock (без мутации и без нового поколения). */
-    fun <T> read(block: (Map<Int, Set<Int>>) -> T): T = synchronized(lock) { block(owners) }
+    /**
+     * Выполнить произвольное чтение под тем же lock (без мутации и без нового поколения).
+     *
+     * iter57 §10: блок получает СНИМОК (копии множеств), а не живые `HashSet`-ы. Раньше
+     * вызывающий мог утащить коллекцию `read`-блока и менять её БЕЗ lock и БЕЗ поколения —
+     * мутация, невидимая для ABA-проверок (mutable-set escape). Прежний `ownersOf(w)` отдавал
+     * живой набор ещё и напрямую; он не использовался и удалён.
+     */
+    fun <T> read(block: (Map<Int, Set<Int>>) -> T): T = synchronized(lock) {
+        block(owners.mapValues { it.value.toSet() })
+    }
 
     /** Только для тестов/восстановления из prefs: задать состояние целиком. */
     fun seed(state: Map<Int, Set<Int>>): Long = synchronized(lock) {

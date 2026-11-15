@@ -110,7 +110,34 @@ object WindowDoors {
     internal fun ventOwnersGeneration(): Long = ventTx.generation()
 
     /** Набор дверей-владельцев окна (создаётся по требованию). ТОЛЬКО для чтения под lock. */
-    private fun ownersOf(w: Int): MutableSet<Int> = ventTx.ownersOf(w)
+    /**
+     * iter57 §10: откат владельцев после НЕподтверждённого закрытия — единственная точка, где
+     * это делается. Вынесено из `closeVentWindow`, чтобы тот же production-код можно было
+     * выполнить в тесте с событием между установкой и откатом (барьер/ABA).
+     *
+     * @return true — откат выполнен, false — запись не тронута (её изменили мы не последними).
+     */
+    internal fun rollbackAfterFailedClose(
+        windowAreaId: Int,
+        installed: Set<Int>,
+        before: Set<Int>,
+        genAtInstall: Long,
+        legacy: Boolean,
+    ): Boolean {
+        var rolledBack = false
+        mutateOwners { map ->
+            val now = map[windowAreaId]?.toSet() ?: emptySet()
+            val restore = ventRollbackOwners(now, installed, before, ventTx.generation(), genAtInstall)
+            if (restore != null) {
+                val set = map.getOrPut(windowAreaId) { HashSet() }
+                set.clear()
+                set.addAll(restore)
+                if (set.isEmpty() && legacy) map.remove(windowAreaId)
+                rolledBack = true
+            }
+        }
+        return rolledBack
+    }
 
     /**
      * §9.1 iter50 — ЕДИНАЯ точка мутации набора владельцев.
@@ -158,6 +185,12 @@ object WindowDoors {
     /** Снимок владельцев — для проверки отсутствия потерянных обновлений. */
     internal fun ownersForTest(): Map<Int, Set<Int>> = ventTx.snapshot()
 
+    /**
+     * iter57 §10: тот же путь чтения, что в production (`read {}`), — чтобы тест мог проверить,
+     * что утащенная из блока коллекция НЕ является живым набором (mutable-set escape).
+     */
+    internal fun readOwnersForTest(): Map<Int, Set<Int>> = ventTx.read { it }
+
     /** Итог ОДНОЙ критической секции закрытия: что было, что стало, при каком поколении. */
     internal data class ClosePlan(
         val before: Set<Int>,
@@ -197,7 +230,17 @@ object WindowDoors {
     @Volatile private var ventReseeded = false
 
     private var screenWakeReceiver: android.content.BroadcastReceiver? = null
-    private var lastSleepTimeMs: Long = SystemClock.elapsedRealtime()
+    /**
+     * iter57 §10: часы берутся через провайдер и НЕ падают там, где `SystemClock` недоступен
+     * (JVM-прогон: стаб `android.jar` бросает `UnsatisfiedLinkError` в статическом
+     * инициализаторе — из-за этого весь объект нельзя было проверить тестом). На устройстве
+     * поведение прежнее: `SystemClock.elapsedRealtime()`.
+     */
+    internal var awakeClock: () -> Long = {
+        runCatching { SystemClock.elapsedRealtime() }.getOrDefault(0L)
+    }
+
+    private var lastSleepTimeMs: Long = awakeClock()
 
     /**
      * Дебаунс unlock-звука: не повторять чаще чем раз в UNLOCK_DEBOUNCE_MS,
@@ -626,19 +669,10 @@ object WindowDoors {
             // VHAL, — владелец, добавленный другой дверью, молча стирался, и его окно больше
             // никто не закрывал. Теперь: содержимое равно тому, что мы сами записали ⇒ откат;
             // иначе запись живёт и не трогается.
-            var rolledBack = false
-            mutateOwners { map ->
-                val now = map[windowAreaId]?.toSet() ?: emptySet()
-                // Сверка содержимого И поколения — под ОДНИМ lock с мутацией (ABA).
-                val restore = ventRollbackOwners(now, ownersAfter, before, ventTx.generation(), genAtInstall)
-                if (restore != null) {
-                    val set = map.getOrPut(windowAreaId) { HashSet() }
-                    set.clear()
-                    set.addAll(restore)         // вернуть как было до попытки
-                    if (set.isEmpty() && legacy) map.remove(windowAreaId)
-                    rolledBack = true                // иначе запись живёт: не трогаем
-                }
-            }
+            // Сверка содержимого И поколения — под ОДНИМ lock с мутацией (ABA).
+            val rolledBack = rollbackAfterFailedClose(
+                windowAreaId, ownersAfter, before, genAtInstall, legacy
+            )
             persistVentOwners(appCtx)
             // §9 iter46: `getIntProperty` возвращает ПОСЛЕДНЕЕ известное значение VHAL, а
             // применение команды может прийти позже (асинхронный стек). Поэтому расхождение —

@@ -59,8 +59,13 @@ class Iter51VentRollbackTest {
         val unconfirmed = src.substringAfter("result=closed pos_after=", "")
         assertTrue("ветка есть", unconfirmed.isNotEmpty())
         val branch = unconfirmed.take(2000)
-        assertTrue("откат использует mutateOwners", branch.contains("mutateOwners {"))
-        assertTrue("решение принимает чистая функция", branch.contains("ventRollbackOwners("))
+        // iter57 §10: откат вынесен в ЕДИНСТВЕННУЮ точку `rollbackAfterFailedClose`, чтобы тот же
+        // production-код можно было выполнить в тесте (барьер/ABA), а не сверять строки.
+        assertTrue("откат идёт через единственную точку", branch.contains("rollbackAfterFailedClose("))
+        val point = src.substringAfter("internal fun rollbackAfterFailedClose", "")
+            .substringBefore("internal fun ")
+        assertTrue("в точке мутации один вход", point.contains("mutateOwners {"))
+        assertTrue("решение принимает чистая функция", point.contains("ventRollbackOwners("))
     }
 
     @Test
