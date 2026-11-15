@@ -120,7 +120,11 @@ class LogFilesTest {
         val s = listOf(File("src/main/java"), File("app/src/main/java")).first { it.isDirectory }
             .resolve("com/example/voiceapp3/tools/LogFiles.kt").readText()
         assertTrue("фоллбэк по результату пробы, а не по null", s.contains("if (writable(d)) return d"))
-        assertTrue("внутренний каталог как запасной", s.contains("File(app.filesDir, \"logs\")"))
+        // iter57 §9: каталог фоллбэка строится внутри `dirFor(externalProvider, internalProvider)`
+        // (в JVM `Context` — стаб, поэтому выбор проверяется провайдерами; фактическое поведение
+        // и честное название места — в `Iter57LogTest`).
+        assertTrue("внутренний каталог как запасной",
+            s.contains("\"logs\"") && s.contains("internal_fallback"))
         assertTrue("при сбое записи — повтор во внутреннем каталоге", s.contains("internal too"))
     }
 

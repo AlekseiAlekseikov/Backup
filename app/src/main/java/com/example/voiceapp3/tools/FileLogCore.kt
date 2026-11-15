@@ -247,14 +247,24 @@ object FileLogCore {
             true
         }.getOrDefault(false)
         // Не удалось записать — `.new` ОСТАЁТСЯ: это свидетельство, а не мусор.
-        if (!written) return "new_merge_failed_kept"
-        if (syncError != null) return "new_merge_unsynced_kept:sync=$syncError"
+        // iter57 §9: место свидетельства называется явно (см. ниже — та же причина).
+        if (!written) return "new_merge_failed_kept origin=${pending.parentFile?.absolutePath}"
+        if (syncError != null) {
+            return "new_merge_unsynced_kept:sync=$syncError origin=${pending.parentFile?.absolutePath}"
+        }
         if (!durableOk(active)) {
             // Запись прошла, но подтвердить её на диске нечем: `.new` не удаляем, а переносим в
             // отдельное имя-свидетельство, чтобы повторный recovery не задваивал записи.
-            val kept = File(active.parentFile, pending.name + ".unsynced." + System.currentTimeMillis())
-            runCatching { pending.renameTo(kept) }
-            return "new_merge_unsynced_kept_as=${kept.name}"
+            // Имя свидетельства — по `clock()` (как и остальное в этом файле), чтобы отказ
+            // переименования можно было воспроизвести в тесте.
+            val kept = File(active.parentFile, pending.name + ".unsynced." + clock())
+            // iter57 §9: свидетельство остаётся там, где лежало, и отчёт называет МЕСТО, а не
+            // только имя файла: `filesDir/logs` (внутренний фоллбэк) — это НЕ то место, куда
+            // владелец смотрит по умолчанию (`getExternalFilesDir(null)/logs`).
+            val moved = runCatching { pending.renameTo(kept) }.getOrDefault(false)
+            val where = if (moved) kept.absolutePath else pending.absolutePath
+            return "new_merge_unsynced_kept_as=${kept.name} at=$where " +
+                "origin=${pending.parentFile?.absolutePath} moved=$moved"
         }
         val deleted = deleteVerified(pending)
         return "new_merged=${toAdd.size} boundary_same=$boundarySame deleted=$deleted"
@@ -265,9 +275,16 @@ object FileLogCore {
      * внутри записи и его ошибка пробрасывается; здесь проверяется, что данные действительно
      * читаются из активного файла целиком (частичная запись/ошибка ФС не выдаётся за успех).
      */
-    private fun durableOk(active: File): Boolean = runCatching {
-        active.isFile && active.length() > 0L && active.canRead()
-    }.getOrDefault(false)
+    private fun durableOk(active: File): Boolean = durableProbe(active)
+
+    /**
+     * iter57 §9: проба подтверждения на диске вынесена в переменную — как `procRoot`/`clock`
+     * ниже. Тестам нужно смоделировать ФС, которая запись приняла, но подтвердить её не может;
+     * production-значение — настоящая проверка файла.
+     */
+    internal var durableProbe: (File) -> Boolean = { f ->
+        runCatching { f.isFile && f.length() > 0L && f.canRead() }.getOrDefault(false)
+    }
 
     private fun writeUnderLock(
         dir: File,

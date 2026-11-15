@@ -177,14 +177,41 @@ object LogFiles {
      * Каталог логов: внешний `getExternalFilesDir(null)/logs`, при недоступности — `filesDir/logs`.
      * Проверяется РЕАЛЬНОЙ пробной записью ([writable]), а не только `!= null`.
      */
+    /**
+     * iter57 §9: ЧЕСТНОЕ место. Владелец ищет логи в `getExternalFilesDir(null)/logs`; при
+     * фоллбэке файлы лежат в `filesDir/logs`, и это обязано быть названо, иначе «логов нет»
+     * читается как «файлы не созданы».
+     */
+    @Volatile
+    var lastDirChoice: String = "unknown"
+
     fun dirFor(context: Context): File {
         val app = context.applicationContext
-        val ext = runCatching { app.getExternalFilesDir(null) }.getOrNull()
+        return dirFor(
+            externalProvider = { runCatching { app.getExternalFilesDir(null) }.getOrNull() },
+            internalProvider = { app.filesDir }
+        )
+    }
+
+    /**
+     * Тот же выбор каталога, но без `Context`: провайдеры вынесены, чтобы ФАКТИЧЕСКОЕ место и
+     * причина фоллбэка проверялись тестами (в JVM `Context` — стаб).
+     */
+    internal fun dirFor(externalProvider: () -> File?, internalProvider: () -> File?): File {
+        val ext = runCatching { externalProvider() }.getOrNull()
         if (ext != null) {
             val d = ensureDir(File(ext, "logs"))
-            if (writable(d)) return d
+            if (writable(d)) return d.also {
+                lastDirChoice = "external path=${it.absolutePath}"
+            }
+            val fb = ensureDir(File(internalProvider() ?: ext, "logs"))
+            lastDirChoice = "internal_fallback path=${fb.absolutePath} " +
+                "reason=external_not_writable external=${d.absolutePath}"
+            return fb
         }
-        return ensureDir(File(app.filesDir, "logs"))
+        val fb = ensureDir(File(internalProvider() ?: File("."), "logs"))
+        lastDirChoice = "internal_fallback path=${fb.absolutePath} reason=external_unavailable"
+        return fb
     }
 
     /** Каталог внутреннего фоллбэка (всегда наш `filesDir/logs`). */
