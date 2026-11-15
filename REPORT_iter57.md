@@ -186,15 +186,15 @@ readback старой попытки не снимает живую запись
 
 | № | Проверка | Тест | Production-файлы, реально компилируемые | Стенд | Результат |
 |---|---|---|---|---|---|
-| 1 | Звук: prepare + журнал с evidence до отправки, crash/restart/позднее выполнение | `Iter57SoundTest.prepareJournalExistsBeforeSend…`, `Iter54DeliveryTest` | `ScriptDelivery.kt`, `LockOp.kt`, `LockSound.kt`* | JVM + fake shell | ✅ |
-| 2 | Звук: no-target/corrupt/legacy, два reconcile, ни один не Ready | `Iter57SoundTest` (no_target, corrupt, legacy) | `ScriptDelivery.kt`, `LockOp.kt` | JVM + fake shell | ✅ |
-| 3 | Звук: старый bind Unknown, сейчас stock — не DONE | `Iter57SoundTest.lateShellOfAnOlderAttempt…` | `ScriptDelivery.kt` | JVM + fake shell | ✅ |
-| 4 | Звук: поздний restore после нового bind невозможен | `Iter54SoundTest`, `Iter57SoundTest` | `LockOp.kt`, `LockSound.kt`* | JVM + fake shell | ✅/🟡 |
+| 1 | Звук: prepare + журнал с evidence до отправки, crash/restart/позднее выполнение | `Iter57SoundTest.provenTerminalAndStockClosesTheOperation`, `Iter54DeliveryTest`, `Iter53DeliveryTest` | `ScriptDelivery.kt`, `LockOp.kt`, `LockSound.kt`* | JVM + fake shell | ✅ |
+| 2 | Звук: no-target/corrupt/legacy, два reconcile, ни один не Ready | `Iter57SoundTest.recordWithoutTargetsNeverBecomesReadyAndNeverClaimsStock`, `…missingEvidenceIsUnknownNotSuccess`, `…emptyDoneFileIsNotATerminal` | `ScriptDelivery.kt`, `LockOp.kt` | JVM + fake shell | ✅ |
+| 3 | Звук: старый bind Unknown, сейчас stock — не DONE | `Iter57SoundTest.stockSnapshotDoesNotCloseAnOperationWhoseTerminalIsUnproven` | `ScriptDelivery.kt` | JVM + fake shell | ✅ |
+| 4 | Звук: поздний restore после нового bind невозможен | `Iter57SoundTest.lostRestoreAnswerBlocksNewBindAndKeepsEvidenceAddress`, `…foreignLayerAboveIsNeverRemovedAndBlocksTheBind`, `Iter54SoundTest` | `LockOp.kt`, `LockSound.kt`* | JVM + fake shell | ✅/🟡 |
 | 5 | Delivery: direct/upload, потеря ответа, marker/identity, cleanup | `Iter53DeliveryTest`, `Iter54DeliveryTest`, `Iter55DeliveryTest` | `ScriptDelivery.kt` | JVM + fake shell | ✅ |
-| 6 | JIT: A seq=1 задержан, B seq=2 завершён, A не заменяет B | `Iter56JitTest.lastIntentWins…` | `JitOwn.kt`, `JitNetCore.kt` | JVM + fake shell | ✅ |
+| 6 | JIT: A seq=1 задержан, B seq=2 завершён, A не заменяет B | `Iter56JitTest.newerIntentWinsEvenWhenTheClockWentBackwards`, `…olderIntentArrivingLateYieldsEvenWithLaterClockReading`, `Iter55JitTest` | `JitOwn.kt`, `JitNetCore.kt` | JVM + fake shell | ✅ |
 | 7 | JIT: два процесса, одновременная выдача seq, reboot/clock назад/tie | `Iter57SeqTest` (9 тестов, внешний процесс держит замок) | `JitNet.kt`, `JitNetCore.kt` | JVM + **реальный второй процесс ОС** | ✅ |
 | 8 | JIT: живой lock подменяет старый между pin/mv; `.dead.*` не стирается | `Iter55JitTest`, `Iter56JitTest` | `JitOwn.kt` | JVM + fake shell | ✅ |
-| 9 | JIT: duplicate same inst не объявляет владельца мёртвым; ручной ON/OFF; boot без zygote; возврат Wi‑Fi без AP/AVAS | `Iter56JitTest.claimShellDeathAlone…`, `Iter57JitE2eTest` (5) | `JitOwn.kt`, `JitNetCore.kt`, `JitNet.kt` | JVM + fake shell | ✅ JVM / 🟡 ГУ |
+| 9 | JIT: duplicate same inst не объявляет владельца мёртвым; ручной ON/OFF; boot без zygote; возврат Wi‑Fi без AP/AVAS | `Iter56JitTest.claimShellDeathAloneIsNotProofThatThePayloadEnded`, `Iter57JitE2eTest` (5) | `JitOwn.kt`, `JitNetCore.kt`, `JitNet.kt` | JVM + fake shell | ✅ JVM / 🟡 ГУ |
 | 10 | TTL: comment unsupported, чужая идентичная цепь не меняется; свой ON→OFF обратим | `Iter57TtlTest` (7), `Iter55TtlTest` (6) | `TtlScript.kt`, `TtlRunner.kt`, `TtlVerify.kt` | JVM + настоящий `/bin/sh` + fake `iptables` с реальной таблицей | ✅ |
 | 11 | TTL: успешный `-A` при reuse, rollback с ошибкой каждой команды, чужие ссылки, delayed shell, no-uplink retries | `Iter57TtlTest`, `Iter52TtlTest`, `Iter53TtlTest`, `Iter51TtlFamilyTest` | `TtlScript.kt` | то же | ✅ |
 | 12 | Логи: rename false/exception, sync failure, две одинаковые boundary-записи, crash, межпроцессно | `Iter57LogTest` (4), `Iter54LogTest`, `LogFilesTest` | `FileLogCore.kt`, `LogFiles.kt` | JVM (обычная ФС) | ✅ |
