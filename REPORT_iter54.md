@@ -1,10 +1,11 @@
 # iter54 — JIT, TTL, звук замка, логи, окна и тумблеры: что реально исправлено
 
 **Ветка:** `fix/v2` (единственная, куда шла запись) · **`--force` не применялся, `main` не пушился**
-**HEAD на момент отчёта:** `d270a2d` · **Кодовый SHA итерации:** `d270a2d` (`SOURCE_SHA` указывает на него)
+**HEAD на момент отчёта:** `789f8f6` · **Кодовый SHA итерации:** `789f8f6` (`SOURCE_SHA` указывает на него)
 **versionCode 63 / versionName 1.0.63 — не менялись**
-**Локальный прогон:** `bash /home/user/runtests.sh` → **`OK (805 tests)`**, ~47–54 с
-**CI:** раны создаются на каждый push, но **jobs отменяются** (`conclusion=cancelled`): `43701879127` (`9f76bb1`), `43702393826` (`8a54ce6`), `43703150481` (`78cc0a4`), `43704050617` (`2252175`), `43704534919` (`74ebdac`, `in_progress`), `43705256662` (`d270a2d`, `pending`). **Подтверждённого зелёного CI на этом HEAD у меня нет** — локальный APK-путь (Gradle) в песочнице не исполнялся.
+**Локальный прогон:** `bash /home/user/runtests.sh` → **`OK (806 tests)`**, ~55 с
+**CI `Build APK`:** run **`43707141785`** на `789f8f6` — **success** (job `build`, шаг 11 `Gradle build (debug)` ✔, шаг 12 `Upload APK` ✔) · https://github.com/AlekseiAlekseikov/Backup/actions/runs/43707141785
+Предыдущий ран `43705256662` на `d270a2d` — **failure**: `:app:compileDebugKotlin`, `ToolsBackend.kt:1046 Unresolved reference 'status'` (у `ToolsResult` нет поля `status`, сводный статус — `statusWire`). Исправлено в `789f8f6`: добавлен `ToggleIntent.Applied.ofWire(...)`, production переведён на него, добавлен тест. Раньше (iter53/ранние iter54) раны отменялись: `43701879127`, `43702393826`, `43703150481`, `43704050617`, `43704534919`, `43706748051`.
 
 > Терминология отчёта: ✅ — исправлено и покрыто исполняемым тестом; 🟡 — исправлено, но проверка ограничена fake/JVM и/или требует ГУ; ❌ — не сделано/не доказано; ⛔ — проверено быть не может в этой среде.
 
@@ -20,7 +21,8 @@
 | `78cc0a4` | §7 звук — трёхзначный журнал, идемпотентная миграция, верхний слой mount | `OK (779)` |
 | `2252175` | §8 окна — `before→переход→установка→поколение` в одной секции | `OK (783)` |
 | `74ebdac` | §9 логи — без content-дедупликации, `.new` под общим локом | `OK (789)` |
-| `d270a2d` | §10 тумблеры — intent/apply/readback разведены | `OK (805)` |
+| `d270a2d` | §10 тумблеры — intent/apply/readback разведены | `OK (805)` (CI `43705256662` — **failure**, компиляция) |
+| `789f8f6` | §10 fix — факт применения из `statusWire` (находка CI) | `OK (806)` · **CI `43707141785` success** |
 
 ---
 
@@ -120,7 +122,7 @@
 
 **Стало:**
 - `ToggleIntent.kt:28` — новый чистый модуль: `Intent{WRITTEN, WRITE_FAILED, UNKNOWN}` считается по **readback хранилища** (`Prefs2.getBooleanOrNull`: конфликт/неизвестность = `null` ⇒ `UNKNOWN`, **не** `false`) плюс отчёт записи; `Applied{APPLIED, PENDING, FAILED, UNKNOWN}` — по статусу действия (`PARTIAL`/`BLOCKED` ⇒ `PENDING`, а не отказ); нейтральные подписи; `confirmsChoice()`.
-- `ToolsBackend.kt:1018` `applyFromUi(...)`, `:1040` `persistReported(res.steps)`, `:1049` лог `TOGGLE_INTENT key=… click_id=… want=… stored=… intent=… applied=… action=… note=…`, `:1074` `persistReported` — отчёт шагов сохранения.
+- `ToolsBackend.kt:1018` `applyFromUi(...)`, `:1040` `persistReported(res.steps)`, `:1049` лог `TOGGLE_INTENT key=… click_id=… want=… stored=… intent=… applied=… action=… note=…` (applied берётся из `statusWire`), `:1074` `persistReported` — отчёт шагов сохранения.
 - `ToolsStateCausality.kt:66` — `WriteAck` несёт `intent`/`applied` (старые снимки читаются по `ok`), `toJson`/`readAcks` — оба факта, `note()`; `decide()` возвращает `WRITE_FAILED` только по факту отказа записи, `UNKNOWN` держит выбор и через бюджет честно называется неподтверждённым.
 - `ToolsPanel.kt:1643` — `applyNotes`; в снимке (`:250–262`) заполняются из `$acks`; подпись (`:1170–1173`) — «сохранено, ждёт применения» / «сохранено, применение не удалось» (нейтрально, без красного); новый клик снимает подпись прошлого намерения; `perfJit` при `unknown` показывает последнее известное (`:1153`), а не `default`.
 - Модель `clickId` iter53 сохранена целиком (`ToolsPanel.kt:1174` создаёт, `UiBridge.kt:496–515` доводит до backend, ack возвращается в снимке).
@@ -152,7 +154,7 @@
 | 12 | UI: самостоятельные ключи, быстрые клики, cold start, intent/apply раздельно | `Iter54ToggleTest` (15), `Iter53UiTest` (13), `Iter52TogglesUiTest` | production `ToolsSnapshotFold`/`ToolsStateCausality` на реальном JSON снимка | 🟡 модель; ⛔ живой рендер |
 | 13 | Строка состояния, климат, видимость наружной температуры | `Iter53UiTest.batteryOffKeepsTheSavedOutsideTemperatureChoice`, `HvacDigitalPropsTest`, `FlagVerifyTest` | модель + разбор production-пути | 🟡 (плагин не запускался) |
 | 14 | `versionCode=63`, `1.0.63`, `SOURCE_SHA`, release без unit-тестов | `BuildMarkerTest`, `app/build.gradle.kts:78–79`, `app/buildinfo.properties` | разбор файлов сборки | ✅ |
-| 15 | JVM tests, сборки, CI на точном HEAD | — | `assembleDebug/Release` локально **не исполнялись** (нет Gradle-кэша/сети SDK) | ❌ CI отменён, ⛔ сборка |
+| 15 | JVM tests, сборки, CI на точном HEAD | CI run `43707141785` @ `789f8f6` | `Gradle build (debug)` + `Upload APK` в CI (JDK 21, Android SDK, Flutter AAR) | ✅ CI success; ⛔ `assembleRelease` локально не исполнялся |
 
 **Что локальный harness не компилирует** (Android-зависимости, проверка только по тексту): `ToolsBackend.kt`, `ToolsPanel.kt`, `UiBridge.kt`, `NetworkTtl.kt`, `LockSound.kt`, `JitNetCore.kt`, `AdbClient.kt`, `WindowDoors.kt`. Инварианты для них проверены чтением кода и тестами чистых модулей, которые они вызывают — **не** зелёной компиляцией.
 
@@ -161,9 +163,9 @@
 ## 9. Версия, маркер, передача
 
 - `versionCode = 63`, `versionName = "1.0.63"` (`app/build.gradle.kts:78–79`) — не менялись.
-- `SOURCE_SHA` в `app/buildinfo.properties` обновлён на кодовый SHA `d270a2d`; Gradle читает файл, `git rev-parse` в сборке не используется (`app/build.gradle.kts:52,61`).
+- `SOURCE_SHA` в `app/buildinfo.properties` = `789f8f6` (кодовый коммит итерации); Gradle читает файл, `git rev-parse` в сборке не используется (`app/build.gradle.kts:52,61`).
 - `assembleRelease` не зависит от unit-тестов (прогон — отдельной командой `runtests.sh`).
-- Изменения между `9f57f5b` (маркер iter53) и `d270a2d`: `8c0f9b1`, `9f76bb1`, `8a54ce6`, `78cc0a4`, `2252175`, `74ebdac`, `d270a2d` + этот handoff-коммит.
+- Изменения между `9f57f5b` (маркер iter53) и `789f8f6`: `8c0f9b1`, `9f76bb1`, `8a54ce6`, `78cc0a4`, `2252175`, `74ebdac`, `d270a2d`, `789f8f6` + этот handoff-коммит.
 
 ---
 
@@ -198,7 +200,7 @@ TOGGLE_INTENT key=<key> click_id=<id> want=<b> stored=<b|null> intent=<written|w
 
 ## 12. Незакрытые долги (не размечены ✅)
 
-- ❌ **CI на HEAD не подтверждён** (jobs отменены), `assembleDebug/Release` локально не собирались.
+- ⛔ **`assembleRelease` локально не собирался** (нет Gradle-кэша SDK в песочнице); CI собирает **debug** (`build` → `Gradle build (debug)`), release-вариант на этом HEAD не проверялся.
 - 🟡 **Живой Android/UI-рендер** (Robolectric/instrumentation) не исполнялся — модель и JSON проверены, listener/render нет.
 - ⛔ **Реальное ГУ:** VHAL-события окон, zygote-переходы, mount верхнего слоя, reboot/update-выживание TTL, поведение плагина SystemUI (`hvacExtTemp` при OFF заряда).
 - 🟡 **Межпроцессность логов** проверена потоками + реальным `FileLock`, без `fork` двух процессов.

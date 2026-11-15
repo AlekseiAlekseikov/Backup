@@ -14,17 +14,18 @@
 | §8 окна | новый `VentOwnerTx` (одно состояние, один lock, поколение); `before→переход→установка→generation` в одной секции; closed-ветка через `mutateOwners` | `Iter54WindowTest` (4): 8×25 транзакций, 200 разных поколений, 0 ошибок | `2252175` `OK (783)` |
 | §9 логи | убрана content-дедупликация (`recoverPendingNew`), позиционная граница (`boundary_dup=N`), слияние `.new` под общим `<name>.lock`, при занятом локе `.new` сохраняется | `Iter54LogTest` (6) | `74ebdac` `OK (789)` |
 | §10 тумблеры | `ToggleIntent` (intent по readback хранилища, applied по статусу действия), `WriteAck{intent, applied}` + `note()`, `decide()` не путает PARTIAL с отказом записи, подписи «сохранено, ждёт применения», `perfJit` показывает последнее известное, а не default | `Iter54ToggleTest` (15) | `d270a2d` `OK (805)` |
-| handoff | `REPORT_iter54.md`, `WORKLOG.md`, `SOURCE_SHA=d270a2d` | — | этот коммит |
+| §10 fix | сводный статус действия — `statusWire` (находка CI: `Unresolved reference 'status'`), `ToggleIntent.Applied.ofWire()` | `Iter54ToggleTest` (16) | `789f8f6` `OK (806)` · CI `43707141785` **success** |
+| handoff | `REPORT_iter54.md`, `WORKLOG.md`, `SOURCE_SHA=789f8f6` | CI на handoff-коммите | этот коммит |
 
 ## Инцидент среды
 
 Песочница откатила `/home/user/w` (пропали `.git` и `app/src`), а также `toolchains/kotlinc/lib`.
 Восстановлено: `git clone -b fix/v2` (все коммиты были запушены) + `kotlin-compiler-1.9.24` заново.
-После восстановления прогнан полный набор: `OK (805 tests)` на `d270a2d` — цифры выше подтверждены на восстановленном дереве.
+После восстановления прогнан полный набор: `OK (805 tests)` на `d270a2d`, затем `OK (806 tests)` на `789f8f6` — цифры выше подтверждены на восстановленном дереве.
 
 ## Открытые долги
 
-- CI раны по `fix/v2` создаются, но jobs **отменяются** (`cancelled`); зелёного CI на HEAD нет. `assembleDebug/Release` локально не собирались.
+- Локально `assembleDebug/Release` не собирались (нет Gradle-кэша SDK в песочнице). CI собирает **debug** на `789f8f6` — success (`43707141785`); **release** на этом HEAD не проверялся.
 - Живой Android/UI-рендер (Robolectric/instrumentation) не исполнялся — проверены production-модели и JSON снимка, не listener/render.
 - На реальном ГУ не проверялись: VHAL окон, zygote-переходы, mount верхнего слоя, выживание TTL после reboot/update, плагин SystemUI.
 - Межпроцессность логов — потоки + реальный `FileLock`, без `fork`.
