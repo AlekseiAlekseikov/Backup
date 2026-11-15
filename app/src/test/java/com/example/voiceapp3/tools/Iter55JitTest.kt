@@ -165,18 +165,26 @@ class Iter55JitTest {
         val o1 = collect(p1)
         val o2 = collect(p2)
 
-        val taken = listOf(o1, o2).count { it.contains("CL_STATUS=taken") }
-        assertEquals("владение получил ровно один претендент: $o1 | $o2", 1, taken)
+        // iter57 §7.1/§7.3: «оба claim'а сказали taken» — НЕ ошибка само по себе: владение
+        // переходит ПОСЛЕДОВАТЕЛЬНО (сначала ONE, затем более позднее намерение TWO), и это и
+        // есть сходимость к последнему выбору владельца. Проверять надо не число ответов
+        // `taken`, а ФАКТ: выжило ровно одно намерение, а payload проигравшего не выполняется.
         val finalClaim = claimText()
         assertTrue("в claim ровно одно из двух намерений: «$finalClaim»",
             finalClaim.startsWith("op=ONE;") || finalClaim.startsWith("op=TWO;"))
-        val loser = if (finalClaim.startsWith("op=ONE;")) o2 else o1
-        assertTrue("второй назвал причину, а не «взял»: $loser",
-            loser.contains("CL_STATUS=busy") || loser.contains("CL_STATUS=stale") ||
-                loser.contains("CL_STATUS=failed"))
-        assertTrue("подмена объекта названа явно, если случилась: $o1 | $o2",
-            !(o1 + o2).contains("refused") || (o1 + o2).contains("race_object_replaced") ||
-                loser.contains("CL_STATUS=busy"))
+        assertTrue("ни один претендент не остался без ответа: $o1 | $o2",
+            listOf(o1, o2).all { it.contains("CL_STATUS=") })
+        // Проигравший — тот, чьё намерение перезаписано. Его payload обязан отказаться сам.
+        val loserIsOne = finalClaim.startsWith("op=TWO;")
+        val loserOp = if (loserIsOne) one else two
+        val loserOut = if (loserIsOne) o1 else o2
+        // Ответ проигравшего на этапе claim мог быть `taken` (владение переходило последовательно);
+        // доказательство уступки — поведение ЕГО payload ниже, а не текст ответа claim.
+        assertTrue("проигравший получил ответ: $loserOut", loserOut.contains("CL_STATUS="))
+        val (_, runLoser) = sh(payload(loserOp, "LOSER", holdMs = 10), "loser.sh")
+        assertTrue("payload проигравшего НЕ выполнил действие: $runLoser",
+            runLoser.contains("JIT_REFUSED"))
+        assertFalse("и side effect'а не появилось", effects().contains("LOSER"))
     }
 
     // ───────── 3. Старый claim прочитал ДО lock, новый записан, старый продолжил ─────────

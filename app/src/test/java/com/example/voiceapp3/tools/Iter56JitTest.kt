@@ -180,32 +180,86 @@ class Iter56JitTest {
     }
 
     @Test
-    fun restoreOfAMovedForeignLockNeverOverwritesTheNewOne() {
-        // Проверяем сам примитив возврата: имя уже занято НОВЫМ живым lock, вернуть нужно
-        // объект, который мы сняли ошибочно. `mv` перезаписал бы живой lock; `ln` — нет.
-        // Файлы ВНЕ пространства имён lock: их не должен задеть trap самого скрипта.
-        val zOp = op("Z", 1_700_100_400_000L, seq = 1)
-        File(base, "foreign.lock").writeText("op=FRN;inst=frn-1;pid=1;pstart=1;boot=x")
-        File(base, "live.lock").writeText("op=NEWLIVE;inst=nl-1;pid=1;pstart=1;boot=x")
-        // Берём НАСТОЯЩИЙ сгенерированный скрипт целиком (примитивы — его часть) и вызываем
-        // примитив возврата в его конце: так тест падает, если примитив исчезнет/изменится.
-        val real = JitOwn.guard(zOp, b)
-        assertTrue("в сгенерированном скрипте есть примитив возврата", real.contains("_jit_restore_dead"))
-        // Claim и lock — наш, чтобы скрипт дошёл до конца (иначе ранние проверки завершат его).
-        // Claim должен принадлежать ТОМУ ЖЕ экземпляру, что и запускаемый guard, иначе скрипт
-        // законно откажется (`instance_mismatch`) и до примитива не дойдёт.
-        File(JitOwn.claimPath(b)).writeText(
-            "op=Z;ts_ms=1700100400000;want=1;inst=${zOp.identity?.inst}"
+    fun foreignLockIsNeverMovedOrRemovedByTakeover() {
+        // iter57 §7.3: прежняя схема пришпиливала inode и делала `mv lock → tmp`, то есть
+        // ВРЕМЕННО уносила имя — и если между pin и mv имя занимал ЖИВОЙ владелец, его lock
+        // исчезал из пространства имён. Теперь смена объекта выполняется только под админ-файлом
+        // и только если содержимое ВСЁ ЕЩЁ равно строке, смерть которой доказана.
+        val real = JitOwn.guard(op("Z", 1_700_100_400_000L, seq = 1), b)
+        assertTrue("в сгенерированном скрипте есть сериализация захвата",
+            real.contains("_jit_lock_acquire") && real.contains("_jit_admin_enter"))
+        assertFalse("перемещения lock (`mv`) больше нет", real.contains(".dead."))
+
+        // Живой чужой lock: pid=1 (init) существует всегда — смерть НЕ доказана.
+        // pstart берём ровно так, как его считает скрипт (`awk` поле 22 /proc/<pid>/stat),
+        // иначе проверка «pid переиспользован» справедливо сочтёт владельца мёртвым.
+        val initStart = java.io.File("/proc/1/stat").readText().trim().split(' ')[21]
+        val live = "op=LIVE;ts_ms=1700100400000;ts_s=1700100400;want=1;inst=live-1;" +
+            "pid=1;pstart=$initStart;boot=${File("/proc/sys/kernel/random/boot_id").readText().trim()}"
+        File(JitOwn.lockPath(b)).writeText(live)
+        val script = JitOwn.guard(op("Z", 1_700_100_400_000L, seq = 1), b)
+        // Запускаем ТОЛЬКО функции из настоящего скрипта (ранние проверки не исполняем).
+        val from = script.indexOf("# ── идентичность этого shell")
+        val to = script.indexOf("_me_line=")
+        assertTrue("блок общих функций найден", from >= 0 && to > from)
+        val call = script.substring(from, to) +
+            "\n_me_line=\"op=Z;inst=Z-1;pid=${'$'}${'$'};pstart=1;boot=x\"\n" +
+            "_me_inst=Z-1\n_me_pid=${'$'}${'$'}\n" +
+            "_me_pid=${'$'}${'$'}; _me_pstart=${'$'}(_me_psof \"${'$'}_me_pid\"); _me_boot=${'$'}(cat /proc/sys/kernel/random/boot_id)\n" +
+            "_jit_owner_dead \"${'$'}(cat '${"${base.absolutePath}"}/voiceapp3_jit.lock')\"; echo \"DEAD=${'$'}?\"\n" +
+            "_jit_may_takeover '${"${base.absolutePath}"}/voiceapp3_jit.lock'; echo \"MAY=${'$'}?\"\n" +
+            "_jit_lock_acquire '${"${base.absolutePath}"}/voiceapp3_jit.lock' 'op=LIVE;ts_ms=1700100400000;ts_s=1700100400;want=1;inst=live-1;pid=1;pstart=$initStart;boot=x'; echo \"ACQ=${'$'}?\"\n"
+        val (_, out) = sh(call, "takeover_probe.sh")
+        assertTrue("перехват живого lock запрещён: $out", out.contains("MAY=1"))
+        assertTrue("взятия имени живого lock не произошло: $out", out.contains("ACQ=1"))
+        assertEquals("живой lock не изменён и не удалён", live, lockText())
+    }
+
+    // ───────── 3b. iter57 §7.3: перехват разрешён только при доказанном конце ЦЕПОЧКИ ─────────
+
+    @Test
+    fun claimShellDeathAloneIsNotProofThatThePayloadEnded() {
+        // lock записан shell'ом claim (pid уже мёртв), но payload этого исполнения УЖЕ НАЧАЛ
+        // работу (START в terminal) и ещё не закончил. Смерть claim-процесса ничего не говорит о
+        // payload'е: перехват запрещён, имя живого владельца не трогается.
+        val ts = 1_700_100_600_000L
+        val inst = "PP-1"
+        File(JitOwn.termPath("PP", b)).writeText("START ts=1 op=PP inst=$inst\n")
+        File(JitOwn.lockPath(b)).writeText(
+            "op=PP;ts_ms=$ts;ts_s=1700100600;want=1;inst=$inst;pid=999998;pstart=1;boot=deadboot"
         )
-        val call = real + "\n_jit_release\n" +
-            "_jit_restore_dead '${base.absolutePath}/foreign.lock' '${base.absolutePath}/live.lock'\n" +
-            "echo \"RC=$?\"\n"
-        val (_, out) = sh(call, "restore_probe.sh")
-        assertTrue("возврат на занятое имя не перезаписал живой lock: $out",
-            File(base, "live.lock").readText().contains("NEWLIVE"))
-        assertTrue("исходный объект СОХРАНЁН, а не удалён",
-            File(base, "foreign.lock").exists() && File(base, "foreign.lock").readText().contains("FRN"))
-        assertTrue("отказ возврата назван явно: $out", out.contains("CL_TAKEOVER_KEPT"))
+        val script = JitOwn.guard(op("NEWPP", ts + 1_000L, seq = 9), b)
+        val from = script.indexOf("# ── идентичность этого shell")
+        val to = script.indexOf("_me_line=")
+        val call = script.substring(from, to) + "\n_me_inst=N2-1\n_me_pid=${'$'}${'$'}\n" +
+            "_me_pstart=${'$'}(_me_psof \"${'$'}_me_pid\")\n_me_boot=${'$'}(cat /proc/sys/kernel/random/boot_id)\n" +
+            "_jit_may_takeover \"${'$'}(cat '${"${base.absolutePath}"}/voiceapp3_jit.lock')\"; " +
+            "echo \"MAY=${'$'}?\"\n"
+        val (_, out) = sh(call, "payload_running_probe.sh")
+        assertTrue("перехват запрещён, пока payload мог работать: $out", out.contains("MAY=2"))
+        assertTrue("lock владельца не изменён",
+            lockText().contains("inst=$inst") && !lockText().contains("ppid="))
+    }
+
+    @Test
+    fun payloadIdentityDeathAllowsTakeoverOfAKilledRun() {
+        // Payload-identity записана в lock (`ppid=`) и этот процесс доказанно мёртв → перехват
+        // разрешён: иначе убитый payload блокировал бы JIT навсегда.
+        val ts = 1_700_100_700_000L
+        File(JitOwn.termPath("KIL", b)).writeText("START ts=1 op=KIL inst=KIL-1\n")
+        File(JitOwn.lockPath(b)).writeText(
+            "op=KIL;ts_ms=$ts;ts_s=1700100700;want=1;inst=KIL-1;pid=999997;pstart=1;boot=deadboot;" +
+                "ppid=999996;ppstart=1"
+        )
+        val script = JitOwn.guard(op("NEWK", ts + 1_000L, seq = 10), b)
+        val from = script.indexOf("# ── идентичность этого shell")
+        val to = script.indexOf("_me_line=")
+        val call = script.substring(from, to) + "\n_me_inst=N3-1\n_me_pid=${'$'}${'$'}\n" +
+            "_me_pstart=${'$'}(_me_psof \"${'$'}_me_pid\")\n_me_boot=${'$'}(cat /proc/sys/kernel/random/boot_id)\n" +
+            "_jit_may_takeover \"${'$'}(cat '${"${base.absolutePath}"}/voiceapp3_jit.lock')\"; " +
+            "echo \"MAY=${'$'}?\"\n"
+        val (_, out) = sh(call, "killed_payload_probe.sh")
+        assertTrue("мёртвый payload не блокирует навсегда: $out", out.contains("MAY=0"))
     }
 
     // ───────── 4. Порядок намерений: монотонное поколение, не часы ─────────
