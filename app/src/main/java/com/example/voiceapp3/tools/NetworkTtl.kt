@@ -201,6 +201,11 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
 
     private val runner: TtlRunner by lazy {
         TtlRunner(
+            // iter53 §8.3: РЕАЛЬНОЕ продолжение после исчерпания бюджета проходов.
+            // Планировщик внедряется из production (BgWorker), иначе TtlRunner честно пишет
+            // `action=pending_no_scheduler`, а ограничение «на следующем поводе» оставалось бы
+            // обещанием, которого в стабильной сети может не быть вовсе.
+            // Одна отложенная задача на все накопившиеся поводы (coalescing — в TtlRunner).
             transport = object : TtlRunner.Transport {
                 override fun apply(want: Boolean): TtlRunner.Outcome = runTransport(want, "runner")
             },
@@ -264,7 +269,16 @@ private fun buildScript(enable: Boolean): String = TtlScript.build(enable)
                 override fun desiredProblem(): String = "unreadable_or_conflict"
             },
             log = { line -> AppLog.i(TAG, line) }
-        )
+        ).also { r ->
+            // iter53 §8.3: РЕАЛЬНОЕ продолжение после исчерпания бюджета проходов.
+            // Планировщик внедряется из production (BgWorker); без него TtlRunner честно пишет
+            // `action=pending_no_scheduler`, а «продолжим на следующем поводе» оставалось бы
+            // обещанием, которого в стабильной сети может не быть вовсе. Одна отложенная задача
+            // на все накопившиеся поводы (coalescing — внутри TtlRunner).
+            r.continuationScheduler = { delayMs, task ->
+                com.example.voiceapp3.tools.BgWorker.postDelayed("ttlContinuation", delayMs, task)
+            }
+        }
     }
 
     /**

@@ -219,4 +219,22 @@ class Iter53TtlTest {
         assertTrue("итог: ${line(out, "TTL_CHECK")}",
             line(out, "TTL_CHECK").contains("SCOPED_OK") || line(out, "TTL_CHECK").contains("SCOPED_V4_ONLY"))
     }
+
+    @Test
+    fun productionInjectsARealContinuationScheduler() {
+        // §8.3: без внедрённого планировщика продолжение остаётся обещанием. Проверяем, что
+        // production-путь (NetworkTtl, единственное место создания runner) его внедряет.
+        val f = listOf(
+            java.io.File("src/main/java/com/example/voiceapp3/tools/NetworkTtl.kt"),
+            java.io.File("app/src/main/java/com/example/voiceapp3/tools/NetworkTtl.kt"),
+            java.io.File("/home/user/w/app/src/main/java/com/example/voiceapp3/tools/NetworkTtl.kt")
+        ).first { it.isFile }
+        val src = f.readText()
+        assertTrue("планировщик внедряется в production: ${f.absolutePath}",
+            src.contains("r.continuationScheduler = { delayMs, task ->"))
+        assertTrue("продолжение ставится в очередь BgWorker",
+            src.contains("BgWorker.postDelayed(\"ttlContinuation\", delayMs, task)"))
+        assertFalse("никаких обещаний без планировщика в production",
+            src.contains("continuationScheduler = null"))
+    }
 }
