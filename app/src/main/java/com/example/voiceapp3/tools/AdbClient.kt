@@ -579,19 +579,39 @@ object AdbClient {
         script: String,
         timeoutMs: Int = 40000,
         expectRoot: Boolean = true
+    ): ScriptDelivery.Result = executePrepared(
+        ScriptDelivery.prepare(name, script), timeoutMs, expectRoot
+    )
+
+    /**
+     * iter57 §5.1 — отправка ПОДГОТОВЛЕННОЙ доставки: nonce и путь свидетельства заданы
+     * вызывающим и уже сохранены им в durable-записи ДО этой функции.
+     *
+     * Почему это отдельная точка, а не параметр «для красоты»: потребитель с необратимым side
+     * effect (звук, TTL) обязан знать адрес свидетельства ДО отправки. Если путь рождается здесь,
+     * внутри, то смерть процесса между отправкой и возвратом оставляет возможный поздний shell
+     * без адреса — именно этот дефект и был в iter56.
+     */
+    fun executePrepared(
+        prep: ScriptDelivery.Prepared,
+        timeoutMs: Int = 40000,
+        expectRoot: Boolean = true
     ): ScriptDelivery.Result {
-        val bytes = ScriptChunker.bytesOf(script)
-        if (bytes.size <= ScriptDelivery.DIRECT_LIMIT) {
-            // iter54 §5: прямая отправка разбирается ТОЙ ЖЕ функцией, что и заливка
-            // ([ScriptDelivery.directResult]): маркеры `VAPP_DIRECT_STARTED/DONE` делают
-            // завершение фактом, а потерянный ответ — честной неизвестностью.
-            // iter55 §5.1: номер попытки входит и в маркер, и в разбор.
-            val nonce = ScriptDelivery.newNonce()
-            val (rc, out) = execute(ScriptDelivery.directScript(script, nonce), timeoutMs, expectRoot)
-            return ScriptDelivery.directResult(name, script, rc, out, nonce)
+        val name = prep.name
+        val script = prep.script
+        if (prep.plan.transport == ScriptDelivery.Transport.DIRECT) {
+            val (rc, out) = execute(
+                ScriptDelivery.directScript(script, prep.nonce, prep.evidencePath),
+                timeoutMs, expectRoot
+            )
+            val res = ScriptDelivery.directResult(name, script, rc, out, prep.nonce, prep)
+            AppLog.i(TAG, "SCRIPT_DIRECT name=$name ${res.wire()}")
+            return res
         }
+        // Выбор транспорта уже сделан в [ScriptDelivery.prepare] по фактической длине UTF-8:
+        // здесь только исполнение. Прямой путь несёт device-side terminal (`<path>.done`).
         val res = synchronized(scriptUploadLock) {
-            ScriptDelivery.deliver(name, script, timeoutMs, expectRoot, ::execute)
+            ScriptDelivery.deliver(name, script, timeoutMs, expectRoot, ::execute, nonce = prep.nonce)
         }
         when (res.state) {
             ScriptDelivery.State.RUN_CONFIRMED, ScriptDelivery.State.RUN_SENT ->

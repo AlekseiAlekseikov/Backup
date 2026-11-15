@@ -112,7 +112,16 @@ internal object LockOp {
          * не «забыть»: раньше свидетельство упоминалось только в строке лога и в журнале не
          * сохранялось вовсе.
          */
-        val evidence: String = ""
+        val evidence: String = "",
+        /**
+         * iter57 §5.3 — свидетельство ПОСЛЕДНЕГО отправленного restore этой операции.
+         *
+         * Restore — тоже shell с side effect (`umount`). Если его ответ потерян, поздний
+         * `umount` может выполниться уже ПОСЛЕ нового bind и снять новый слой. Поэтому исход
+         * restore типизирован, а его адрес сохраняется: следующая сверка дочитывает terminal,
+         * а новый bind до этого не отправляется.
+         */
+        val restoreEv: String = ""
     ) {
         fun encode(): String = (listOf(
             "id=$id",
@@ -122,7 +131,8 @@ internal object LockOp {
             "stage=$stage",
             "targets=${targets.joinToString(",")}",
             "reason=$reason"
-        ) + (if (evidence.isEmpty()) emptyList() else listOf("ev=$evidence"))).joinToString(";")
+        ) + (if (evidence.isEmpty()) emptyList() else listOf("ev=$evidence")) +
+            (if (restoreEv.isEmpty()) emptyList() else listOf("rev=$restoreEv"))).joinToString(";")
 
         fun wire(): String =
             "id=$id gen=$gen desired=$desired state=${state.name.lowercase()} " +
@@ -147,7 +157,8 @@ internal object LockOp {
         return BindOp(
             id = id, gen = gen, desired = desired == "1", stage = map["stage"].orEmpty(),
             targets = targets, state = state, reason = map["reason"].orEmpty(),
-            evidence = map["ev"].orEmpty()
+            evidence = map["ev"].orEmpty(),
+            restoreEv = map["rev"].orEmpty()
         )
     }
 
@@ -272,6 +283,163 @@ internal object LockOp {
      *  • [UNPROVEN]      — таблица/namespace не прочитаны, идентичность не доказана.
      */
     enum class Reconcile { STOCK_RESTORED, FOREIGN_LEFT, UNPROVEN }
+
+    // ───────────── iter57 §5.2/§5.3: РЕШАТЕЛЬ СВЕРКИ (production-путь) ─────────────
+
+    /**
+     * Исход сверки ОДНОЙ операции — то, что можно утверждать после чтения свидетельства и restore.
+     *
+     * [newState]/[reason] идут в журнал, [conflict] агрегируется в [SoundRecovery.Conflict],
+     * [unresolved] — «исход не доказан, нужен повторный read-only проход» ([SoundRecovery.Pending]).
+     * Отправка нового bind разрешена ТОЛЬКО когда ни одна операция не дала conflict/unresolved.
+     */
+    data class ReconStep(
+        val opId: String,
+        val newState: State,
+        val reason: String,
+        val conflict: String? = null,
+        val unresolved: Boolean = false,
+        /** Поздний shell (bind или restore) всё ещё возможен — новый bind запрещён. */
+        val lateShell: Boolean = false,
+        /** Запись, которую надо сохранить (изменённый restoreEv/причина), или `null`. */
+        val persist: BindOp? = null,
+        /** Нужен ли read-only повтор: true — планируется следующая сверка, петли нет. */
+        val deferReread: Boolean = false,
+        val note: String = ""
+    ) {
+        fun wire(): String = "op=$opId state=${newState.name.lowercase()} reason=$reason" +
+            (if (conflict != null) " conflict=$conflict" else "") +
+            (if (unresolved) " unresolved=1" else "") +
+            (if (lateShell) " late_shell=1" else "")
+    }
+
+    /**
+     * Порты устройства для сверки. Реализация — в [com.example.voiceapp3.tools.LockSound]
+     * (настоящий ADB); в тестах — управляемая подмена. Решение принимает ТОЛЬКО код ниже,
+     * поэтому тест исполняет тот же production-путь, а не его копию.
+     */
+    interface ReconPorts {
+        /** `null` — свидетельства нет/не читается: это НЕ «всё в порядке». */
+        fun evidence(op: BindOp, path: String): EvidenceFacts?
+
+        /**
+         * Выполнить restore по целям операции. Возвращает типизированный исход:
+         * `sent=false` — доказано, что shell не уходил; `unknown=true` — исход неизвестен;
+         * иначе — `rc`+`out` фактического исполнения.
+         */
+        fun restore(op: BindOp): RestoreOutcome
+
+        /** Путь свидетельства для ПОДГОТОВЛЕННОГО restore (известен до отправки). */
+        fun prepareRestore(op: BindOp): String
+    }
+
+    data class RestoreOutcome(
+        val sent: Boolean,
+        val unknown: Boolean,
+        val rc: Int,
+        val out: String,
+        val evidence: String = "",
+        val why: String = ""
+    )
+
+    /**
+     * Сверка ОДНОЙ операции. Порядок проверок — от «нельзя утверждать ничего» к «можно закрыть».
+     *
+     * 1. Нет целей/stage → конфликт `no_targets`: снимать наугад нельзя, но и считать
+     *    разрешённым нельзя (именно здесь iter56 делал `continue` и ниже возвращал `Ready`).
+     * 2. Нет/не читается свидетельство bind → конфликт `evidence_*`: поздний bind не исключён.
+     * 3. Свидетельство прочитано, terminal НЕ доказан → `late_shell_unproven`; restore ещё
+     *    выполняется (снять СВОЙ слой), но операция НЕ закрывается, даже если сейчас stock.
+     * 4. Restore не отправлен → retry безопасен, состояние не меняем (остаётся UNKNOWN).
+     * 5. Restore отправлен, исход неизвестен → `restore_outcome_unknown`, адрес сохраняется.
+     * 6. Restore завершился (rc известен) и terminal bind доказан → вердикт по целям:
+     *    `STOCK_RESTORED` закрывает операцию, `FOREIGN_LEFT`/`UNPROVEN` — конфликт.
+     */
+    fun reconStep(op: BindOp, ports: ReconPorts): ReconStep {
+        if (op.targets.isEmpty() || op.stage.isEmpty()) {
+            return ReconStep(
+                op.id, State.UNDEFINED, "no_targets", conflict = "no_targets:" + op.id,
+                unresolved = true, persist = op.copy(reason = "no_targets"),
+                note = "в записи нет целей/staging: снять наугад нельзя"
+            )
+        }
+        // 1) Свидетельство BIND: без него нельзя утверждать, что старый shell не стартует позже.
+        val bindFacts = if (op.evidence.isEmpty()) null else ports.evidence(op, op.evidence)
+        val bindTerminal = bindFacts?.terminalProven == true
+        val bindLate = !bindTerminal
+        // 2) Свидетельство RESTORE (если restore уже отправлялся ранее).
+        val restoreEvKnown = op.restoreEv.isNotEmpty()
+        val restoreTerminal = if (!restoreEvKnown) false else
+            ports.evidence(op, op.restoreEv)?.terminalProven == true
+
+        val out = ports.restore(op)
+        // Restore не ушёл: доказуемо «ничего не исполнялось» — повтор разрешён, состояние не
+        // закрываем (bind всё равно не доказан), но и конфликт не создаём.
+        if (!out.sent && !out.unknown) {
+            return ReconStep(
+                op.id, State.UNDEFINED, "restore_not_sent:" + out.why.ifEmpty { "unknown" },
+                unresolved = true, persist = op.copy(reason = "restore_not_sent"),
+                note = "restore не отправлен: побочных действий не было, нужен повтор"
+            )
+        }
+        // Restore ушёл, исход неизвестен: поздний umount возможен ⇒ fencing на новый bind.
+        if (out.unknown && !restoreTerminal) {
+            val ev = out.evidence.ifEmpty { op.restoreEv }
+            return ReconStep(
+                op.id, State.UNDEFINED, "restore_outcome_unknown",
+                conflict = "restore_unknown:" + op.id, unresolved = true, lateShell = true,
+                persist = op.copy(restoreEv = ev, reason = "restore_outcome_unknown"),
+                deferReread = ev.isNotEmpty(),
+                note = "restore мог выполниться позже: новый bind не отправляется до terminal"
+            )
+        }
+        // 3) terminal bind не доказан ⇒ операцию НЕ закрываем, даже если сейчас виден stock.
+        if (bindLate) {
+            val why = if (bindFacts == null) "evidence_absent_or_unreadable" else "late_shell_unproven"
+            val conflict = if (bindFacts == null) "evidence_unknown:" + op.id
+                           else "late_shell_possible:" + op.id
+            return ReconStep(
+                op.id, State.UNDEFINED, why, conflict = conflict, unresolved = true, lateShell = true,
+                persist = op.copy(reason = why), deferReread = op.evidence.isNotEmpty(),
+                note = "terminal этого исполнения не доказан: слой снят, но операция открыта"
+            )
+        }
+        // 4) terminal bind доказан и restore завершился — можно судить по фактической таблице.
+        val detail = reconcileDetail(out.rc, out.out, op.targets)
+        val verdict = detail.verdict
+        return when (verdict) {
+            Reconcile.STOCK_RESTORED -> ReconStep(
+                op.id, State.DONE, "reconciled_restore", persist = op.copy(reason = ""),
+                note = "сток по всем целям при доказанном terminal bind"
+            )
+            Reconcile.FOREIGN_LEFT -> ReconStep(
+                op.id, State.UNDEFINED, "foreign_above_left",
+                conflict = "foreign_above:" + op.id, unresolved = true,
+                persist = op.copy(reason = "foreign_above_left"),
+                note = "поверх чужой слой: снимать нельзя"
+            )
+            Reconcile.UNPROVEN -> ReconStep(
+                op.id, State.UNDEFINED, "reconcile_unproven",
+                conflict = "unproven:" + op.id, unresolved = true,
+                persist = op.copy(reason = "reconcile_unproven"),
+                note = "снятие не подтверждено по всем целям"
+            )
+        }
+    }
+
+    /**
+     * ЯВНЫЙ путь разрешения неразрешимого по доказательствам случая (легаси-запись без
+     * свидетельства, нечитаемый канал и т.п.).
+     *
+     * Вызывается только по решению владельца (`owner=explicit`) и оставляет след: состояние
+     * `DONE`, причина `owner_resolved_unprovable:<class>`. Это НЕ доказательство стока — это
+     * отказ от дальнейших автоматических попыток по этой записи, чтобы функция не была
+     * заблокирована навсегда.
+     */
+    fun ownerResolve(op: BindOp, why: String): BindOp = op.copy(
+        state = State.DONE,
+        reason = "owner_resolved_unprovable:" + why.ifEmpty { "explicit" }
+    )
 
     /**
      * Разбор вывода сверки ПО КАЖДОЙ ОЖИДАЕМОЙ ЦЕЛИ (iter53 §7.2).

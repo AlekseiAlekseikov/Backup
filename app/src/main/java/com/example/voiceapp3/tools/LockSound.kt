@@ -1069,9 +1069,15 @@ object LockSound {
                 // без учёта, и снять их было нечем. Если запись не подтверждена чтением —
                 // bind не отправляется (иначе возможно необратимое неучтённое монтирование).
                 val opId = "bind_" + gen + "_" + Stage0.hash(stagePath)
+                // iter57 §5.1: IDENTITY И СВИДЕТЕЛЬСТВО — ДО ЖУРНАЛА И ДО ОТПРАВКИ.
+                // Раньше запись была `PLANNED` без пути, путь появлялся только из результата
+                // доставки: смерть процесса между отправкой и возвратом оставляла возможный
+                // старый shell без адреса, по которому его terminal можно дочитать.
+                val prepared = ScriptDelivery.prepare("lock_bind", bindScript)
                 val op = LockOp.BindOp(
                     id = opId, gen = gen, desired = true, stage = stagePath,
-                    targets = glideTargets, state = LockOp.State.PLANNED
+                    targets = glideTargets, state = LockOp.State.PLANNED,
+                    evidence = prepared.evidencePath
                 )
                 val journalOk = writeOpJournal(appCtx, op)
                 if (!journalOk) {
@@ -1080,8 +1086,9 @@ object LockSound {
                     recordBindFailure("journal_not_confirmed", appCtx, deterministic = false)
                     return@post
                 }
-                AppLog.i(ctx, TAG, "LOCKSOUND_OP planned ${op.wire()} " +
-                    "(запись журнала подтверждена чтением ДО mount; fsync не заявляется)")
+                AppLog.i(ctx, TAG, "LOCKSOUND_OP planned ${op.wire()} evidence=${op.evidence} " +
+                    "(запись журнала подтверждена чтением ДО mount; путь-свидетельство известен " +
+                    "ДО отправки; fsync не заявляется)")
                 val bindPlan = ScriptDelivery.plan("lock_bind", bindScript)
                 AppLog.i(ctx, TAG, "LOCKSOUND_BIND TRANSPORT ${bindPlan.wire()} " +
                     "(длина измерена по фактическим UTF-8 байтам, не по оценке)")
@@ -1089,7 +1096,9 @@ object LockSound {
                 // исход обязан доходить сюда тремя различимыми состояниями, а не `rc`.
                 // Раньше `RUN_UNKNOWN` терялся: «ответ потерян» и «не выполнено» выглядели
                 // одинаково, и вызывающий код мог либо повторить bind, либо заявить успех.
-                val bindDetailed = AdbClient.executeScriptDetailed("lock_bind", bindScript, 30000)
+                // Отправляется РОВНО подготовленный nonce: свидетельство в журнале и адрес на
+                // устройстве совпадают, повторной «скрытой» identity не возникает.
+                val bindDetailed = AdbClient.executePrepared(prepared, 30000)
                 val bindRes = Pair(bindDetailed.rc, bindDetailed.out)
                 val bindOutcome = ScriptDelivery.outcome(bindDetailed, opId)
                 AppLog.i(ctx, TAG, "lockSound bind rc=${bindRes.first}: ${bindRes.second.replace('\n', ' ').take(500)}")
@@ -1116,7 +1125,8 @@ object LockSound {
                         // iter55 §5.2: путь-свидетельство СОХРАНЯЕТСЯ в журнале (durable), а не
                         // только в строке лога: после рестарта процесса именно по нему идёт
                         // read-only сверка, а не «забыли про операцию».
-                        val ev = (bindOutcome as ScriptDelivery.DeliveryOutcome.Unknown).evidence.path
+                        val ev = (bindOutcome as ScriptDelivery.DeliveryOutcome.Unknown)
+                            .evidence.path.ifEmpty { op.evidence }
                         finishOpJournal(ctx, op.copy(evidence = ev), LockOp.State.UNDEFINED,
                             "bind_outcome_unknown:" + bindOutcome.why + " ev=" + ev.ifEmpty { "none" })
                         AppLog.w(ctx, TAG, "LOCKSOUND_BIND UNKNOWN op=$opId ${bindOutcome.wire()} " +
@@ -1705,19 +1715,23 @@ object LockSound {
      * (только чтение). Возвращает `null`, если свидетельства нет в записи или прочитать его не
      * удалось — тогда исход остаётся `Unknown`, а не «всё в порядке».
      */
-    internal fun readEvidence(ctx: Context, op: LockOp.BindOp): LockOp.EvidenceFacts? {
-        if (op.evidence.isEmpty()) return null
+    internal fun readEvidence(ctx: Context, op: LockOp.BindOp): LockOp.EvidenceFacts? =
+        readEvidencePath(ctx, op.id, op.evidence)
+
+    /** То же чтение по явному пути: нужно и для bind-, и для restore-свидетельства. */
+    internal fun readEvidencePath(ctx: Context, opId: String, path: String): LockOp.EvidenceFacts? {
+        if (path.isEmpty()) return null
         val r = runCatching {
-            AdbClient.execute(ScriptDelivery.evidenceCommand(op.evidence), 8000, expectRoot = false)
+            AdbClient.execute(ScriptDelivery.evidenceCommand(path), 8000, expectRoot = false)
         }.getOrNull()
         if (r == null) {
-            AppLog.w(ctx, TAG, "LOCKSOUND_EVIDENCE op=${op.id} path=${op.evidence} action=unreadable " +
+            AppLog.w(ctx, TAG, "LOCKSOUND_EVIDENCE op=$opId path=$path action=unreadable " +
                 "(прочитать свидетельство не удалось: исход остаётся неизвестным)")
             return null
         }
         val facts = LockOp.parseEvidence(r.second)
         if (facts == null) {
-            AppLog.w(ctx, TAG, "LOCKSOUND_EVIDENCE op=${op.id} path=${op.evidence} rc=${r.first} " +
+            AppLog.w(ctx, TAG, "LOCKSOUND_EVIDENCE op=$opId path=$path rc=${r.first} " +
                 "action=no_fields out=${r.second.replace('\n', ' ').take(200)}")
         }
         return facts
@@ -1776,86 +1790,66 @@ object LockSound {
         val lateShell = ArrayList<String>()
         var evidencePath = ""
         var conflictReason: String? = null
+        var needReread = false
         AppLog.i(ctx, TAG, "LOCKSOUND_RECONCILE source=$source pending=${pending.size} " +
             "journal=«${journal.wire()}» ops=${pending.joinToString(",") { it.id }} " +
             "(незавершённые операции будут сверены по фактической таблице монтирований)")
         val appCtx = ctx.applicationContext
-        for (op in pending) {
-            val entries = op.targets.map { it to op.stage }
-            if (entries.isEmpty() || op.stage.isEmpty()) {
-                finishOpJournal(appCtx, op, LockOp.State.UNDEFINED, "reconcile_no_targets")
-                AppLog.e(appCtx, TAG, "LOCKSOUND_RECONCILE op=${op.id} action=none reason=no_targets " +
-                    "(в записи нет целей/staging: снять наугад нельзя, запись сохранена)")
-                continue
-            }
-            // iter55 §5.2/§7.1: ПЕРЕД любой мутацией — read-only чтение свидетельства доставки
-            // этой операции (`<path>`, `<path>.started`, `<path>.done`). Раньше путь-свидетельство
-            // жил только в строке лога: «Unknown» нельзя было разрешить после рестарта, и решение
-            // принималось по одному лишь ответу restore-скрипта.
-            val ev = readEvidence(appCtx, op)
-            if (ev != null) {
-                AppLog.i(appCtx, TAG, "LOCKSOUND_EVIDENCE op=${op.id} path=${op.evidence} " +
-                    "${ev.wire()}")
-                // Пишем факт в журнал ДО мутации: если процесс умрёт во время restore, следующая
-                // сверка увидит уже прочитанное свидетельство, а не начнёт с нуля.
-                writeOpJournal(appCtx, op.copy(
-                    reason = "evidence_started=${ev.started} done=${ev.done} " +
-                        "script=${ev.scriptPresent}"
-                ))
-                if (!ev.terminalProven && ev.scriptPresent) {
-                    // Скрипт лежит на устройстве, terminal не доказан → поздний shell ещё может
-                    // выполниться. Убираем наш слой (restore ниже), но новый bind не разрешаем.
-                    lateShell.add(op.id)
+        // iter57 §5.2/§5.3: решение по КАЖДОЙ операции принимает [LockOp.reconStep] — тот же
+        // код, который гоняют тесты. Здесь только порты устройства и запись результата.
+        val ports = object : LockOp.ReconPorts {
+            override fun evidence(op: LockOp.BindOp, path: String): LockOp.EvidenceFacts? =
+                readEvidencePath(appCtx, op.id, path)
+
+            override fun restore(op: LockOp.BindOp): LockOp.RestoreOutcome {
+                val script = LockMountScripts.restoreScript(op.targets.map { it to op.stage })
+                val prep = ScriptDelivery.prepare("lock_restore", script)
+                val res = AdbClient.executePrepared(prep, 30000)
+                val outcome = ScriptDelivery.outcome(res, op.id)
+                return when (outcome) {
+                    is ScriptDelivery.DeliveryOutcome.NotSent ->
+                        LockOp.RestoreOutcome(false, false, res.rc, res.out,
+                            prep.evidencePath, outcome.why)
+                    is ScriptDelivery.DeliveryOutcome.Unknown ->
+                        LockOp.RestoreOutcome(true, true, res.rc, res.out,
+                            outcome.evidence.path.ifEmpty { prep.evidencePath }, outcome.why)
+                    is ScriptDelivery.DeliveryOutcome.Finished ->
+                        LockOp.RestoreOutcome(true, false, res.rc, res.out, prep.evidencePath, "")
                 }
             }
-            val script = LockMountScripts.restoreScript(entries)
-            val (rc, out) = AdbClient.executeScript("lock_reconcile_restore", script, 30000)
-            // iter53 §7.2: вердикт требует покрытия ВСЕХ ожидаемых целей и rc=0; одиночный
-            // `STOCK_OK` доказательством «всё снято» больше не считается.
-            val detail = LockOp.reconcileDetail(rc, out, op.targets)
-            val verdict = detail.verdict
-            val state = LockOp.stateForVerdict(verdict)
-            val reason = when (verdict) {
-                LockOp.Reconcile.STOCK_RESTORED -> "reconciled_restore"
-                LockOp.Reconcile.FOREIGN_LEFT -> "foreign_above_left"
-                LockOp.Reconcile.UNPROVEN -> "reconcile_unproven"
+
+            override fun prepareRestore(op: LockOp.BindOp): String = ""
+        }
+        for (op in pending) {
+            val step = runCatching { LockOp.reconStep(op, ports) }.getOrElse { t ->
+                LockOp.ReconStep(
+                    op.id, LockOp.State.UNDEFINED, "reconcile_threw:" + t.javaClass.simpleName,
+                    conflict = "reconcile_threw:" + op.id, unresolved = true
+                )
             }
-            finishOpJournal(appCtx, op, state, reason)
-            AppLog.i(appCtx, TAG, "LOCKSOUND_RECONCILE op=${op.id} rc=$rc " +
-                "verdict=${verdict.name.lowercase()} ${detail.wire()} state=${state.name.lowercase()} " +
-                "out=${out.replace('\n', ' ').take(300)}")
-            if (state == LockOp.State.UNDEFINED) {
+            // Одна запись на проход: состояние + обновлённый адрес свидетельства restore.
+            finishOpJournal(appCtx, step.persist ?: op, step.newState, step.reason)
+            AppLog.i(appCtx, TAG, "LOCKSOUND_RECONCILE op=${op.id} ${step.wire()} " +
+                "evidence=${op.evidence.ifEmpty { "none" }} restore_ev=${op.restoreEv.ifEmpty { "none" }} " +
+                "note=«${step.note}»")
+            if (step.lateShell) lateShell.add(op.id)
+            if (step.unresolved) {
                 unresolvedNow += op.id
-                if (evidencePath.isEmpty()) evidencePath = op.evidence
+                if (evidencePath.isEmpty()) evidencePath = op.evidence.ifEmpty { op.restoreEv }
             }
-            if (verdict == LockOp.Reconcile.UNPROVEN || verdict == LockOp.Reconcile.FOREIGN_LEFT) {
-                conflictReason = "${verdict.name.lowercase()}:${op.id}"
-            }
+            if (step.deferReread) needReread = true
+            step.conflict?.let { conflictReason = conflictReason ?: it }
+        }
+        if (needReread) {
+            // Один отложенный read-only проход (без горячей петли): terminal позднего исполнения
+            // появляется через доли секунды, а следующий проход уже сможет закрыть операцию.
+            scheduleReread(appCtx, source)
         }
         if (lateShell.isNotEmpty()) {
-            // iter55 §5.2: свидетельство показывает, что скрипт ещё лежит на устройстве без
-            // terminal → он может стартовать ПОЗЖЕ. Наш слой уже снят, но объявлять «сходимость»
-            // и монтировать новый поверх нельзя: получилось бы два слоя и «звук не тот».
             AppLog.e(appCtx, TAG, "LOCKSOUND_RECONCILE source=$source action=stop " +
                 "late_shell_possible=${lateShell.joinToString(",")} " +
-                "(удалённый запуск не доказал завершение: bind не отправляется)")
+                "(terminal исполнения не доказан: операция НЕ закрывается, bind не отправляется)")
             conflictReason = conflictReason ?: ("late_shell_possible:" + lateShell.first())
-        }
-        // Сверка не «доказала сток», если хоть одна операция осталась недоказанной или поверх
-        // оказался чужой слой. Тогда новый bind НЕ отправляется: старый shell мог не завершиться.
-        if (conflictReason != null) {
-            AppLog.e(appCtx, TAG, "LOCKSOUND_RECONCILE source=$source action=stop " +
-                "conflict=$conflictReason unresolved=${unresolvedNow.size} " +
-                "(намерение владельца сохраняется; bind не отправляется)")
-            return LockOp.SoundRecovery.Conflict(conflictReason)
-        }
-        if (unresolvedNow.isNotEmpty()) {
-            AppLog.w(appCtx, TAG, "LOCKSOUND_RECONCILE source=$source action=defer " +
-                "unresolved=${unresolvedNow.size} evidence=${evidencePath.ifEmpty { "none" }} " +
-                "(исход не доказан: нужен повторный read-only проход, новый bind не отправляется)")
-            return LockOp.SoundRecovery.Pending(
-                "unresolved_ops=${unresolvedNow.size}", evidencePath
-            )
         }
         // Сходимость к последнему сохранённому намерению (не к «состоянию до»).
         if (isEnabled(appCtx)) {
@@ -1870,6 +1864,70 @@ object LockSound {
         }
         return LockOp.SoundRecovery.Ready
     }
+
+    /**
+     * iter57 §5.3 — ОДИН отложенный read-only проход сверки (без горячей петли).
+     *
+     * Нужен там, где terminal позднего исполнения ещё не успел появиться: через несколько секунд
+     * свидетельство уже читается, и операция закрывается сама. Повтор не запускает никаких
+     * side effect — только чтение и, при доказанном terminal, безопасное снятие СВОИХ слоёв.
+     */
+    private fun scheduleReread(ctx: Context, source: String) {
+        val appCtx = ctx.applicationContext
+        runCatching {
+            BgWorker.postDelayed("LockSound.reread", REREAD_DELAY_MS) {
+                runCatching { reconcilePendingOps(appCtx, "reread_after:" + source) }
+            }
+        }
+    }
+
+    /**
+     * iter57 §5.3 — ЯВНОЕ разрешение операции, которую нельзя доказать (легаси-запись без
+     * свидетельства, убитый канал). Вызывается только по решению владельца; оставляет след
+     * `owner_resolved_unprovable` и НЕ заявляет сток.
+     */
+    fun resolveUnprovableOps(ctx: Context, reason: String): ToolsResult {
+        gateEnter("resolve")
+        try {
+            val t0 = SystemClock.elapsedRealtime()
+            val read = readOpJournal(ctx)
+            if (read !is LockOp.JournalRead.Readable) {
+                return ToolsResult(
+                    action = "locksound.resolveUnprovable", title = "Разрешение записей звука",
+                    steps = listOf(ToolsStep(
+                        step = "read_journal", command = "readOpJournal()", startedAtMs = t0,
+                        finishedAtMs = SystemClock.elapsedRealtime(), exitCode = 1,
+                        stderr = "журнал операций недоступен: " + read.wire(),
+                        status = ToolsStep.Status.FAILED
+                    ))
+                )
+            }
+            val ops = read.journal.unresolved()
+            var n = 0
+            for (op in ops) {
+                val resolved = LockOp.ownerResolve(op, reason)
+                if (appendOp(ctx, resolved, "owner_resolve")) n++
+                AppLog.w(ctx, TAG, "LOCKSOUND_OP owner_resolved op=${op.id} reason=$reason " +
+                    "(разрешено владельцем; сток по этой записи НЕ доказан и не заявляется)")
+            }
+            return ToolsResult(
+                action = "locksound.resolveUnprovable", title = "Разрешение записей звука",
+                steps = listOf(ToolsStep(
+                    step = "owner_resolve",
+                    command = "LockOp.ownerResolve(ops=$n, reason=$reason)",
+                    startedAtMs = t0, finishedAtMs = SystemClock.elapsedRealtime(),
+                    exitCode = 0, actual = "$n",
+                    stdout = "разрешено записей: $n (это НЕ доказательство стока)",
+                    status = if (ops.isEmpty()) ToolsStep.Status.PARTIAL else ToolsStep.Status.OK
+                ))
+            )
+        } finally {
+            gateExit()
+        }
+    }
+
+    /** Пауза перед отложенным read-only проходом сверки. */
+    internal var REREAD_DELAY_MS: Long = 3000L
 
     /** Хэш пути staging: короткая детерминированная метка, без содержимого WAV. */
     internal object Stage0 {

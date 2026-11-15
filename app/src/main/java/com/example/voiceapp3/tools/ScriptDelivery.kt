@@ -269,15 +269,36 @@ object ScriptDelivery {
      * Маркер `VAPP_DIRECT_DONE rc=…` делает завершение фактом, а его отсутствие при потерянном
      * ответе — честной неизвестностью (iter54 §5).
      */
-    fun directScript(script: String, nonce: String = newNonce()): String =
+    fun directScript(
+        script: String,
+        nonce: String = newNonce(),
+        terminalPath: String = ""
+    ): String {
+        val n = sanitize(nonce)
         // ПОДОБОЛОЧКА обязательна: `exit N` внутри скрипта иначе завершит весь shell и маркер
         // завершения не напечатается — «ответ есть, а маркера нет» снова стало бы догадкой.
         //
         // iter55 §5.1: маркер несёт НОМЕР ПОПЫТКИ. Без него строка `VAPP_DIRECT_DONE` в теле
         // самого payload (эхо, сообщение об ошибке, чужой вывод) могла быть принята за
         // завершение — terminal должен принадлежать ИМЕННО этой попытке.
-        "( echo VAPP_DIRECT_STARTED_" + sanitize(nonce) + "; " + script + "\n) ; echo " +
-            "\"VAPP_DIRECT_DONE_" + sanitize(nonce) + " rc=\$?\""
+        //
+        // iter57 §5.1: при заданном [terminalPath] тот же shell оставляет на устройстве `rc=N`
+        // в `<path>.done`. Прямая отправка больше не «невосстановима»: после потери ответа
+        // terminal читается read-only ([evidenceCommand]), а не угадывается повтором.
+        val terminal = if (terminalPath.isEmpty()) "" else
+            "; _VRC=\$?; echo \"rc=\$_VRC\" > " + terminalPath + ".done 2>/dev/null; " +
+                "if [ -e " + terminalPath + ".done ]; then " +
+                "echo \"VAPP_DIRECT_TERMINAL_" + n + " written=1\"; else " +
+                "echo \"VAPP_DIRECT_TERMINAL_" + n + " written=0\"; fi; exit \$_VRC"
+        val body = if (terminalPath.isEmpty()) {
+            "( echo VAPP_DIRECT_STARTED_" + n + "; " + script + "\n) ; echo " +
+                "\"VAPP_DIRECT_DONE_" + n + " rc=\$?\""
+        } else {
+            "( echo VAPP_DIRECT_STARTED_" + n + "; " + script + "\n) ; _VRC=\$?; " +
+                "echo \"VAPP_DIRECT_DONE_" + n + " rc=\$_VRC\"" + terminal
+        }
+        return body
+    }
 
     /**
      * Разбор прямой отправки по фактам её вывода.
@@ -295,9 +316,17 @@ object ScriptDelivery {
         script: String,
         rc: Int,
         out: String,
-        nonce: String = ""
+        nonce: String = "",
+        prepared: Prepared? = null
     ): Result {
-        val plan = plan(name, script)
+        val plan = prepared?.plan ?: plan(name, script)
+        // iter57 §5.1: доказал ли САМ shell, что terminal лёг на устройство. Только в этом случае
+        // путь-свидетельство попадает в результат: без файла `Unknown` нечем разрешать, и
+        // выдавать nonce из stdout за восстанавливаемое свидетельство нельзя.
+        val termWritten = nonce.isNotEmpty() && out.contains(
+            "VAPP_DIRECT_TERMINAL_" + sanitize(nonce) + " written=1"
+        )
+        val evidence = if (termWritten) plan.path else ""
         val lost = out.contains("ERR_ADB_TIMEOUT") || out.contains("ERR_ADB_")
         val marker = if (nonce.isEmpty()) Regex("VAPP_DIRECT_DONE rc=(-?\\d+)")
         else Regex("VAPP_DIRECT_DONE_" + Regex.escape(sanitize(nonce)) + " rc=(-?\\d+)")
@@ -306,11 +335,13 @@ object ScriptDelivery {
             // Ровно один маркер этой попытки: два и больше — не terminal, а мусор/подделка.
             doneLines.size == 1 -> Result(
                 doneLines.first().groupValues[1].toIntOrNull() ?: rc, out, plan, 1,
-                State.RUN_CONFIRMED, true, false, "", false, contentKind = "direct_marker"
+                State.RUN_CONFIRMED, true, false, "", false, contentKind = "direct_marker",
+                evidencePath = evidence
             )
             else -> Result(
                 rc, out, plan, 1, State.RUN_UNKNOWN, false, false, "", true,
-                contentKind = if (lost) "direct_none" else "direct_no_terminal"
+                contentKind = if (lost) "direct_none" else "direct_no_terminal",
+                evidencePath = evidence
             )
         }
     }
@@ -330,6 +361,57 @@ object ScriptDelivery {
                 pathFor(name, nonce), cksum(bytes), ""
             )
         }
+    }
+
+    // ─────────────────── iter57 §5.1: ПОДГОТОВКА ДО ОТПРАВКИ ───────────────────
+
+    /**
+     * ПОДГОТОВЛЕННАЯ доставка: имя, nonce, транспорт и ПУТЬ СВИДЕТЕЛЬСТВА известны ДО того, как
+     * на устройство уйдёт первый байт.
+     *
+     * Зачем это отдельный тип. В iter56 потребитель (звук) писал в журнал `PLANNED` без пути
+     * свидетельства, отправлял скрипт и только по возвращении `Unknown` узнавал путь — из
+     * результата. Смерть процесса между отправкой и возвратом оставляла возможный старый shell
+     * БЕЗ адреса, по которому его terminal можно дочитать: операция оставалась «неизвестной»
+     * навсегда, а новый bind при этом мог быть отправлен.
+     *
+     * Теперь путь входит в [Plan] до отправки (`pathFor(name, nonce)`), потребитель сохраняет его
+     * в журнале и передаёт в [com.example.voiceapp3.tools.AdbClient.executePrepared] — то есть
+     * отправляется РОВНО тот nonce, чьё свидетельство записано. Повторной «скрытой» identity нет.
+     */
+    data class Prepared(
+        val name: String,
+        val nonce: String,
+        val script: String,
+        val plan: Plan
+    ) {
+        /**
+         * Путь устройства, по которому лежит (или не лежит) свидетельство исполнения:
+         * `<path>` — скрипт, `<path>.started`, `<path>.done` — terminal с `rc=`.
+         *
+         * Для ПРЯМОЙ отправки iter57 тоже пишет device-side `.done` (см. [directScript]):
+         * раньше «прямой» путь не оставлял на устройстве ничего, и потерянный ответ нельзя было
+         * разрешить иначе, чем повторной опасной отправкой.
+         */
+        val evidencePath: String get() = plan.path
+
+        fun wire(): String =
+            "name=$name nonce=$nonce ${plan.wire()} evidence=${evidencePath.ifEmpty { "none" }}"
+    }
+
+    /** Подготовить доставку (без отправки). Один nonce на попытку и на её свидетельство. */
+    fun prepare(
+        name: String,
+        script: String,
+        nonce: String = newNonce()
+    ): Prepared {
+        val safe = sanitize(nonce)
+        val plan0 = plan(name, script, safe)
+        // Для прямого транспорта путь считается так же: terminal пишется в `<path>.done` той же
+        // командой, что исполняет скрипт. Для «слишком большой» — пути нет (отправки не будет).
+        val plan = if (plan0.transport == Transport.DIRECT)
+            plan0.copy(path = pathFor(name, safe)) else plan0
+        return Prepared(sanitize(name), safe, script, plan)
     }
 
     // ─────────────────────────── команды устройства ───────────────────────────
