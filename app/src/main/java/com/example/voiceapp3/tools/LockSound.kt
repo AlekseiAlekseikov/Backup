@@ -1578,13 +1578,18 @@ object LockSound {
     }
 
     /** Обновить состояние операции (append новой строки) и подтвердить запись. */
-    internal fun finishOpJournal(ctx: Context, op: LockOp.BindOp, state: LockOp.State, reason: String) {
+    internal fun finishOpJournal(ctx: Context, op: LockOp.BindOp, state: LockOp.State,
+                                 reason: String): Boolean {
         val now = op.copy(state = state, reason = reason)
         // iter52 §5.1(4): результат записи проверяется; DONE без подтверждения не заявляется.
+        // iter60 §5: функция возвращает РЕЗУЛЬТАТ, а не `Unit`. Раньше вызывающий не мог узнать,
+        // что DONE не закреплён на диске, и продолжал как при успехе — «успех» жил только в логе.
         if (!appendOp(ctx, now, "finish_${state.name.lowercase()}")) {
             AppLog.e(ctx, TAG, "LOCKSOUND_OP DONE_NOT_PERSISTED op=${op.id} state=${state.name.lowercase()} " +
                 "reason=$reason (состояние операции не зафиксировано на диске)")
+            return false
         }
+        return true
     }
 
     /** Старая запись (iter50 и раньше): одна операция в одном файле. */
@@ -1808,6 +1813,8 @@ object LockSound {
         var evidencePath = ""
         var conflictReason: String? = null
         var needReread = false
+        val journalUnconfirmed = ArrayList<String>()
+        val rereadOps = ArrayList<String>()
         AppLog.i(ctx, TAG, "LOCKSOUND_RECONCILE source=$source pending=${pending.size} " +
             "journal=«${journal.wire()}» ops=${pending.joinToString(",") { it.id }} " +
             "(незавершённые операции будут сверены по фактической таблице монтирований)")
@@ -1910,7 +1917,14 @@ object LockSound {
                 )
             }
             // Одна запись на проход: состояние + обновлённый адрес свидетельства restore.
-            finishOpJournal(appCtx, step.persist ?: op, step.newState, step.reason)
+            // iter60 §5: без durable DONE операция НЕ объявляется закрытой — она остаётся
+            // незавершённой, а проход сообщает «журнал не закреплён» вместо «готово».
+            val journalOk = finishOpJournal(appCtx, step.persist ?: op, step.newState, step.reason)
+            if (!journalOk) {
+                journalUnconfirmed += op.id
+                unresolvedNow += op.id
+                conflictReason = conflictReason ?: ("journal_not_persisted:" + op.id)
+            }
             AppLog.i(appCtx, TAG, "LOCKSOUND_RECONCILE op=${op.id} ${step.wire()} " +
                 "evidence=${op.evidence.ifEmpty { "none" }} restore_ev=${op.restoreEv.ifEmpty { "none" }} " +
                 "note=«${step.note}»")
@@ -1919,13 +1933,16 @@ object LockSound {
                 unresolvedNow += op.id
                 if (evidencePath.isEmpty()) evidencePath = op.evidence.ifEmpty { op.restoreEv }
             }
-            if (step.deferReread) needReread = true
+            if (step.deferReread) {
+                needReread = true
+                rereadOps.add(op.id)
+            }
             step.conflict?.let { conflictReason = conflictReason ?: it }
         }
         if (needReread) {
             // Один отложенный read-only проход (без горячей петли): terminal позднего исполнения
             // появляется через доли секунды, а следующий проход уже сможет закрыть операцию.
-            scheduleReread(appCtx, source)
+            scheduleReread(appCtx, source, rereadOps)
         }
         if (lateShell.isNotEmpty()) {
             AppLog.e(appCtx, TAG, "LOCKSOUND_RECONCILE source=$source action=stop " +
@@ -1988,17 +2005,55 @@ object LockSound {
      * свидетельство уже читается, и операция закрывается сама. Повтор не запускает никаких
      * side effect — только чтение и, при доказанном terminal, безопасное снятие СВОИХ слоёв.
      */
-    private fun scheduleReread(ctx: Context, source: String) {
+    private fun scheduleReread(ctx: Context, source: String, opIds: Collection<String> = emptyList()) {
         val appCtx = ctx.applicationContext
+        // iter60 §5: reread ОГРАНИЧЕН и ДЕДУПЛИЦИРОВАН. Дефект iter59: каждый проход с
+        // `deferReread` ставил новую задачу, поэтому при непрогрессирующей операции получалась
+        // самоподдерживающаяся цепочка чтений (и дубли задач на одну и ту же операцию).
+        val scheduled: List<String>
+        synchronized(rereadState) {
+            if (rereadScheduled) {
+                AppLog.i(appCtx, TAG, "LOCKSOUND_REREAD action=dedup source=$source " +
+                    "pending=${rereadState.keys.joinToString(",").ifEmpty { "none" }} " +
+                    "(отложенный проход уже запланирован)")
+                return
+            }
+            scheduled = opIds.filter { (rereadState[it] ?: 0) < REREAD_MAX_PER_OP }
+            if (scheduled.isEmpty()) {
+                AppLog.w(appCtx, TAG, "LOCKSOUND_REREAD action=exhausted source=$source " +
+                    "ops=${opIds.joinToString(",").ifEmpty { "none" }} limit=$REREAD_MAX_PER_OP " +
+                    "(предел отложенных чтений исчерпан: нужен обычный проход по событию)")
+                return
+            }
+            scheduled.forEach { rereadState[it] = (rereadState[it] ?: 0) + 1 }
+            rereadScheduled = true
+        }
+        val attempt = scheduled.maxOf { rereadState[it] ?: 1 }
+        // Линейная пауза по номеру попытки: чтения не идут плотной серией.
+        val delay = REREAD_DELAY_MS * attempt
         runCatching {
-            BgWorker.postDelayed("LockSound.reread", REREAD_DELAY_MS) {
-                // iter58 §3.2: отложенный проход — ТОЛЬКО чтение свидетельств.
-                runCatching {
-                    reconcilePendingOps(appCtx, "reread_after:" + source, allowRestore = false)
+            BgWorker.postDelayed("LockSound.reread", delay) {
+                try {
+                    // iter58 §3.2: отложенный проход — ТОЛЬКО чтение свидетельств.
+                    runCatching {
+                        reconcilePendingOps(appCtx, "reread_after:" + source, allowRestore = false)
+                    }
+                } finally {
+                    synchronized(rereadState) { rereadScheduled = false }
                 }
             }
+        }.onFailure {
+            synchronized(rereadState) { rereadScheduled = false }
         }
+        AppLog.i(appCtx, TAG, "LOCKSOUND_REREAD scheduled=1 source=$source delay_ms=$delay " +
+            "ops=${scheduled.joinToString(",")} attempt=$attempt limit=$REREAD_MAX_PER_OP")
     }
+
+    /** Предел отложенных read-only проходов на одну операцию (iter60 §5). */
+    internal var REREAD_MAX_PER_OP: Int = 3
+
+    private val rereadState = HashMap<String, Int>()
+    private var rereadScheduled = false
 
     /**
      * iter57 §5.3 — ЯВНОЕ разрешение операции, которую нельзя доказать (легаси-запись без

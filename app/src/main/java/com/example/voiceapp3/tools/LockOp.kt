@@ -446,8 +446,21 @@ internal object LockOp {
         // затем применялся к исходу НОВОЙ отправки. Здесь terminal проверяется только для того,
         // чтобы решить, можно ли начинать следующую попытку.
         val prevEv = op.restoreEv
-        val prevTerminal = prevEv.isNotEmpty() && ports.evidence(op, prevEv)?.terminalProven == true
-        if (prevEv.isNotEmpty() && !prevTerminal) {
+        val prevFacts = if (prevEv.isEmpty()) null else ports.evidence(op, prevEv)
+        val prevTerminal = prevFacts?.terminalProven == true
+        // iter60 §5: `NotSent` с НЕПУСТЫМ `restoreEv` больше не превращается в «вечный»
+        // `previous_restore_unresolved`. Если прошлая попытка доказанно не уходила, terminal у неё
+        // не появится НИКОГДА, и требовать его — значит запрещать восстановление звука бессрочно
+        // (дефект iter59: `restore_not_sent` сохранял путь, а следующая сверка падала в шаг 2).
+        val prevProvenNotSent = prevEv.isNotEmpty() && (
+            op.reason.startsWith("restore_not_sent") ||
+                // «подготовлено, но не начато» — обоснованная recovery crash-до-send: скрипта нет,
+                // `.started` нет, terminal нет ⇒ исполнение доказанно не начиналось.
+                (op.reason == "restore_prepared" && prevFacts != null &&
+                    !prevFacts.terminalProven && prevFacts.started.isEmpty() &&
+                    !prevFacts.scriptPresent)
+            )
+        if (prevEv.isNotEmpty() && !prevTerminal && !prevProvenNotSent) {
             return ReconStep(
                 op.id, State.UNDEFINED, "previous_restore_unresolved",
                 conflict = "previous_restore_unresolved:" + op.id, unresolved = true,
@@ -498,9 +511,12 @@ internal object LockOp {
 
         val out = ports.restore(op, attempt)
         if (!out.sent && !out.unknown) {
+            // Фаза «доказано не отправлено» durable: следующий проход НЕ требует terminal этой
+            // попытки (его не будет) и может повторить restore безопасно.
             return ReconStep(
                 op.id, State.UNDEFINED, "restore_not_sent:" + out.why.ifEmpty { "unknown" },
-                unresolved = true, persist = withAttempt.copy(reason = "restore_not_sent"),
+                unresolved = true,
+                persist = withAttempt.copy(reason = "restore_not_sent:" + out.why.ifEmpty { "unknown" }),
                 note = "restore доказанно не уходил: повтор возможен, побочных действий не было"
             )
         }
@@ -509,6 +525,8 @@ internal object LockOp {
         // независимо от того, что прежняя попытка когда-то завершилась (дефект iter58: там
         // terminal СТАРОЙ попытки разрешал новую).
         if (out.unknown) {
+            // Отличие от crash-до-send: здесь отправка НАЧАЛАСЬ (identity ушла в shell), поэтому
+            // фаза — «могло исполниться», и требуется terminal ЭТОЙ попытки.
             val why = "restore_outcome_unknown"
             return ReconStep(
                 op.id, State.UNDEFINED, why, conflict = "restore_unknown:" + op.id,
