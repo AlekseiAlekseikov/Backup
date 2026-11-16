@@ -247,3 +247,49 @@ identity до отправки + правило повтора; `Pair`-retry у�
 ⛔ Release-сборка локально невозможна (Gradle 9 → JVM 17). ⛔ UI/ГУ/VHAL/интернет — только владелец.
 ❌ Не сделано в этом проходе: `JitNet` seq/epoch, UI-корень визуального OFF, `FileLogCore`,
 `VentOwnerTx`.
+
+---
+
+# iter60 (2026-10-22) — рабочий JIT, durable TTL, звук по фазам, delivery без подмены identity
+
+База `5c092d7`, `SOURCE_SHA=53a4f9c`, версия 63/1.0.63 без повышения. Полный отчёт —
+`docs/agent/REPORT_iter60.md`.
+
+## §3 JIT admin (P0)
+Гонка одинаковых ticket воспроизведена (участник останавливается между выбором ticket и
+публикацией). Протокол: сначала публикуется фаза выбора `c.<inst>.<pid>`, затем ticket; ждущий
+не входит при живом `c.*` ⇒ два владельца невозможны. Identity (`inst`+`pid`+`pstart`) при
+повторном входе, глубина вложенности, снятие чужой записи только по своему имени и после
+доказанной смерти, legacy `<lock>.admin` мигрируется со сверкой. Regression
+`Iter60JitTicketRaceTest` (9): на коде iter59 падают 5, на iter60 — 9/9.
+
+## §4 TTL (P0)
+`TtlState` (новый): append-only журнал попыток с фазами `PREPARED/MAY_HAVE_RUN/TERMINAL/PROVEN_NOT_SENT`,
+fence до сверки прошлой попытки, закрытие ровно по ЕЁ terminal, отдельное durable намерение
+владельца (поколение), миграция iter59 как «неизвестно». `NetworkTtl`: persistDesire → fence →
+recordAttempt → send → durable фаза; `TTL_DESIRE_LAG` вместо ложного успеха. 13 тестов.
+
+## §5 звук (P0)
+`NotSent` с непустым `restoreEv` больше не даёт `previous_restore_unresolved` (это был бессрочный
+запрет восстановления). Crash до send (`restore_prepared` без следов) восстанавливается, crash
+после send (`started=1`/`outcome_unknown`) блокирует. Reread ограничен (`REREAD_MAX_PER_OP=3`),
+дедуплицирован, флаг снимается в `finally`. `finishOpJournal` → `Boolean`; без durable DONE
+операция не закрывается. 8 тестов (5 падают на iter59).
+
+## §6 доставка
+При `EXISTS` nonce внутри отправки НЕ меняется: `State.COLLISION` → `NotSent`, новую identity
+готовит вызывающий. Коды различены: payload / transport / stdout-маркер / `.done`. 4 теста,
+2 старых теста обновлены под новый контракт.
+
+## §7 UI/окна/логи
+`VentOwnerTx.mutate` больше не отдаёт живые коллекции (mutable-set escape закрыт, 800 конкурентных
+мутаций). `FileLogCore` проверен (renameTo/fsync/свидетельство). Таблица ключей настроек — в отчёте.
+❌ Плагин статус-бара, док по скриншоту, климат — не делались; VHAL/стекло/логи на ГУ не проверялись.
+
+## §0 гигиена
+`REPORT_iter54..59.md` → `docs/agent/` (`git mv`). Новые агентские `.md` только в `docs/agent/`.
+
+## Прогон и честные поправки
+`bash /home/user/runtests58.sh` → **`OK (992 tests)`**. `typecheck_lock.sh` → **53 → 53, новых нет**
+(до исправления пути к kotlinc скрипт писал ложные «0/0» — это исправлено в iter60).
+⛔ ГУ не проверялась: JIT на toybox, Wi‑Fi/интернет, TTL/iptables, слышимость звука, VHAL, release.
