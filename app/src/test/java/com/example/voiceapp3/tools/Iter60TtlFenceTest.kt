@@ -214,13 +214,16 @@ class Iter60TtlFenceTest {
     }
 
     @Test
-    fun forceAbandonKeepsTheFactUnknownAndRecordsTheReason() {
+    fun forceAbandonNeverPretendsToBeNotSentAndKeepsTheId() {
         val a = attempt("a", true, 1, TtlState.Phase.MAY_HAVE_RUN)
         val ab = TtlState.forceAbandon(a, "owner_cancelled", now = 9L)
         assertFalse("попытка больше не блокирует", ab.unresolved)
         assertEquals("код НЕ выдуман", Int.MIN_VALUE, ab.payloadRc)
-        assertTrue("причина записана в идентификатор", ab.id.contains("abandoned:owner_cancelled"))
-        // Это видимый компромисс: содержимое не доказано, но и «применено» не заявляется.
+        // iter61 §4.4: отказ владельца — не доказанное «не отправлено», и id НЕ меняется,
+        // иначе из-за last-wins старая запись могла бы всплыть или потеряться.
+        assertEquals("id не меняется", "a", ab.id)
+        assertNotEquals("и это не PROVEN_NOT_SENT", TtlState.Phase.PROVEN_NOT_SENT, ab.phase)
+        assertTrue("причина названа", ab.reasonHint.startsWith("owner_resolved_unprovable"))
     }
 
     // ─────────────── 8. свидетельство с устройства: что можно утверждать ───────────────
@@ -239,14 +242,20 @@ class Iter60TtlFenceTest {
         assertNull("«мог исполниться» не закрывается сам",
             TtlState.applyEvidence(attempt("a", true, 1, TtlState.Phase.MAY_HAVE_RUN), started, 5L))
 
-        // Ни следа файла, ни .started, ни .done ⇒ доказанно не запускался.
-        val never = TtlState.classifyEvidence("SH=0\nSTARTED=0\nDONE=\nPRESENT=0\n")
-        assertEquals(TtlState.Evidence.NotStarted, never)
-        val closed = TtlState.applyEvidence(attempt("a", true, 1, TtlState.Phase.MAY_HAVE_RUN), never, 5L)!!
-        assertEquals("доказанное «не уходило»", TtlState.Phase.PROVEN_NOT_SENT, closed.phase)
-        assertEquals("код не выдуман", Int.MIN_VALUE, closed.payloadRc)
-        assertEquals("нет следа ⇒ не блокирует", TtlState.Fence.Clean,
-            TtlState.fence(listOf(closed)))
+        // iter61 §4.1: НИ СЛЕДА файлов — это НЕ «доказанно не запускался»: отправленный shell мог
+        // ещё не стартовать (особенно direct-транспорт). Прежнее ожидание (NotStarted →
+        // PROVEN_NOT_SENT) было ошибочным и разрешало поздний ON после OFF.
+        val absent = TtlState.classifyEvidence("SH=0\nSTARTED=0\nDONE=\nPRESENT=0\n")
+        assertEquals(TtlState.Evidence.TracesAbsent, absent)
+        assertNull("отсутствие следов НЕ закрывает попытку",
+            TtlState.applyEvidence(attempt("a", true, 1, TtlState.Phase.MAY_HAVE_RUN), absent, 5L))
+        assertTrue("fence держится",
+            TtlState.fence(listOf(attempt("a", true, 1, TtlState.Phase.MAY_HAVE_RUN)))
+                is TtlState.Fence.Blocked)
+        // Снять её может только ограждение поколением (её скрипт уже не применит правила).
+        val sup = TtlState.supersede(attempt("a", true, 1, TtlState.Phase.MAY_HAVE_RUN), "7", 5L)
+        assertEquals("ограждение — отдельная фаза", TtlState.Phase.SUPERSEDED, sup.phase)
+        assertEquals("после ограждения fence снят", TtlState.Fence.Clean, TtlState.fence(listOf(sup)))
 
         // Мусор/ошибка чтения ⇒ ничего не утверждаем.
         assertEquals(TtlState.Evidence.Unreadable, TtlState.classifyEvidence(null))

@@ -39,6 +39,9 @@ object NetworkTtl {
     @Volatile private var networkReceiver: BroadcastReceiver? = null
 
     /** §5 iter45: СОХРАНЁННОЕ НАМЕРЕНИЕ владельца. Только пользователь меняет его. */
+    /** iter61 §4.1: durable-поколение на устройстве; старые скрипты читают его и отступают. */
+    const val GEN_SLOT_FILE = "/data/local/tmp/voiceapp3_ttl_gen"
+
     const val PREF_TTL_65_ACTIVE = "ttl_65_ativo"
 
     /**
@@ -134,7 +137,10 @@ object NetworkTtl {
  * случай» новую цепь при неизвестном реестре нельзя — иначе каждое неудачное чтение плодило бы
  * цепь, а прежняя оставалась бы висеть неуправляемой.
  */
-private fun buildScript(enable: Boolean, reg: TtlOwnership.Registry?): String {
+private fun buildScript(enable: Boolean, reg: TtlOwnership.Registry?,
+                            slotGen: Long = -1L): String {
+    val guardFile = if (slotGen >= 0) GEN_SLOT_FILE else ""
+    val guardGen = if (slotGen >= 0) slotGen.toString() else ""
     val known = reg != null && reg.state == TtlOwnership.RegistryState.PRESENT && reg.chain != null
     if (!known) {
         return TtlScript.build(
@@ -142,14 +148,18 @@ private fun buildScript(enable: Boolean, reg: TtlOwnership.Registry?): String {
             gen = "unknown",
             ownChain = TtlScript.OUR_CHAIN,
             legacyChain = TtlOwnership.LEGACY_CHAIN,
-            registryUnknown = true
+            registryUnknown = true,
+            guardGen = guardGen,
+            genFile = guardFile
         )
     }
     return TtlScript.build(
         enable = enable,
         gen = reg!!.token!!,
         ownChain = reg.chain!!,
-        legacyChain = TtlOwnership.LEGACY_CHAIN
+        legacyChain = TtlOwnership.LEGACY_CHAIN,
+        guardGen = guardGen,
+        genFile = guardFile
     )
 }
 
@@ -355,7 +365,8 @@ private fun buildScript(enable: Boolean, reg: TtlOwnership.Registry?): String {
         } else {
             AppLog.i(TAG, "TTL_OWNERSHIP_REGISTRY ${reg.wire()}")
         }
-        val script = buildScript(want, reg)
+        // iter61 §4.1: скрипт несёт номер поколения и читает durable-файл поколения на устройстве;
+        // поздний скрипт старой попытки откажется менять таблицу (`exit 90`).
         // iter54 §5: исход доставки различает «не отправлено», «неизвестно» и «завершено».
         // Раньше TTL видел только `rc`/`out`, поэтому «ответ потерян» и «не выполнено» были
         // неразличимы — и `VERIFY_*` мог быть построен на выводе, которого не было.
@@ -372,9 +383,21 @@ private fun buildScript(enable: Boolean, reg: TtlOwnership.Registry?): String {
                 "(намерение владельца не подтверждено записью: таблица не меняется)")
             return TtlRunner.Outcome(false, "desire_not_persisted", "")
         }
-        // iter60 §4: FENCE. Пока прошлая попытка могла исполняться, новая мутация запрещена:
-        // сначала читаем ЕЁ terminal (read-only) и закрываем именно её, а не «вообще всё».
-        if (!resolvePreviousAttempts()) {
+        // Скрипт собирается ПОСЛЕ фиксации намерения: он несёт номер поколения (iter61 §4.1).
+        val script = buildScript(want, reg, desire.generation)
+        // iter61 §4.2: СНАЧАЛА миграция legacy iter59 → журнал iter60/61 и ПОДТВЕРЖДЕНИЕ записи,
+        // и только потом fence. Дефект iter60: миграция вызывалась из `recordAttempt`, то есть
+        // ПОСЛЕ fence — первый проход после обновления видел пустой новый журнал, разрешал send и
+        // лишь затем добавлял старую запись `MAY_HAVE_RUN`.
+        if (!migrateLegacyBeforeFence(desire.generation)) {
+            AppLog.e(TAG, "TTL_MIGRATE persisted=no action=no_send source=$source " +
+                "(перенос прежней попытки не подтверждён: таблица не меняется)")
+            return TtlRunner.Outcome(false, "legacy_migration_not_persisted", "")
+        }
+        // iter60 §4 / iter61 §4.1: FENCE. Пока прошлая попытка не разрешена, новая мутация
+        // запрещена. Разрешение — только её собственный terminal ЛИБО ограждение поколением
+        // (durable-поколение на устройстве делает её скрипт безвредным), но НЕ отсутствие файлов.
+        if (!resolvePreviousAttempts(desire.generation)) {
             AppLog.w(TAG, "TTL_FENCE action=blocked desired=${desire.on} gen=${desire.generation} " +
                 "source=$source (прошлая попытка не доказана: новой мутации нет, повтор после readback)")
             return TtlRunner.Outcome(false, "previous_attempt_unresolved", "")
@@ -389,8 +412,13 @@ private fun buildScript(enable: Boolean, reg: TtlOwnership.Registry?): String {
         AppLog.i(TAG, "TTL_ATTEMPT op=$opId evidence=${prep.evidencePath} want=$want persisted=ok " +
             "source=$source")
         // ОДНА доставка: тот же результат используется и для исхода, и для разбора вывода.
-        // Отправка началась: фаза «могло исполниться» пишется ДО shell, а не после ответа.
-        markAttempt(prep.evidencePath, want, desire.generation, TtlState.Phase.MAY_HAVE_RUN)
+        // Отправка начинается: фаза «могло исполниться» пишется ДО shell, а не после ответа.
+        // iter61 §4.4: если запись фазы НЕ подтверждена, скрипт не отправляется — иначе его исход
+        // остался бы без durable-записи и следующий fence увидел бы PREPARED.
+        if (!markAttempt(prep.evidencePath, want, desire.generation, TtlState.Phase.MAY_HAVE_RUN)) {
+            AppLog.e(TAG, "TTL_PHASE persisted=no phase=may_have_run action=no_send source=$source")
+            return TtlRunner.Outcome(false, "phase_not_persisted", "")
+        }
         val detailed = AdbClient.executePrepared(prep, 40000)
         val delivery = ScriptDelivery.outcome(detailed, opId)
         val firstOutcome = delivery
@@ -424,6 +452,7 @@ private fun buildScript(enable: Boolean, reg: TtlOwnership.Registry?): String {
         // решение принимает [TtlAttempt.decide] по типизированному исходу, и каждая новая
         // попытка получает СВОЮ identity (новый nonce/путь), которая снова подтверждается
         // записью до отправки.
+        var lastFinishedPath = prep.evidencePath
         if (want) {
             var attempt = 1
             var current = delivery
@@ -434,16 +463,35 @@ private fun buildScript(enable: Boolean, reg: TtlOwnership.Registry?): String {
                     "reason=no_uplink pause_ms=$TTL_UPLINK_RETRY_PAUSE_MS source=$source " +
                     "(скрипт доказанно завершён без применения: правила не менялись)")
                 runCatching { Thread.sleep(TTL_UPLINK_RETRY_PAUSE_MS) }
+                // iter61 §4.4: у КАЖДОЙ повторной попытки своя identity и СВОИ фазы.
                 val nextPrep = ScriptDelivery.prepare("ttl_script", script)
                 if (!recordAttempt(nextPrep.evidencePath, want, desire.generation)) {
                     AppLog.e(TAG, "TTL_ATTEMPT persisted=no action=no_send attempt=$attempt " +
                         "source=$source (адрес свидетельства не подтверждён: повтор не отправляется)")
                     break
                 }
+                if (!markAttempt(nextPrep.evidencePath, want, desire.generation,
+                        TtlState.Phase.MAY_HAVE_RUN)) {
+                    AppLog.e(TAG, "TTL_PHASE persisted=no phase=may_have_run attempt=$attempt " +
+                        "action=no_send source=$source")
+                    break
+                }
                 val again = AdbClient.executePrepared(nextPrep, 40000)
                 current = ScriptDelivery.outcome(again, opId + "_r" + attempt)
                 exitCode = if (again.payloadRc != ScriptDelivery.RC_UNKNOWN) again.payloadRc else -1
                 output = again.out
+                // Исход ЭТОЙ попытки фиксируется сразу: NotSent/Unknown/DONE — её собственные.
+                when (current) {
+                    is ScriptDelivery.DeliveryOutcome.NotSent ->
+                        markAttempt(nextPrep.evidencePath, want, desire.generation,
+                            TtlState.Phase.PROVEN_NOT_SENT)
+                    is ScriptDelivery.DeliveryOutcome.Unknown -> { /* остаётся MAY_HAVE_RUN */ }
+                    is ScriptDelivery.DeliveryOutcome.Finished ->
+                        markAttempt(nextPrep.evidencePath, want, desire.generation,
+                            TtlState.Phase.TERMINAL,
+                            if (again.payloadRc != ScriptDelivery.RC_UNKNOWN) again.payloadRc else exitCode)
+                }
+                if (current is ScriptDelivery.DeliveryOutcome.Finished) lastFinishedPath = nextPrep.evidencePath
                 attempt++
                 if (current !is ScriptDelivery.DeliveryOutcome.Finished) {
                     AppLog.w(TAG, "TTL_UPLINK_RETRY result=${current.wire()} action=stop " +
@@ -452,14 +500,17 @@ private fun buildScript(enable: Boolean, reg: TtlOwnership.Registry?): String {
                 }
             }
         }
-        markAttempt(prep.evidencePath, want, desire.generation, TtlState.Phase.TERMINAL,
+        markAttempt(lastFinishedPath, want, desire.generation, TtlState.Phase.TERMINAL,
             if (detailed.payloadRc != ScriptDelivery.RC_UNKNOWN) detailed.payloadRc else exitCode)
         // Расхождение последнего желания и выполненного применения — не «успех»: называем явно,
         // доводит следующий проход по durable-намерению.
         val lastDesire = desiredFile()?.let { TtlState.loadDesired(it) }
         if (lastDesire != null && lastDesire.on != want) {
             AppLog.i(TAG, "TTL_DESIRE_LAG applied=$want desired=${lastDesire.on} " +
-                "gen=${lastDesire.generation} action=next_pass (намерение новее применения)")
+                "gen=${lastDesire.generation} action=schedule_next_pass (намерение новее применения)")
+            // iter61 §4.4: «следующий проход» должен БЫТЬ, а не подразумеваться. Ставим отложенный
+            // проход к последнему желанию (ограниченно, через существующий механизм сети/загрузки).
+            scheduleDesiredConvergence("desire_lag")
         }
         val verify = parseVerifyResult(want, output)
         val status = verify.status
@@ -484,18 +535,15 @@ private fun buildScript(enable: Boolean, reg: TtlOwnership.Registry?): String {
      * чтением ДО отправки; файл переживает смерть процесса, поэтому потерянный ответ не
      * оставляет мутацию `iptables` без адреса для readback.
      */
-    /** Миграция iter59 → iter60 выполняется один раз за жизнь процесса. */
-    @Volatile
-    private var legacyMigrated = false
-
+    /** Прежний (iter59) файл одной попытки: только источник миграции, production его не пишет. */
     private fun attemptFile(): File? {
         val ctx = appCtxRef ?: return null
         return File(ctx.filesDir, "ttl_last_attempt")
     }
 
     /**
-     * iter60 §4: журнал попыток (append-only, last-wins по id) вместо одного перезаписываемого
-     * файла. `ttl_last_attempt` остаётся только источником миграции iter59 → iter60.
+     * iter60 §4 / iter61 §4.2: журнал попыток (append-only, last-wins по id) вместо одного
+     * перезаписываемого файла. `ttl_last_attempt` остаётся только источником миграции iter59.
      */
     private fun attemptJournal(): File? {
         val ctx = appCtxRef ?: return null
@@ -515,10 +563,13 @@ private fun buildScript(enable: Boolean, reg: TtlOwnership.Registry?): String {
         return d
     }
 
-    /** Дописать попытку в журнал и подтвердить полным readback. */
+    /**
+     * Записать попытку в журнал и ПОДТВЕРДИТЬ полным readback.
+     *
+     * @return false — identity не подтверждена ⇒ отправки быть не должно.
+     */
     private fun recordAttempt(path: String, want: Boolean, generation: Long): Boolean {
         val j = attemptJournal() ?: return false
-        migrateLegacyAttempt(j, generation)
         val id = "ttl_" + (if (want) "on" else "off") + "_" +
             System.currentTimeMillis() + "_" + generation
         val a = TtlState.Attempt(id, path, want, generation, TtlState.Phase.PREPARED,
@@ -533,45 +584,84 @@ private fun buildScript(enable: Boolean, reg: TtlOwnership.Registry?): String {
     }
 
     /**
-     * Перенос записи iter59 в журнал ровно один раз. Старый формат не различал «не отправлено» и
-     * «неизвестно», поэтому миграция даёт `MAY_HAVE_RUN`: она блокирует мутацию до readback,
-     * а не притворяется доказанным «не исполнялось».
+     * Сменить фазу попытки в журнале (durable, с readback).
+     *
+     * iter61 §4.4: возвращает РЕЗУЛЬТАТ. Если фаза не подтверждена, отправлять скрипт нельзя:
+     * иначе исход попытки останется без записи, и следующий fence увидит PREPARED.
      */
-    private fun migrateLegacyAttempt(journal: File, generation: Long) {
-        if (legacyMigrated) return
-        legacyMigrated = true
-        val legacy = runCatching { attemptFile()?.takeIf { it.exists() }?.readText() }.getOrNull()
-            ?: return
-        val migrated = TtlState.migrateLegacy(legacy, generation, "ttl") ?: return
-        if (TtlState.record(journal, migrated)) {
-            AppLog.i(TAG, "TTL_ATTEMPT_MIGRATED ${migrated.evidence()} action=fence_until_readback")
-        }
-    }
-
-    /** Сменить фазу попытки в журнале (durable, с readback). */
     private fun markAttempt(path: String, want: Boolean, generation: Long, phase: TtlState.Phase,
-                            payloadRc: Int = Int.MIN_VALUE) {
-        val j = attemptJournal() ?: return
+                            payloadRc: Int = Int.MIN_VALUE): Boolean {
+        val j = attemptJournal() ?: return false
         val records = TtlState.parseJournal(runCatching { j.readText() }.getOrNull())
         val a = records.lastOrNull {
             it.evidencePath == path && it.want == want && it.generation == generation
-        } ?: return
+        } ?: return false
         val next = a.copy(phase = phase, payloadRc = payloadRc, ts = System.currentTimeMillis())
-        if (!TtlState.transition(j, next)) {
-            AppLog.e(TAG, "TTL_ATTEMPT_PHASE ${next.evidence()} persisted=no")
-        }
+        val ok = TtlState.transition(j, next)
+        if (!ok) AppLog.e(TAG, "TTL_ATTEMPT_PHASE ${next.evidence()} persisted=no")
+        return ok
     }
 
     /**
-     * iter60 §4: закрыть прошлые попытки по durable-свидетельству, ПРЕЖДЕ чем менять таблицу.
+     * iter61 §4.2 — ПЕРЕНОС ПРЕЖНЕЙ ПОПЫТКИ ДО FENCE, идемпотентно и с подтверждением записи.
      *
-     * @return true — незавершённых попыток не осталось; false — мутация запрещена.
+     * Первый проход после обновления обязан «увидеть» прежнюю (iter59) запись раньше, чем решит,
+     * что мутировать можно. Перенос выполняется один раз; при повторе либо он уже в журнале
+     * (проверяется по `id`), либо повторяется — но никогда не размножает попытку и не теряет её.
+     *
+     * @return false — перенос не подтверждён (send запрещён).
      */
-    private fun resolvePreviousAttempts(): Boolean {
+    private fun migrateLegacyBeforeFence(generation: Long): Boolean {
+        val legacyFile = attemptFile() ?: return true
+        val journalFile = attemptJournal() ?: return false
+        val exists = runCatching { legacyFile.exists() }.getOrDefault(false)
+        if (!exists) return true
+        val raw = runCatching { legacyFile.readText() }.getOrNull()
+        if (raw == null) {
+            // Файл есть, но не читается: это НЕ «нет записи».
+            AppLog.e(TAG, "TTL_MIGRATE file=present read=failed action=no_send")
+            return false
+        }
+        val migrated = TtlState.migrateLegacy(raw, generation, "ttl") ?: return true
+        val existing = runCatching { journalFile.readText() }.getOrNull()
+        if (existing != null && TtlState.parseJournal(existing).any { it.id == migrated.id }) {
+            return true   // уже перенесено ранее
+        }
+        if (!TtlState.record(journalFile, migrated)) {
+            AppLog.e(TAG, "TTL_MIGRATE persisted=no attempt=${migrated.id} action=no_send")
+            return false
+        }
+        AppLog.i(TAG, "TTL_MIGRATE ${migrated.evidence()} action=fence_until_resolved")
+        return true
+    }
+
+    /**
+     * iter61 §4.1/§4.3 — сверка прошлых попыток перед мутацией.
+     *
+     * 1. terminal ЭТОЙ попытки (`DONE=rc=N`) — закрывает её с кодом payload;
+     * 2. иначе — ограждение поколением: durable-поколение на устройстве уже другое, и скрипт
+     *    попытки откажется применять правила (`VAPP_TTL_SUPERSEDED`, `exit 90`), т.е. безвреден;
+     * 3. иначе — попытка остаётся неразрешённой, мутации нет.
+     *
+     * Отсутствие файлов, `.started` без terminal и нечитаемый ответ доказательством НЕ являются.
+     */
+    private fun resolvePreviousAttempts(slotGen: Long): Boolean {
         val j = attemptJournal() ?: return false
-        val records = TtlState.parseJournal(runCatching { j.readText() }.getOrNull())
-        val pending = TtlState.unresolved(records)
+        val exists = runCatching { j.exists() }.getOrDefault(false)
+        val text = runCatching { j.readText() }.getOrNull()
+        val journal = TtlState.readJournal(text, exists)
+        if (!journal.mutationAllowed) {
+            AppLog.e(TAG, "TTL_JOURNAL state=${journal.state.name.lowercase()} " +
+                "bad_lines=${journal.badLines} action=no_send " +
+                "(журнал недостоверен: неизвестная попытка не исключена)")
+            return false
+        }
+        val pending = TtlState.unresolved(journal.records)
         if (pending.isEmpty()) return true
+        if (!publishSlotGeneration(slotGen)) {
+            AppLog.w(TAG, "TTL_FENCE gen=$slotGen published=no action=wait")
+            return false
+        }
         for (a in pending) {
             if (a.evidencePath.isEmpty()) {
                 AppLog.w(TAG, "TTL_FENCE attempt=${a.id} evidence=none state=unresolved")
@@ -583,13 +673,38 @@ private fun buildScript(enable: Boolean, reg: TtlOwnership.Registry?): String {
             }.getOrNull()
             val ev = TtlState.classifyEvidence(r?.takeIf { it.first == 0 }?.second)
             val resolved = TtlState.applyEvidence(a, ev, System.currentTimeMillis())
-            AppLog.i(TAG, "TTL_FENCE attempt=${a.id} evidence=${a.evidencePath} " +
-                "kind=${ev::class.simpleName} action=${if (resolved == null) "wait" else "close"}")
-            if (resolved == null) return false
-            if (!TtlState.transition(j, resolved)) return false
+            if (resolved != null) {
+                if (!TtlState.transition(j, resolved)) return false
+                AppLog.i(TAG, "TTL_FENCE attempt=${a.id} kind=DONE action=close " +
+                    "payload_rc=${resolved.payloadRc}")
+                continue
+            }
+            val sup = TtlState.supersede(a, slotGen.toString(), System.currentTimeMillis())
+            if (!TtlState.transition(j, sup)) {
+                AppLog.e(TAG, "TTL_FENCE attempt=${a.id} persisted=no action=wait")
+                return false
+            }
+            AppLog.i(TAG, "TTL_FENCE attempt=${a.id} kind=${ev::class.simpleName} " +
+                "action=superseded gen=$slotGen (поздний скрипт не изменит таблицу)")
         }
-        return TtlState.unresolved(TtlState.parseJournal(runCatching { j.readText() }.getOrNull()))
-            .isEmpty()
+        val after = TtlState.readJournal(runCatching { j.readText() }.getOrNull(), true)
+        return after.mutationAllowed && TtlState.unresolved(after.records).isEmpty()
+    }
+
+    /**
+     * Записать durable-поколение на устройстве. Именно оно делает старые скрипты безвредными:
+     * скрипт попытки читает файл и при несовпадении выходит с `exit 90` до любой мутации.
+     */
+    private fun publishSlotGeneration(gen: Long): Boolean {
+        val cmd = "printf '%s' '$gen' > $GEN_SLOT_FILE 2>/dev/null; cat $GEN_SLOT_FILE 2>/dev/null"
+        val r = runCatching { AdbClient.execute(cmd, 8000, false) }.getOrNull() ?: return false
+        val back = r.second.trim()
+        if (back != gen.toString()) {
+            AppLog.w(TAG, "TTL_GEN publish=no gen=$gen readback=«${back.take(16)}»")
+            return false
+        }
+        AppLog.i(TAG, "TTL_GEN published gen=$gen file=$GEN_SLOT_FILE")
+        return true
     }
 
     /** Факт применения: значение + поколение + загрузка (все три проверяются при чтении). */
@@ -822,6 +937,9 @@ private fun buildScript(enable: Boolean, reg: TtlOwnership.Registry?): String {
     /** Один отложенный повтор по сетевому событию (без циклов: флаг single-shot). */
     @Volatile private var recheckScheduled = false
 
+    /** Пауза перед доведением последнего намерения (iter61 §4.4). */
+    internal var TTL_DESIRE_LAG_DELAY_MS: Long = 5000L
+
     private fun networkRecheckOnce(ctx: Context, delayMs: Long) {
         if (recheckScheduled) return
         recheckScheduled = true
@@ -829,6 +947,19 @@ private fun buildScript(enable: Boolean, reg: TtlOwnership.Registry?): String {
             recheckScheduled = false
             runCatching { reapplyForNetwork(ctx) }
         }
+    }
+
+    /**
+     * iter61 §4.4 — РЕАЛЬНЫЙ следующий проход к последнему намерению владельца.
+     *
+     * Раньше расхождение «применено ≠ желание» только логировалось (`TTL_DESIRE_LAG`): гарантии,
+     * что проход действительно произойдёт, не было. Здесь проход ставится тем же ограниченным
+     * механизмом, что и реакция на сеть: один раз, с задержкой, с дедупликацией.
+     */
+    private fun scheduleDesiredConvergence(reason: String) {
+        val ctx = appCtxRef ?: return
+        networkRecheckOnce(ctx, TTL_DESIRE_LAG_DELAY_MS)
+        AppLog.i(TAG, "TTL_CONVERGE scheduled=1 reason=$reason delay_ms=$TTL_DESIRE_LAG_DELAY_MS")
     }
 
     /**

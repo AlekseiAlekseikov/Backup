@@ -21,7 +21,7 @@ import java.util.concurrent.TimeUnit
  * [JitOwn.ownHelpersForTest], реальные `/proc`, реальная сигнализация):
  *  1. старое правило, воспроизведённое в тесте с барьерами, действительно удаляет admin ЖИВОГО
  *     владельца и пускает второго в секцию (дефект подтверждён, а не описан словами);
- *  2. новый протокол (уникальное имя участника `p.<inst>.<pid>` + билеты) в тех же условиях
+ *  2. новый протокол (уникальная запись НОМЕРА `n.<k>` + noclobber-захват, iter61 §3) в тех же условиях
  *     второго не пускает и файл живого не трогает;
  *  3. взаимное исключение под 4 реальными конкурентными процессами: каждый вход проверяется
  *     «свидетелем», который может держать только один; считаются ФАКТИЧЕСКИЕ нарушения;
@@ -69,17 +69,22 @@ class Iter59JitAdminTest {
     private fun startSleeper(sec: String = "30"): Process =
         ProcessBuilder("sleep", sec).redirectErrorStream(true).start()
 
-    private fun participantFile(inst: String, pid: Long) = File(admDir, "p.$inst.$pid")
+    private fun participantFile(slot: Int) = File(admDir, "n.$slot")
 
-    private fun writeParticipant(inst: String, pid: Long, pstart: String, ticket: Int = 1) {
+    private fun writeParticipant(inst: String, pid: Long, pstart: String, slot: Int = 1) {
         admDir.mkdirs()
-        participantFile(inst, pid).writeText(
-            "ticket=$ticket;inst=$inst;pid=$pid;pstart=$pstart;boot=${bootId()}\n"
+        participantFile(slot).writeText(
+            "slot=$slot;inst=$inst;pid=$pid;pstart=$pstart;boot=${bootId()}\n"
         )
     }
 
     private fun participantNames(): List<String> =
-        admDir.listFiles()?.filter { it.name.startsWith("p.") }?.map { it.name }?.sorted() ?: emptyList()
+        admDir.listFiles()?.filter { it.name.matches(Regex("n\\.\\d+")) }?.map { it.name }?.sorted()
+            ?: emptyList()
+
+    /** Содержимое всех записей номеров — по нему видно, чья запись осталась/снята. */
+    private fun participantContents(): List<String> =
+        participantNames().map { File(admDir, it).readText().trim() }
 
     // ───────── 1. Дефект iter58 воспроизведён: «сравнить → rm по имени» удаляет ЖИВОГО ─────────
 
@@ -162,8 +167,8 @@ class Iter59JitAdminTest {
     fun newProtocolKeepsTheLiveParticipantAndRefusesTheSecond() {
         val live = startSleeper()
         try {
-            writeParticipant("LIVE", live.pid(), pstartOf(live.pid()), ticket = 1)
-            val before = participantFile("LIVE", live.pid()).readText()
+            writeParticipant("LIVE", live.pid(), pstartOf(live.pid()), slot = 1)
+            val before = participantFile(1).readText()
 
             val (_, out) = withHelpers("new_enter.sh", "CONTENDER",
                 """
@@ -173,10 +178,10 @@ class Iter59JitAdminTest {
 
             val rc = out.substringAfter("ENTER=").substringBefore("\n").trim()
             assertEquals("вход при живом участнике запрещён", "1", rc)
-            assertEquals("запись живого участника не тронута", before,
-                participantFile("LIVE", live.pid()).readText())
-            assertFalse("своей записи после отказа не осталось",
-                participantNames().any { it.startsWith("p.CONTENDER.") })
+            assertEquals("запись живого участника не тронута", before, participantFile(1).readText())
+            assertFalse("своей записи после отказа не осталось: ${participantContents()}",
+                participantContents().any { it.contains("inst=CONTENDER") })
+            assertEquals("лишних номеров не появилось: ${participantNames()}", 1, participantNames().size)
             assertTrue("живой процесс жив", live.isAlive)
         } finally {
             live.destroyForcibly()
@@ -238,24 +243,24 @@ class Iter59JitAdminTest {
         val deadPid = dead.pid()
         dead.waitFor(30, TimeUnit.SECONDS)
         // pstart намеренно не тот: pid уже переиспользован/освобождён → смерть доказана.
-        writeParticipant("DEAD", deadPid, "1", ticket = 1)
+        writeParticipant("DEAD", deadPid, "1", slot = 1)
 
         val (_, out) = withHelpers("reclaim.sh", "NEW",
             """
             _jit_admin_enter
             echo "ENTER=${'$'}?"
-            _ad_me="${'$'}{_adm_dir}/p.NEW.${'$'}{_me_pid}"
-            [ -f "${'$'}_ad_me" ] && echo "OWN_FILE=during"
+            _ad_me="${'$'}{_ad_me:-}"
+            [ -n "${'$'}_ad_me" ] && [ -f "${'$'}_ad_me" ] && echo "OWN_FILE=during"
             _jit_admin_exit
-            [ -f "${'$'}_ad_me" ] && echo "OWN_FILE=after" || echo "OWN_FILE=gone"
+            [ -n "${'$'}_ad_me" ] && [ -f "${'$'}_ad_me" ] && echo "OWN_FILE=after" || echo "OWN_FILE=gone"
             """.trimIndent())
 
         assertEquals("вход под доказанно мёртвым разрешён", "0",
             out.substringAfter("ENTER=").substringBefore("\n").trim())
         assertTrue("своя запись существует внутри секции: $out", out.contains("OWN_FILE=during"))
         assertTrue("своя запись снята на выходе: $out", out.contains("OWN_FILE=gone"))
-        assertFalse("запись мёртвого снята по своему имени: ${participantNames()}",
-            participantNames().any { it.startsWith("p.DEAD.") })
+        assertFalse("запись мёртвого снята по своему имени: ${participantContents()}",
+            participantContents().any { it.contains("inst=DEAD") })
     }
 
     @Test
@@ -275,7 +280,8 @@ class Iter59JitAdminTest {
         val firstLine = holderOut.readLine()
         assertEquals("владелец вошёл", "HOLDER_IN=0", firstLine)
         Thread.sleep(100)
-        assertTrue("участник держит секцию", participantNames().any { it.startsWith("p.HOLDER.") })
+        assertTrue("участник держит секцию: ${participantContents()}",
+            participantContents().any { it.contains("inst=HOLDER") })
 
         p.destroyForcibly()                       // crash внутри секции: файл участника остался
         p.waitFor(30, TimeUnit.SECONDS)
@@ -292,8 +298,8 @@ class Iter59JitAdminTest {
         assertEquals("после crash вход состоялся", "0",
             out.substringAfter("ENTER=").substringBefore("\n").trim())
         assertTrue("ожидание ограничено, а не бесконечно: ${took}ms", took < 30_000)
-        assertFalse("запись упавшего снята: ${participantNames()}",
-            participantNames().any { it.startsWith("p.HOLDER.") })
+        assertFalse("запись упавшего снята: ${participantContents()}",
+            participantContents().any { it.contains("inst=HOLDER") })
     }
 
     // ───────── 5. Legacy admin-файл и повреждённая запись ─────────
@@ -336,7 +342,7 @@ class Iter59JitAdminTest {
     @Test
     fun corruptParticipantEntryIsNeverRemovedWithoutProofOfDeath() {
         admDir.mkdirs()
-        val corrupt = File(admDir, "p.GARBAGE.999999").apply { writeText("") }
+        val corrupt = File(admDir, "n.1").apply { writeText("") }
 
         val (_, out) = withHelpers("corrupt.sh", "NEW3",
             """
@@ -347,8 +353,8 @@ class Iter59JitAdminTest {
         assertEquals("вход при недоказуемой записи запрещён", "1",
             out.substringAfter("ENTER=").substringBefore("\n").trim())
         assertTrue("повреждённая запись не удалена «наугад»", corrupt.exists())
-        assertFalse("своей записи не осталось",
-            participantNames().any { it.startsWith("p.NEW3.") })
+        assertFalse("своей записи не осталось: ${participantContents()}",
+            participantContents().any { it.contains("inst=NEW3") })
     }
 
     // ───────── 6. Production-путь: guard не идёт к опасному действию без владения ─────────
@@ -370,7 +376,8 @@ class Iter59JitAdminTest {
             guard.indexOf("if ! _lock_self_mark; then") < guard.indexOf("START ts="))
         // Админ-секция — уникальные имена участников, а не общий файл, удаляемый по имени.
         val helpers = JitOwn.ownHelpersForTest(b)
-        assertTrue("участник с уникальным именем", helpers.contains("/p."))
+        assertTrue("номер занимается атомарным созданием noclobber: n.<k>",
+            helpers.contains("n.\${'$'}{_acs_k}") || helpers.contains("${'$'}{_adm_dir}/n."))
         assertFalse("общий admin-файл больше не удаляется по имени",
             Regex("rm -f \"?\\$\\{lock\\}\\.admin").containsMatchIn(helpers))
     }

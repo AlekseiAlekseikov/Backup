@@ -63,7 +63,25 @@ internal object TtlScript {
          * (ни ON, ни OFF). Это не «выключение функции навсегда»: причина и путь восстановления
          * видны в отчёте, а выбор владельца остаётся сохранённым.
          */
-        registryUnknown: Boolean = false
+        registryUnknown: Boolean = false,
+        /**
+         * iter61 §4.1 — ОГРАЖДЕНИЕ СТАРОЙ ПОПЫТКИ ПОКОЛЕНИЕМ.
+         *
+         * Отсутствие файлов на устройстве НЕ доказывает, что отправленный ранее shell не начнёт
+         * исполняться позже. Поэтому вместо «доказанного NotSent по пустому readback» вводится
+         * механизм, который делает ПОЗДНЮЮ попытку безвредной: каждая попытка несёт свой номер
+         * поколения, а в начале payload читает durable-файл поколения на устройстве и отказывается
+         * что-либо менять, если поколение уже сменилось (`exit 90`, код `superseded`).
+         *
+         * Так «старая попытка» перестаёт быть неопределённостью: её исход больше не влияет на
+         * таблицу, и можно безопасно продолжать к последнему выбору владельца — без вечной
+         * блокировки и без ложного утверждения «не отправлено».
+         *
+         * [guardGen] — номер поколения этой попытки; [genFile] — путь durable-файла на устройстве.
+         * Пустые значения выключают ограждение (совместимость со старыми вызовами).
+         */
+        guardGen: String = "",
+        genFile: String = ""
     ): String {
         val enableBit = if (registryUnknown) "2" else if (enable) "1" else "0"
         // `gen` — токен УСТАНОВКИ (не константа): он делает владение проверяемым настолько,
@@ -76,9 +94,21 @@ internal object TtlScript {
             .ifEmpty { OUR_CHAIN }
         val safeLegacy = legacyChain.filter { it.isLetterOrDigit() || it == '_' }.take(28)
             .ifEmpty { LEGACY_CHAIN }
+        val safeGuard = guardGen.filter { it.isLetterOrDigit() || it == '_' || it == '-' }.take(32)
+        val safeGenFile = genFile.filter { it.isLetterOrDigit() || it == '/' || it == '_' || it == '.' || it == '-' }
+        val guard = if (safeGuard.isEmpty() || safeGenFile.isEmpty()) "" else """
+# ---------- iter61 §4.1: ОГРАЖДЕНИЕ ПОКОЛЕНИЕМ (до любой мутации таблицы) ----------
+TTL_SLOT_GEN='${safeGuard}'
+TTL_SLOT_FILE='${safeGenFile}'
+_seen_gen=${D}(cat "${D}TTL_SLOT_FILE" 2>/dev/null)
+if [ "${D}_seen_gen" != "${D}TTL_SLOT_GEN" ]; then
+  echo "VAPP_TTL_SUPERSEDED gen=${D}TTL_SLOT_GEN cur=${D}{_seen_gen:-none}"
+  exit 90
+fi
+echo "VAPP_TTL_GEN_OK gen=${D}TTL_SLOT_GEN"
+"""
         return """
-set +e
-ENABLE=@ENABLE_VALUE@
+set +e""" + guard + "\n" + """ENABLE=@ENABLE_VALUE@
 REGISTRY_UNKNOWN=@REGISTRY_UNKNOWN@
 OUR=@OUR_CHAIN@
 # Историческое имя цепи (только для отчёта; никогда не изменяется). iter54 §6.1.

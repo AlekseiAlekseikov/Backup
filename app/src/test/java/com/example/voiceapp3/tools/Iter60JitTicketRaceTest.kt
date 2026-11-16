@@ -9,7 +9,15 @@ import java.io.File
 import java.util.concurrent.TimeUnit
 
 /**
- * iter60 §3 — ДЕТЕРМИНИРОВАННЫЙ regression: гонка «одинаковый ticket до публикации».
+ * iter60 §3 — ДЕТЕРМИНИРОВАННЫЙ regression: гонка «одинаковый номер до публикации».
+ *
+ * ВАЖНО (iter61 §3): протокол входа заменён — вместо пары `c.<inst>.<pid>` / `p.<inst>.<pid>`
+ * (снимок каталога + вычисленный ticket) производственный код занимает НОМЕР через
+ * создание файла `n.<k>` в режиме noclobber и ждёт меньшие номера поимённо
+ * (`JitOwn.kt:_adm_claim_slot`, `:649–717`). Этот файл обновлён под новый протокол: сценарии
+ * и инварианты сохранены (два владельца невозможны, вложенность, живой не снимается, мёртвый
+ * освобождается, identity по содержимому), изменены ТОЛЬКО имена записей и точка остановки
+ * (`_adm_barrier_after_slot`). Ослаблений нет: добавлено требование видимости записи номера.
  *
  * Дефект iter59 (`JitOwn.kt:497–516` + `:519–554`), независимо воспроизведён проверяющим:
  * ```text
@@ -19,9 +27,9 @@ import java.util.concurrent.TimeUnit
  * ```
  * Итог — два живых владельца в секции. Стресс 4×15 такое расписание не ловит.
  *
- * Как сделано детерминированно: производственный код вызывает `_adm_barrier_after_ticket` —
+ * Как сделано детерминированно: производственный код вызывает `_adm_barrier_after_slot` —
  * в бою это пустой no-op; тест ПЕРЕОПРЕДЕЛЯЕТ его и останавливает участника ровно между
- * вычислением тикета и публикацией. Алгоритм не меняется, добавляется только точка остановки.
+ * сразу ПОСЛЕ занятия номера и ДО ожидания меньших номеров. Алгоритм не меняется, добавляется только точка остановки.
  *
  * Проверяется фактическое состояние: файлы участников, «свидетель» (может держать только один),
  * живость процессов и число реальных нарушений, а не совпадение текста shell.
@@ -80,7 +88,7 @@ class Iter60JitTicketRaceTest {
      */
     private fun participant(inst: String, holdMs: Int, barrierPrefix: String = ""): Runner {
         val barrier = if (barrierPrefix.isEmpty()) "" else """
-            _adm_barrier_after_ticket() {
+            _adm_barrier_after_slot() {
               : > "${barrierPrefix}.scanned"
               _bw=0
               while [ ! -f "${barrierPrefix}.go" ] && [ "${'$'}_bw" -lt 3000 ]; do
@@ -166,26 +174,26 @@ class Iter60JitTicketRaceTest {
     // ─────────────── 2. Фаза выбора публикуется ДО вычисления тикета ───────────────
 
     @Test
-    fun choosingPhaseIsPublishedBeforeTheTicketIsComputed() {
+    fun slotRecordIsPublishedBeforeTheParticipantWaits() {
         val barrier = File(base, "barrier_c").absolutePath
         val a = participant("a", holdMs = 0, barrierPrefix = barrier)
         assertTrue("a дошёл до барьера", waitFor(File("$barrier.scanned")))
 
         val names = entries()
-        assertTrue("фаза выбора видна другим участникам: $names",
-            names.any { it.startsWith("c.") || it.startsWith(".tmp.") })
-        assertFalse("тикет ещё не опубликован: $names", names.any { it.startsWith("p.") })
+        assertTrue("занятый номер виден другим участникам: $names",
+            names.any { it.matches(Regex("n\\.\\d+")) })
+        assertTrue("ровно одна запись номера: $names", names.count { it.startsWith("n.") } == 1)
 
-        // Пока a выбирает номер, новый участник не имеет права войти.
+        // Пока a ждёт (номер занят, секция не получена), новый участник не имеет права войти.
         val z = participant("z", holdMs = 0)
         assertTrue("z получил исход", z.await("ENTER z") || z.await("REFUSE z"))
         val zOut = z.text()
-        assertTrue("z не вошёл при незавершённом выборе: $zOut",
+        assertTrue("z не вошёл, пока a держит барьер: $zOut",
             zOut.contains("REFUSE z") && !zOut.contains("ENTER z"))
         z.stop()
 
         File("$barrier.go").createNewFile()
-        assertTrue("после публикации тикета a входит: ${a.text()}", a.await("ENTER a witness=taken"))
+        assertTrue("после барьера a входит: ${a.text()}", a.await("ENTER a witness=taken"))
         assertFalse("нарушений нет: ${a.text()}", a.text().contains("VIOLATION"))
         a.stop()
     }
@@ -203,7 +211,7 @@ class Iter60JitTicketRaceTest {
             val s = participant(second, holdMs = 0)
             // Второй участник НЕ должен войти, пока первый выбирает номер.
             Thread.sleep(400)
-            assertFalse("$second вошёл, пока $first выбирал номер: ${s.text()}",
+            assertFalse("$second вошёл, пока $first стоял на барьере: ${s.text()}",
                 s.text().contains("ENTER $second witness=taken"))
             File("$barrier.go").createNewFile()
             assertTrue("$first получил исход", f.await("ENTER $first") || f.await("REFUSE $first"))
@@ -212,7 +220,7 @@ class Iter60JitTicketRaceTest {
             assertFalse("порядок $order: нарушений свидетеля нет: $all", all.contains("VIOLATION"))
             f.stop(); s.stop()
             // Между итерациями каталог чистим только от завершённых участников.
-            admDir.listFiles()?.forEach { if (it.name.startsWith("p.") || it.name.startsWith("c.")) it.delete() }
+            admDir.listFiles()?.forEach { if (it.name.startsWith("n.")) it.delete() }
             witness.delete()
         }
     }
@@ -228,13 +236,14 @@ class Iter60JitTicketRaceTest {
                 _jit_admin_enter; echo "INNER=${'$'}?"
                 echo "DEPTH=${'$'}{_ad_depth:-0}"
                 _jit_admin_exit
-                if [ -f "${'$'}{_adm_dir}/p.nested.${'$'}{_me_pid}" ]; then
+                _sl="${'$'}{_ad_me:-}"
+                if [ -n "${'$'}_sl" ] && [ -f "${'$'}_sl" ]; then
                   echo "STILL_OWNER=yes"
                 else
                   echo "STILL_OWNER=no"
                 fi
                 _jit_admin_exit
-                if [ -f "${'$'}{_adm_dir}/p.nested.${'$'}{_me_pid}" ]; then
+                if [ -n "${'$'}_sl" ] && [ -f "${'$'}_sl" ]; then
                   echo "AFTER_FINAL=left"
                 else
                   echo "AFTER_FINAL=gone"
@@ -249,17 +258,17 @@ class Iter60JitTicketRaceTest {
         assertTrue("внутренний вход: $out", out.contains("INNER=0"))
         assertTrue("глубина вложенности учтена (внешний + внутренний = 2): $out",
             out.contains("DEPTH=2"))
-        assertTrue("внутренний выход НЕ снял запись внешнего: $out", out.contains("STILL_OWNER=yes"))
-        assertTrue("после внешнего выхода запись снята: $out", out.contains("AFTER_FINAL=gone"))
+        assertTrue("внутренний выход НЕ снял номер внешнего: $out", out.contains("STILL_OWNER=yes"))
+        assertTrue("после внешнего выхода номер снят: $out", out.contains("AFTER_FINAL=gone"))
     }
 
     @Test
     fun anotherIdentityWithMyNameIsNeverTreatedAsMySection() {
         // Прямая проверка правила identity: совпало только имя файла — это НЕ моя секция.
         val myPid = 4242L
-        val mine = "ticket=1;inst=me;pid=$myPid;pstart=777;boot=B1"
-        val other = "ticket=1;inst=me;pid=$myPid;pstart=999;boot=B1"
-        val otherInst = "ticket=1;inst=other;pid=$myPid;pstart=777;boot=B1"
+        val mine = "slot=1;inst=me;pid=$myPid;pstart=777;boot=B1"
+        val other = "slot=1;inst=me;pid=$myPid;pstart=999;boot=B1"
+        val otherInst = "slot=1;inst=other;pid=$myPid;pstart=777;boot=B1"
         val script = File(base, "identity.sh").apply {
             writeText(
                 JitOwn.ownHelpersForTest(b) + "\n_me_inst=\"me\"\n_me_pid=$myPid\n_me_pstart=777\n" + """
@@ -284,27 +293,27 @@ class Iter60JitTicketRaceTest {
         val deadPid = dead.pid()
         dead.waitFor(30, TimeUnit.SECONDS)
         admDir.mkdirs()
-        val stale = File(admDir, "p.stale.$deadPid")
-        stale.writeText("ticket=1;inst=stale;pid=$deadPid;pstart=1;boot=${bootId()}\n")
+        val stale = File(admDir, "n.1")
+        stale.writeText("slot=1;inst=stale;pid=$deadPid;pstart=1;boot=${bootId()}\n")
 
         val a = participant("a", holdMs = 0)
-        assertTrue("вход после снятия мёртвой записи: ${a.text()}", a.await("ENTER a witness=taken"))
-        assertFalse("запись мёртвого снята: ${entries()}", stale.exists())
+        assertTrue("вход после снятия мёртвого номера: ${a.text()}", a.await("ENTER a witness=taken"))
+        assertFalse("номер мёртвого освобождён: ${entries()}", stale.exists())
         a.stop()
 
         // (б) живая запись (другой владелец внутри) ⇒ вход НЕ даётся, запись не тронута.
         val live = startSleeper()
         try {
-            val liveFile = File(admDir, "p.live.${live.pid()}")
+            val liveFile = File(admDir, "n.1")
             liveFile.writeText(
-                "ticket=1;inst=live;pid=${live.pid()};pstart=${pstartOf(live.pid())};boot=${bootId()}\n"
+                "slot=1;inst=live;pid=${live.pid()};pstart=${pstartOf(live.pid())};boot=${bootId()}\n"
             )
             val z = participant("z", holdMs = 0)
             assertTrue("участник получил исход: ${z.text()}",
                 z.await("ENTER z") || z.await("REFUSE z", 20_000))
             assertTrue("при живом владельце входа нет: ${z.text()}",
                 z.text().contains("REFUSE z") && !z.text().contains("ENTER z"))
-            assertTrue("запись живого не тронута: ${entries()}", liveFile.exists())
+            assertTrue("номер живого не тронут: ${entries()}", liveFile.exists())
             assertTrue("живой процесс жив", live.isAlive)
             z.stop()
         } finally {

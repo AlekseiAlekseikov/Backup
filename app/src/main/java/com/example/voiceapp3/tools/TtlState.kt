@@ -35,7 +35,21 @@ import java.io.FileOutputStream
 internal object TtlState {
 
     /** Фаза попытки. `TERMINAL` знает код payload, `PROVEN_NOT_SENT` — доказанное «не уходило». */
-    enum class Phase { PREPARED, MAY_HAVE_RUN, TERMINAL, PROVEN_NOT_SENT }
+    enum class Phase {
+        PREPARED,
+        MAY_HAVE_RUN,
+        TERMINAL,
+        /** Доказанное транспортом «ни байта не ушло» (только по outcome доставки). */
+        PROVEN_NOT_SENT,
+        /**
+         * iter61 §4.1: намерение старой попытки ОТМЕНЕНО durable-поколением на устройстве.
+         *
+         * Это не «не отправлено» и не terminal: скрипт мог начать исполняться, но его защита
+         * поколением гарантирует, что он не применит свои правила (`exit 90`). Поэтому попытка
+         * перестаёт блокировать новую мутацию — без вечной блокировки и без ложного NotSent.
+         */
+        SUPERSEDED
+    }
 
     data class Attempt(
         val id: String,
@@ -44,7 +58,9 @@ internal object TtlState {
         val generation: Long,
         val phase: Phase,
         val payloadRc: Int = Int.MIN_VALUE,
-        val ts: Long = 0L
+        val ts: Long = 0L,
+        /** Пояснение для журнала (не влияет на решение fence). */
+        val reasonHint: String = ""
     ) {
         fun wire(): String = "id=$id;path=$evidencePath;want=${if (want) "on" else "off"};" +
             "gen=$generation;phase=${phase.name.lowercase()};" +
@@ -55,6 +71,7 @@ internal object TtlState {
             "payload_rc=${if (payloadRc == Int.MIN_VALUE) "unknown" else payloadRc.toString()}"
 
         /** Попытка ещё может исполняться: её terminal обязан быть разрешён до новой мутации. */
+        /** Попытка ещё не разрешена. `SUPERSEDED` разрешена: её скрипт больше не применит правила. */
         val unresolved: Boolean get() = phase == Phase.PREPARED || phase == Phase.MAY_HAVE_RUN
     }
 
@@ -89,6 +106,43 @@ internal object TtlState {
         val gen = Regex("gen=(-?\\d+)").find(text)?.groupValues?.get(1)?.toLongOrNull() ?: return null
         val ts = Regex("ts=(\\d+)").find(text)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
         return Desired(on, gen, ts)
+    }
+
+    /**
+     * Состояние журнала попыток. iter61 §4.3: «нет файла» и «файл не прочитан/битый» — РАЗНОЕ.
+     * Второе не даёт права что-либо менять: неизвестная попытка могла быть.
+     */
+    enum class JournalState { ABSENT, OK, UNREADABLE, CORRUPT }
+
+    data class Journal(val state: JournalState, val records: List<Attempt>, val badLines: Int) {
+        /** Можно ли продолжать: только когда журнал прочитан и в нём нет незавершённых попыток. */
+        val mutationAllowed: Boolean get() = state != JournalState.UNREADABLE && state != JournalState.CORRUPT
+    }
+
+    /**
+     * Классифицировать содержимое журнала.
+     *
+     * @param text `null` — файла нет ЛИБО прочитать не удалось; различие задаёт [exists].
+     */
+    fun readJournal(text: String?, exists: Boolean): Journal {
+        if (text == null) {
+            return Journal(if (exists) JournalState.UNREADABLE else JournalState.ABSENT, emptyList(), 0)
+        }
+        var bad = 0
+        for (line in text.lineSequence()) {
+            if (line.isBlank()) continue
+            if (parseAttempt(line) == null) bad++
+        }
+        val records = parseJournal(text)
+        // Обрезанная последняя строка (нет завершающего перевода строки и не разбирается) — признак
+        // частичной записи: журнал НЕ считается достоверным.
+        val truncated = text.isNotEmpty() && !text.endsWith("\n") && bad > 0
+        val state = when {
+            truncated -> JournalState.CORRUPT
+            bad > 0 -> JournalState.CORRUPT
+            else -> JournalState.OK
+        }
+        return Journal(state, records, bad)
     }
 
     /** Журнал: последняя строка по `id` побеждает (как в `LockOp.parseJournal`). */
@@ -235,8 +289,21 @@ internal object TtlState {
      * оставляет `payloadRc` неизвестным и записывает причину в id (аудит в журнале).
      */
     fun forceAbandon(a: Attempt, reason: String, now: Long): Attempt =
-        a.copy(phase = Phase.PROVEN_NOT_SENT, payloadRc = Int.MIN_VALUE, ts = now,
-            id = a.id + ":abandoned:" + reason.take(24))
+        // iter61 §4.4: НЕ выдаём отказ владельца за доказанное NotSent и не меняем `id`
+        // (иначе из-за last-wins старая незавершённая запись могла бы «потеряться» или всплыть).
+        a.copy(phase = Phase.SUPERSEDED, payloadRc = Int.MIN_VALUE, ts = now,
+            reasonHint = "owner_resolved_unprovable:" + reason.take(24))
+
+    /**
+     * iter61 §4.1 — ОГРАЖДЕНИЕ ПОКОЛЕНИЕМ: попытка снимается не «по отсутствию файлов», а потому
+     * что durable-поколение на устройстве уже другое, и её собственный скрипт откажется применять
+     * правила (`VAPP_TTL_SUPERSEDED`, `exit 90`).
+     *
+     * @param slotGen поколение, подтверждённое записью на устройстве.
+     */
+    fun supersede(a: Attempt, slotGen: String, now: Long): Attempt =
+        a.copy(phase = Phase.SUPERSEDED, payloadRc = Int.MIN_VALUE, ts = now,
+            id = a.id)
 
     /** Что говорит durable-свидетельство на устройстве о прошлой попытке. */
     sealed class Evidence {
@@ -246,41 +313,46 @@ internal object TtlState {
         /** Скрипт начал исполняться (`.started=1`), terminal нет ⇒ исход НЕИЗВЕСТЕН. */
         data object MayHaveRun : Evidence()
 
-        /** Ни скрипта, ни `.started`, ни `.done` ⇒ доказанно не запускался. */
-        data object NotStarted : Evidence()
+        /**
+         * Следов нет В МОМЕНТ ЧТЕНИЯ. iter61 §4.1: это НЕ доказательство «не отправлено»:
+         * ранее отправленный shell мог ещё не стартовать (особенно direct-транспорт, который не
+         * обязан создавать файл до исполнения). Поэтому такая попытка остаётся неразрешённой и
+         * снимается только ограждением поколением либо собственным terminal.
+         */
+        data object TracesAbsent : Evidence()
 
-        /** Ответ не разобран ⇒ ничего не утверждаем (и мутацию не разрешаем). */
+        /** Ответ не разобран ⇒ ничего не утверждаем. */
         data object Unreadable : Evidence()
     }
 
     /**
      * Разбор вывода `ScriptDelivery.evidenceCommand`.
      *
-     * Правило: `DONE` — единственное доказательство исхода; `.started` без `DONE` — «мог
-     * исполниться»; полное отсутствие следов — «не запускался». Всё остальное — «неизвестно».
+     * Правило: `DONE` — единственное доказательство исхода; `.started` без `DONE` и полное
+     * отсутствие следов одинаково означают «неизвестно» (различие только в причине для лога).
      */
     fun classifyEvidence(text: String?): Evidence {
         if (text == null || text.isBlank()) return Evidence.Unreadable
         val doneVal = Regex("(?:^|\\s)DONE=(\\S*)").find(text)?.groupValues?.get(1)
         if (doneVal != null && doneVal.isNotEmpty()) {
-            // Есть непустое значение DONE, но не код ⇒ формат не наш: не утверждаем ничего.
             val rc = Regex("^rc=(-?\\d+)$").find(doneVal)?.groupValues?.get(1)?.toIntOrNull()
             return if (rc == null) Evidence.Unreadable else Evidence.Done(rc)
         }
         fun flag(name: String): Boolean =
             Regex("(?:^|\\s)" + Regex.escape(name) + "=1(?:\\s|$)").containsMatchIn(text)
-        // Нет ни одного нашего поля ⇒ вывод не от свидетельства.
         if (!Regex("(?:^|\\s)(?:DONE|STARTED|PRESENT|SH)=").containsMatchIn(text)) {
             return Evidence.Unreadable
         }
         if (flag("STARTED")) return Evidence.MayHaveRun
-        return if (flag("SH") || flag("PRESENT")) Evidence.MayHaveRun else Evidence.NotStarted
+        return if (flag("SH") || flag("PRESENT")) Evidence.MayHaveRun else Evidence.TracesAbsent
     }
 
     /** Применить свидетельство к попытке (durable-переход). `null` — состояние не доказано. */
     fun applyEvidence(a: Attempt, ev: Evidence, now: Long): Attempt? = when (ev) {
         is Evidence.Done -> a.copy(phase = Phase.TERMINAL, payloadRc = ev.rc, ts = now)
-        Evidence.NotStarted -> a.copy(phase = Phase.PROVEN_NOT_SENT, payloadRc = Int.MIN_VALUE, ts = now)
+        // Отсутствие следов НЕ закрывает попытку (iter61 §4.1): снимается только ограждением
+        // поколением ([supersede]) или собственным terminal.
+        Evidence.TracesAbsent -> null
         Evidence.MayHaveRun -> null
         Evidence.Unreadable -> null
     }

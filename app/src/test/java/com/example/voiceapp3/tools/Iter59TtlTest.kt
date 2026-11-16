@@ -199,8 +199,15 @@ class Iter59TtlTest {
         assertTrue("identity подтверждается ДО отправки",
             src.indexOf("if (!recordAttempt(prep.evidencePath, want, desire.generation))") in
                 1 until src.indexOf("AdbClient.executePrepared(prep, 40000)"))
-        assertTrue("перед записью попытки выполняется fence прошлой попытки",
-            src.indexOf("if (!resolvePreviousAttempts())") in
+        assertTrue("перед записью попытки выполняется fence прошлой попытки " +
+                "(и ДО fence — миграция legacy-записи: iter61 §4)",
+            src.indexOf("if (!migrateLegacyBeforeFence(") in
+                1 until src.indexOf("if (!resolvePreviousAttempts(") )
+        assertFalse("попытка не отправляется без подтверждённой phase-записи",
+            src.indexOf("if (!resolvePreviousAttempts(") < 0 ||
+                !src.contains("if (!recordAttempt("))
+        assertTrue("fence прошлой попытки идёт до подготовки новой отправки",
+            src.indexOf("if (!resolvePreviousAttempts(") in
                 1 until src.indexOf("val prep = ScriptDelivery.prepare("))
         assertTrue("каждая повторная попытка получает свою identity",
             src.contains("val nextPrep = ScriptDelivery.prepare(\"ttl_script\", script)"))
