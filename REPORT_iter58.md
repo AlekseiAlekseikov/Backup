@@ -19,9 +19,23 @@ a99f2d7f  iter58 §5 TTL: маркер владения с проверкой ч
 ```
 
 **Локальный прогон:** `OK (921 tests)` (база `026e2f4` тем же стендом — `OK (890 tests)`).
-**CI:** ⛔ не запускался: push из песочницы отклоняется (`could not read Username for
-'https://github.com'`), учётных данных нет. Последний известный успешный run — `43750940250` на
-`026e2f4` (debug-сборка, без unit-тестов и release). «Зелёного CI на iter58» нет и я его не заявляю.
+
+**CI — зелёный, но не с первого раза (важно):**
+1. push `c95f7aa` → run [`43846209389`](https://github.com/AlekseiAlekseikov/Backup/actions/runs/43846209389)
+   — **failure**: `LockSound.kt:1835 Unresolved reference 'evalLog'` и
+   `LockSound.kt:1929 Condition type mismatch: Unit but Boolean`. Это ровно тот класс ошибок,
+   который локальный JVM-стенд не видит (`LockSound.kt` в него не входит).
+2. Исправлено коммитом `7ddee6b`: вместо несуществующего `evalLog` — запись в `AppLog`;
+   `applySystemLockSoundBind` возвращает `Unit` (работа уходит в `BgWorker`), поэтому «применено»
+   больше не заявляется — возвращается `Pending("bind_scheduled")`.
+3. Добавлен страж `typecheck_lock.sh` (сравнение ошибок компиляции ВСЕГО пакета `tools` с базой
+   `026e2f4`): на `c95f7aa` он воспроизводит обе ошибки CI и падает, на исправлении — проходит.
+4. push `7ddee6b` → run [`43849065192`](https://github.com/AlekseiAlekseikov/Backup/actions/runs/43849065192)
+   — **success**; job `133236610256`, шаги «Gradle build (debug)» = success, «Upload APK» = success,
+   артефакт `app-debug` (177 449 429 байт).
+
+**Границы CI:** workflow собирает только **debug** и загружает APK. Юнит-тесты (921) в CI **не
+исполняются**, release не собирается, на устройстве ничего не запускается.
 
 ---
 
