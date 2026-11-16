@@ -17,6 +17,21 @@
 | §10 fix | сводный статус действия — `statusWire` (находка CI: `Unresolved reference 'status'`), `ToggleIntent.Applied.ofWire()` | `Iter54ToggleTest` (16) | `789f8f6` `OK (806)` · CI `43707141785` **success** |
 | handoff | `REPORT_iter54.md`, `WORKLOG.md`, `SOURCE_SHA=789f8f6` | CI `43708022868` на `e4f22ec` — **success** | `e4f22ec` |
 
+## iter61 — JIT-вход, TTL-поколение, звук, доставка
+
+Ветка `fix/v2`, `versionCode=63` без изменений, `--force` не применялся. Полный отчёт — `docs/agent/REPORT_iter61.md`.
+Локально: `bash /home/user/runtests58.sh` → `OK (1033 tests)`; `typecheck_lock.sh` → `53/53`, новых нет.
+На ГУ ничего не выполнялось.
+
+| Шаг | Что сделано | Проверка | Коммит |
+|---|---|---|---|
+| §3 JIT | снимок `for f in c.* p.*` заменён протоколом НОМЕРА `n.<k>`: захват через noclobber + readback, ожидание меньших номеров поимённо, освобождение только по доказанной смерти (`JitOwn.kt:553`, `:572`, `:595`); тесты iter59/iter60 приведены к новому протоколу без ослабления инвариантов | `Iter61JitSlotRaceTest` (8) падает на iter60 и зелёный на iter61; `Iter60JitTicketRaceTest` (9), `Iter59JitAdminTest` | `be669ba` |
+| §4 TTL | отсутствие следов ⇒ «неизвестно» (fence держится), снятие только по durable-поколению (`exit 90`), миграция legacy ДО fence, `JournalState` вместо `null→пусто`, своя фаза у каждой retry, `markAttempt(): Boolean` блокирует send, `desire_lag` планируется | `Iter61TtlFenceTest` (10) + всё TTL-семейство (107 в одном прогоне) | `be669ba` |
+| §5 звук | дефект воспроизведён зондом (`previous_restore_unresolved restores=0` на production-значениях); `StartedMark{PRESENT,ABSENT,UNKNOWN}` + доказательство из журнала (`restore_prepared`/`restore_not_sent`), durable-фаза `restore_handoff` ДО транспорта | `Iter61SoundEvidenceTest` (9) по цепочке `evidenceCommand → parseEvidence → reconStep → recoveryGate`; `Iter60SoundAttemptTest` (8) на production-свидетельстве | `d27eae1` |
+| §3.4 JIT-клик | счётчики: один клик = ровно одна payload-команда, ноль прямых вызовов Wi-Fi, второй клик `previous_unfinished`; `ctl.restart zygote` последним, санация `ip rule oif wlan0` в той же команде; LWW по `seq` при переводе часов назад (`_jit_intent_order`) | `Iter61JitClickChainTest` (8) | `4624f0f` |
+| §6 доставка | коллизия имени не подменяет nonce (`State.COLLISION`), четыре факта (payload rc / transport rc / stdout-маркер / `.done`) различимы, identity в журнале до send | `Iter61DeliveryFactsTest` (6) | `4624f0f` |
+| §7/§8 | §7 — только стенд (🟡), ГУ ⛔; отчёт `docs/agent/REPORT_iter61.md`, CI на точном HEAD | `OK (1033)` | см. отчёт |
+
 ## Инцидент среды
 
 Песочница откатила `/home/user/w` (пропали `.git` и `app/src`), а также `toolchains/kotlinc/lib`.
