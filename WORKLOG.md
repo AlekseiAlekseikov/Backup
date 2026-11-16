@@ -214,3 +214,36 @@ CI на `c95f7aa` упал ДВУМЯ ошибками компиляции в `
 заявляется — `Pending("bind_scheduled")`, готовность объявит проход, который прочитает факт.
 Страж: `bash /home/user/typecheck_lock.sh` (весь пакет `tools` против стаба `android.jar`,
 сравнение с базой `026e2f4`) — на сломанной версии падает с теми же двумя ошибками.
+
+# iter59 — звук/JIT/TTL/доставка (ветка `fix/v2`, база `446b343`)
+
+## §3 звук
+`LockOp.reconStep` переписан: terminal BIND → terminal прежней попытки → (read-only: наблюдение) →
+подготовка identity → отправка → исход → сверка целей. `ReconPorts.restore(op, attempt)` отправляет
+ровно записанный путь; `readOnly()`/`observe(op)` дают читающему проходу закрыть операцию по факту.
+`LockSound.appendOp` подтверждает запись `LockOp.sameIdentity` (все поля), а не `state`+`gen`.
+`LockMountScripts.observeScript` — чисто читающий скрипт (`STOCK_OK`/`OWN_PROOF`/`FOREIGN_MOUNT`/
+`STOCK_UNPROVEN`), ни `mount`, ни `umount`, ни записи файлов.
+Осознанно изменено поведение iter58: restore при недоказанном terminal bind НЕ отправляется.
+
+## §5 JIT
+Общий `<lock>.admin` → каталог `<lock>.adm` с уникальными записями `p.<inst>.<pid>` (temp+`ln`) и
+входом по билетам; чужое снимается только по своему имени и только после доказанной смерти.
+`_lock_self_mark` подтверждает результат чтением; `guard` делает `_refuse self_mark_failed` до
+опасного действия. Разбор записей — без внешних процессов (секция ~в 3 раза быстрее).
+
+## §6 TTL
+`ownmark_ok v4|v6` + `NAMED_OWN_V4/V6` + `chain_state` по инструменту ⇒ чужая v6 не становится
+своей. Отказ маркера v6 симметричен v4 (`chain_delete_rc` учитывается). `TtlAttempt`: durable
+identity до отправки + правило повтора; `Pair`-retry удалён, `Unknown` не повторяется.
+
+## §7 доставка
+`Result.transportRc/payloadRc/rcFromDone`; потребители берут код payload. Коллизия имени: noclobber
++ новый nonce, занятое имя не перезаписывается.
+
+## Прогон
+`bash /home/user/runtests58.sh` → **`OK (954 tests)`** (+33 новых).
+`bash /home/user/typecheck_lock.sh /home/user/w59` → 0 новых ошибок (база `026e2f4`).
+⛔ Release-сборка локально невозможна (Gradle 9 → JVM 17). ⛔ UI/ГУ/VHAL/интернет — только владелец.
+❌ Не сделано в этом проходе: `JitNet` seq/epoch, UI-корень визуального OFF, `FileLogCore`,
+`VentOwnerTx`.
