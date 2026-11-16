@@ -2,6 +2,7 @@ package com.example.voiceapp3.tools
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -58,13 +59,15 @@ class Iter57SoundTest {
     ) : LockOp.ReconPorts {
         var restores = 0
         var prepares = 0
+        var sentAttempts = ArrayList<String>()
         /** Адрес свидетельства, подготовленный ДО отправки (iter58 §3.2). */
         var prepareResult: String = "/data/local/tmp/voiceapp3_lock_restore_new.sh"
         override fun evidence(op: LockOp.BindOp, path: String): LockOp.EvidenceFacts? =
             if (facts.containsKey(path)) facts[path] else null
 
-        override fun restore(op: LockOp.BindOp): LockOp.RestoreOutcome {
+        override fun restore(op: LockOp.BindOp, attempt: String): LockOp.RestoreOutcome {
             restores++
+            sentAttempts.add(attempt)
             return restore
         }
 
@@ -119,7 +122,8 @@ class Iter57SoundTest {
         assertEquals("late_shell_unproven", step.reason)
         assertTrue("поздний shell назван", step.lateShell)
         assertTrue("конфликт виден", step.conflict == "late_shell_possible:bind_7_deadbeef")
-        assertEquals("restore всё равно снимает СВОЙ слой", 1, p.restores)
+        // iter59 §3.2.5: при недоказанном terminal bind restore не отправляется вовсе.
+        assertEquals("restore при недоказанном terminal bind не отправляется", 0, p.restores)
         assertFalse("новый bind не разрешён", recoveryOf(step).mayBind)
 
         // Даже повторный проход со «свежим» stock не закрывает запись.
@@ -168,12 +172,19 @@ class Iter57SoundTest {
         assertEquals("restore_unknown:bind_7_deadbeef", step.conflict)
         assertTrue("поздний umount назван", step.lateShell)
         assertTrue("нужен read-only повтор", step.deferReread)
-        assertEquals("адрес свидетельства restore сохранён",
+        // iter59 §3.2.2: в журнал попадает identity, ЗАПИСАННАЯ ДО ОТПРАВКИ (подготовленный
+        // путь), а не путь, который вернул слой доставки: иначе поздний `umount` можно
+        // «перенести» на чужой/подставленный адрес и потерять terminal настоящей попытки.
+        assertEquals("сохранена identity отправленной попытки",
+            p.prepareResult, step.persist?.restoreEv)
+        assertEquals("отправлялся ровно подготовленный путь", listOf(p.prepareResult), p.sentAttempts)
+        assertNotEquals("подставленный путь доставки journal НЕ перезаписывает",
             "/data/local/tmp/voiceapp3_lock_restore_zzz.sh", step.persist?.restoreEv)
         assertFalse("новый bind поверх возможного позднего umount запрещён", recoveryOf(step).mayBind)
         // Журнал сохраняет адрес: следующий проход дочитает terminal вместо угадывания.
         val line = LockOp.journalLine(step.persist!!, 1L)
-        assertTrue("rev= в строке журнала: $line", line.contains("rev=/data/local/tmp/voiceapp3_lock_restore_zzz.sh"))
+        assertTrue("rev= в строке журнала: $line",
+            line.contains("rev=" + p.prepareResult))
         val back = LockOp.decode(line.substringAfter('|'))!!
         assertEquals("адрес переживает перезапись журнала", back.restoreEv, step.persist.restoreEv)
     }
@@ -181,7 +192,8 @@ class Iter57SoundTest {
     @Test
     fun restoreThatWasNeverSentIsSafeToRepeat() {
         val p = Ports(
-            facts = mapOf("/data/local/tmp/voiceapp3_lock_bind_abc.sh" to facts("0", "", false)),
+            // bind терминален — иначе новая семантика (iter59 §3.2.5) до restore не дойдёт
+            facts = mapOf("/data/local/tmp/voiceapp3_lock_bind_abc.sh" to facts("1", "rc=0", false)),
             restore = LockOp.RestoreOutcome(false, false, 1, "ERR_SCRIPT_UPLOAD", "", "upload_incomplete")
         )
         val step = LockOp.reconStep(op(), p)

@@ -373,6 +373,62 @@ drop_own_layers() {
     }
 
     /** Одинарные кавычки для путей: внутри пути апострофов быть не должно (проверяется). */
+    /**
+     * iter59 §3.2.7 — ЧИСТО ЧИТАЮЩИЙ скрипт состояния целей.
+     *
+     * Ни `mount`, ни `umount`, ни создания файлов: единственный побочный эффект — строки вывода.
+     * Зачем отдельный скрипт: read-only проход сверки раньше не мог ничего доказать (restore в нём
+     * запрещён), и запись навсегда оставалась «не подготовлено». Чтение таблицы даёт факт
+     * «наших слоёв нет» без единого device-side изменения.
+     *
+     * Печатает для КАЖДОЙ цели ровно один итог:
+     *  • `STOCK_OK:<t>`        — слоёв нет (доказанный сток);
+     *  • `OWN_PROOF:<t> …`     — сверху НАШ слой (root совпал с ожидаемым);
+     *  • `FOREIGN_MOUNT:<t> …` — сверху чужой/неопознанный слой (снимать нельзя);
+     *  • `STOCK_UNPROVEN:<t> …`— таблица/строка не читаются: «не знаю», а не «сток».
+     */
+    fun observeScript(entries: List<Pair<String, String>>): String {
+        val sb = StringBuilder()
+        sb.append(commonPrologue())
+        sb.append("\n")
+        sb.append("STAGE_PREFIX=${shQuote(STAGE_PREFIX)}\n")
+        sb.append(
+            """
+# Наблюдение по цели: НИЧЕГО не меняет (нет mount/umount/записи файлов).
+observe_one() {
+  t=${'$'}1; want=${'$'}2
+  if [ ! -r "${'$'}MI" ]; then echo "STOCK_UNPROVEN:${'$'}t reason=table_unreadable"; return 0; fi
+  n=${'$'}(mi_count "${'$'}t")
+  case "${'$'}n" in ''|*[!0-9]*) echo "STOCK_UNPROVEN:${'$'}t reason=count_unknown"; return 0 ;; esac
+  if [ "${'$'}n" = "0" ]; then echo "STOCK_OK:${'$'}t"; return 0; fi
+  top=${'$'}(mi_top "${'$'}t")
+  case "${'$'}top" in
+    AMBIGUOUS*|'') echo "STOCK_UNPROVEN:${'$'}t reason=order_ambiguous"; return 0 ;;
+  esac
+  mi_split "${'$'}top" || { echo "STOCK_UNPROVEN:${'$'}t reason=bad_line"; return 0; }
+  exp=""
+  if [ -n "${'$'}want" ]; then exp=${'$'}(expected_root_for "${'$'}want" 2>/dev/null); fi
+  if [ -n "${'$'}exp" ] && [ "${'$'}ROOT" = "${'$'}exp" ]; then
+    echo "OWN_PROOF:${'$'}t source=observe mid=${'$'}MID root=${'$'}ROOT"; return 0
+  fi
+  if [ -z "${'$'}exp" ]; then
+    case "${'$'}ROOT" in
+      ${'$'}want) echo "OWN_PROOF:${'$'}t source=observe mid=${'$'}MID root=${'$'}ROOT"; return 0 ;;
+    esac
+  fi
+  echo "FOREIGN_MOUNT:${'$'}t mid=${'$'}MID root=${'$'}ROOT expected=${'$'}{exp:-unknown} reason=ownership_not_proven"
+  return 0
+}
+""".trimIndent()
+        )
+        sb.append("\n")
+        for ((t, w) in entries) {
+            sb.append("observe_one ${shQuote(t)} ${shQuote(w)}\n")
+        }
+        sb.append("exit 0\n")
+        return sb.toString()
+    }
+
     fun shQuote(s: String): String =
         "'" + s.replace("'", "'\\''") + "'"
 }

@@ -53,13 +53,19 @@ class Iter58SoundTest {
         var facts: Map<String, LockOp.EvidenceFacts?> = emptyMap(),
         var restoreOutcome: LockOp.RestoreOutcome =
             LockOp.RestoreOutcome(true, false, 0, "", ""),
-        var preparePath: String = "/data/local/tmp/voiceapp3_lock_restore_new.sh"
+        var preparePath: String = "/data/local/tmp/voiceapp3_lock_restore_new.sh",
+        var readOnlyPass: Boolean = false,
+        var observed: LockOp.Reconcile? = null
     ) : LockOp.ReconPorts {
         var restores = 0
         var prepares = 0
+        var sentAttempts = ArrayList<String>()
         override fun evidence(op: LockOp.BindOp, path: String): LockOp.EvidenceFacts? = facts[path]
-        override fun restore(op: LockOp.BindOp): LockOp.RestoreOutcome {
+        override fun readOnly(): Boolean = readOnlyPass
+        override fun observe(op: LockOp.BindOp): LockOp.Reconcile? = observed
+        override fun restore(op: LockOp.BindOp, attempt: String): LockOp.RestoreOutcome {
             restores++
+            sentAttempts.add(attempt)
             return restoreOutcome
         }
         override fun prepareRestore(op: LockOp.BindOp): String {
@@ -148,7 +154,9 @@ class Iter58SoundTest {
 
     @Test
     fun previousUnknownRestoreBlocksANewOne() {
-        val p = Ports()   // порты restore/prepare не должны даже вызваться
+        // bind терминален: проверка «прежний restore не разрешён» идёт ПОСЛЕ него (iter59 §3.2.5).
+        val p = Ports(facts = mapOf(bindEv to facts("1", "rc=0")))
+        // порты restore/prepare не должны даже вызваться
         val step = LockOp.reconStep(op(restoreEv = oldRestoreEv), p)
 
         assertEquals("повторный umount не отправлен", 0, p.restores)
@@ -192,7 +200,7 @@ class Iter58SoundTest {
     }
 
     @Test
-    fun unprovenBindNeverClosesTheOperationEvenWhenStockLooksRestored() {
+    fun unprovenBindNeverClosesTheOperationAndForbidsRestore() {
         val p = Ports(
             facts = mapOf(bindEv to facts("1", "")),   // START есть, terminal (.done rc=) нет
             restoreOutcome = LockOp.RestoreOutcome(
@@ -202,7 +210,10 @@ class Iter58SoundTest {
         )
         val step = LockOp.reconStep(op(), p)
 
-        assertEquals("ровно один restore (снять СВОИ слои можно)", 1, p.restores)
+        // iter59 §3.2.5 меняет поведение iter58 осознанно: пока terminal bind не доказан,
+        // НИКАКОЙ restore не отправляется (поздний bind мог бы наложиться сверху уже после
+        // снятия). В iter58 здесь отправлялся restore — это и был дефект аудита.
+        assertEquals("restore при недоказанном terminal bind не отправляется", 0, p.restores)
         assertEquals(LockOp.State.UNDEFINED, step.newState)
         assertEquals("late_shell_unproven", step.reason)
         assertTrue("операция остаётся открытой: ${step.wire()}", step.unresolved && step.lateShell)

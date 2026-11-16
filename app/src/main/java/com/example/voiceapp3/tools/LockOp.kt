@@ -364,14 +364,33 @@ internal object LockOp {
         fun evidence(op: BindOp, path: String): EvidenceFacts?
 
         /**
-         * Выполнить restore по целям операции. Возвращает типизированный исход:
-         * `sent=false` — доказано, что shell не уходил; `unknown=true` — исход неизвестен;
-         * иначе — `rc`+`out` фактического исполнения.
+         * Выполнить restore, чья identity УЖЕ подготовлена и записана в журнал.
+         *
+         * [attempt] — точный путь свидетельства ЭТОЙ попытки. Реализация обязана отправлять
+         * именно его: подмена пути в момент отправки превращает терминальный факт в догадку.
+         *
+         * Возвращает типизированный исход: `sent=false` — доказано, что shell не уходил;
+         * `unknown=true` — исход неизвестен; иначе — `rc`+`out` фактического исполнения.
          */
-        fun restore(op: BindOp): RestoreOutcome
+        fun restore(op: BindOp, attempt: String): RestoreOutcome
 
-        /** Путь свидетельства для ПОДГОТОВЛЕННОГО restore (известен до отправки). */
+        /**
+         * Подготовить identity НОВОЙ попытки restore и durable-подтвердить её запись
+         * (сравнением всех значимых полей). Пустая строка — отправки НЕ будет.
+         */
         fun prepareRestore(op: BindOp): String
+
+        /**
+         * iter59 §3.2: этому проходу запрещены device-side mutation (снятие слоёв, bind,
+         * отправка restore). Разрешено читать свидетельства и состояние.
+         */
+        fun readOnly(): Boolean = false
+
+        /**
+         * ТОЛЬКО ЧТЕНИЕ фактического состояния целей: остались ли НАШИ слои.
+         * `null` — прочитать нельзя (это не «сток» и не «слой есть»).
+         */
+        fun observe(op: BindOp): Reconcile? = null
     }
 
     data class RestoreOutcome(
@@ -404,91 +423,115 @@ internal object LockOp {
                 note = "в записи нет целей/staging: снять наугад нельзя"
             )
         }
-        // 1) Свидетельство BIND: без него нельзя утверждать, что старый shell не стартует позже.
+
+        // ── 1) BIND: пока его terminal не доказан, НИЧЕГО не отправляем ──────────────────────
+        // iter59 §3.2.5: дефект iter58 — `prepareRestore`/`ports.restore` вызывались ДО этой
+        // проверки, поэтому поздний bind мог накрыть уже восстановленное состояние. Теперь
+        // сначала решается «можно ли действовать», и только потом действие.
         val bindFacts = if (op.evidence.isEmpty()) null else ports.evidence(op, op.evidence)
         val bindTerminal = bindFacts?.terminalProven == true
-        val bindLate = !bindTerminal
-        // 2) Свидетельство RESTORE (если restore уже отправлялся ранее).
-        val restoreEvKnown = op.restoreEv.isNotEmpty()
-        val restoreTerminal = if (!restoreEvKnown) false else
-            ports.evidence(op, op.restoreEv)?.terminalProven == true
-
-        // iter58 §3.2 — РЕШЕНИЕ ДО ОТПРАВКИ.
-        // Дефект iter57: `ports.restore` вызывался ДО этих проверок, поэтому новый umount уходил
-        // на устройство, пока прошлый restore мог ещё исполняться, и его terminal нельзя было
-        // отнести к новой попытке.
-        if (restoreEvKnown && !restoreTerminal) {
-            return ReconStep(
-                op.id, State.UNDEFINED, "previous_restore_unresolved",
-                conflict = "previous_restore_unresolved:" + op.id, unresolved = true,
-                lateShell = true, persist = op.copy(reason = "previous_restore_unresolved"),
-                deferReread = true,
-                note = "прежний restore не терминален: параллельный повтор запрещён"
-            )
-        }
-        // Адрес свидетельства НОВОЙ попытки обязан быть известен ДО отправки и сохранён в
-        // журнале: после crash между send и записью результата путь уже не восстановить.
-        val prepared = ports.prepareRestore(op)
-        if (prepared.isEmpty()) {
-            return ReconStep(
-                op.id, State.UNDEFINED, "restore_evidence_not_prepared",
-                unresolved = true, persist = op.copy(reason = "restore_evidence_not_prepared"),
-                note = "адрес свидетельства restore не подготовлен: отправки нет"
-            )
-        }
-
-        val out = ports.restore(op)
-        // Restore не ушёл: доказуемо «ничего не исполнялось» — повтор разрешён, состояние не
-        // закрываем (bind всё равно не доказан), но и конфликт не создаём.
-        if (!out.sent && !out.unknown) {
-            return ReconStep(
-                op.id, State.UNDEFINED, "restore_not_sent:" + out.why.ifEmpty { "unknown" },
-                unresolved = true, persist = op.copy(reason = "restore_not_sent"),
-                note = "restore не отправлен: побочных действий не было, нужен повтор"
-            )
-        }
-        // Restore ушёл, исход неизвестен: поздний umount возможен ⇒ fencing на новый bind.
-        if (out.unknown && !restoreTerminal) {
-            val ev = out.evidence.ifEmpty { op.restoreEv }
-            return ReconStep(
-                op.id, State.UNDEFINED, "restore_outcome_unknown",
-                conflict = "restore_unknown:" + op.id, unresolved = true, lateShell = true,
-                persist = op.copy(restoreEv = ev, reason = "restore_outcome_unknown"),
-                deferReread = ev.isNotEmpty(),
-                note = "restore мог выполниться позже: новый bind не отправляется до terminal"
-            )
-        }
-        // 5) terminal bind не доказан ⇒ операцию НЕ закрываем, даже если сейчас виден stock.
-        //    Проверка стоит ПОСЛЕ restore намеренно: снять СВОИ слои можно (это не заявляет
-        //    сток), но закрыть операцию и разрешить новый bind — нельзя.
-        if (bindLate) {
+        if (!bindTerminal) {
             val why = if (bindFacts == null) "evidence_absent_or_unreadable" else "late_shell_unproven"
             val conflict = if (bindFacts == null) "evidence_unknown:" + op.id
                            else "late_shell_possible:" + op.id
             return ReconStep(
                 op.id, State.UNDEFINED, why, conflict = conflict, unresolved = true, lateShell = true,
                 persist = op.copy(reason = why), deferReread = op.evidence.isNotEmpty(),
-                note = "terminal этого исполнения не доказан: слой снят, но операция открыта"
+                note = "terminal bind не доказан: restore и новый bind не отправляются"
             )
         }
-        // 4) terminal bind доказан и restore завершился — можно судить по фактической таблице.
+
+        // ── 2) ПРЕДЫДУЩАЯ попытка restore: её terminal относится к НЕЙ, а не к новой ─────────
+        // iter59 §3.2.1: дефект iter58 — `restoreTerminal` вычислялся по старому `restoreEv` и
+        // затем применялся к исходу НОВОЙ отправки. Здесь terminal проверяется только для того,
+        // чтобы решить, можно ли начинать следующую попытку.
+        val prevEv = op.restoreEv
+        val prevTerminal = prevEv.isNotEmpty() && ports.evidence(op, prevEv)?.terminalProven == true
+        if (prevEv.isNotEmpty() && !prevTerminal) {
+            return ReconStep(
+                op.id, State.UNDEFINED, "previous_restore_unresolved",
+                conflict = "previous_restore_unresolved:" + op.id, unresolved = true,
+                lateShell = true, persist = op.copy(reason = "previous_restore_unresolved"),
+                deferReread = true,
+                note = "прежний restore не терминален: новая попытка не отправляется"
+            )
+        }
+
+        // ── 3) ЧИТАЮЩИЙ проход: mutation запрещены, но операция может быть ЗАКРЫТА по факту ──
+        // iter59 §3.2.7: дефект iter58 — в read-only проходе `prepareRestore` возвращал пустую
+        // строку, и запись навсегда оставалась `restore_evidence_not_prepared`. Теперь проход
+        // читает РЕАЛЬНОЕ состояние целей и закрывает операцию только по доказанному стоку.
+        if (ports.readOnly()) {
+            val obs = ports.observe(op)
+            return when (obs) {
+                Reconcile.STOCK_RESTORED -> ReconStep(
+                    op.id, State.DONE, "observed_stock", persist = op.copy(reason = ""),
+                    note = "слоёв нет по факту чтения (без device-side mutation)"
+                )
+                Reconcile.FOREIGN_LEFT -> ReconStep(
+                    op.id, State.UNDEFINED, "observed_foreign_above",
+                    conflict = "foreign_above:" + op.id, unresolved = true,
+                    persist = op.copy(reason = "observed_foreign_above"),
+                    note = "сверху чужой слой: не снимаем"
+                )
+                else -> ReconStep(
+                    op.id, State.UNDEFINED, "observed_unproven", unresolved = true,
+                    persist = op.copy(reason = "observed_unproven"), deferReread = true,
+                    note = "прочитать состояние не удалось: нужен обычный проход"
+                )
+            }
+        }
+
+        // ── 4) НОВАЯ попытка: identity готовится и подтверждается ДО отправки ─────────────────
+        val attempt = ports.prepareRestore(op)
+        if (attempt.isEmpty()) {
+            return ReconStep(
+                op.id, State.UNDEFINED, "restore_evidence_not_prepared",
+                unresolved = true, persist = op.copy(reason = "restore_evidence_not_prepared"),
+                note = "identity новой попытки не подтверждена: отправки нет"
+            )
+        }
+        // С этого места КАЖДАЯ запись журнала несёт identity этой попытки. Дефект iter58:
+        // последующие ветки возвращали `persist = op.copy(...)` (старый/пустой `restoreEv`), и
+        // последняя строка журнала затирала только что сохранённый путь (parseJournal = last wins).
+        val withAttempt = op.copy(restoreEv = attempt, reason = "")
+
+        val out = ports.restore(op, attempt)
+        if (!out.sent && !out.unknown) {
+            return ReconStep(
+                op.id, State.UNDEFINED, "restore_not_sent:" + out.why.ifEmpty { "unknown" },
+                unresolved = true, persist = withAttempt.copy(reason = "restore_not_sent"),
+                note = "restore доказанно не уходил: повтор возможен, побочных действий не было"
+            )
+        }
+        // terminal ЭТОЙ попытки: `Finished` от слоя доставки означает, что terminal-файл
+        // (`<path>.done` с rc) этого самого пути прочитан. Исход Unknown остаётся Unknown
+        // независимо от того, что прежняя попытка когда-то завершилась (дефект iter58: там
+        // terminal СТАРОЙ попытки разрешал новую).
+        if (out.unknown) {
+            val why = "restore_outcome_unknown"
+            return ReconStep(
+                op.id, State.UNDEFINED, why, conflict = "restore_unknown:" + op.id,
+                unresolved = true, lateShell = true,
+                persist = withAttempt.copy(reason = why), deferReread = true,
+                note = "поздний umount этой попытки возможен: новый bind не отправляется"
+            )
+        }
+        // ── 5) terminal bind И terminal этой попытки доказаны → можно судить по фактам ─────────
         val detail = reconcileDetail(out.rc, out.out, op.targets)
-        val verdict = detail.verdict
-        return when (verdict) {
+        return when (detail.verdict) {
             Reconcile.STOCK_RESTORED -> ReconStep(
-                op.id, State.DONE, "reconciled_restore", persist = op.copy(reason = ""),
-                note = "сток по всем целям при доказанном terminal bind"
+                op.id, State.DONE, "reconciled_restore", persist = withAttempt.copy(reason = ""),
+                note = "сток по всем целям при доказанных terminal bind и restore"
             )
             Reconcile.FOREIGN_LEFT -> ReconStep(
-                op.id, State.UNDEFINED, "foreign_above_left",
-                conflict = "foreign_above:" + op.id, unresolved = true,
-                persist = op.copy(reason = "foreign_above_left"),
+                op.id, State.UNDEFINED, "foreign_above_left", conflict = "foreign_above:" + op.id,
+                unresolved = true, persist = withAttempt.copy(reason = "foreign_above_left"),
                 note = "поверх чужой слой: снимать нельзя"
             )
             Reconcile.UNPROVEN -> ReconStep(
-                op.id, State.UNDEFINED, "reconcile_unproven",
-                conflict = "unproven:" + op.id, unresolved = true,
-                persist = op.copy(reason = "reconcile_unproven"),
+                op.id, State.UNDEFINED, "reconcile_unproven", conflict = "unproven:" + op.id,
+                unresolved = true, persist = withAttempt.copy(reason = "reconcile_unproven"),
                 note = "снятие не подтверждено по всем целям"
             )
         }
@@ -543,6 +586,27 @@ internal object LockOp {
     }
 
     private val TARGET_MARKER = Regex("^(STOCK_OK|UMOUNTED_OK|UMOUNT_DETACHED):(\\S+)\\s*(.*)$")
+
+    /**
+     * iter59 §3.2.3 — ПОЛНАЯ сверка записанной операции с тем, что прочиталось из журнала.
+     *
+     * Дефект iter58 (`appendOp`, LockSound.kt:1556–1570): подтверждением записи считалось
+     * совпадение `state`+`gen`. Этого мало: последняя строка журнала побеждает при разборе, и
+     * копия БЕЗ новой identity (`restoreEv`) спокойно проходила проверку — новый адрес
+     * свидетельства затирался, а crash после этого оставлял поздний `umount` без адреса.
+     *
+     * Сравниваются ВСЕ поля, которые участвуют в решении (identity попытки, цели, staging,
+     * свидетельство bind). `ts` намеренно не сравнивается: он не влияет на решения.
+     */
+    fun sameIdentity(written: BindOp, back: BindOp): Boolean =
+        written.id == back.id &&
+            written.state == back.state &&
+            written.gen == back.gen &&
+            written.stage == back.stage &&
+            written.targets == back.targets &&
+            written.evidence == back.evidence &&
+            written.restoreEv == back.restoreEv &&
+            written.reason == back.reason
 
     fun reconcileDetail(rc: Int, out: String, expected: Collection<String>): Reconciled {
         val exp = expected.filter { it.isNotBlank() }.distinct()

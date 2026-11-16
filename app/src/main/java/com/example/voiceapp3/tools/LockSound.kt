@@ -1562,7 +1562,11 @@ object LockSound {
         }.isSuccess
         // Читаем ВСЕГДА: подтверждение — это факт чтения, а не отсутствие исключения.
         val back = LockOp.parseJournal(runCatching { file.readText() }.getOrNull())
-        val confirmed = back.ops[op.id]?.state == op.state && back.ops[op.id]?.gen == op.gen
+        // iter59 §3.2.3: подтверждение — это совпадение ВСЕЙ значимой записи, а не только
+        // `state`+`gen`. Иначе копия без новой identity попытки (`restoreEv`) считалась
+        // записанной, а её строка затирала сохранённый адрес свидетельства (last wins).
+        val backOp = back.ops[op.id]
+        val confirmed = backOp != null && LockOp.sameIdentity(op, backOp)
         if (!written || !confirmed) {
             AppLog.e(ctx, TAG, "LOCKSOUND_OP write=unconfirmed tag=$tag ${op.wire()} " +
                 "written=$written journal=«${back.wire()}» (журнал не подтверждён: неизвестно, " +
@@ -1814,53 +1818,80 @@ object LockSound {
         // ОДИН раз в [prepareRestore] и ДО отправки сохраняется в журнал; сама отправка берёт
         // ровно её, поэтому crash между send и записью результата не оставляет поздний umount
         // без адреса свидетельства, а повторный restore не подменяет identity.
+        // prepared по ПУТИ свидетельства: отправка берёт ровно ту попытку, чья identity уже
+        // записана, поэтому подменить путь в момент отправки нельзя (iter59 §3.2.2).
         val preparedRestore = HashMap<String, ScriptDelivery.Prepared>()
         val readOnlyPass = !allowRestore
         val ports = object : LockOp.ReconPorts {
+            override fun readOnly(): Boolean = readOnlyPass
+
             override fun evidence(op: LockOp.BindOp, path: String): LockOp.EvidenceFacts? =
                 readEvidencePath(appCtx, op.id, path)
+
+            /**
+             * iter59 §3.2.7 — факт состояния целей БЕЗ изменений на устройстве.
+             * Пустая/нечитаемая таблица даёт «неизвестно», а не «сток».
+             */
+            override fun observe(op: LockOp.BindOp): LockOp.Reconcile? {
+                val script = LockMountScripts.observeScript(op.targets.map { it to op.stage })
+                val r = runCatching { AdbClient.execute(script, 15000, expectRoot = false) }.getOrNull()
+                if (r == null) {
+                    AppLog.w(appCtx, TAG, "LOCKSOUND_OBSERVE op=${op.id} action=unreadable " +
+                        "(состояние целей не прочитано: остаётся неизвестным)")
+                    return null
+                }
+                val detail = LockOp.reconcileDetail(r.first, r.second, op.targets)
+                AppLog.i(appCtx, TAG, "LOCKSOUND_OBSERVE op=${op.id} rc=${r.first} " +
+                    "verdict=${detail.verdict.name.lowercase()} proven=${detail.proven.size} " +
+                    "missing=${detail.missing.size} action=none")
+                return detail.verdict
+            }
 
             override fun prepareRestore(op: LockOp.BindOp): String {
                 if (readOnlyPass) return ""
                 val script = LockMountScripts.restoreScript(op.targets.map { it to op.stage })
                 val prep = ScriptDelivery.prepare("lock_restore", script)
-                preparedRestore[op.id] = prep
-                // Durable ЗАПИСЬ адреса свидетельства ДО отправки: если её не подтвердить,
-                // restore не отправляется вовсе (см. reconStep).
+                // Durable ЗАПИСЬ identity ДО отправки: appendOp подтверждает её ПОЛНЫМ
+                // сравнением записи (iter59 §3.2.3). Не подтвердили — отправки нет вовсе.
+                val candidate = op.copy(restoreEv = prep.evidencePath, reason = "restore_prepared")
                 val persisted = runCatching {
-                    appendOp(appCtx, op.copy(restoreEv = prep.evidencePath, reason = "restore_prepared"),
-                        "restore_prepared")
+                    appendOp(appCtx, candidate, "restore_prepared")
                 }.getOrDefault(false)
                 if (!persisted) {
-                    // Адрес свидетельства НЕ сохранён ⇒ restore не отправляется: иначе после
-                    // crash между send и записью результата поздний `umount` остался бы без
-                    // адреса, по которому его terminal можно прочитать.
                     AppLog.e(appCtx, TAG, "LOCKSOUND_RESTORE_PREPARE op=${op.id} " +
                         "persisted=no action=no_send reason=restore_prepare_not_persisted " +
                         "evidence=${prep.evidencePath.ifEmpty { "none" }}")
                     return ""
                 }
+                preparedRestore[prep.evidencePath] = prep
                 return prep.evidencePath
             }
 
-            override fun restore(op: LockOp.BindOp): LockOp.RestoreOutcome {
+            /**
+             * iter59 §3.2.1/§3.2.2: отправляется РОВНО [attempt] — путь, чья identity уже в
+             * журнале. Нет такой подготовки ⇒ доказанно ничего не отправлено (NotSent), а не
+             * «попробуем другой путь».
+             */
+            override fun restore(op: LockOp.BindOp, attempt: String): LockOp.RestoreOutcome {
                 if (readOnlyPass) {
                     return LockOp.RestoreOutcome(false, false, -1, "", "", "read_only_pass")
                 }
-                val prep = preparedRestore.remove(op.id)
-                    ?: return LockOp.RestoreOutcome(false, false, -1, "", "",
-                        "restore_not_prepared")
+                if (attempt.isEmpty()) {
+                    return LockOp.RestoreOutcome(false, false, -1, "", "", "attempt_identity_empty")
+                }
+                val prep = preparedRestore.remove(attempt)
+                    ?: return LockOp.RestoreOutcome(false, false, -1, "", "", "attempt_not_prepared")
                 val res = AdbClient.executePrepared(prep, 30000)
                 val outcome = ScriptDelivery.outcome(res, op.id)
                 return when (outcome) {
                     is ScriptDelivery.DeliveryOutcome.NotSent ->
                         LockOp.RestoreOutcome(false, false, res.rc, res.out,
-                            prep.evidencePath, outcome.why)
+                            attempt, outcome.why)
                     is ScriptDelivery.DeliveryOutcome.Unknown ->
                         LockOp.RestoreOutcome(true, true, res.rc, res.out,
-                            outcome.evidence.path.ifEmpty { prep.evidencePath }, outcome.why)
+                            outcome.evidence.path.ifEmpty { attempt }, outcome.why)
                     is ScriptDelivery.DeliveryOutcome.Finished ->
-                        LockOp.RestoreOutcome(true, false, res.rc, res.out, prep.evidencePath, "")
+                        LockOp.RestoreOutcome(true, false, res.rc, res.out, attempt, "")
                 }
             }
         }
