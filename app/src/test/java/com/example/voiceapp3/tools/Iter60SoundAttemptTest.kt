@@ -3,10 +3,12 @@ package com.example.voiceapp3.tools
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
+import java.util.concurrent.TimeUnit
 
 /**
  * iter60 §5 — ЗВУК: фазы попытки restore, различимость crash-до/после send, ограниченный reread
@@ -72,6 +74,22 @@ class Iter60SoundAttemptTest {
 
     private fun bindTerminal() = mapOf(bindEv to facts(started = "1", done = "rc=0"))
 
+    /**
+     * iter61 §5.1: свидетельство читается ПРОИЗВОДСТВЕННЫМ путём — реальная команда
+     * [ScriptDelivery.evidenceCommand] исполняется настоящим `/bin/sh` в каталоге [dir], ответ
+     * разбирает [LockOp.parseEvidence]. Никаких синтетических строк: `STARTED=0` из production
+     * обязан вести себя так же, как «следов нет» в прежних тестах (дефект: ветка проверяла
+     * `.started.isEmpty()`, а production всегда печатает `STARTED=0`).
+     */
+    private fun evidenceViaProduction(dir: File, path: String): LockOp.EvidenceFacts? {
+        val cmd = ScriptDelivery.evidenceCommand(path)
+        val p = ProcessBuilder("/bin/sh", "-c", cmd)
+            .directory(dir).redirectErrorStream(true).start()
+        val out = p.inputStream.bufferedReader().readText()
+        p.waitFor(30, TimeUnit.SECONDS)
+        return LockOp.parseEvidence(out)
+    }
+
     // ─────────────── 1. NotSent не превращается в бессрочный запрет ───────────────
 
     @Test
@@ -93,8 +111,15 @@ class Iter60SoundAttemptTest {
     fun crashBeforeSendIsRecoveredAsNotStartedButCrashAfterSendIsNot() {
         // (а) crash ДО send: запись `restore_prepared`, следов скрипта нет ⇒ исполнение не
         // начиналось ⇒ безопасный повтор (иначе одна неудачная попытка запрещала бы всё навсегда).
+        val emptyDir = File.createTempFile("sound61", "").let { f -> f.delete(); f.mkdirs(); f }
+        val noTraces = evidenceViaProduction(emptyDir, File(emptyDir, "attempt_a.sh").absolutePath)
+        assertNotNull("production-свидетельство разобрано", noTraces)
+        assertEquals("файла .started нет — это факт ABSENT, а не пустая строка",
+            LockOp.StartedMark.ABSENT, noTraces!!.startedMark)
+        assertFalse("terminal не доказан", noTraces.terminalProven)
+        assertFalse("скрипта нет", noTraces.scriptPresent)
         val beforeSend = Ports(
-            facts = bindTerminal() + (attemptA to facts("", "", present = false)),
+            facts = bindTerminal() + (attemptA to noTraces),
             restoreOutcome = LockOp.RestoreOutcome(true, false, 0, "STOCK_OK:$t1", "")
         )
         val stepA = LockOp.reconStep(op(restoreEv = attemptA, reason = "restore_prepared"), beforeSend)
@@ -104,8 +129,13 @@ class Iter60SoundAttemptTest {
 
         // (б) тот же журнал, но скрипт НАЧАЛ исполняться (`started=1`, terminal нет) ⇒ исход
         // неизвестен, новая отправка запрещена. Это и есть различие «до» и «после» send.
+        val startedFile = File(emptyDir, "attempt_b.sh").apply { writeText("#!/bin/sh\ntrue\n") }
+        File(emptyDir, "attempt_b.sh.started").writeText("started=1\n")
+        val startedFacts = evidenceViaProduction(emptyDir, startedFile.absolutePath)!!
+        assertEquals("файл .started есть — PRESENT", LockOp.StartedMark.PRESENT,
+            startedFacts.startedMark)
         val afterSend = Ports(
-            facts = bindTerminal() + (attemptA to facts("1", done = "", present = false)),
+            facts = bindTerminal() + (attemptA to startedFacts),
             restoreOutcome = LockOp.RestoreOutcome(true, false, 0, "STOCK_OK:$t1", "")
         )
         val stepB = LockOp.reconStep(op(restoreEv = attemptA, reason = "restore_prepared"), afterSend)

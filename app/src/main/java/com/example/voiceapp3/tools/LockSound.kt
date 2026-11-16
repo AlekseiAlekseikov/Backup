@@ -1888,6 +1888,20 @@ object LockSound {
                 }
                 val prep = preparedRestore.remove(attempt)
                     ?: return LockOp.RestoreOutcome(false, false, -1, "", "", "attempt_not_prepared")
+                // iter61 §5.2: durable-фаза ПЕРЕДАЧИ транспорту пишется ДО вызова. Это и есть
+                // доказательство «отправка начиналась»: без неё запись `restore_prepared`
+                // означает «до транспорта не дошли» (crash до send) и повтор безопасен. Не
+                // подтвердили запись — не отправляем (`handoff_not_persisted`), иначе
+                // последующая сверка не отличит нашу же отправку от чужой.
+                val handoffOk = runCatching {
+                    appendOp(appCtx, op.copy(restoreEv = attempt, reason = "restore_handoff:$attempt"),
+                        "restore_handoff")
+                }.getOrDefault(false)
+                if (!handoffOk) {
+                    AppLog.e(appCtx, TAG, "LOCKSOUND_RESTORE_HANDOFF op=${op.id} " +
+                        "persisted=no action=no_send reason=handoff_not_persisted evidence=$attempt")
+                    return LockOp.RestoreOutcome(false, false, -1, "", attempt, "handoff_not_persisted")
+                }
                 val res = AdbClient.executePrepared(prep, 30000)
                 val outcome = ScriptDelivery.outcome(res, op.id)
                 // iter59 §7: наружу отдаётся код PAYLOAD. Транспортный rc (-1/1 при потере

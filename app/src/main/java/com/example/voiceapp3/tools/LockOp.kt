@@ -26,6 +26,21 @@ internal object LockOp {
     /** Состояния операции. `UNDEFINED` — ответ потерян/процесс умер: нужна сверка, не успех. */
     enum class State { PLANNED, DONE, UNDEFINED, FAILED }
 
+    /**
+     * iter61 §5.1 — ТИПИЗИРОВАННАЯ метка старта. Строка `started` из свидетельства не является
+     * решением: `evidenceCommand` печатает `STARTED=0`, когда файла `.started` нет, `STARTED=1`,
+     * когда он есть, и НЕ печатает строку вовсе, если команда не выполнилась. Три разных факта:
+     *  - [PRESENT] — файл `.started` есть ⇒ исполнение начиналось;
+     *  - [ABSENT]  — команда ответила `0` ⇒ файла `.started` НЕТ (это факт о файле);
+     *  - [UNKNOWN] — строки нет/значение не `0`/`1` ⇒ свидетельство не прочитано.
+     *
+     * Отсутствие `.started` само по себе НЕ доказывает, что отправки не было: файл мог быть
+     * убран. Доказательство «не отправляли» даёт ТОЛЬКО durable-фаза журнала
+     * (`restore_prepared` — до передачи транспорту, `restore_not_sent:*` — исход слоя доставки);
+     * отсутствие следов используется лишь как СВЕРКА и при противоречии блокирует.
+     */
+    enum class StartedMark { PRESENT, ABSENT, UNKNOWN }
+
     /** Факты, прочитанные из свидетельства доставки (read-only, без мутаций). */
     data class EvidenceFacts(
         val started: String,
@@ -34,8 +49,15 @@ internal object LockOp {
         /** `done` содержит `rc=<число>` → запуск ДОКАЗАННО завершился. */
         val terminalProven: Boolean
     ) {
+        val startedMark: StartedMark
+            get() = when (started) {
+                "1" -> StartedMark.PRESENT
+                "0" -> StartedMark.ABSENT
+                else -> StartedMark.UNKNOWN
+            }
+
         fun wire(): String = "started=$started done=$done script=$scriptPresent " +
-            "terminal=$terminalProven"
+            "terminal=$terminalProven mark=${startedMark.name.lowercase()}"
     }
 
     /**
@@ -452,13 +474,24 @@ internal object LockOp {
         // `previous_restore_unresolved`. Если прошлая попытка доказанно не уходила, terminal у неё
         // не появится НИКОГДА, и требовать его — значит запрещать восстановление звука бессрочно
         // (дефект iter59: `restore_not_sent` сохранял путь, а следующая сверка падала в шаг 2).
+        // iter61 §5.2: доказательство «не отправляли» берётся ИЗ ЖУРНАЛА, а не из отсутствия
+        // следов на устройстве.
+        //  • `restore_not_sent:*` — слой доставки вернул NotSent (durable-фаза);
+        //  • `restore_prepared` — identity записана, но передача транспорту НЕ начиналась:
+        //    `LockSound.restore` пишет durable-фазу `restore_handoff:<path>` ПЕРЕД вызовом
+        //    транспорта, поэтому запись без handoff означает «до отправки не дошли»;
+        //  • `restore_handoff:*` — передача начиналась ⇒ terminal обязателен, иначе запрет.
+        // Следы на устройстве — СВЕРКА: если журнал говорит «не отправляли», а скрипт/`.started`
+        // /terminal на месте, это противоречие ⇒ исход НЕ доказан (блокируем и просим разбор).
+        val journalProvesNoHandoff = op.reason == "restore_prepared"
+        val journalProvesNotSent = op.reason.startsWith("restore_not_sent")
+        val evidenceContradicts = prevFacts != null && (
+            prevFacts.startedMark != StartedMark.ABSENT || prevFacts.terminalProven ||
+                prevFacts.scriptPresent
+            )
         val prevProvenNotSent = prevEv.isNotEmpty() && (
-            op.reason.startsWith("restore_not_sent") ||
-                // «подготовлено, но не начато» — обоснованная recovery crash-до-send: скрипта нет,
-                // `.started` нет, terminal нет ⇒ исполнение доказанно не начиналось.
-                (op.reason == "restore_prepared" && prevFacts != null &&
-                    !prevFacts.terminalProven && prevFacts.started.isEmpty() &&
-                    !prevFacts.scriptPresent)
+            journalProvesNotSent ||
+                (journalProvesNoHandoff && !evidenceContradicts)
             )
         if (prevEv.isNotEmpty() && !prevTerminal && !prevProvenNotSent) {
             return ReconStep(
