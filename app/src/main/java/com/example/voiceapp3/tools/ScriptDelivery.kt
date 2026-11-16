@@ -286,7 +286,11 @@ object ScriptDelivery {
         // в `<path>.done`. Прямая отправка больше не «невосстановима»: после потери ответа
         // terminal читается read-only ([evidenceCommand]), а не угадывается повтором.
         val terminal = if (terminalPath.isEmpty()) "" else
-            "; _VRC=\$?; echo \"rc=\$_VRC\" > " + terminalPath + ".done 2>/dev/null; " +
+            // iter58 §4: `_VRC` снят один раз СРАЗУ после payload — здесь его не переснимаем.
+            // Дефект iter57: второй `_VRC=$?` захватывал код предыдущего `echo`, поэтому при
+            // payload `exit 7` в `<path>.done` попадал `rc=0`, и «завершено успешно» выводилось
+            // из собственного украшения обёртки, а не из кода возврата скрипта.
+            "; echo \"rc=\$_VRC\" > " + terminalPath + ".done 2>/dev/null; " +
                 "if [ -e " + terminalPath + ".done ]; then " +
                 "echo \"VAPP_DIRECT_TERMINAL_" + n + " written=1\"; else " +
                 "echo \"VAPP_DIRECT_TERMINAL_" + n + " written=0\"; fi; exit \$_VRC"
