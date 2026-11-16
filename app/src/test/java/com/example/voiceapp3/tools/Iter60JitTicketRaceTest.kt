@@ -336,15 +336,31 @@ class Iter60JitTicketRaceTest {
 
     @Test
     fun deadLegacyIsMigratedAndTheNewProtocolWorksAfterwards() {
-        val dead = startSleeper("0.05")
-        val pid = dead.pid()
-        dead.waitFor(30, TimeUnit.SECONDS)
-        File(JitOwn.lockPath(b) + ".admin").writeText("inst=OLD;pid=$pid;pstart=1;boot=${bootId()}\n")
+        // PID может быть переиспользован другим процессом стенда — тогда запись законно
+        // считается ЖИВОЙ (это не дефект протокола). Поэтому попытки ограниченно повторяются,
+        // и повтор объясняется в сообщении, а не «увеличением таймаута».
+        var entered = false
+        var text = ""
+        var attempts = 0
+        while (attempts < 5 && !entered) {
+            attempts++
+            val dead = startSleeper("0.05")
+            val pid = dead.pid()
+            dead.waitFor(30, TimeUnit.SECONDS)
+            File(JitOwn.lockPath(b) + ".admin").writeText("inst=OLD;pid=$pid;pstart=1;boot=${bootId()}\n")
 
-        val a = participant("a", holdMs = 0)
-        assertTrue("после миграции вход разрешён: ${a.text()}", a.await("ENTER a witness=taken"))
-        assertFalse("legacy-файл мёртвого снят", File(JitOwn.lockPath(b) + ".admin").exists())
-        a.stop()
+            val a = participant("a", holdMs = 0)
+            entered = a.await("ENTER a witness=taken")
+            text = a.text()
+            a.stop()
+            if (entered) {
+                assertFalse("legacy-файл мёртвого снят",
+                    File(JitOwn.lockPath(b) + ".admin").exists())
+            } else if (!File("/proc/$pid").exists()) {
+                break   // запись мёртвого осталась при отсутствующем процессе — это дефект
+            }
+        }
+        assertTrue("после миграции вход разрешён: $text (попыток=$attempts)", entered)
 
         val z = participant("z", holdMs = 0)
         assertTrue("следующий участник тоже входит: ${z.text()}", z.await("ENTER z witness=taken"))

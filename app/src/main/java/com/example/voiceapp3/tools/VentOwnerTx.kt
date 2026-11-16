@@ -46,9 +46,20 @@ internal class VentOwnerTx {
     fun contains(window: Int): Boolean = synchronized(lock) { owners.containsKey(window) }
 
 
-    /** Единственная точка мутации: блок выполняется под lock, затем двигается поколение. */
+    /**
+     * Единственная точка мутации: блок выполняется под lock, затем двигается поколение.
+     *
+     * iter60 §7.4: блок получает КОПИЮ, а не живые коллекции. Дефект: вызывающий мог сохранить
+     * ссылку на `owners`/`HashSet` из блока и менять её позже, вне lock и без нового поколения —
+     * то есть мутация владельцев, невидимая для ABA-проверок (mutable-set escape). Копия под
+     * lock и коммит в конце сохраняют атомарность и делают утёкшую ссылку безвредной.
+     */
     fun mutate(block: (MutableMap<Int, MutableSet<Int>>) -> Unit): Long = synchronized(lock) {
-        block(owners)
+        val working = LinkedHashMap<Int, MutableSet<Int>>()
+        owners.forEach { (w, ds) -> working[w] = HashSet(ds) }
+        block(working)
+        owners.clear()
+        working.forEach { (w, ds) -> owners[w] = HashSet(ds) }
         gen.incrementAndGet()
     }
 
