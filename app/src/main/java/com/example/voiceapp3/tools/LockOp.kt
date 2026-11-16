@@ -293,6 +293,40 @@ internal object LockOp {
      * [unresolved] — «исход не доказан, нужен повторный read-only проход» ([SoundRecovery.Pending]).
      * Отправка нового bind разрешена ТОЛЬКО когда ни одна операция не дала conflict/unresolved.
      */
+
+    /**
+     * iter58 §3.1 — ЕДИНСТВЕННОЕ решающее правило агрегатора звука.
+     *
+     * Собирает итог по всем операциям журнала в одно из трёх состояний. Порядок старшинства
+     * намеренно такой: конфликт (нужно решение владельца) → недоказанный исход (нужен ещё один
+     * read-only проход) → «этому проходу side effect не разрешён» → `null` (можно сходиться к
+     * последнему намерению владельца).
+     *
+     * Зачем отдельная функция: в iter57 решение считалось в `reconStep`, а агрегатор
+     * `LockSound.reconcileLocked` его отбрасывал — и отправлял новый bind (с `reconcileFirst =
+     * false`), ставил «применено OFF» и возвращал `Ready`. Теперь production спрашивает ЭТУ
+     * функцию и без `null` не делает ни одного side effect.
+     *
+     * @param unresolved id операций, чей исход не доказан (`reconStep.unresolved`).
+     * @param conflict   первый агрегированный конфликт (`reconStep.conflict`), если он есть.
+     * @param lateShell  id операций, где поздний shell всё ещё возможен.
+     * @param readOnlyPass true для отложенного прохода: он читает свидетельства, но не действует.
+     */
+    fun recoveryGate(
+        unresolved: List<String>,
+        conflict: String?,
+        lateShell: List<String>,
+        readOnlyPass: Boolean
+    ): SoundRecovery? {
+        val why = conflict ?: lateShell.firstOrNull()?.let { "late_shell_possible:" + it }
+        if (why != null) return SoundRecovery.Conflict(why)
+        if (unresolved.isNotEmpty()) {
+            return SoundRecovery.Pending("unresolved:" + unresolved.joinToString(","))
+        }
+        if (readOnlyPass) return SoundRecovery.Pending("read_only_pass")
+        return null
+    }
+
     data class ReconStep(
         val opId: String,
         val newState: State,
@@ -311,6 +345,13 @@ internal object LockOp {
             (if (conflict != null) " conflict=$conflict" else "") +
             (if (unresolved) " unresolved=1" else "") +
             (if (lateShell) " late_shell=1" else "")
+
+        /**
+         * iter58 §3.1: можно ли строить новый bind по итогу ЭТОЙ операции — только доказанный
+         * сток (DONE) без конфликта и без неразрешённого исхода. Раньше агрегатор это не
+         * спрашивал и отправлял bind поверх нерешённого late shell.
+         */
+        val mayBind: Boolean get() = newState == State.DONE && conflict == null && !unresolved
     }
 
     /**
@@ -372,6 +413,30 @@ internal object LockOp {
         val restoreTerminal = if (!restoreEvKnown) false else
             ports.evidence(op, op.restoreEv)?.terminalProven == true
 
+        // iter58 §3.2 — РЕШЕНИЕ ДО ОТПРАВКИ.
+        // Дефект iter57: `ports.restore` вызывался ДО этих проверок, поэтому новый umount уходил
+        // на устройство, пока прошлый restore мог ещё исполняться, и его terminal нельзя было
+        // отнести к новой попытке.
+        if (restoreEvKnown && !restoreTerminal) {
+            return ReconStep(
+                op.id, State.UNDEFINED, "previous_restore_unresolved",
+                conflict = "previous_restore_unresolved:" + op.id, unresolved = true,
+                lateShell = true, persist = op.copy(reason = "previous_restore_unresolved"),
+                deferReread = true,
+                note = "прежний restore не терминален: параллельный повтор запрещён"
+            )
+        }
+        // Адрес свидетельства НОВОЙ попытки обязан быть известен ДО отправки и сохранён в
+        // журнале: после crash между send и записью результата путь уже не восстановить.
+        val prepared = ports.prepareRestore(op)
+        if (prepared.isEmpty()) {
+            return ReconStep(
+                op.id, State.UNDEFINED, "restore_evidence_not_prepared",
+                unresolved = true, persist = op.copy(reason = "restore_evidence_not_prepared"),
+                note = "адрес свидетельства restore не подготовлен: отправки нет"
+            )
+        }
+
         val out = ports.restore(op)
         // Restore не ушёл: доказуемо «ничего не исполнялось» — повтор разрешён, состояние не
         // закрываем (bind всё равно не доказан), но и конфликт не создаём.
@@ -393,7 +458,9 @@ internal object LockOp {
                 note = "restore мог выполниться позже: новый bind не отправляется до terminal"
             )
         }
-        // 3) terminal bind не доказан ⇒ операцию НЕ закрываем, даже если сейчас виден stock.
+        // 5) terminal bind не доказан ⇒ операцию НЕ закрываем, даже если сейчас виден stock.
+        //    Проверка стоит ПОСЛЕ restore намеренно: снять СВОИ слои можно (это не заявляет
+        //    сток), но закрыть операцию и разрешить новый bind — нельзя.
         if (bindLate) {
             val why = if (bindFacts == null) "evidence_absent_or_unreadable" else "late_shell_unproven"
             val conflict = if (bindFacts == null) "evidence_unknown:" + op.id

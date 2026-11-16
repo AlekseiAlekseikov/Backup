@@ -1752,17 +1752,30 @@ object LockSound {
      *   был `Boolean`, и production его ИГНОРИРОВАЛ: несовместимый bind уходил даже при
      *   неизвестном/повреждённом журнале.
      */
-    internal fun reconcilePendingOps(ctx: Context, source: String): LockOp.SoundRecovery {
+    internal fun reconcilePendingOps(
+        ctx: Context,
+        source: String,
+        /**
+         * iter58 §3.2: отложенный проход после «позднего shell» — ТОЛЬКО чтение. Он может
+         * закрыть операцию, если terminal уже читается, но не имеет права отправить новый
+         * restore/umount: иначе «read-only reread» снова запускал side effect.
+         */
+        allowRestore: Boolean = true
+    ): LockOp.SoundRecovery {
         gateEnter("reconcile")
         try {
-            return reconcileLocked(ctx, source)
+            return reconcileLocked(ctx, source, allowRestore)
         } finally {
             gateExit()
         }
     }
 
     /** Тело сверки — выполняется под [ioGate] (см. [reconcilePendingOps]). */
-    private fun reconcileLocked(ctx: Context, source: String): LockOp.SoundRecovery {
+    private fun reconcileLocked(
+        ctx: Context,
+        source: String,
+        allowRestore: Boolean = true
+    ): LockOp.SoundRecovery {
         val read = readOpJournal(ctx)
         if (read is LockOp.JournalRead.Unknown) {
             // «Прочитать нельзя» — это НЕ «операций не было»: объявлять «всё снято» и
@@ -1797,13 +1810,41 @@ object LockSound {
         val appCtx = ctx.applicationContext
         // iter57 §5.2/§5.3: решение по КАЖДОЙ операции принимает [LockOp.reconStep] — тот же
         // код, который гоняют тесты. Здесь только порты устройства и запись результата.
+        // iter58 §3.2: подготовленные restore по операции. Identity (nonce/path) создаётся
+        // ОДИН раз в [prepareRestore] и ДО отправки сохраняется в журнал; сама отправка берёт
+        // ровно её, поэтому crash между send и записью результата не оставляет поздний umount
+        // без адреса свидетельства, а повторный restore не подменяет identity.
+        val preparedRestore = HashMap<String, ScriptDelivery.Prepared>()
+        val readOnlyPass = !allowRestore
         val ports = object : LockOp.ReconPorts {
             override fun evidence(op: LockOp.BindOp, path: String): LockOp.EvidenceFacts? =
                 readEvidencePath(appCtx, op.id, path)
 
-            override fun restore(op: LockOp.BindOp): LockOp.RestoreOutcome {
+            override fun prepareRestore(op: LockOp.BindOp): String {
+                if (readOnlyPass) return ""
                 val script = LockMountScripts.restoreScript(op.targets.map { it to op.stage })
                 val prep = ScriptDelivery.prepare("lock_restore", script)
+                preparedRestore[op.id] = prep
+                // Durable ЗАПИСЬ адреса свидетельства ДО отправки: если её не подтвердить,
+                // restore не отправляется вовсе (см. reconStep).
+                val persisted = runCatching {
+                    appendOp(appCtx, op.copy(restoreEv = prep.evidencePath, reason = "restore_prepared"),
+                        "restore_prepared")
+                }.getOrDefault(false)
+                if (!persisted) {
+                    evalLog = evalLog + "restore_prepare_not_persisted:" + op.id
+                    return ""
+                }
+                return prep.evidencePath
+            }
+
+            override fun restore(op: LockOp.BindOp): LockOp.RestoreOutcome {
+                if (readOnlyPass) {
+                    return LockOp.RestoreOutcome(false, false, -1, "", "", "read_only_pass")
+                }
+                val prep = preparedRestore.remove(op.id)
+                    ?: return LockOp.RestoreOutcome(false, false, -1, "", "",
+                        "restore_not_prepared")
                 val res = AdbClient.executePrepared(prep, 30000)
                 val outcome = ScriptDelivery.outcome(res, op.id)
                 return when (outcome) {
@@ -1817,8 +1858,6 @@ object LockSound {
                         LockOp.RestoreOutcome(true, false, res.rc, res.out, prep.evidencePath, "")
                 }
             }
-
-            override fun prepareRestore(op: LockOp.BindOp): String = ""
         }
         for (op in pending) {
             val step = runCatching { LockOp.reconStep(op, ports) }.getOrElse { t ->
@@ -1851,14 +1890,44 @@ object LockSound {
                 "(terminal исполнения не доказан: операция НЕ закрывается, bind не отправляется)")
             conflictReason = conflictReason ?: ("late_shell_possible:" + lateShell.first())
         }
+        // ── iter58 §3.1: РЕШЕНИЕ АГРЕГАТОРА ────────────────────────────────────────────────
+        // Дефект iter57: unresolved/conflict/lateShell считались, логировались — и затем
+        // игнорировались: при ON всё равно планировался новый bind (с `reconcileFirst=false`,
+        // то есть с обходом проверки), при OFF ставилась отметка «применено OFF», а функция
+        // всегда возвращала Ready. Правильные решения модели `LockOp.reconStep` до вызывающих
+        // мест не доходили.
+        //
+        // Теперь, пока хоть одна операция не разрешена, агрегатор:
+        //  • НЕ отправляет bind и НЕ сходится к намерению;
+        //  • НЕ объявляет «применено OFF»/«сток доказан»;
+        //  • возвращает Pending (нужен ещё проход) или Conflict (нужно решение владельца).
+        val gate = LockOp.recoveryGate(unresolvedNow, conflictReason, lateShell, readOnlyPass)
+        if (gate != null) {
+            AppLog.e(appCtx, TAG, "LOCKSOUND_RECONCILE source=$source action=blocked " +
+                "unresolved=${unresolvedNow.joinToString(",").ifEmpty { "none" }} " +
+                "conflict=${conflictReason ?: "none"} " +
+                "late_shell=${lateShell.joinToString(",").ifEmpty { "none" }} " +
+                "${gate.wire()} bind_sent=no off_applied=no " +
+                "desired=${if (isEnabled(appCtx)) "on" else "off"} " +
+                "(операция не разрешена: новый bind и отметка OFF запрещены)")
+            return gate
+        }
         // Сходимость к последнему сохранённому намерению (не к «состоянию до»).
         if (isEnabled(appCtx)) {
             val path = getSelectedPath(appCtx)
-            if (path.isNotEmpty() && File(path).exists()) {
-                AppLog.i(appCtx, TAG, "LOCKSOUND_RECONCILE action=converge_to_intent desired=true " +
-                    "(после сверки возвращаем звук к последнему выбору владельца)")
-                applySystemLockSoundBind(appCtx, File(path), reconcileFirst = false)
+            if (path.isEmpty() || !File(path).exists()) {
+                // Включено, но файл недоступен: это НЕ «сток доказан» и не повод объявлять
+                // готовность — выбор владельца сохранён, применение не подтверждено.
+                AppLog.e(appCtx, TAG, "LOCKSOUND_RECONCILE action=blocked desired=true " +
+                    "reason=selected_file_missing path=${path.ifEmpty { "none" }} " +
+                    "(настройка сохранена, применение не подтверждено)")
+                return LockOp.SoundRecovery.Pending("selected_file_missing")
             }
+            AppLog.i(appCtx, TAG, "LOCKSOUND_RECONCILE action=converge_to_intent desired=true " +
+                "(после сверки возвращаем звук к последнему выбору владельца)")
+            val applied = applySystemLockSoundBind(appCtx, File(path), reconcileFirst = false)
+            return if (applied) LockOp.SoundRecovery.Ready
+            else LockOp.SoundRecovery.Pending("bind_not_confirmed")
         } else {
             markApplied(appCtx, false, "reconciled_off")
         }
@@ -1876,7 +1945,10 @@ object LockSound {
         val appCtx = ctx.applicationContext
         runCatching {
             BgWorker.postDelayed("LockSound.reread", REREAD_DELAY_MS) {
-                runCatching { reconcilePendingOps(appCtx, "reread_after:" + source) }
+                // iter58 §3.2: отложенный проход — ТОЛЬКО чтение свидетельств.
+                runCatching {
+                    reconcilePendingOps(appCtx, "reread_after:" + source, allowRestore = false)
+                }
             }
         }
     }

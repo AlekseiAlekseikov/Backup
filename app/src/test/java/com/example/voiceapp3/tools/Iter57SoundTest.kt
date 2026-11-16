@@ -57,6 +57,9 @@ class Iter57SoundTest {
         )
     ) : LockOp.ReconPorts {
         var restores = 0
+        var prepares = 0
+        /** Адрес свидетельства, подготовленный ДО отправки (iter58 §3.2). */
+        var prepareResult: String = "/data/local/tmp/voiceapp3_lock_restore_new.sh"
         override fun evidence(op: LockOp.BindOp, path: String): LockOp.EvidenceFacts? =
             if (facts.containsKey(path)) facts[path] else null
 
@@ -65,7 +68,10 @@ class Iter57SoundTest {
             return restore
         }
 
-        override fun prepareRestore(op: LockOp.BindOp): String = ""
+        override fun prepareRestore(op: LockOp.BindOp): String {
+            prepares++
+            return prepareResult
+        }
     }
 
     private fun facts(started: String, done: String, present: Boolean) =
