@@ -207,9 +207,20 @@ class Iter52DeliveryTest {
             parentFile.mkdirs(); writeText("ЧУЖИЕ ДАННЫЕ")
         }
         val res = ScriptDelivery.deliver("lock_bind", script, 30_000, true, dev::exec, nonce = nonce)
-        assertEquals("доставка прошла под другим именем", ScriptDelivery.State.RUN_CONFIRMED, res.state)
+        // iter60 §6: имя, подтверждённое вызывающим (journal), внутри отправки НЕ меняется.
+        // Отправка сообщает коллизию и ничего не делает; новую identity готовит вызывающий.
+        assertEquals("коллизия названа честно", ScriptDelivery.State.COLLISION, res.state)
+        assertEquals("ответ по-прежнему один и тот же путь", path, res.plan.path)
         assertEquals("чужой файл не тронут", "ЧУЖИЕ ДАННЫЕ", existing.readText())
-        assertNotEquals("взято другое имя", path, res.plan.path)
+        assertFalse("запуска не было", res.mayHaveRun)
+
+        // Вызывающий готовит НОВУЮ identity (prepare → journal → upload) — вот это разрешено.
+        val other = ScriptDelivery.pathFor("lock_bind", "0f0f0f0f0f0f0f0f")
+        val res2 = ScriptDelivery.deliver("lock_bind", script, 30_000, true, dev::exec,
+            nonce = "0f0f0f0f0f0f0f0f")
+        assertEquals("доставка под новым именем", ScriptDelivery.State.RUN_CONFIRMED, res2.state)
+        assertEquals("новый путь — тот, что подготовлен", other, res2.plan.path)
+        assertEquals("чужой файл по-прежнему не тронут", "ЧУЖИЕ ДАННЫЕ", existing.readText())
     }
 
     @Test

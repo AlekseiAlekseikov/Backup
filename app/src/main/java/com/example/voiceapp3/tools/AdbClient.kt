@@ -625,6 +625,11 @@ object AdbClient {
                     "сверка фактического состояния функции)")
             ScriptDelivery.State.NOT_SENT ->
                 AppLog.w(TAG, "SCRIPT_UPLOAD NOT_SENT name=$name ${res.wire()}")
+            // iter60 §6: имя занято — отправки не было. Новую identity готовит ВЫЗЫВАЮЩИЙ
+            // (prepare → journal → upload), здесь nonce не подменяется.
+            ScriptDelivery.State.COLLISION ->
+                AppLog.w(TAG, "SCRIPT_UPLOAD COLLISION name=$name ${res.wire()} " +
+                    "action=no_send (нужна новая identity, подготовленная вызывающим)")
         }
         return res
     }

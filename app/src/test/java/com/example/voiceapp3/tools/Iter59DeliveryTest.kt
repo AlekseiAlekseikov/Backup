@@ -109,20 +109,12 @@ class Iter59DeliveryTest {
     // ───────── 3. Коллизия имени: не перезаписываем чужое ─────────
 
     @Test
-    fun nameCollisionTakesANewNonceAndNeverOverwrites() {
+    fun nameCollisionIsReportedAndNeverChangesTheNonceInsideSend() {
         val calls = mutableListOf<String>()
-        var createdOnce = false
         val exec: (String, Int, Boolean) -> Pair<Int, String> = { cmd, _, _ ->
             calls.add(cmd)
             when {
-                cmd.contains("set -C") && cmd.contains(": >") -> {
-                    if (!createdOnce) {
-                        createdOnce = true
-                        1 to "EXISTS"            // имя занято чужим/старым файлом
-                    } else {
-                        0 to "CREATED"
-                    }
-                }
+                cmd.contains("set -C") && cmd.contains(": >") -> 1 to "EXISTS"
                 cmd.contains("base64") || cmd.contains("printf") -> 0 to "OK"
                 else -> 0 to "SCRIPT_BYTES=6 EXPECTED=6 SCRIPT_CONTENT_OK checked=1 " +
                     "SCRIPT_RUN_DONE rc=0"
@@ -130,19 +122,23 @@ class Iter59DeliveryTest {
         }
         val res = ScriptDelivery.deliver("lock_bind", bigScript(), 30_000, false, exec, nonce = "aaaa")
 
-        assertEquals("створ: имя занято → создано новое", true, createdOnce)
+        // iter60 §6: iter59 менял nonce ВНУТРИ отправки, и скрипт исполнялся по пути, которого
+        // нет в durable журнале вызывающего. Теперь: одна попытка создания, коллизия наружу.
         val creates = calls.filter { it.contains("set -C") }
-        assertTrue("создание повторено с ДРУГИМ именем: $creates", creates.size >= 2)
-        val names = creates.map { Regex("voiceapp3_[a-z_]+_([0-9a-f]+)\\.sh").find(it)?.groupValues?.get(1) }
-        assertTrue("nonce сменился: $names", names.distinct().size >= 2)
-        // Создание — ТОЛЬКО в режиме noclobber (иначе оно перезаписало бы занятое имя).
+        assertEquals("создание ровно одно (без подмены nonce): $creates", 1, creates.size)
         assertTrue("создание под noclobber: ${creates.first()}", creates.first().contains("set -C"))
+        assertTrue("занятое имя сохранено в плане: ${res.plan.path}", res.plan.path.endsWith("_aaaa.sh"))
+        assertEquals("запуска не было", ScriptDelivery.State.COLLISION, res.state)
+        assertFalse("повтор не отправлялся", res.mayHaveRun)
         assertFalse("занятое имя никто не удалял: $calls",
             calls.any { it.contains("rm -f") && it.contains("_aaaa.sh") })
         assertFalse("в занятое имя никто не писал: $calls",
             calls.any { it.contains(">> /data/local/tmp") && it.contains("_aaaa.sh") })
-        assertFalse("итоговый путь не равен занятому",
-            res.plan.path.endsWith("_aaaa.sh"))
+        assertFalse("после коллизии не запускалось НИЧЕГО: $calls",
+            calls.any { it.contains("SCRIPT_RUN_DONE") || it.contains("sh /data/local/tmp") })
+        // Коллизия — доказанное «не отправлено», повтор возможен только с новой identity.
+        assertTrue("исход для потребителя — NotSent",
+            ScriptDelivery.outcome(res, "op") is ScriptDelivery.DeliveryOutcome.NotSent)
     }
 
     // ───────── 4. Потребители берут код payload ─────────

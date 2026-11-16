@@ -54,7 +54,14 @@ object ScriptDelivery {
      * [RUN_UNKNOWN] — ответ потерян и terminal не прочитан: запуск МОГ произойти.
      */
     enum class State {
-        NOT_SENT, UPLOAD_INCOMPLETE, RUN_SENT, RUN_CONFIRMED, RUN_UNKNOWN, TOO_LARGE
+        NOT_SENT, UPLOAD_INCOMPLETE, RUN_SENT, RUN_CONFIRMED, RUN_UNKNOWN, TOO_LARGE,
+
+        /**
+         * iter60 §6: имя, подтверждённое вызывающим (durable journal), занято чужим файлом.
+         * Ничего не отправлено и НЕ отправлено под другим nonce: смена identity внутри отправки
+         * сделала бы journal (путь A) ложью, а исполнение произошло бы по пути B.
+         */
+        COLLISION
     }
 
     data class Plan(
@@ -211,6 +218,9 @@ object ScriptDelivery {
         State.UPLOAD_INCOMPLETE -> DeliveryOutcome.NotSent("upload_incomplete")
         State.TOO_LARGE -> DeliveryOutcome.NotSent("script_too_large")
         State.NOT_SENT -> DeliveryOutcome.NotSent("not_sent")
+        // Коллизия — доказанное «не отправлено»: ни байта скрипта, ни запуска. Повтор допустим
+        // только с НОВОЙ identity, подготовленной и записанной вызывающим.
+        State.COLLISION -> DeliveryOutcome.NotSent("path_collision_requires_new_identity")
     }
 
     // ─────────────────────────── имена и содержимое ───────────────────────────
@@ -569,33 +579,30 @@ object ScriptDelivery {
         var lastOut = ""
         var attempts = 0
         var path = plan.path
-        var currentNonce = nonce
 
         for (attempt in 1..tries) {
             attempts = attempt
-            // 1) Эксклюзивное создание: занятое имя не перезаписываем — берём новое.
-            var created = false
-            // ВАЖНО: `return@repeat` в Kotlin НЕ прерывает `repeat` — он лишь завершает текущую
-            // итерацию. Из-за этого после успешного создания цикл шёл дальше, получал `EXISTS`
-            // и создавал ВТОРОЙ файл, который потом никто не удалял (найдено тестом на реальном
-            // shell: `files2=[voiceapp3_lock_bind_<A>.sh, voiceapp3_lock_bind_<B>.sh]`).
-            for (i in 0 until 3) {
-                val (rcCreate, outCreate) = exec(createCommand(path), 8000, expectRoot)
-                if (rcCreate == 0 && outCreate.contains("CREATED")) {
-                    created = true
-                    break
-                }
-                if (outCreate.contains("EXISTS")) {
-                    // Имя занято (чужой/старый файл): НЕ трогаем его, берём новое.
-                    currentNonce = newNonce()
-                    path = pathFor(name, currentNonce)
-                    continue
-                }
-                break
+            // 1) Эксклюзивное создание. iter60 §6: имя НЕ меняется внутри отправки.
+            //
+            // Дефект iter59 (`:582–591`): при `EXISTS` здесь генерировался НОВЫЙ nonce, и скрипт
+            // исполнялся по пути, которого нет в durable журнале вызывающего (там записан путь A).
+            // Свидетельство тогда указывало не туда, а «исход неизвестен» становился неразрешимым.
+            // Правильное разделение: caller готовит B (prepare B → journal B → upload B), а
+            // отправка A честно сообщает COLLISION и НИЧЕГО не делает.
+            val (rcCreate, outCreate) = exec(createCommand(path), 8000, expectRoot)
+            val created = rcCreate == 0 && outCreate.contains("CREATED")
+            if (!created && outCreate.contains("EXISTS")) {
+                // Ни upload, ни run: чужая запись не тронута, новых файлов не появилось.
+                return Result(
+                    rc = rcCreate, out = "ERR_SCRIPT_PATH_COLLISION: $outCreate",
+                    plan = plan.copy(path = path), attempts = attempt,
+                    state = State.COLLISION, sizeChecked = false, contentChecked = false,
+                    leftoverPath = "", mayHaveRun = false
+                )
             }
             if (!created) {
-                lastRc = 1
-                lastOut = "ERR_SCRIPT_UPLOAD_CREATE: $lastOut"
+                lastRc = rcCreate
+                lastOut = "ERR_SCRIPT_UPLOAD_CREATE: $outCreate"
                 continue
             }
 
