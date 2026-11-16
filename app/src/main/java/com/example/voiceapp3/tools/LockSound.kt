@@ -1832,7 +1832,12 @@ object LockSound {
                         "restore_prepared")
                 }.getOrDefault(false)
                 if (!persisted) {
-                    evalLog = evalLog + "restore_prepare_not_persisted:" + op.id
+                    // Адрес свидетельства НЕ сохранён ⇒ restore не отправляется: иначе после
+                    // crash между send и записью результата поздний `umount` остался бы без
+                    // адреса, по которому его terminal можно прочитать.
+                    AppLog.e(appCtx, TAG, "LOCKSOUND_RESTORE_PREPARE op=${op.id} " +
+                        "persisted=no action=no_send reason=restore_prepare_not_persisted " +
+                        "evidence=${prep.evidencePath.ifEmpty { "none" }}")
                     return ""
                 }
                 return prep.evidencePath
@@ -1925,9 +1930,13 @@ object LockSound {
             }
             AppLog.i(appCtx, TAG, "LOCKSOUND_RECONCILE action=converge_to_intent desired=true " +
                 "(после сверки возвращаем звук к последнему выбору владельца)")
-            val applied = applySystemLockSoundBind(appCtx, File(path), reconcileFirst = false)
-            return if (applied) LockOp.SoundRecovery.Ready
-            else LockOp.SoundRecovery.Pending("bind_not_confirmed")
+            // iter58 §3.1: `applySystemLockSoundBind` НЕ возвращает результат — работа уходит в
+            // BgWorker. Значит, «применено» здесь заявить нельзя: возвращаем Pending и говорим,
+            // что bind только ЗАПЛАНИРОВАН. Готовность объявит проход, который прочитает факт.
+            applySystemLockSoundBind(appCtx, File(path), reconcileFirst = false)
+            AppLog.i(appCtx, TAG, "LOCKSOUND_RECONCILE action=bind_scheduled desired=true " +
+                "path=$path (отправка запланирована в BgWorker; применение ещё НЕ подтверждено)")
+            return LockOp.SoundRecovery.Pending("bind_scheduled", path)
         } else {
             markApplied(appCtx, false, "reconciled_off")
         }
