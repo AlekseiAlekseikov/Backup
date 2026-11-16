@@ -1883,15 +1883,22 @@ object LockSound {
                     ?: return LockOp.RestoreOutcome(false, false, -1, "", "", "attempt_not_prepared")
                 val res = AdbClient.executePrepared(prep, 30000)
                 val outcome = ScriptDelivery.outcome(res, op.id)
+                // iter59 §7: наружу отдаётся код PAYLOAD. Транспортный rc (-1/1 при потере
+                // ответа) за код скрипта не принимается: иначе «umount не выполнен» и «umount
+                // выполнен, ответ потерян» выглядели бы одинаково.
+                val payloadRc = if (res.payloadRc != ScriptDelivery.RC_UNKNOWN) res.payloadRc else -1
+                AppLog.i(appCtx, TAG, "LOCKSOUND_RESTORE_RESULT op=${op.id} state=${res.state.name} " +
+                    "payload_rc=$payloadRc transport_rc=${res.transportRc} " +
+                    "rc_from_done=${res.rcFromDone} evidence=${attempt}")
                 return when (outcome) {
                     is ScriptDelivery.DeliveryOutcome.NotSent ->
-                        LockOp.RestoreOutcome(false, false, res.rc, res.out,
+                        LockOp.RestoreOutcome(false, false, payloadRc, res.out,
                             attempt, outcome.why)
                     is ScriptDelivery.DeliveryOutcome.Unknown ->
-                        LockOp.RestoreOutcome(true, true, res.rc, res.out,
+                        LockOp.RestoreOutcome(true, true, payloadRc, res.out,
                             outcome.evidence.path.ifEmpty { attempt }, outcome.why)
                     is ScriptDelivery.DeliveryOutcome.Finished ->
-                        LockOp.RestoreOutcome(true, false, res.rc, res.out, attempt, "")
+                        LockOp.RestoreOutcome(true, false, payloadRc, res.out, attempt, "")
                 }
             }
         }

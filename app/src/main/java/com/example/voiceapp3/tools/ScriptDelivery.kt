@@ -71,6 +71,9 @@ object ScriptDelivery {
                 (if (reason.isEmpty()) "" else " reason=$reason")
     }
 
+    /** Значение [Result.payloadRc], когда код возврата payload НЕ доказан. */
+    const val RC_UNKNOWN: Int = Int.MIN_VALUE
+
     data class Result(
         val rc: Int,
         val out: String,
@@ -91,7 +94,21 @@ object ScriptDelivery {
          * iter53 §6.2: файлы-свидетельства (`<path>`, `<path>.started`, `<path>.done`),
          * ОСТАВЛЕННЫЕ на устройстве, когда исход неизвестен. Пусто — свидетельств не осталось.
          */
-        val evidencePath: String = ""
+        val evidencePath: String = "",
+        /**
+         * iter59 §7: код ТРАНСПОРТА (ADB/канал), а не код возврата payload.
+         * `rc` выше остаётся «лучшим известным ответом», но потребитель, которому важен именно
+         * payload, обязан смотреть [payloadRc]: раньше потеря ответа давала в `rc` код канала
+         * (`-1`/`1`), и он неотличимо совпадал с кодом скрипта.
+         */
+        val transportRc: Int = -1,
+        /**
+         * Код возврата PAYLOAD. [RC_UNKNOWN] — НЕ доказан (не путать с `0 = успех`).
+         * Источники по силе: durable `<path>.done` (readback) → маркер завершения этой попытки.
+         */
+        val payloadRc: Int = RC_UNKNOWN,
+        /** Код взят из durable `<path>.done`, а не из stdout. */
+        val rcFromDone: Boolean = false
     ) {
         /**
          * iter54 §5: `cksum`/CRC — проверка ЦЕЛОСТНОСТИ заливки, а НЕ криптографическое
@@ -176,7 +193,12 @@ object ScriptDelivery {
      *  • всё остальное — `NotSent` (доказанное «не исполнялось»).
      */
     fun outcome(result: Result, operationId: String): DeliveryOutcome = when (result.state) {
-        State.RUN_CONFIRMED -> DeliveryOutcome.Finished(operationId, result.rc)
+        // iter59 §7: наружу отдаётся код PAYLOAD; если он не доказан, а состояние всё же
+        // подтверждено, используется известный rc (иначе потребитель получил бы «-1» как успех).
+        State.RUN_CONFIRMED -> DeliveryOutcome.Finished(
+            operationId,
+            if (result.payloadRc != RC_UNKNOWN) result.payloadRc else result.rc
+        )
         // iter55 §5.1: «отправлено» ≠ «завершено». Terminal есть только у RUN_CONFIRMED.
         State.RUN_SENT -> DeliveryOutcome.Unknown(
             operationId, EvidenceRef(result.evidencePath.ifEmpty { result.plan.path }),
@@ -337,15 +359,23 @@ object ScriptDelivery {
         val doneLines = marker.findAll(out).toList()
         return when {
             // Ровно один маркер этой попытки: два и больше — не terminal, а мусор/подделка.
-            doneLines.size == 1 -> Result(
-                doneLines.first().groupValues[1].toIntOrNull() ?: rc, out, plan, 1,
-                State.RUN_CONFIRMED, true, false, "", false, contentKind = "direct_marker",
-                evidencePath = evidence
-            )
+            doneLines.size == 1 -> {
+                val payload = doneLines.first().groupValues[1].toIntOrNull()
+                Result(
+                    payload ?: rc, out, plan, 1,
+                    State.RUN_CONFIRMED, true, false, "", false, contentKind = "direct_marker",
+                    evidencePath = evidence,
+                    // iter59 §7: код маркера — код PAYLOAD; rc транспорта хранится отдельно.
+                    transportRc = rc,
+                    payloadRc = payload ?: RC_UNKNOWN
+                )
+            }
             else -> Result(
                 rc, out, plan, 1, State.RUN_UNKNOWN, false, false, "", true,
                 contentKind = if (lost) "direct_none" else "direct_no_terminal",
-                evidencePath = evidence
+                evidencePath = evidence,
+                // iter59 §7: без маркера код payload НЕ доказан — в `payloadRc` его нет.
+                transportRc = rc, payloadRc = RC_UNKNOWN
             )
         }
     }
@@ -524,7 +554,8 @@ object ScriptDelivery {
         val plan = plan(name, script, nonce)
         if (plan.reason.startsWith("script_too_large")) {
             return Result(1, "ERR_SCRIPT_TOO_LARGE: bytes=${plan.bytes} limit=$MAX_SCRIPT_BYTES",
-                plan, 0, State.TOO_LARGE, false, false, "", false)
+                plan, 0, State.TOO_LARGE, false, false, "", false,
+                transportRc = 1, payloadRc = RC_UNKNOWN)
         }
         if (plan.transport == Transport.DIRECT) {
             // iter54 §5: прямая отправка тоже несёт маркеры начала/завершения — иначе
@@ -610,7 +641,8 @@ object ScriptDelivery {
                         rc = rcRun, out = outRun, plan = plan.copy(path = path), attempts = attempt,
                         state = State.UPLOAD_INCOMPLETE, sizeChecked = sizeOk,
                         contentChecked = false, leftoverPath = cleaned, mayHaveRun = false,
-                        contentKind = contentKind, evidencePath = if (cleaned.isEmpty()) "" else path
+                        contentKind = contentKind, evidencePath = if (cleaned.isEmpty()) "" else path,
+                        transportRc = rcRun, payloadRc = RC_UNKNOWN
                     )
                 }
                 continue
@@ -625,7 +657,9 @@ object ScriptDelivery {
                         out = outRun, plan = plan.copy(path = path), attempts = attempt,
                         state = State.RUN_CONFIRMED, sizeChecked = true, contentChecked = contentOk,
                         leftoverPath = leftover, mayHaveRun = false,
-                        contentKind = contentKind, evidencePath = if (leftover.isEmpty()) "" else path
+                        contentKind = contentKind, evidencePath = if (leftover.isEmpty()) "" else path,
+                        transportRc = rcRun,
+                        payloadRc = finished.groupValues[1].toIntOrNull() ?: RC_UNKNOWN
                     )
                 }
                 // Запуск начался, но `SCRIPT_RUN_DONE` не доехал: сначала read-only сверка.
@@ -636,7 +670,8 @@ object ScriptDelivery {
                         rc = rec, out = outRun, plan = plan.copy(path = path), attempts = attempt,
                         state = State.RUN_CONFIRMED, sizeChecked = true, contentChecked = contentOk,
                         leftoverPath = leftover, mayHaveRun = false,
-                        contentKind = contentKind, evidencePath = if (leftover.isEmpty()) "" else path
+                        contentKind = contentKind, evidencePath = if (leftover.isEmpty()) "" else path,
+                        transportRc = rcRun, payloadRc = rec, rcFromDone = true
                     )
                 }
                 // iter53 §6.2.2: исход НЕИЗВЕСТЕН — свидетельства НЕ удаляются.
@@ -644,7 +679,8 @@ object ScriptDelivery {
                     rc = rcRun, out = outRun, plan = plan.copy(path = path), attempts = attempt,
                     state = State.RUN_UNKNOWN, sizeChecked = true, contentChecked = contentOk,
                     leftoverPath = "", mayHaveRun = true,
-                    contentKind = contentKind, evidencePath = path
+                    contentKind = contentKind, evidencePath = path,
+                    transportRc = rcRun, payloadRc = RC_UNKNOWN
                 )
             }
             // Ни маркера содержимого, ни явного отказа: ответ потерян. Запуск МОГ произойти.
@@ -656,7 +692,8 @@ object ScriptDelivery {
                     rc = reconciled, out = outRun, plan = plan.copy(path = path), attempts = attempt,
                     state = State.RUN_CONFIRMED, sizeChecked = sizeOk, contentChecked = false,
                     leftoverPath = leftover, mayHaveRun = false,
-                    contentKind = contentKind, evidencePath = if (leftover.isEmpty()) "" else path
+                    contentKind = contentKind, evidencePath = if (leftover.isEmpty()) "" else path,
+                    transportRc = rcRun, payloadRc = reconciled, rcFromDone = true
                 )
             }
             // iter53 §6.2.2: `cleanup` здесь БОЛЬШЕ НЕ ВЫЗЫВАЕТСЯ. Скрипт и terminal остаются на
@@ -667,14 +704,16 @@ object ScriptDelivery {
                 rc = rcRun, out = outRun, plan = plan.copy(path = path), attempts = attempt,
                 state = State.RUN_UNKNOWN, sizeChecked = sizeOk, contentChecked = contentOk,
                 leftoverPath = "", mayHaveRun = true,
-                contentKind = contentKind, evidencePath = path
+                contentKind = contentKind, evidencePath = path,
+                transportRc = rcRun, payloadRc = RC_UNKNOWN
             )
         }
         // Ни одна попытка не дошла до запуска: это ДОКАЗАННЫЙ «не отправлено/не запущено».
         val leftover = cleanup(path, exec, expectRoot)
         return Result(lastRc, lastOut, plan.copy(path = path), attempts,
             State.UPLOAD_INCOMPLETE, false, false, leftover, false,
-            evidencePath = if (leftover.isEmpty()) "" else path)
+            evidencePath = if (leftover.isEmpty()) "" else path,
+            transportRc = lastRc, payloadRc = RC_UNKNOWN)
     }
 
     /**

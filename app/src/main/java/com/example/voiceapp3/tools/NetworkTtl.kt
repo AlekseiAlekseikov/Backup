@@ -387,8 +387,14 @@ private fun buildScript(enable: Boolean, reg: TtlOwnership.Registry?): String {
                 "факт даст readback/следующий проход)")
             return TtlRunner.Outcome(false, "unknown:${firstOutcome.why}", firstOutcome.wire())
         }
-        var exitCode = detailed.rc
+        // iter59 §7: `rc` payload'а отделён от `rc` транспорта. При потере ответа код канала
+        // (-1/1) НЕ выдаётся за код скрипта: payload_rc = -1 означает «не доказан».
+        var exitCode = if (detailed.payloadRc != ScriptDelivery.RC_UNKNOWN) detailed.payloadRc else -1
         var output = detailed.out
+        if (detailed.transportRc != exitCode) {
+            AppLog.i(TAG, "TTL_DELIVERY_RC transport_rc=${detailed.transportRc} payload_rc=$exitCode " +
+                "rc_from_done=${detailed.rcFromDone} source=$source")
+        }
         // iter59 §6: повтор — только по ДОКАЗАННОМУ факту «скрипт завершён и сообщил no_uplink».
         // Дефект iter58: повтор шёл через `executeScript` (`Pair`), поэтому повторялся и после
         // «доставлено, исход неизвестен» — то есть мутация могла выполниться дважды. Теперь
@@ -413,7 +419,7 @@ private fun buildScript(enable: Boolean, reg: TtlOwnership.Registry?): String {
                 }
                 val again = AdbClient.executePrepared(nextPrep, 40000)
                 current = ScriptDelivery.outcome(again, opId + "_r" + attempt)
-                exitCode = again.rc
+                exitCode = if (again.payloadRc != ScriptDelivery.RC_UNKNOWN) again.payloadRc else -1
                 output = again.out
                 attempt++
                 if (current !is ScriptDelivery.DeliveryOutcome.Finished) {
