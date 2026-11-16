@@ -313,72 +313,83 @@ _me_pid=${'$'}${'$'}
 _me_psof() { awk '{print ${'$'}22}' "/proc/${'$'}1/stat" 2>/dev/null; }
 _me_pstart=${'$'}(_me_psof "${'$'}_me_pid")
 _me_boot=${'$'}(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
-# ── смерть владельца lock-строки ${'$'}1 доказана? ──────────────────────────
-# rc 0 = жив ИЛИ доказать смерть нечем → перехватывать НЕЛЬЗЯ
-# rc 1 = смерть доказана: другая загрузка; процесса нет; pid переиспользован;
-#        либо сам владелец написал END/REFUSED в свой terminal-файл
-_jit_owner_dead() {
-  _lo=${'$'}1
-  # iter57 §7.3: lock пишется короткоживущим shell'ом ЗАПИСИ CLAIM, а опасное действие исполняет
-  # ДРУГОЙ shell (payload). Смерть процесса, записавшего claim, ничего не говорит о намерении.
-  # Поэтому payload, беря lock, ДОПИСЫВАЕТ свою identity (`ppid=`/`ppstart=`), и если она есть —
-  # доказательство смерти опирается именно на неё. `_lopid` — идентичность «держателя», когда
-  # payload-identity ещё нет (только что созданный claim-lock).
-  _loppid=${'$'}(printf '%s' "${'$'}_lo" | sed -n 's/.*ppid=\([0-9][0-9]*\).*/\1/p')
-  if [ -n "${'$'}_loppid" ]; then
-    _lopid=${'$'}_loppid
-    _lopst=${'$'}(printf '%s' "${'$'}_lo" | sed -n 's/.*ppstart=\([0-9][0-9]*\).*/\1/p')
-    _lopayload=1
+# ── identity, извлечённая из lock-строки ${'$'}1 ─────────────────────────────
+# Поля «держателя»: если payload уже отметился (`ppid=`/`ppstart=`), доказательство опирается
+# на НЕГО, иначе — на shell, записавший claim (`pid=`/`pstart=`).
+_jit_line_fields() {
+  _lf=${'$'}1
+  _lf_ppid=${'$'}(printf '%s' "${'$'}_lf" | sed -n 's/.*ppid=\([0-9][0-9]*\).*/\1/p')
+  if [ -n "${'$'}_lf_ppid" ]; then
+    _lf_pid=${'$'}_lf_ppid
+    _lf_pst=${'$'}(printf '%s' "${'$'}_lf" | sed -n 's/.*ppstart=\([0-9][0-9]*\).*/\1/p')
+    _lf_payload=1
   else
-    _lopid=${'$'}(printf '%s' "${'$'}_lo" | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p')
-    _lopst=${'$'}(printf '%s' "${'$'}_lo" | sed -n 's/.*pstart=\([0-9][0-9]*\).*/\1/p')
-    _lopayload=0
+    _lf_pid=${'$'}(printf '%s' "${'$'}_lf" | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p')
+    _lf_pst=${'$'}(printf '%s' "${'$'}_lf" | sed -n 's/.*pstart=\([0-9][0-9]*\).*/\1/p')
+    _lf_payload=0
   fi
-  _loboot=${'$'}(printf '%s' "${'$'}_lo" | sed -n 's/.*boot=\([^;]*\).*/\1/p')
-  _loop=${'$'}(printf '%s' "${'$'}_lo" | sed -n 's/^op=\([A-Za-z0-9_.-]*\).*/\1/p')
-  # iter55 §4.2: terminal ЭКЗЕМПЛЯРА, а не «opId вообще». Прежний grep по одному opId
-  # принимал REFUSED/END ДРУГОГО экземпляра той же операции за смерть владельца и
-  # разрешал takeover живого lock. Identity сравнивается целиком; без inst — не доказано.
-  _loinst=${'$'}(printf '%s' "${'$'}_lo" | sed -n 's/.*inst=\([^;]*\).*/\1/p')
-  # iter56 §4.1: `REFUSED` — НЕ доказательство конца владельца. Отказ пишет ДРУГОЙ shell (в том
-  # числе повторная доставка того же payload с ТЕМ ЖЕ inst): раньше эта строка объявляла живого
-  # владельца мёртвым и разрешала перехват его lock. Теперь конец доказывает только `END`,
-  # записанный САМИМ владельцем: совпадают op, inst, pid и (если известен) pstart из lock-строки.
-  if [ -n "${'$'}_loop" ] && [ -n "${'$'}_loinst" ] && [ -n "${'$'}_lopid" ]; then
-    _loterm="${termPrefix}${'$'}_loop.term"
-    _loneed=3
-    case "${'$'}_lopst" in ""|"?") : ;; *) _loneed=4 ;; esac
-    if awk -v o="${'$'}_loop" -v i="${'$'}_loinst" -v p="${'$'}_lopid" -v s="${'$'}_lopst" \
-         -v need="${'$'}_loneed" '
-        ${'$'}1=="END" {
-          ok_o=0; ok_i=0; ok_p=0; ok_s=0
-          for (n=2; n<=NF; n++) {
-            split(${'$'}n, kv, "=")
-            if (kv[1]=="op" && kv[2]==o) ok_o=1
-            else if (kv[1]=="inst" && kv[2]==i) ok_i=1
-            else if (kv[1]=="pid" && kv[2]==p) ok_p=1
-            else if (kv[1]=="pstart" && kv[2]==s) ok_s=1
-          }
-          if (ok_o && ok_i && ok_p && (ok_o+ok_i+ok_p+ok_s)>=need) found=1
-        }
-        END { exit (found ? 0 : 1) }' "${'$'}_loterm" 2>/dev/null; then return 1; fi
-  fi
-  [ -z "${'$'}_lopid" ] && return 0
-  if [ -n "${'$'}_loboot" ] && [ -n "${'$'}_me_boot" ] && [ "${'$'}_loboot" != "${'$'}_me_boot" ]; then return 1; fi
-  if [ -d /proc/1 ] && [ ! -d "/proc/${'$'}_lopid" ]; then return 1; fi
-  _cur=${'$'}(_me_psof "${'$'}_lopid")
-  if [ -n "${'$'}_cur" ] && [ -n "${'$'}_lopst" ] && [ "${'$'}_cur" != "${'$'}_lopst" ]; then return 1; fi
-  return 0
+  _lf_boot=${'$'}(printf '%s' "${'$'}_lf" | sed -n 's/.*boot=\([^;]*\).*/\1/p')
+  _lf_op=${'$'}(printf '%s' "${'$'}_lf" | sed -n 's/^op=\([A-Za-z0-9_.-]*\).*/\1/p')
+  _lf_inst=${'$'}(printf '%s' "${'$'}_lf" | sed -n 's/.*inst=\([^;]*\).*/\1/p')
+}
+# ── написал ли САМ владелец собственный END в свой terminal-файл ─────────────
+# rc 0 = да (op, inst, pid и — когда он есть — pstart совпали целиком).
+# Это единственное свидетельство «исполнение закончилось», не зависящее от /proc и часов.
+# `REFUSED` доказательством НЕ является: его пишет другой shell (в том числе повторная доставка
+# того же payload с тем же inst) — в iter56 эта строка объявляла живого владельца мёртвым.
+_jit_end_proven() {
+  _ep=${'$'}1
+  _jit_line_fields "${'$'}_ep"
+  [ -z "${'$'}_lf_op" ] && return 1
+  [ -z "${'$'}_lf_inst" ] && return 1
+  [ -z "${'$'}_lf_pid" ] && return 1
+  _ep_term="${termPrefix}${'$'}_lf_op.term"
+  [ -f "${'$'}_ep_term" ] || return 1
+  _ep_need=3
+  case "${'$'}_lf_pst" in ""|"?") : ;; *) _ep_need=4 ;; esac
+  awk -v o="${'$'}_lf_op" -v i="${'$'}_lf_inst" -v p="${'$'}_lf_pid" -v s="${'$'}_lf_pst" \
+      -v need="${'$'}_ep_need" '
+    ${'$'}1=="END" {
+      ok_o=0; ok_i=0; ok_p=0; ok_s=0
+      for (n=2; n<=NF; n++) {
+        split(${'$'}n, kv, "=")
+        if (kv[1]=="op" && kv[2]==o) ok_o=1
+        else if (kv[1]=="inst" && kv[2]==i) ok_i=1
+        else if (kv[1]=="pid" && kv[2]==p) ok_p=1
+        else if (kv[1]=="pstart" && kv[2]==s) ok_s=1
+      }
+      if (ok_o && ok_i && ok_p && (ok_o+ok_i+ok_p+ok_s)>=need) found=1
+    }
+    END { exit (found ? 0 : 1) }' "${'$'}_ep_term" 2>/dev/null
+}
+# ── death proven? — смерть владельца lock-строки ${'$'}1 ДОКАЗАНА? ──────────
+# rc 0 = смерть ДОКАЗАНА: собственный END владельца; другая загрузка; процесса нет;
+#        pid переиспользован.
+# rc 1 = ЖИВ или доказать нечем → объект НЕ трогаем.
+# Полярность положительная и совпадает с именем: у вызывающих нет отрицаний, поэтому «живой»
+# не может быть прочитан как «мёртвый». Именно это произошло в iter57 — функция с именем
+# `_jit_owner_dead` возвращала 0 для ЖИВОГО владельца, и admin-файл живого удалялся.
+_jit_death_proven() {
+  _dp=${'$'}1
+  _jit_end_proven "${'$'}_dp" && return 0
+  _jit_line_fields "${'$'}_dp"
+  # Идентичность держателя неизвестна → доказать смерть нечем.
+  [ -z "${'$'}_lf_pid" ] && return 1
+  if [ -n "${'$'}_lf_boot" ] && [ -n "${'$'}_me_boot" ] && [ "${'$'}_lf_boot" != "${'$'}_me_boot" ]; then return 0; fi
+  # /proc недоступен (контейнер/урезанная среда) — «процесса нет» доказательством не считается.
+  if [ -d /proc/1 ] && [ ! -d "/proc/${'$'}_lf_pid" ]; then return 0; fi
+  _dp_cur=${'$'}(_me_psof "${'$'}_lf_pid")
+  if [ -n "${'$'}_dp_cur" ] && [ -n "${'$'}_lf_pst" ] && [ "${'$'}_dp_cur" != "${'$'}_lf_pst" ]; then return 0; fi
+  # Процесс есть и identity совпала → владелец ЖИВ.
+  return 1
 }
 # ── начал ли payload ЭТОГО исполнения работу (START в terminal) ─────────────
 # rc 0 = START найден (исполнение могло начаться), rc 1 = START нет.
 _jit_started_evidence() {
-  _st_line=${'$'}1
-  _st_op=${'$'}(printf '%s' "${'$'}_st_line" | sed -n 's/^op=\([A-Za-z0-9_.-]*\).*/\1/p')
-  _st_inst=${'$'}(printf '%s' "${'$'}_st_line" | sed -n 's/.*inst=\([^;]*\).*/\1/p')
-  [ -z "${'$'}_st_op" ] && return 1
-  [ -f "${termPrefix}${'$'}_st_op.term" ] || return 1
-  awk -v o="${'$'}_st_op" -v i="${'$'}_st_inst" '
+  _jit_line_fields ${'$'}1
+  [ -z "${'$'}_lf_op" ] && return 1
+  [ -f "${termPrefix}${'$'}_lf_op.term" ] || return 1
+  awk -v o="${'$'}_lf_op" -v i="${'$'}_lf_inst" '
     ${'$'}1=="START" {
       ok_o=0; ok_i=0
       for (n=2; n<=NF; n++) { split(${'$'}n, kv, "=")
@@ -386,20 +397,24 @@ _jit_started_evidence() {
         else if (kv[1]=="inst" && kv[2]==i) ok_i=1 }
       if (ok_o && ok_i) found=1
     }
-    END { exit (found ? 0 : 1) }' "${termPrefix}${'$'}_st_op.term" 2>/dev/null
+    END { exit (found ? 0 : 1) }' "${termPrefix}${'$'}_lf_op.term" 2>/dev/null
 }
 # ── можно ли перехватить lock этой строки ─────────────────────────────────
 # 0 = да (смерть доказана И цепочка исполнения не может продолжиться),
-# 1 = нет (жив/недоказуемо), 2 = payload мог начать работу, его смерть не доказана.
+# 1 = нет (жив / смерть недоказуема), 2 = payload мог начать работу и его смерть не доказана.
+#
+# Различие принципиально для ОПАСНОГО действия: lock, записанный короткоживущим shell'ом claim,
+# не описывает payload. Если payload уже печатал START, а процесс-держатель мёртв по сторонним
+# признакам (нет /proc, переиспользован pid), повторять то же опасное действие нельзя, пока
+# владелец не оставит собственный END. Если END ЕСТЬ — исполнение закончилось, START не мешает.
 _jit_may_takeover() {
   _mo_line=${'$'}1
-  # ВНИМАНИЕ на полярность: [_jit_owner_dead] возвращает 0, когда владелец ЖИВ (или смерть
-  # доказать нечем), и 1 — когда смерть доказана. Здесь это ровно наоборот по смыслу проверки.
-  _jit_owner_dead "${'$'}_mo_line" && return 1
-  _mo_pp=${'$'}(printf '%s' "${'$'}_mo_line" | sed -n 's/.*ppid=\([0-9][0-9]*\).*/\1/p')
-  if [ -n "${'$'}_mo_pp" ]; then return 0; fi
-  # payload-identity нет: lock написан shell'ом записи claim. Перехват безопасен ТОЛЬКО если
-  # payload ещё не начинал (START): иначе он мог быть жив в момент проверки.
+  # Полярность одна и та же во всём файле: [_jit_death_proven] rc 0 = смерть ДОКАЗАНА.
+  _jit_death_proven "${'$'}_mo_line" || return 1
+  _jit_end_proven "${'$'}_mo_line" && return 0
+  _jit_line_fields "${'$'}_mo_line"
+  # payload уже отметился в lock своей identity ⇒ доказательство смерти относится к нему.
+  if [ "${'$'}_lf_payload" = "1" ]; then return 0; fi
   if _jit_started_evidence "${'$'}_mo_line"; then return 2; fi
   return 0
 }
@@ -439,8 +454,12 @@ _jit_admin_enter() {
       continue
     fi
     _ad_cur=${'$'}(cat "${'$'}_ad" 2>/dev/null)
-    if [ -n "${'$'}_ad_cur" ] && _jit_owner_dead "${'$'}_ad_cur"; then
-      # Владелец админ-файла доказанно мёртв: снимаем ИМЕННО его строку (не чужую).
+    # iter58 §2.1: админ-файл снимается ТОЛЬКО когда смерть владельца ДОКАЗАНА
+    # (`_jit_death_proven` rc 0). Дефект iter57: условие стояло без отрицания при функции с
+    # обратной полярностью (0 = жив), поэтому удалялся админ-файл ЖИВОГО владельца и вся
+    # сериализация смены lock разрушалась.
+    if [ -n "${'$'}_ad_cur" ] && _jit_death_proven "${'$'}_ad_cur"; then
+      # Смерть доказана: снимаем ИМЕННО проверенную строку (не чужую, подменённую).
       _ad_now=${'$'}(cat "${'$'}_ad" 2>/dev/null)
       [ "${'$'}_ad_now" = "${'$'}_ad_cur" ] && rm -f "${'$'}_ad" 2>/dev/null
     fi
@@ -514,12 +533,52 @@ _jit_intent_order() {
   _ord_verdict=older_intent
   return 0
 }
-# ── освободить ТОЛЬКО свою блокировку ─────────────────────────────────────
+# ── освободить ТОЛЬКО свою блокировку (под admin) ─────────────────────────
+# iter58 §2.1: удаление основного lock — такая же СМЕНА объекта, как создание и перехват,
+# поэтому она тоже идёт под `<lock>.admin`. Прежний `rm -f` без admin пересекался с перехватом:
+# претендент снимал имя и ставил своё, а release удалял УЖЕ ЕГО lock.
+# rc 0 — своей блокировки больше нет; 1 — lock не наш (не трогали); 2 — admin занят живым
+# владельцем, lock оставлен (его снимет доказанно мёртвый путь: вечной блокировки это не даёт).
 _jit_release() {
   _cl=${'$'}(cat ${lock} 2>/dev/null)
   case "${'$'}_cl" in
-    *"inst=${'$'}_me_inst"*) rm -f ${lock} 2>/dev/null ;;
+    *"inst=${'$'}{_me_inst:-?}"*) : ;;
+    *) return 1 ;;
   esac
+  _jit_admin_enter || return 2
+  _cl2=${'$'}(cat ${lock} 2>/dev/null)
+  case "${'$'}_cl2" in
+    *"inst=${'$'}{_me_inst:-?}"*) rm -f ${lock} 2>/dev/null ;;
+  esac
+  _jit_admin_exit
+  return 0
+}
+
+# ── payload ДОПИСЫВАЕТ свою identity в lock (ppid/ppstart) ДО первого действия ──
+# Определение обязано существовать ДО вызова. В iter57 вызов стоял выше определения (и ошибка
+# была подавлена `2>/dev/null`), поэтому отметка identity payload не выполнялась; функции жили
+# только в тексте. Теперь она в общих helper'ах, которые подключаются и claim-командой, и
+# гвардией.
+_lock_self_mark() {
+  _sm_cur=${'$'}(cat ${lock} 2>/dev/null)
+  case "${'$'}_sm_cur" in
+    *"inst=${'$'}{_me_inst:-?}"*) : ;;
+    *) return 1 ;;
+  esac
+  case "${'$'}_sm_cur" in
+    *"ppid="*) return 0 ;;
+  esac
+  _jit_admin_enter || return 2
+  _sm_now=${'$'}(cat ${lock} 2>/dev/null)
+  case "${'$'}_sm_now" in
+    *"inst=${'$'}{_me_inst:-?}"*)
+      rm -f ${lock} 2>/dev/null
+      _jit_take_lock "${'$'}_sm_now;ppid=${'$'}_me_pid;ppstart=${'$'}{_me_pstart:-?}" || {
+        _jit_take_lock "${'$'}_sm_now" 2>/dev/null
+      } ;;
+  esac
+  _jit_admin_exit
+  return 0
 }
 """.trimIndent()
     }
@@ -579,9 +638,11 @@ case "${'$'}_cm_verdict" in
   *)
 _lo=""
 [ -f ${lock} ] && _lo=${'$'}(cat ${lock} 2>/dev/null)
-if [ -n "${'$'}_lo" ] && ! _jit_owner_dead "${'$'}_lo"; then
-  # Смерть доказана. Перехват — под админ-файлом и ТОЛЬКО если содержимое всё ещё ровно то,
-  # смерть которого доказана (живой lock сюда не попадает: его строка другая).
+_mo=1
+[ -n "${'$'}_lo" ] && _jit_may_takeover "${'$'}_lo"; _mo=${'$'}?
+if [ "${'$'}_mo" = "0" ]; then
+  # Смерть доказана И payload не мог начать. Перехват — под админ-файлом и ТОЛЬКО если
+  # содержимое всё ещё ровно то, смерть которого доказана.
   _jit_lock_acquire "${'$'}_me_line" "${'$'}_lo"; _acq=${'$'}?
   case "${'$'}_acq" in
     0) echo "CL_TAKEOVER proof=owner_dead_exact_inst owner=${'$'}_lo" ;;
@@ -590,6 +651,10 @@ if [ -n "${'$'}_lo" ] && ! _jit_owner_dead "${'$'}_lo"; then
     *) _cl_status=busy; _cl_owner="race_object_replaced"
        echo "CL_TAKEOVER proof=refused reason=object_replaced (имя уже занято ДРУГИМ lock)" ;;
   esac
+elif [ "${'$'}_mo" = "2" ]; then
+  # Владелец мёртв, но payload МОГ начать работу (есть START): повторять опасное действие нельзя.
+  _cl_status=busy; _cl_owner="payload_possibly_running"
+  echo "CL_TAKEOVER proof=refused reason=payload_possibly_running owner=${'$'}_lo"
 else
   # Живого владельца не перехватываем: берём только СВОБОДНОЕ имя.
   _jit_lock_acquire "${'$'}_me_line" ""; _acq=${'$'}?
@@ -667,6 +732,15 @@ echo CL_END
     }
 
     /** Разбор вывода [claimCmd]: те же строгие правила, что и у чтения. */
+    /**
+     * iter58 §2.1 — тот же текст общих shell-функций владения, но доступный тесту.
+     *
+     * Смысл: проверки admin-lock, `release`, `_lock_self_mark` и доказательства смерти должны
+     * исполняться НАСТОЯЩИМ `/bin/sh` на том же коде, который уходит на устройство, а не на его
+     * пересказе в тесте. Ничего, кроме доступа к тексту, эта функция не добавляет.
+     */
+    internal fun ownHelpersForTest(base: String = BASE): String = ownHelpers(base)
+
     fun claimResult(rc: Int, out: String): ClaimWrite {
         if (rc != 0) return ClaimWrite.Failed("transport_rc=$rc")
         if (out.contains("ERR_")) return ClaimWrite.Failed("transport")
@@ -981,9 +1055,15 @@ if [ -f ${lock} ]; then
   case "${'$'}_lo" in
     *"inst=${'$'}_me_inst"*) _refuse duplicate_instance "${'$'}_lo" ;;
   esac
-  if ! _jit_owner_dead "${'$'}_lo"; then
-    # Смерть доказана. Перехват — под админ-файлом (iter57 §7.3) и только того объекта,
-    # содержимое которого проверено: живой lock никогда не перемещается и не удаляется.
+  _mo=1
+  _jit_may_takeover "${'$'}_lo"; _mo=${'$'}?
+  if [ "${'$'}_mo" = "2" ]; then
+    # Payload мог начать работу: его смерть не доказана, повторять опасное действие нельзя.
+    _refuse payload_possibly_running "${'$'}_lo"
+  fi
+  if [ "${'$'}_mo" = "0" ]; then
+    # Смерть доказана. Перехват — под админ-файлом и только того объекта, содержимое которого
+    # проверено: живой lock никогда не перемещается и не удаляется.
     _jit_lock_acquire "${'$'}_me_line" "${'$'}_lo"; _acq=${'$'}?
     case "${'$'}_acq" in
       0) _lk=1; echo "JIT_LOCK_TAKEOVER proof=owner_dead_exact_inst owner=${'$'}_lo" ;;
@@ -1037,27 +1117,6 @@ esac
 # Теперь lock описывает процесс, который реально исполняет опасное действие (`ppid`), а не
 # короткоживущий shell записи claim. Без этого «claim-процесс мёртв» ошибочно считалось
 # доказательством конца намерения, и свежий lock живого payload можно было перехватить.
-_lock_self_mark() {
-  _sm_cur=${'$'}(cat ${lock} 2>/dev/null)
-  case "${'$'}_sm_cur" in
-    *"inst=${'$'}_me_inst"*) : ;;
-    *) return 1 ;;
-  esac
-  case "${'$'}_sm_cur" in
-    *"ppid="*) return 0 ;;
-  esac
-  _jit_admin_enter || return 1
-  _sm_now=${'$'}(cat ${lock} 2>/dev/null)
-  case "${'$'}_sm_now" in
-    *"inst=${'$'}_me_inst"*)
-      rm -f ${lock} 2>/dev/null
-      _jit_take_lock "${'$'}_sm_now;ppid=${'$'}_me_pid;ppstart=${'$'}{_me_pstart:-?}" || {
-        _jit_take_lock "${'$'}_sm_now" 2>/dev/null
-      } ;;
-  esac
-  _jit_admin_exit
-  return 0
-}
 # ── начало операции видно на устройстве ───────────────────────────────────
 # `inst` обязателен: по нему terminal отличается «этот экземпляр» от «тот же opId, другой shell».
 # ДОЗАПИСЬ, а не усечение: отказ другого экземпляра мог быть записан раньше, и `>` его терял.
