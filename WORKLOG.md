@@ -158,3 +158,51 @@ EFFECT_VERIFIED             → по каждой цели ровно один V
 ## Прогон
 `bash /home/user/runtests.sh` → `OK (890 tests)`. Стенд: JVM + fake shell (+ настоящий `/bin/sh` и
 подставные `iptables` для TTL). Release локально не собран: Gradle требует JVM 17, доступна 11.
+
+---
+
+# ITER58 — восстановленная итерация (база `026e2f4`)
+
+## Почему «восстановленная»
+Песочница потеряла `.git` и `app/src` рабочего дерева; коммиты iter58 существовали только как
+запись. Итерация повторена на свежем клоне `fix/v2` (`026e2f4`): правки применены теми же
+скриптами (`patch_jitown*.py`, `patch_sound*.py`, `patch_ttl58.py`), тесты написаны заново.
+**SHAs отличаются от прежней записи** — воспроизвести их невозможно (хэш зависит от содержимого).
+
+## §2.1 JIT-lock: реальный маршрут
+```
+клик → JitOp.click → claimCmd (shell)
+  _jit_admin_enter   (атомарное set -C создание <lock>.admin; снятие — только при _jit_death_proven)
+  _jit_take_lock     (tmp + ln: имя появляется сразу с содержимым)
+  запись claim (tmp + mv, readback = taken)
+  _jit_release       (под admin, повторное чтение, удаляется ТОЛЬКО своя строка)
+  _lock_self_mark    (определена ДО вызова; дописывает ppid/ppstart payload)
+guard payload:
+  _jit_death_proven → _jit_may_takeover (0 можно / 1 нельзя / 2 payload мог начать)
+```
+Полярность одна: `rc 0` = смерть ДОКАЗАНА. `REFUSED` доказательством не является.
+
+## §3.1/§3.2 Звук
+```
+тумблер → LockSound.applySystemLockSoundBind → BgWorker → reconcileLocked(allowRestore)
+  LockOp.reconStep(op, ports):
+    no_targets → previous_restore_unresolved → prepareRestore (пустой ⇒ нет отправки)
+    → ports.restore → not_sent / outcome_unknown → bindLate → verdict
+  агрегатор: LockOp.recoveryGate(unresolved, conflict, lateShell, readOnlyPass)
+    Conflict > Pending(unresolved:…) > Pending(read_only_pass) > null (можно сходиться)
+  null ⇒ bind/OFF-отметка; иначе — ранний return gate, side effect НЕТ
+```
+
+## §4 Delivery
+`directScript`: `_VRC` снимается ОДИН раз сразу после payload; `.done` получает код payload,
+внешний код совпадает; отказ записи честно `written=0`.
+
+## §5 TTL
+`-N` → маркер `…_own_<gen>` (шапка один раз + строки `v4=created`/`v6=created`, чтение обратно)
+→ при отказе: `action=stop reason=ownmark_not_persisted` + снятие созданной цепи.
+`ownmark_ok` требует совпадения цепи И поколения И существования цепи.
+OFF снимает только строку своего семейства; файл — когда семей не осталось.
+
+## Прогон
+`bash /home/user/runtests58.sh` (клон `/tmp/iter58`) → **`OK (921 tests)`**.
+База `026e2f4` тем же стендом → `OK (890 tests)`.
