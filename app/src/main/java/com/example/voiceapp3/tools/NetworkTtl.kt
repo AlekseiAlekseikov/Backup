@@ -4,6 +4,7 @@ import com.example.voiceapp3.tools.Prefs2
 
 import android.content.BroadcastReceiver
 import android.content.Context
+import java.io.File
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.SharedPreferences
@@ -359,8 +360,20 @@ private fun buildScript(enable: Boolean, reg: TtlOwnership.Registry?): String {
         // Раньше TTL видел только `rc`/`out`, поэтому «ответ потерян» и «не выполнено» были
         // неразличимы — и `VERIFY_*` мог быть построен на выводе, которого не было.
         val opId = "ttl_" + (if (want) "on" else "off") + "_" + t0
+        // iter59 §6: identity попытки (nonce + адрес свидетельства) готовится вызывающим и
+        // ПОДТВЕРЖДАЕТСЯ ЗАПИСЬЮ ДО ОТПРАВКИ. Иначе потеря ответа оставляла мутацию `iptables`
+        // без адреса, по которому можно прочитать terminal этой самой попытки.
+        val prep = ScriptDelivery.prepare("ttl_script", script)
+        if (!recordAttempt(prep.evidencePath, want)) {
+            AppLog.e(TAG, "TTL_ATTEMPT persisted=no action=no_send source=$source " +
+                "evidence=${prep.evidencePath.ifEmpty { "none" }} " +
+                "(адрес свидетельства попытки не подтверждён: таблица не меняется)")
+            return TtlRunner.Outcome(false, "attempt_not_persisted", "")
+        }
+        AppLog.i(TAG, "TTL_ATTEMPT op=$opId evidence=${prep.evidencePath} want=$want persisted=ok " +
+            "source=$source")
         // ОДНА доставка: тот же результат используется и для исхода, и для разбора вывода.
-        val detailed = AdbClient.executeScriptDetailed("ttl_script", script, 40000)
+        val detailed = AdbClient.executePrepared(prep, 40000)
         val delivery = ScriptDelivery.outcome(detailed, opId)
         val firstOutcome = delivery
         if (firstOutcome is ScriptDelivery.DeliveryOutcome.NotSent) {
@@ -376,16 +389,38 @@ private fun buildScript(enable: Boolean, reg: TtlOwnership.Registry?): String {
         }
         var exitCode = detailed.rc
         var output = detailed.out
+        // iter59 §6: повтор — только по ДОКАЗАННОМУ факту «скрипт завершён и сообщил no_uplink».
+        // Дефект iter58: повтор шёл через `executeScript` (`Pair`), поэтому повторялся и после
+        // «доставлено, исход неизвестен» — то есть мутация могла выполниться дважды. Теперь
+        // решение принимает [TtlAttempt.decide] по типизированному исходу, и каждая новая
+        // попытка получает СВОЮ identity (новый nonce/путь), которая снова подтверждается
+        // записью до отправки.
         if (want) {
             var attempt = 1
-            while (attempt <= TTL_UPLINK_RETRIES && isNoUplink(output)) {
+            var current = delivery
+            while (TtlAttempt.decide(current, output, attempt, TTL_UPLINK_RETRIES) ==
+                TtlAttempt.Decision.RETRY
+            ) {
                 AppLog.i(TAG, "TTL_UPLINK_RETRY attempt=$attempt/$TTL_UPLINK_RETRIES " +
-                    "reason=no_uplink pause_ms=$TTL_UPLINK_RETRY_PAUSE_MS source=$source")
+                    "reason=no_uplink pause_ms=$TTL_UPLINK_RETRY_PAUSE_MS source=$source " +
+                    "(скрипт доказанно завершён без применения: правила не менялись)")
                 runCatching { Thread.sleep(TTL_UPLINK_RETRY_PAUSE_MS) }
-                val again = AdbClient.executeScript("ttl_script", script, 40000)
-                exitCode = again.first
-                output = again.second
+                val nextPrep = ScriptDelivery.prepare("ttl_script", script)
+                if (!recordAttempt(nextPrep.evidencePath, want)) {
+                    AppLog.e(TAG, "TTL_ATTEMPT persisted=no action=no_send attempt=$attempt " +
+                        "source=$source (адрес свидетельства не подтверждён: повтор не отправляется)")
+                    break
+                }
+                val again = AdbClient.executePrepared(nextPrep, 40000)
+                current = ScriptDelivery.outcome(again, opId + "_r" + attempt)
+                exitCode = again.rc
+                output = again.out
                 attempt++
+                if (current !is ScriptDelivery.DeliveryOutcome.Finished) {
+                    AppLog.w(TAG, "TTL_UPLINK_RETRY result=${current.wire()} action=stop " +
+                        "source=$source (исход повтора не доказан: «применено» не заявляется)")
+                    return TtlRunner.Outcome(false, "retry_unknown", current.wire())
+                }
             }
         }
         val verify = parseVerifyResult(want, output)
@@ -404,6 +439,26 @@ private fun buildScript(enable: Boolean, reg: TtlOwnership.Registry?): String {
             reason ?: if (ok) "foreign_rules_remain" else status.wire,
             if (ok && status == ToolsStep.Status.PARTIAL) "foreign_rules_remain" else ""
         )
+    }
+
+    /**
+     * iter59 §6: durable-identity попытки TTL. Адрес свидетельства пишется и подтверждается
+     * чтением ДО отправки; файл переживает смерть процесса, поэтому потерянный ответ не
+     * оставляет мутацию `iptables` без адреса для readback.
+     */
+    private fun attemptFile(): File? {
+        val ctx = appCtxRef ?: return null
+        return File(ctx.filesDir, "ttl_last_attempt")
+    }
+
+    private fun recordAttempt(path: String, want: Boolean): Boolean {
+        val f = attemptFile() ?: return false
+        val ok = TtlAttempt.record(f, path, want, System.currentTimeMillis())
+        if (ok) {
+            AppLog.i(TAG, "TTL_ATTEMPT record=${TtlAttempt.last(f)?.evidence() ?: "none"} " +
+                "persisted=ok")
+        }
+        return ok
     }
 
     /** Факт применения: значение + поколение + загрузка (все три проверяются при чтении). */

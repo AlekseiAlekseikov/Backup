@@ -127,14 +127,23 @@ OWN_TAG="voiceapp3:ttl:${D}OWN_GEN"
 TTL_STATE_DIR=${D}{VAPP_TTL_STATE:-/data/local/tmp}
 OWNMARK=${D}TTL_STATE_DIR/voiceapp3_ttl_own_${D}OWN_GEN
 ownmark_ok() {
+  _ok_fam=${D}{1:-v4}
   [ -f "${D}OWNMARK" ] || return 1
   grep -q "^chain=${D}OUR${D}" "${D}OWNMARK" 2>/dev/null || return 1
   # iter58 §5.2: маркер привязан к ПОКОЛЕНИЮ установки. Без этого файл, оставшийся от прежнего
   # поколения, «доказывал» бы владение цепью, которую создал кто-то другой с тем же именем.
   grep -q "^gen=${D}OWN_GEN${D}" "${D}OWNMARK" 2>/dev/null || return 1
+  # iter59 §6: владение доказывается ПО СЕМЕЙСТВУ. Раньше проверка всегда читала v4-цепь:
+  # наличие своей v4-цепи «доказывало» и одноимённую v6-цепь, которую мог создать кто-то другой
+  # (аудит iter58). Теперь нужна строка создания ИМЕННО этого семейства и чтение тем же
+  # инструментом, что и будет изменяться.
+  grep -q "^${D}{_ok_fam}=created" "${D}OWNMARK" 2>/dev/null || return 1
   # Маркер сам по себе не вечен: если цепь исчезла и была создана извне, файл ничего не
   # доказывает. Поэтому владение дополнительно требует, чтобы цепь СЕЙЧАС существовала.
-  iptables -w 5 -t mangle -S "${D}OUR" >/dev/null 2>&1 || return 1
+  case "${D}{_ok_fam}" in
+    v6) ip6tables -w 5 -t mangle -S "${D}OUR" >/dev/null 2>&1 || return 1 ;;
+    *)  iptables -w 5 -t mangle -S "${D}OUR" >/dev/null 2>&1 || return 1 ;;
+  esac
   return 0
 }
 COMMENT_OK=0
@@ -165,14 +174,19 @@ MARK_ARGS=""
 # (историческое имя, неизвестный реестр) — НИ ОДНОГО изменения таблицы: честный отказ до
 # первой мутации, желание владельца сохраняется.
 REGISTRY_UNKNOWN=@REGISTRY_UNKNOWN@
+# iter59 §6: владение немаркированной цепью ДОКАЗЫВАЕТСЯ ОТДЕЛЬНО ДЛЯ КАЖДОГО СЕМЕЙСТВА.
+# Дефект iter58: один общий флаг считался по v4, поэтому своя v4-цепь «доказывала» и v6-цепь с
+# тем же именем — и чужая v6-цепь могла быть изменена/удалена как «наша».
+NAMED_OWN_V4=0
+NAMED_OWN_V6=0
 NAMED_OWN=0
-# iter57 §8.1: имя установки больше НЕ доказательство. Своя немаркированная цепь — только та,
-# чьё создание записано маркером на устройстве (`ownmark_ok`).
-if [ "${D}COMMENT_OK" = "0" ] && [ -n "${D}OUR" ] && [ "${D}OUR" != "${D}LEGACY" ] && ownmark_ok; then
-  NAMED_OWN=1
+if [ "${D}COMMENT_OK" = "0" ] && [ -n "${D}OUR" ] && [ "${D}OUR" != "${D}LEGACY" ]; then
+  ownmark_ok v4 && NAMED_OWN_V4=1
+  if [ "${D}V6_SUPPORTED" = "1" ]; then ownmark_ok v6 && NAMED_OWN_V6=1; fi
+  if [ "${D}NAMED_OWN_V4" = "1" ] || [ "${D}NAMED_OWN_V6" = "1" ]; then NAMED_OWN=1; fi
 fi
 echo "TTL_IDENTITY comment_supported=${D}COMMENT_OK registry_unknown=${D}REGISTRY_UNKNOWN " \
-  "named_ownership=${D}NAMED_OWN chain=${D}OUR"
+  "named_ownership=${D}NAMED_OWN named_v4=${D}NAMED_OWN_V4 named_v6=${D}NAMED_OWN_V6 chain=${D}OUR"
 
 # ---------- владение: точные сравнения, а не подстроки ----------
 # Спецификации переходов POSTROUTING, у которых target — ТОЧНО наше имя.
@@ -263,6 +277,9 @@ del_jump() {
 # unknown — прочитать нельзя (нет бинарника/прав/lock): это НЕ «правил нет».
 chain_state() {
   tool=${D}1; want=${D}2
+  # iter59 §6: «своя по имени» проверяется ТОЛЬКО для того семейства, чью таблицу читаем.
+  nown=${D}NAMED_OWN_V4
+  case "${D}tool" in ip6tables) nown=${D}NAMED_OWN_V6 ;; esac
   if ! out=${D}(${D}tool -t mangle -S "${D}OUR" 2>/dev/null); then
     if ${D}tool -t mangle -S >/dev/null 2>&1; then echo absent; else echo unknown; fi
     return
@@ -283,7 +300,7 @@ chain_state() {
         if [ "${D}body" = "${D}want" ]; then
           # iter55 §6.1: без маркера владение может доказываться ТОЛЬКО уникальным именем
           # установки (см. NAMED_OWN). Иначе — unproven и никаких изменений.
-          if [ "${D}NAMED_OWN" = "1" ]; then echo ours_named; return; fi
+          if [ "${D}nown" = "1" ]; then echo ours_named; return; fi
           echo unproven; return
         fi ;;
     esac
@@ -504,7 +521,7 @@ elif [ "${D}ENABLE" = "1" ]; then
     # изменяется: иначе «своя по маркеру» цепь могла бы оказаться цепью прежней версии, которую
     # другой код считает своей. Это единственный безусловный стоп по имени.
     if [ -n "${D}LEGACY" ] && [ "${D}OUR" = "${D}LEGACY" ] && \
-       [ "${D}COMMENT_OK" = "0" ] && ! ownmark_ok; then
+       [ "${D}COMMENT_OK" = "0" ] && ! ownmark_ok v4; then
       TTL_STOP=1
       echo "TTL_TRY action=stop reason=legacy_name_not_owned chain=${D}OUR " \
         "note=\"историческое имя цепи не создаётся и не изменяется: владение по нему не " \
@@ -632,6 +649,15 @@ elif [ "${D}ENABLE" = "1" ]; then
       fi
       if [ "${D}V6_SUPPORTED" = "1" ] && [ "${D}TTL_STOP" = "0" ]; then
         ip6tables -w 5 -t mangle -N "${D}OUR" 2>/dev/null; rc_n6=${D}?
+        # iter59 §6: создание v6-цепи БЕЗ маркера — неуправляемый объект (его нельзя доказать как
+        # свой и нельзя безопасно снять). Раньше при отсутствии файла маркера это только
+        # логировалось, и цепь оставалась.
+        if [ "${D}rc_n6" = "0" ] && [ ! -f "${D}OWNMARK" ]; then
+          ip6tables -w 5 -t mangle -X "${D}OUR" >/dev/null 2>&1; rc_xm6=${D}?
+          echo "TTL_TRY action=stop reason=ownmark_absent family=v6 chain_delete_rc=${D}rc_xm6 " \
+            "note=\"маркера создания нет: v6-правило не добавляется, созданная цепь убрана\""
+          TTL_STOP=1
+        fi
         if [ "${D}rc_n6" = "0" ] && [ -f "${D}OWNMARK" ]; then
           echo "TTL_OWNMARK v6=created chain=${D}OUR (маркер уже записан v4)"
         fi
@@ -659,7 +685,18 @@ elif [ "${D}ENABLE" = "1" ]; then
           if grep -q '^v6=created' "${D}OWNMARK" 2>/dev/null; then
             echo "TTL_OWNMARK write=ok path=${D}OWNMARK chain=${D}OUR family=v6 readback=ok"
           else
+            # iter59 §6: симметрично v4 — неподтверждённый маркер останавливает проход, а
+            # созданная этим проходом v6-цепь снимается (иначе она неуправляема), rc снятия
+            # УЧИТЫВАЕТСЯ и печатается.
             echo "TTL_OWNMARK write=failed path=${D}OWNMARK family=v6 reason=family_line_not_persisted"
+            ip6tables -w 5 -t mangle -D POSTROUTING -o "${D}UPLINK" -j "${D}OUR" >/dev/null 2>&1; rc_rj6=${D}?
+            ip6tables -w 5 -t mangle -F "${D}OUR" >/dev/null 2>&1; rc_rf6=${D}?
+            ip6tables -w 5 -t mangle -X "${D}OUR" >/dev/null 2>&1; rc_xm6=${D}?
+            echo "TTL_TRY action=stop reason=ownmark_not_persisted family=v6 " \
+              "jump_del_rc=${D}rc_rj6 chain_flush_rc=${D}rc_rf6 chain_delete_rc=${D}rc_xm6 " \
+              "note=\"маркер семейства v6 не подтверждён: правила сняты, цепь убрана\""
+            TTL_STOP=1
+            TOUCHED_v6=no
           fi
         fi
         if [ "${D}rc_n6" = "0" ] || [ "${D}rc_a6" = "0" ] || [ "${D}rc_j6" = "0" ]; then TOUCHED_v6=yes; fi

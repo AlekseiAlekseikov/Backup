@@ -449,10 +449,17 @@ _jit_take_lock() {
 # pid/pstart/boot (`_jit_death_proven`) и снимает ИМЕННО его запись. Если смерть доказать
 # нечем — вход не происходит (безопасный отказ), а не «действие без секции».
 
-# Разобрать запись участника: _ak_t = тикет (для дешёвого сравнения ключей).
+# Разобрать запись участника БЕЗ внешних процессов: в критической секции важен каждый fork.
+# Результат: _ak_t (тикет) и _ak_pid (pid участника); пустой _ak_t = запись не разобрана.
 _adm_read() {
-  _ak_line=${'$'}(cat "${'$'}1" 2>/dev/null)
-  _ak_t=${'$'}(printf '%s' "${'$'}_ak_line" | sed -n 's/^ticket=\([0-9][0-9]*\);.*/\1/p')
+  _ak_line=
+  IFS= read -r _ak_line < "${'$'}1" 2>/dev/null || _ak_line=
+  _ak_t=${'$'}{_ak_line#ticket=}
+  _ak_t=${'$'}{_ak_t%%;*}
+  case "${'$'}_ak_t" in ''|*[!0-9]*) _ak_t="" ;; esac
+  _ak_pid=${'$'}{_ak_line#*pid=}
+  _ak_pid=${'$'}{_ak_pid%%;*}
+  case "${'$'}_ak_pid" in ''|*[!0-9]*) _ak_pid="" ;; esac
 }
 
 _jit_admin_enter() {
@@ -482,7 +489,8 @@ _jit_admin_enter() {
   # 1) Своя запись уже есть (вложенный вход того же shell) — считаем, что мы внутри.
   if [ -f "${'$'}_ad_me" ]; then
     _ad_own=0
-    _ad_t=${'$'}(sed -n 's/^ticket=\([0-9][0-9]*\);.*/\1/p' "${'$'}_ad_me" 2>/dev/null)
+    _adm_read "${'$'}_ad_me"
+    _ad_t=${'$'}_ak_t
     return 0
   fi
 
@@ -490,9 +498,9 @@ _jit_admin_enter() {
   _ad_maxt=0
   for _ad_f in "${'$'}_adm_dir"/p.*; do
     [ -f "${'$'}_ad_f" ] || continue
-    _ad_t2=${'$'}(sed -n 's/^ticket=\([0-9][0-9]*\);.*/\1/p' "${'$'}_ad_f" 2>/dev/null)
-    case "${'$'}_ad_t2" in ''|*[!0-9]*) continue ;; esac
-    [ "${'$'}_ad_t2" -gt "${'$'}_ad_maxt" ] && _ad_maxt=${'$'}_ad_t2
+    _adm_read "${'$'}_ad_f"
+    [ -n "${'$'}_ak_t" ] || continue
+    [ "${'$'}_ak_t" -gt "${'$'}_ad_maxt" ] && _ad_maxt=${'$'}_ak_t
   done
   _ad_t=${'$'}((_ad_maxt + 1))
 
@@ -518,7 +526,7 @@ _jit_admin_enter() {
     for _ad_f in "${'$'}_adm_dir"/p.*; do
       [ -f "${'$'}_ad_f" ] || continue
       [ "${'$'}_ad_f" = "${'$'}_ad_me" ] && continue
-      _ak_t=${'$'}(sed -n 's/^ticket=\([0-9][0-9]*\);.*/\1/p' "${'$'}_ad_f" 2>/dev/null)
+      _adm_read "${'$'}_ad_f"
       if [ -z "${'$'}_ak_t" ]; then
         # Содержимое не разобрано: по этому протоколу живой участник так выглядеть не может
         # (имя появляется сразу с содержимым). Снимаем только после доказанной смерти.
@@ -529,11 +537,11 @@ _jit_admin_enter() {
       # Нас блокирует только МЕНЬШИЙ ключ (тикет, имя). Больший уступит нам сам.
       if [ "${'$'}_ak_t" -gt "${'$'}_ad_t" ]; then continue; fi
       if [ "${'$'}_ak_t" -eq "${'$'}_ad_t" ]; then
-        case "${'$'}(basename "${'$'}_ad_f")" in
-          "${'$'}(basename "${'$'}_ad_me")") continue ;;
-        esac
-        # Равные тикеты: приоритет у меньшего имени.
-        if [ "${'$'}(basename "${'$'}_ad_f")" \> "${'$'}(basename "${'$'}_ad_me")" ]; then continue; fi
+        # Равные тикеты (гонка двух создателей): приоритет у меньшего имени.
+        _ad_jn=${'$'}{_ad_f##*/}
+        _ad_mn=${'$'}_ad_me
+        _ad_mn=${'$'}{_ad_mn##*/}
+        if [ "${'$'}_ad_jn" \> "${'$'}_ad_mn" ]; then continue; fi
       fi
       _ad_line=${'$'}(cat "${'$'}_ad_f" 2>/dev/null)
       if _jit_death_proven "${'$'}_ad_line"; then
