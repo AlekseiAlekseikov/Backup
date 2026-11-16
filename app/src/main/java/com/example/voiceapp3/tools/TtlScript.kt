@@ -129,6 +129,12 @@ OWNMARK=${D}TTL_STATE_DIR/voiceapp3_ttl_own_${D}OWN_GEN
 ownmark_ok() {
   [ -f "${D}OWNMARK" ] || return 1
   grep -q "^chain=${D}OUR${D}" "${D}OWNMARK" 2>/dev/null || return 1
+  # iter58 §5.2: маркер привязан к ПОКОЛЕНИЮ установки. Без этого файл, оставшийся от прежнего
+  # поколения, «доказывал» бы владение цепью, которую создал кто-то другой с тем же именем.
+  grep -q "^gen=${D}OWN_GEN${D}" "${D}OWNMARK" 2>/dev/null || return 1
+  # Маркер сам по себе не вечен: если цепь исчезла и была создана извне, файл ничего не
+  # доказывает. Поэтому владение дополнительно требует, чтобы цепь СЕЙЧАС существовала.
+  iptables -w 5 -t mangle -S "${D}OUR" >/dev/null 2>&1 || return 1
   return 0
 }
 COMMENT_OK=0
@@ -444,7 +450,19 @@ EOF_SPECS
     echo "TTL_OWN family=${D}fam state=absent removed=ok jumps_left=0 rules_left=0"
     # Цепи больше нет ⇒ маркер создания не должен пережить её: иначе следующая установка с тем же
     # gen сочла бы «своей» цепь, которую создаст кто-то другой.
-    if [ "${D}fam" = "v4" ]; then rm -f "${D}OWNMARK" 2>/dev/null; echo "TTL_OWNMARK clear=ok path=${D}OWNMARK"; fi
+    # iter58 §5.2: снимаем ТОЛЬКО строку своего семейства. Файл удаляется, когда в нём не
+    # осталось ни одного семейства: иначе успешный OFF v4 стирал доказательство владения v6,
+    # и последующий OFF v6 уже не мог отличить свою цепь от чужой.
+    if [ -f "${D}OWNMARK" ]; then
+      grep -v "^${D}fam=created" "${D}OWNMARK" 2>/dev/null > "${D}OWNMARK.tmp.${D}${D}" && \
+        mv -f "${D}OWNMARK.tmp.${D}${D}" "${D}OWNMARK" 2>/dev/null
+      if grep -q '^v[46]=created' "${D}OWNMARK" 2>/dev/null; then
+        echo "TTL_OWNMARK clear_family=${D}fam path=${D}OWNMARK remaining=yes"
+      else
+        rm -f "${D}OWNMARK" 2>/dev/null
+        echo "TTL_OWNMARK clear_family=${D}fam path=${D}OWNMARK remaining=no"
+      fi
+    fi
     echo "${D}fam:ok"
   else
     echo "TTL_OWN family=${D}fam state=${D}st2 removed=partial jumps_left=${D}jc2"; echo "${D}fam:partial"
@@ -544,9 +562,42 @@ elif [ "${D}ENABLE" = "1" ]; then
       iptables -w 5 -t mangle -N "${D}OUR" 2>/dev/null; rc_n=${D}?
       # iter57 §8.1: цепь создана НАМИ (rc=0) — фиксируем это на устройстве.
       if [ "${D}rc_n" = "0" ]; then
-        printf 'chain=%s\ngen=%s\ncreated=%s\n' "${D}OUR" "${D}OWN_GEN" "$(date +%s 2>/dev/null)" \
-          > "${D}OWNMARK" 2>/dev/null || echo "TTL_OWNMARK write=failed path=${D}OWNMARK"
-        echo "TTL_OWNMARK write=ok path=${D}OWNMARK chain=${D}OUR"
+        # iter58 §5.1: отказ записи маркера ОСТАНАВЛИВАЕТ проход. Дефект iter57: строка
+        # `… || echo write=failed` печатала отказ, но следующая строка безусловно печатала
+        # `write=ok`, и дальше добавлялись правило и переход — свои объекты оставались без
+        # подтверждённой identity (при недоступном `-m comment` их уже не отличить от чужих).
+        # iter58 §5.2: шапка (chain/gen/created) пишется ОДИН раз, семейства — отдельными
+        # строками `v4=created`/`v6=created`: частичный OFF одного семейства не должен стирать
+        # доказательство владения ДРУГИМ.
+        if [ ! -f "${D}OWNMARK" ]; then
+          printf 'chain=%s\ngen=%s\ncreated=%s\n' "${D}OUR" "${D}OWN_GEN" "$(date +%s 2>/dev/null)" \
+            > "${D}OWNMARK" 2>/dev/null; rc_mark=${D}?
+        else
+          rc_mark=0
+        fi
+        mk_chain=${D}(sed -n 's/^chain=//p' "${D}OWNMARK" 2>/dev/null)
+        mk_gen=${D}(sed -n 's/^gen=//p' "${D}OWNMARK" 2>/dev/null)
+        if [ "${D}rc_mark" = "0" ] && [ "${D}mk_chain" = "${D}OUR" ] && \
+           [ "${D}mk_gen" = "${D}OWN_GEN" ]; then
+          if ! grep -q '^v4=created' "${D}OWNMARK" 2>/dev/null; then
+            printf 'v4=created\n' >> "${D}OWNMARK" 2>/dev/null || rc_mark=1
+          fi
+        fi
+        if [ "${D}rc_mark" = "0" ] && [ "${D}mk_chain" = "${D}OUR" ] && \
+           [ "${D}mk_gen" = "${D}OWN_GEN" ] && \
+           grep -q '^v4=created' "${D}OWNMARK" 2>/dev/null; then
+          echo "TTL_OWNMARK write=ok path=${D}OWNMARK chain=${D}OUR gen=${D}OWN_GEN family=v4 readback=ok"
+        else
+          echo "TTL_OWNMARK write=failed path=${D}OWNMARK rc=${D}rc_mark " \
+            "readback_chain=${D}{mk_chain:-none} readback_gen=${D}{mk_gen:-none}"
+          # Свою цепь, созданную этим проходом, убираем сразу: без подтверждённого маркера она
+          # стала бы неуправляемой (её нельзя доказать как свою).
+          iptables -w 5 -t mangle -X "${D}OUR" >/dev/null 2>&1; rc_xm=${D}?
+          rm -f "${D}OWNMARK" 2>/dev/null
+          echo "TTL_TRY action=stop reason=ownmark_not_persisted family=v4 chain_delete_rc=${D}rc_xm " \
+            "note=\"маркер создания не подтверждён: правило не добавляется, созданная цепь убрана\""
+          TTL_STOP=1
+        fi
       fi
       if [ "${D}rc_n" != "0" ]; then
         st_n=${D}(chain_state iptables "${D}RULE4")
@@ -601,6 +652,16 @@ elif [ "${D}ENABLE" = "1" ]; then
         ip6tables -w 5 -t mangle -A POSTROUTING -o "${D}UPLINK" -j "${D}OUR" 2>&1
         rc_j6=${D}?; echo "TTL_ADD family=v6 jump scope=\"-o ${D}UPLINK\" rc=${D}rc_j6"
         # iter56 §8: то же для v6 — учитывается любое состоявшееся добавление, не только `-N`.
+        # iter58 §5.2: семейство v6 отмечается своей строкой маркера — независимо от v4.
+        if [ "${D}rc_n6" = "0" ] && [ -f "${D}OWNMARK" ]; then
+          grep -q '^v6=created' "${D}OWNMARK" 2>/dev/null || \
+            printf 'v6=created\n' >> "${D}OWNMARK" 2>/dev/null
+          if grep -q '^v6=created' "${D}OWNMARK" 2>/dev/null; then
+            echo "TTL_OWNMARK write=ok path=${D}OWNMARK chain=${D}OUR family=v6 readback=ok"
+          else
+            echo "TTL_OWNMARK write=failed path=${D}OWNMARK family=v6 reason=family_line_not_persisted"
+          fi
+        fi
         if [ "${D}rc_n6" = "0" ] || [ "${D}rc_a6" = "0" ] || [ "${D}rc_j6" = "0" ]; then TOUCHED_v6=yes; fi
         fi
       fi
@@ -643,7 +704,11 @@ elif [ "${D}ENABLE" = "1" ]; then
           iptables -w 5 -t mangle -X "${D}OUR" >/dev/null 2>&1; rx4=${D}?
           # Цепь снята — маркер создания больше не нужен (иначе он «доказывал» бы владение
           # несуществующей цепью и мог быть подхвачен чужой установкой с тем же gen).
-          [ "${D}rx4" = "0" ] && rm -f "${D}OWNMARK" 2>/dev/null
+          if [ "${D}rx4" = "0" ] && [ -f "${D}OWNMARK" ]; then
+            grep -v '^v4=created' "${D}OWNMARK" 2>/dev/null > "${D}OWNMARK.tmp.${D}${D}" && \
+              mv -f "${D}OWNMARK.tmp.${D}${D}" "${D}OWNMARK" 2>/dev/null
+            grep -q '^v[46]=created' "${D}OWNMARK" 2>/dev/null || rm -f "${D}OWNMARK" 2>/dev/null
+          fi
           echo "TTL_ROLLBACK family=v4 jump_del_rc=${D}rj4 chain_flush_rc=${D}rf4 chain_del_rc=${D}rx4"
           TOUCHED_v4=no
         fi

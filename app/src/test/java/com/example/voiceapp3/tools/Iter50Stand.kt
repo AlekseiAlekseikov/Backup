@@ -286,6 +286,10 @@ class Iter50Stand {
         e["PATH"] = "${binDir.absolutePath}:${System.getenv("PATH") ?: "/bin:/usr/bin"}"
         e["MOUNTINFO"] = mountinfo.absolutePath
         e["STATE"] = stateDir.absolutePath
+        // iter58 §5.1: каталог состояния TTL на устройстве (`/data/local/tmp`) — записываемый.
+        // Без этого проверка «маркер создания сохранён» всегда падала, и тесты не доходили до
+        // реальной логики (дефект iter57: отказ записи маскировался строкой `write=ok`).
+        e["VAPP_TTL_STATE"] = File(stateDir, "ttlstate").apply { mkdirs() }.absolutePath
         e["ARGV_LOG"] = argvLog.absolutePath
         e["MOUNT_LOG"] = mountLog.absolutePath
         e["MOUNT_FAIL"] = "0"
