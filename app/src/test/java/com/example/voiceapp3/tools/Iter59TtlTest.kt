@@ -195,9 +195,13 @@ class Iter59TtlTest {
             src.contains("TtlAttempt.decide(current, output, attempt, TTL_UPLINK_RETRIES)"))
         assertFalse("повтор больше не идёт через Pair (executeScript)",
             Regex("AdbClient\\.executeScript\\(\\s*\"ttl_script\"").containsMatchIn(src))
+        // iter60 §4: identity записывается вместе с поколением намерения владельца.
         assertTrue("identity подтверждается ДО отправки",
-            src.indexOf("if (!recordAttempt(prep.evidencePath, want))") in
+            src.indexOf("if (!recordAttempt(prep.evidencePath, want, desire.generation))") in
                 1 until src.indexOf("AdbClient.executePrepared(prep, 40000)"))
+        assertTrue("перед записью попытки выполняется fence прошлой попытки",
+            src.indexOf("if (!resolvePreviousAttempts())") in
+                1 until src.indexOf("val prep = ScriptDelivery.prepare("))
         assertTrue("каждая повторная попытка получает свою identity",
             src.contains("val nextPrep = ScriptDelivery.prepare(\"ttl_script\", script)"))
         assertTrue("неизвестный исход повтора не выдаётся за применение",

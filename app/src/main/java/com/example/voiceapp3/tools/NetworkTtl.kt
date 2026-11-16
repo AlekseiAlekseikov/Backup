@@ -363,8 +363,24 @@ private fun buildScript(enable: Boolean, reg: TtlOwnership.Registry?): String {
         // iter59 §6: identity попытки (nonce + адрес свидетельства) готовится вызывающим и
         // ПОДТВЕРЖДАЕТСЯ ЗАПИСЬЮ ДО ОТПРАВКИ. Иначе потеря ответа оставляла мутацию `iptables`
         // без адреса, по которому можно прочитать terminal этой самой попытки.
+        // iter60 §4: ЖЕЛАНИЕ владельца фиксируется durable и отдельно от факта применения/identity.
+        // Иначе смена ON→OFF во время pending терялась (дефект iter59: `ttl_last_attempt`
+        // перезаписывался, а прошлый Unknown не сверялся).
+        val desire = persistDesire(want)
+        if (desire == null) {
+            AppLog.e(TAG, "TTL_DESIRE persisted=no action=no_send source=$source " +
+                "(намерение владельца не подтверждено записью: таблица не меняется)")
+            return TtlRunner.Outcome(false, "desire_not_persisted", "")
+        }
+        // iter60 §4: FENCE. Пока прошлая попытка могла исполняться, новая мутация запрещена:
+        // сначала читаем ЕЁ terminal (read-only) и закрываем именно её, а не «вообще всё».
+        if (!resolvePreviousAttempts()) {
+            AppLog.w(TAG, "TTL_FENCE action=blocked desired=${desire.on} gen=${desire.generation} " +
+                "source=$source (прошлая попытка не доказана: новой мутации нет, повтор после readback)")
+            return TtlRunner.Outcome(false, "previous_attempt_unresolved", "")
+        }
         val prep = ScriptDelivery.prepare("ttl_script", script)
-        if (!recordAttempt(prep.evidencePath, want)) {
+        if (!recordAttempt(prep.evidencePath, want, desire.generation)) {
             AppLog.e(TAG, "TTL_ATTEMPT persisted=no action=no_send source=$source " +
                 "evidence=${prep.evidencePath.ifEmpty { "none" }} " +
                 "(адрес свидетельства попытки не подтверждён: таблица не меняется)")
@@ -373,15 +389,22 @@ private fun buildScript(enable: Boolean, reg: TtlOwnership.Registry?): String {
         AppLog.i(TAG, "TTL_ATTEMPT op=$opId evidence=${prep.evidencePath} want=$want persisted=ok " +
             "source=$source")
         // ОДНА доставка: тот же результат используется и для исхода, и для разбора вывода.
+        // Отправка началась: фаза «могло исполниться» пишется ДО shell, а не после ответа.
+        markAttempt(prep.evidencePath, want, desire.generation, TtlState.Phase.MAY_HAVE_RUN)
         val detailed = AdbClient.executePrepared(prep, 40000)
         val delivery = ScriptDelivery.outcome(detailed, opId)
         val firstOutcome = delivery
         if (firstOutcome is ScriptDelivery.DeliveryOutcome.NotSent) {
+            // Доказанное «не уходило» ⇒ попытка закрывается как PROVEN_NOT_SENT, а не блокирует
+            // следующую мутацию. Это единственный случай, когда закрытие допустимо без terminal.
+            markAttempt(prep.evidencePath, want, desire.generation, TtlState.Phase.PROVEN_NOT_SENT)
             AppLog.w(TAG, "TTL_DELIVERY op=$opId ${firstOutcome.wire()} source=$source " +
                 "action=stop (ни один байт скрипта не исполнялся: таблица не менялась)")
             return TtlRunner.Outcome(false, "not_sent:" + firstOutcome.why, firstOutcome.wire())
         }
         if (firstOutcome is ScriptDelivery.DeliveryOutcome.Unknown) {
+            // Исход неизвестен: попытка ОСТАЁТСЯ незавершённой, её адрес сохранён в журнале,
+            // следующая мутация будет ждать readback ЕЁ terminal (fence выше).
             AppLog.w(TAG, "TTL_DELIVERY op=$opId ${firstOutcome.wire()} source=$source " +
                 "action=pending (исход применения неизвестен: «применено» не заявляется, " +
                 "факт даст readback/следующий проход)")
@@ -412,7 +435,7 @@ private fun buildScript(enable: Boolean, reg: TtlOwnership.Registry?): String {
                     "(скрипт доказанно завершён без применения: правила не менялись)")
                 runCatching { Thread.sleep(TTL_UPLINK_RETRY_PAUSE_MS) }
                 val nextPrep = ScriptDelivery.prepare("ttl_script", script)
-                if (!recordAttempt(nextPrep.evidencePath, want)) {
+                if (!recordAttempt(nextPrep.evidencePath, want, desire.generation)) {
                     AppLog.e(TAG, "TTL_ATTEMPT persisted=no action=no_send attempt=$attempt " +
                         "source=$source (адрес свидетельства не подтверждён: повтор не отправляется)")
                     break
@@ -428,6 +451,15 @@ private fun buildScript(enable: Boolean, reg: TtlOwnership.Registry?): String {
                     return TtlRunner.Outcome(false, "retry_unknown", current.wire())
                 }
             }
+        }
+        markAttempt(prep.evidencePath, want, desire.generation, TtlState.Phase.TERMINAL,
+            if (detailed.payloadRc != ScriptDelivery.RC_UNKNOWN) detailed.payloadRc else exitCode)
+        // Расхождение последнего желания и выполненного применения — не «успех»: называем явно,
+        // доводит следующий проход по durable-намерению.
+        val lastDesire = desiredFile()?.let { TtlState.loadDesired(it) }
+        if (lastDesire != null && lastDesire.on != want) {
+            AppLog.i(TAG, "TTL_DESIRE_LAG applied=$want desired=${lastDesire.on} " +
+                "gen=${lastDesire.generation} action=next_pass (намерение новее применения)")
         }
         val verify = parseVerifyResult(want, output)
         val status = verify.status
@@ -452,19 +484,112 @@ private fun buildScript(enable: Boolean, reg: TtlOwnership.Registry?): String {
      * чтением ДО отправки; файл переживает смерть процесса, поэтому потерянный ответ не
      * оставляет мутацию `iptables` без адреса для readback.
      */
+    /** Миграция iter59 → iter60 выполняется один раз за жизнь процесса. */
+    @Volatile
+    private var legacyMigrated = false
+
     private fun attemptFile(): File? {
         val ctx = appCtxRef ?: return null
         return File(ctx.filesDir, "ttl_last_attempt")
     }
 
-    private fun recordAttempt(path: String, want: Boolean): Boolean {
-        val f = attemptFile() ?: return false
-        val ok = TtlAttempt.record(f, path, want, System.currentTimeMillis())
+    /**
+     * iter60 §4: журнал попыток (append-only, last-wins по id) вместо одного перезаписываемого
+     * файла. `ttl_last_attempt` остаётся только источником миграции iter59 → iter60.
+     */
+    private fun attemptJournal(): File? {
+        val ctx = appCtxRef ?: return null
+        return File(ctx.filesDir, "ttl_attempts.log")
+    }
+
+    private fun desiredFile(): File? {
+        val ctx = appCtxRef ?: return null
+        return File(ctx.filesDir, "ttl_desired.txt")
+    }
+
+    /** Зафиксировать намерение владельца durable (поколение растёт монотонно). */
+    private fun persistDesire(on: Boolean): TtlState.Desired? {
+        val f = desiredFile() ?: return null
+        val d = TtlState.saveDesired(f, on, System.currentTimeMillis()) ?: return null
+        AppLog.i(TAG, "TTL_DESIRE on=${d.on} gen=${d.generation} persisted=ok")
+        return d
+    }
+
+    /** Дописать попытку в журнал и подтвердить полным readback. */
+    private fun recordAttempt(path: String, want: Boolean, generation: Long): Boolean {
+        val j = attemptJournal() ?: return false
+        migrateLegacyAttempt(j, generation)
+        val id = "ttl_" + (if (want) "on" else "off") + "_" +
+            System.currentTimeMillis() + "_" + generation
+        val a = TtlState.Attempt(id, path, want, generation, TtlState.Phase.PREPARED,
+            Int.MIN_VALUE, System.currentTimeMillis())
+        val ok = TtlState.record(j, a)
         if (ok) {
-            AppLog.i(TAG, "TTL_ATTEMPT record=${TtlAttempt.last(f)?.evidence() ?: "none"} " +
-                "persisted=ok")
+            AppLog.i(TAG, "TTL_ATTEMPT ${a.evidence()} persisted=ok")
+        } else {
+            AppLog.e(TAG, "TTL_ATTEMPT path=$path persisted=no (identity не подтверждена)")
         }
         return ok
+    }
+
+    /**
+     * Перенос записи iter59 в журнал ровно один раз. Старый формат не различал «не отправлено» и
+     * «неизвестно», поэтому миграция даёт `MAY_HAVE_RUN`: она блокирует мутацию до readback,
+     * а не притворяется доказанным «не исполнялось».
+     */
+    private fun migrateLegacyAttempt(journal: File, generation: Long) {
+        if (legacyMigrated) return
+        legacyMigrated = true
+        val legacy = runCatching { attemptFile()?.takeIf { it.exists() }?.readText() }.getOrNull()
+            ?: return
+        val migrated = TtlState.migrateLegacy(legacy, generation, "ttl") ?: return
+        if (TtlState.record(journal, migrated)) {
+            AppLog.i(TAG, "TTL_ATTEMPT_MIGRATED ${migrated.evidence()} action=fence_until_readback")
+        }
+    }
+
+    /** Сменить фазу попытки в журнале (durable, с readback). */
+    private fun markAttempt(path: String, want: Boolean, generation: Long, phase: TtlState.Phase,
+                            payloadRc: Int = Int.MIN_VALUE) {
+        val j = attemptJournal() ?: return
+        val records = TtlState.parseJournal(runCatching { j.readText() }.getOrNull())
+        val a = records.lastOrNull {
+            it.evidencePath == path && it.want == want && it.generation == generation
+        } ?: return
+        val next = a.copy(phase = phase, payloadRc = payloadRc, ts = System.currentTimeMillis())
+        if (!TtlState.transition(j, next)) {
+            AppLog.e(TAG, "TTL_ATTEMPT_PHASE ${next.evidence()} persisted=no")
+        }
+    }
+
+    /**
+     * iter60 §4: закрыть прошлые попытки по durable-свидетельству, ПРЕЖДЕ чем менять таблицу.
+     *
+     * @return true — незавершённых попыток не осталось; false — мутация запрещена.
+     */
+    private fun resolvePreviousAttempts(): Boolean {
+        val j = attemptJournal() ?: return false
+        val records = TtlState.parseJournal(runCatching { j.readText() }.getOrNull())
+        val pending = TtlState.unresolved(records)
+        if (pending.isEmpty()) return true
+        for (a in pending) {
+            if (a.evidencePath.isEmpty()) {
+                AppLog.w(TAG, "TTL_FENCE attempt=${a.id} evidence=none state=unresolved")
+                return false
+            }
+            val r = runCatching {
+                AdbClient.executeScript("ttl_evidence", ScriptDelivery.evidenceCommand(a.evidencePath),
+                    8000, false)
+            }.getOrNull()
+            val ev = TtlState.classifyEvidence(r?.takeIf { it.first == 0 }?.second)
+            val resolved = TtlState.applyEvidence(a, ev, System.currentTimeMillis())
+            AppLog.i(TAG, "TTL_FENCE attempt=${a.id} evidence=${a.evidencePath} " +
+                "kind=${ev::class.simpleName} action=${if (resolved == null) "wait" else "close"}")
+            if (resolved == null) return false
+            if (!TtlState.transition(j, resolved)) return false
+        }
+        return TtlState.unresolved(TtlState.parseJournal(runCatching { j.readText() }.getOrNull()))
+            .isEmpty()
     }
 
     /** Факт применения: значение + поколение + загрузка (все три проверяются при чтении). */
