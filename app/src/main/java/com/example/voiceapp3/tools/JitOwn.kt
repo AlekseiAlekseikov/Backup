@@ -549,166 +549,161 @@ _adm_unpublish_mine() {
 }
 
 # ─── ЗАНЯТЬ НОМЕР: единственная атомарная операция протокола ───
-# 0 — номер занят нами; 1 — занят другим (живым или ещё не разобранным); 2 — занять нельзя.
-_adm_claim_slot() {
-  _acs_k=${'$'}1
-  _acs_f="${'$'}{_adm_dir}/n.${'$'}{_acs_k}"
-  _acs_line="slot=${'$'}{_acs_k};inst=${'$'}{_ad_inst:-?};pid=${'$'}{_ad_pid0:-?};pstart=${'$'}{_ad_pst0:-?};boot=${'$'}{_ad_boot0:-?}"
-  # noclobber: файл создаётся ТОЛЬКО если такого имени ещё нет — это и есть атомарный захват.
-  if (set -C; : > "${'$'}_acs_f") 2>/dev/null; then
-    printf '%s\n' "${'$'}_acs_line" > "${'$'}_acs_f" 2>/dev/null
-    # Подтверждение: имя наше и содержимое наше (иначе — не считаем номер своим).
-    _adm_read "${'$'}_acs_f"
-    _adm_mine "${'$'}_ak_line" && return 0
-    rm -f "${'$'}_acs_f" 2>/dev/null
-    return 2
-  fi
-  [ -f "${'$'}_acs_f" ] && return 1
-  # Создать не удалось, и файла нет: файловая система/права. Секции не будет.
-  return 2
+  # ─── iter62 §A1: ВЗАИМНОЕ ИСКЛЮЧЕНИЕ БЕЗ ОЧЕРЕДИ ───
+  # Прежний протокол («номер на единицу больше максимального ЖИВОГО») нарушал инвариант:
+  # освободившийся номер доставался новому участнику НИЖЕ живого и цикл ожидания «меньших
+  # номеров» не выполнялся ни разу ⇒ два живых владельца (воспроизведено аудитом на iter61).
+  # Здесь упорядочивающего ключа нет вовсе: владелец ровно один — тот, кто владеет ЕДИНСТВЕННЫМ
+  # файлом `<lock>.own/o`. Атомарность даёт `ln` на заранее записанный файл с identity:
+  #   • `ln` либо создаёт имя, либо нет — на любой POSIX ФС (без flock/renameat2/CAS-unlink);
+  #   • содержимое появляется АТОМАРНО вместе с именем ⇒ нет окна «файл есть, identity нет».
+  # Смерть владельца доказывается только по `/proc` (pid + pstart + boot); лишь после
+  # доказательства файл переносится (`mv`) в уникальное имя, сверяется и удаляется. Живой не
+  # трогается никогда. Разбор строк — встроенными средствами (read, case, удаление суффикса):
+  # fork-шторм из восьми `sed` на каждую запись убран; 22-е поле `/proc/<pid>/stat` читается
+  # без fork'ов.
+# Корень /proc вынесен в переменную ТОЛЬКО ради теста «/proc недоступен» (A1-6):
+# в бою это ровно `/proc`, менять его нечем.
+# Значение кэшируется в `_adm_root` при входе: подстановка команды `$(...)` создавала бы fork.
+_adm_stat_pstart() {
+  _adp_pst=
+  _adp_stat=
+  { IFS= read -r _adp_stat < "${'$'}{_adm_root:-/proc}/${'$'}1/stat"; } 2>/dev/null || return 1
+  [ -n "${'$'}_adp_stat" ] || return 1
+  _adp_rest=${'$'}{_adp_stat##*)}
+  _adp_n=0
+  for _adp_f in ${'$'}_adp_rest; do
+    _adp_n=${'$'}(( _adp_n + 1 ))
+    if [ "${'$'}_adp_n" -eq 20 ]; then _adp_pst=${'$'}_adp_f; return 0; fi
+  done
+  return 1
 }
 
-# Освободить МЁРТВЫЙ номер: только если владелец доказанно мёртв. Живой не трогается никогда.
-_adm_reclaim_dead() {
-  _ard_k=${'$'}1
-  _ard_f="${'$'}{_adm_dir}/n.${'$'}{_ard_k}"
-  [ -f "${'$'}_ard_f" ] || return 0
-  _adm_read "${'$'}_ard_f"
-  _adm_mine "${'$'}_ak_line" && return 0
-  _jit_death_proven "${'$'}_ak_line" || return 1
-  # Повторная сверка содержимого: между проверкой и `rm` владелец мог переписать файл.
-  _ard_again=${'$'}(cat "${'$'}_ard_f" 2>/dev/null)
-  [ "${'$'}_ard_again" = "${'$'}_ak_line" ] || return 1
-  rm -f "${'$'}_ard_f" 2>/dev/null
-  [ -f "${'$'}_ard_f" ] && return 1
+# Смерть владельца строки ${'$'}1 ДОКАЗАНА?  0 — да; 1 — жив или доказать нечем.
+_adm_dead_proven() {
+  _adm_parse "${'$'}1"
+  [ -n "${'$'}_ak_pid" ] || return 1
+  if [ -n "${'$'}_ak_boot" ] && [ -n "${'$'}_me_boot" ] && [ "${'$'}_ak_boot" != "${'$'}_me_boot" ]; then
+    return 0
+  fi
+  # /proc недоступен ⇒ «процесса нет» доказательством НЕ считается.
+  _adp_root=${'$'}{_adm_root:-/proc}
+  [ -d "${'$'}_adp_root/1" ] || return 1
+  [ -d "${'$'}_adp_root/${'$'}_ak_pid" ] || return 0
+  _adm_stat_pstart "${'$'}_ak_pid" || return 1
+  [ -n "${'$'}_ak_pst" ] && [ -n "${'$'}_adp_pst" ] && [ "${'$'}_ak_pst" != "${'$'}_adp_pst" ] && return 0
+  return 1
+}
+
+# Снять ДОКАЗАННО мёртвую запись: `mv` в уникальное имя → сверка содержимого → удаление.
+# Два претендента на снятие: у второго `mv` не найдёт имени, он просто повторит попытку.
+_adm_reclaim() {
+  _rc_f=${'$'}1; _rc_want=${'$'}2
+  [ -f "${'$'}_rc_f" ] || return 0
+  _adm_read "${'$'}_rc_f"
+  [ "${'$'}_ak_line" = "${'$'}_rc_want" ] || return 1
+  _rc_tmp="${'$'}{_adm_dir}/retired.${'$'}{_me_pid:-0}.${'$'}{_ad_try:-0}"
+  mv -f "${'$'}_rc_f" "${'$'}_rc_tmp" 2>/dev/null || return 1
+  _adm_read "${'$'}_rc_tmp"
+  if [ "${'$'}_ak_line" != "${'$'}_rc_want" ]; then
+    # Содержимое успело измениться (появился живой владелец) — вернуть на место.
+    mv -f "${'$'}_rc_tmp" "${'$'}_rc_f" 2>/dev/null
+    return 1
+  fi
+  rm -f "${'$'}_rc_tmp" 2>/dev/null
   return 0
 }
 
 # Точки остановки для детерминированных тестов (в бою — пустые no-op).
-_adm_barrier_after_slot() { :; }
-_adm_barrier_before_scan() { :; }
-# Нарушение порядка (внутри секции найден ЖИВОЙ участник с меньшим номером). В бою это
-# диагностический факт для журнала: секция уже удерживается, поэтому действие не начинается, а
-# нарушение фиксируется. Детерминированный тест читает эту переменную.
+_adm_barrier_before_claim() { :; }
+_adm_barrier_after_claim() { :; }
+# Причина отказа последнего входа — для честного лога, не для логики.
+_adm_refuse=""
+# Нарушение порядка. В протоколе §A1 упорядочивания нет, поэтому переменная остаётся только
+# ради совместимости старых тестов, которые её читают; production её не выставляет.
 _adm_violation=""
 
 _jit_admin_enter() {
-  _adm_dir="${lock}.adm"
+  _adm_dir="${lock}.own"
   mkdir -p "${'$'}_adm_dir" 2>/dev/null || return 1
   _ad_me=${'$'}{_ad_me:-}
-  _ad_slot=${'$'}{_ad_slot:-}
   _ad_inst=${'$'}{_ad_inst:-${'$'}{_me_inst:-?}}
   _ad_pid0=${'$'}{_ad_pid0:-${'$'}{_me_pid:-?}}
   _ad_pst0=${'$'}{_ad_pst0:-${'$'}{_me_pstart:-?}}
   _ad_boot0=${'$'}{_ad_boot0:-${'$'}{_me_boot:-?}}
   _ad_depth=${'$'}{_ad_depth:-0}
+  _ad_owner="${'$'}{_adm_dir}/o"
+  _adm_refuse=
+  _adm_root=${'$'}{_ADM_PROC:-/proc}
 
-  # 0) Совместимость: admin-ФАЙЛ прежней версии. Новый код его не создаёт. Удалять по имени
-  #    нельзя (это и была гонка iter58): доказали смерть → перенесли в УНИКАЛЬНОЕ имя и сверили
-  #    содержимое; не совпало (появился живой) → вернули обратно.
+  # 0) Legacy admin-файл прежней версии. Миграция ТОЛЬКО при доказанной смерти, снятие — через
+  #    уникальное имя со сверкой содержимого (не `rm` по имени).
   if [ -f "${lock}.admin" ]; then
-    _ad_old=${'$'}(cat "${lock}.admin" 2>/dev/null)
-    _jit_death_proven "${'$'}_ad_old" || return 1
+    _adm_read "${lock}.admin"
+    _ad_old=${'$'}_ak_line
+    if ! _adm_dead_proven "${'$'}_ad_old"; then
+      _adm_refuse=legacy_alive; return 1
+    fi
     _ad_mv="${'$'}{_adm_dir}/retired.legacy.${'$'}{_me_pid:-0}"
     mv -f "${lock}.admin" "${'$'}_ad_mv" 2>/dev/null
-    _ad_got=${'$'}(cat "${'$'}_ad_mv" 2>/dev/null)
-    if [ "${'$'}_ad_got" != "${'$'}_ad_old" ]; then
-      ln "${'$'}_ad_mv" "${lock}.admin" 2>/dev/null || cp "${'$'}_ad_mv" "${lock}.admin" 2>/dev/null
-      rm -f "${'$'}_ad_mv" 2>/dev/null
-      return 1
+    _adm_read "${'$'}_ad_mv"
+    if [ "${'$'}_ak_line" != "${'$'}_ad_old" ]; then
+      mv -f "${'$'}_ad_mv" "${lock}.admin" 2>/dev/null
+      _adm_refuse=legacy_changed; return 1
     fi
     rm -f "${'$'}_ad_mv" 2>/dev/null
   fi
 
-  # 1) Повторный (вложенный) вход ЭТОГО shell. Участник владеет ровно ОДНИМ номером, иначе
-  #    ожидание меньшего номера заблокировало бы самого себя. Поиск ограничен 64 именами.
-  if [ "${'$'}_ad_depth" -ge 1 ] && [ -n "${'$'}_ad_slot" ]; then
-    _adm_read "${'$'}{_adm_dir}/n.${'$'}_ad_slot"
+  # 1) Вложенный вход ЭТОГО shell: секция уже наша — глубина растёт, владение не дублируется.
+  if [ "${'$'}_ad_depth" -ge 1 ] && [ -n "${'$'}_ad_me" ] && [ -f "${'$'}_ad_me" ]; then
+    _adm_read "${'$'}_ad_me"
     if _adm_mine "${'$'}_ak_line"; then
       _ad_depth=${'$'}(( _ad_depth + 1 ))
       return 0
     fi
-    _ad_slot=
+    _ad_me=
   fi
 
-  # 2) ЗАНЯТЬ НОМЕР.
-  # Порядок участников определяется НОМЕРОМ, а не снимком каталога. Претендент занимает номер на
-  # единицу больше МАКСИМАЛЬНОГО ЖИВОГО: меньшие номера — те, кто зарегистрировался раньше и ещё
-  # жив; мёртвые номера не учитываются и освобождаются по одному (иначе счётчик рос бы вечно).
-  # Ранняя остановка на первом свободном номере недопустима: участник, занявший номер позже,
-  # не увидел бы уже вошедшего более раннего владельца.
-  _ad_max=0
-  _ad_k=1
-  while [ "${'$'}_ad_k" -le 64 ]; do
-    if [ -f "${'$'}{_adm_dir}/n.${'$'}_ad_k" ]; then
-      if _adm_reclaim_dead "${'$'}_ad_k"; then
-        :
-      else
-        _ad_max=${'$'}_ad_k
+  # 2) Захват: identity подготовлена ЗАРАНЕЕ, имя владельца появляется атомарно вместе с ней.
+  _ad_line="inst=${'$'}_ad_inst;pid=${'$'}_ad_pid0;pstart=${'$'}_ad_pst0;boot=${'$'}_ad_boot0"
+  _ad_try=0
+  while [ "${'$'}_ad_try" -lt "${'$'}{_ADM_WAIT_ITERS:-400}" ]; do
+    _ad_try=${'$'}(( _ad_try + 1 ))
+    _adm_barrier_before_claim
+    _ad_tmp="${'$'}{_adm_dir}/t.${'$'}{_ad_pid0}.${'$'}_ad_try"
+    printf '%s\n' "${'$'}_ad_line" > "${'$'}_ad_tmp" 2>/dev/null || {
+      _adm_refuse=tmp_write_failed; return 2; }
+    if ln "${'$'}_ad_tmp" "${'$'}_ad_owner" 2>/dev/null; then
+      rm -f "${'$'}_ad_tmp" 2>/dev/null
+      _adm_read "${'$'}_ad_owner"
+      if ! _adm_mine "${'$'}_ak_line"; then
+        _adm_refuse=claim_unverified; return 2
       fi
+      _ad_me="${'$'}_ad_owner"
+      _ad_depth=1
+      _adm_barrier_after_claim
+      return 0
     fi
-    _ad_k=${'$'}(( _ad_k + 1 ))
+    rm -f "${'$'}_ad_tmp" 2>/dev/null
+    # Владелец мог освободить имя МЕЖДУ неудачным `ln` и чтением (он снимает свою запись после
+    # сверки). Отсутствие файла — не «битая запись»: повторяем попытку, ничего не объявляя.
+    if [ ! -f "${'$'}_ad_owner" ]; then continue; fi
+    _adm_read "${'$'}_ad_owner"
+    if [ -z "${'$'}_ak_line" ]; then
+      # Битая запись: смерть доказать нечем ⇒ явный отказ, файл НЕ удаляется.
+      _adm_refuse=owner_unreadable; return 1
+    fi
+    if _adm_mine "${'$'}_ak_line"; then
+      _ad_me="${'$'}_ad_owner"; _ad_depth=1; return 0
+    fi
+    if _adm_dead_proven "${'$'}_ak_line"; then
+      _adm_reclaim "${'$'}_ad_owner" "${'$'}_ak_line"
+      continue
+    fi
+    _adm_refuse=busy_alive
+    sleep 0.02
   done
-  _ad_k=${'$'}(( _ad_max + 1 ))
-  [ "${'$'}_ad_k" -le 64 ] || return 1
-  _ad_claim_rc=2
-  _ad_tries=0
-  while [ "${'$'}_ad_tries" -lt 8 ]; do
-    _adm_claim_slot "${'$'}_ad_k"
-    _ad_claim_rc=${'$'}?
-    [ "${'$'}_ad_claim_rc" = 0 ] && break
-    [ "${'$'}_ad_claim_rc" = 2 ] && break
-    # номер перехвачен конкурентом — берём следующий
-    _ad_k=${'$'}(( _ad_k + 1 ))
-    [ "${'$'}_ad_k" -le 128 ] || break
-    _ad_tries=${'$'}(( _ad_tries + 1 ))
-  done
-  [ "${'$'}_ad_claim_rc" = 0 ] || return 1
-  _ad_slot=${'$'}_ad_k
-  _ad_me="${'$'}{_adm_dir}/n.${'$'}_ad_slot"
-
-  # 3) Контролируемая точка остановки (в бою ничего не делает).
-  _adm_barrier_after_slot
-
-  # 4) Ждём освобождения ВСЕХ меньших номеров. Никакого снимка списка нет: на каждой итерации
-  #    проверяются конкретные имена по возрастанию, поэтому поздняя публикация меньшего номера
-  #    не может «проскочить» незамеченной — она либо видна, либо её владелец доказанно мёртв.
-  _ad_wait=0
-  while [ "${'$'}_ad_wait" -lt 600 ]; do
-    _ad_wait=${'$'}(( _ad_wait + 1 ))
-    _adm_barrier_before_scan
-    _ad_block=0
-    _ad_j=1
-    while [ "${'$'}_ad_j" -lt "${'$'}_ad_slot" ]; do
-      _ad_f="${'$'}{_adm_dir}/n.${'$'}_ad_j"
-      if [ -f "${'$'}_ad_f" ]; then
-        if _adm_reclaim_dead "${'$'}_ad_j"; then
-          :   # мёртвый владелец: номер освобождён, идём дальше
-        else
-          _adm_read "${'$'}_ad_f"
-          if _adm_mine "${'$'}_ak_line"; then
-            :   # наш собственный номер (вложенный случай) — не блокирует
-          else
-            # ЖИВОЙ участник с меньшим номером. Он обязан был получить номер раньше нас, поэтому
-            # такая картина означает, что последовательность номеров не была соблюдена.
-            if [ "${'$'}{_ad_depth:-0}" -ge 1 ]; then
-              _adm_violation="live_lower_slot=${'$'}_ad_j"
-            fi
-            _ad_block=1
-            break
-          fi
-        fi
-      fi
-      _ad_j=${'$'}(( _ad_j + 1 ))
-    done
-    [ "${'$'}_ad_block" = "1" ] || { _ad_depth=1; return 0; }
-    sleep 0.01
-  done
-
-  # Не дождались: уходим БЕЗ секции и без своих записей (иначе заблокировали бы всех навсегда).
-  _adm_unpublish_mine "${'$'}_ad_me"
-  _ad_me=
-  _ad_slot=
+  _adm_refuse=busy_timeout
   return 1
 }
 
@@ -721,11 +716,9 @@ _jit_admin_exit() {
   fi
   _adm_unpublish_mine "${'$'}{_ad_me:-}"
   _ad_me=
-  _ad_slot=
   _ad_depth=0
   return 0
 }
-
 # ── ПОЛУЧИТЬ lock: 0 — наш; 1 — занят живым/не доказано; 2 — не взяли админ-файл ──
 # $1 — строка, которую надо записать; $2 — строка, смерть которой доказана ('' — не нужно).
 _jit_lock_acquire() {
