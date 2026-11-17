@@ -12,7 +12,7 @@
 | A2 + A3 (TTL + звук) | `a61a955` |
 | регресс A1/A2 (скрипт + тесты прежних протоколов) | `71ab974` |
 | **CODE_SHA** (код + тесты, блок B) | `6fccb1403acb437776cc1c8770c5d3f86b67149b` |
-| HANDOFF_SHA (этот отчёт + WORKLOG + маркер) | см. `git log -1` ветки `fix/v2` |
+| **HANDOFF_SHA** (маркер + этот отчёт + WORKLOG) | `50343bb7ca4a1c1f9bd3a2b38f7cbfef4e01b0d3` |
 
 Содержимое `app/buildinfo.properties` в handoff:
 
@@ -25,6 +25,8 @@ SOURCE_SHA=6fccb1403acb437776cc1c8770c5d3f86b67149b
 - `bash /home/user/runtests62.sh` (production-код + все JVM-тесты, настоящий `/bin/sh`, `/proc`):
   **`OK (1072 tests)`**, failures 0, skipped 0.
 - `bash /home/user/typecheck_lock.sh /tmp/w62`: **53 → 53, новых ошибок нет**.
+- CI на HANDOFF_SHA `50343bb`: run **`44157118616`**, job `build` — **success**; шаги: `JDK 21`,
+  `Gradle build (debug)`, `Upload APK` (все success). Debug-CI ≠ unit-тесты ≠ release ≠ проверка на ГУ.
 - Новых тестовых методов в iter62: **39** (8 + 7 + 8 + 8 + 4 + 4).
 - Локальная Gradle-сборка (`:app:assembleDebug`, `:app:assembleRelease`, `:app:testDebugUnitTest`)
   в этой среде **невозможна**: JDK 11, нет Android SDK и сети. Единственная настоящая сборка —
@@ -94,8 +96,12 @@ TTL-семейства (`Iter50TtlArgvTest`, `Iter52TtlTest`, `Iter53TtlTest`, `
 
 ### A4. Маркер сборки
 
-Порядок соблюдён: код+тесты → `CODE_SHA=6fccb14…` → `SOURCE_SHA=<CODE_SHA>` в `app/buildinfo.properties`
+Порядок соблюдён: код+тесты → `CODE_SHA=6fccb1403acb437776cc1c8770c5d3f86b67149b` → `SOURCE_SHA=<CODE_SHA>` в `app/buildinfo.properties`
 → этот отчёт + `WORKLOG.md` → handoff. `git rev-parse` внутри build-скрипта не используется.
+
+Проверка `git diff --name-only <CODE_SHA>..<HANDOFF_SHA>`:
+`WORKLOG.md`, `app/buildinfo.properties`, `docs/agent/REPORT_iter62.md` — production-код между
+этими коммитами не менялся.
 
 ## 4. Блок B — функции владельца
 
