@@ -192,17 +192,19 @@ class Iter53LogTest {
     }
 
     @Test
-    fun boundaryMatchKeepsBothRecordsInsteadOfDroppingOne() {
+    fun boundaryMatchIsDeduplicatedExactlyOnce() {
         val d = setup()
         val name = "app.log"
         val active = File(d, name).apply { writeText("a\nb\n") }
-        // iter55 §8: совпадение текста на границе НЕ доказывает, что это одно событие. Раньше
-        // вторая "b" выбрасывалась (молча терялось самостоятельное событие). Теперь переносятся
-        // все записи, а совпадение только сообщается.
+        // iter62 §B2 (контракт ИЗМЕНЁН по требованию владельца: «нет потери строк и нет ДУБЛЕЙ
+        // при crash на границе»). До iter62 совпадение только сообщалось, и граничная запись
+        // попадала в журнал дважды — именно этот дубль владелец и видел.
+        // Теперь выбрасывается РОВНО ОДНА граничная запись и только при точном совпадении с
+        // последней ЦЕЛОЙ записью активного файла; записи внутри `.new` не трогаются.
         File(d, "$name.new").writeText("b\ne\n")
         FileLogCore.drainSpill(d, name)
         val lines = active.readLines().filter { it.isNotEmpty() }
-        assertEquals("журнал: $lines", listOf("a", "b", "b", "e"), lines)
+        assertEquals("граница не задвоена, новая запись на месте: $lines", listOf("a", "b", "e"), lines)
     }
 
     @Test

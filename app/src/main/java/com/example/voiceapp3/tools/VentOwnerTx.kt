@@ -113,7 +113,10 @@ internal class VentOwnerTx {
             allOwners = owners.mapValues { it.value.toSet() },
             gen = genNow,
             legacy = legacy,
-            states = states
+            // iter62 §B3: КОПИЯ, а не ссылка. Раньше `ClosePlan` отдавал наружу ту же карту, что
+            // передал вызывающий: изменение карты после транзакции меняло «снимок решения»
+            // (в том числе то, по чему принималось решение о закрытии окна).
+            states = states.toMap()
         )
     }
 }

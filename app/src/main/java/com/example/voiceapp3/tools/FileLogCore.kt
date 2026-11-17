@@ -228,9 +228,22 @@ object FileLogCore {
             val prevIdx = bytes.copyOfRange(0, endIdx).indexOfLast { it == '\n'.code.toByte() }
             String(bytes, prevIdx + 1, endIdx - prevIdx - 1, Charsets.UTF_8)
         }.getOrNull()
-        // Совпадение — только ФАКТ для отчёта, а не разрешение выбросить запись.
+        // iter62 §B2 — ГРАНИЦА НЕ ДУБЛИРУЕТСЯ.
+        //
+        // Сценарий падения: строка записана в `.new`, процесс умер, и та же строка уже лежит
+        // последней в активном файле (или наоборот — активный дописали после записи в `.new`).
+        // Раньше совпадение только СООБЩАЛОСЬ (`boundary_same=1`), а строка переносилась снова —
+        // то есть в журнале появлялся ровно один дубль, который владелец и видел.
+        // Теперь выбрасывается РОВНО ОДНА граничная запись и только при точном совпадении с
+        // последней ЦЕЛОЙ записью активного файла. Одинаковые записи внутри `.new` не трогаются:
+        // две действительно одинаковые строки — нормальный журнал, а не дубль.
         val boundarySame = if (lastActive != null && lines.first() == lastActive) 1 else 0
-        val toAdd = lines
+        val toAdd = if (boundarySame == 1) lines.drop(1) else lines
+        if (toAdd.isEmpty()) {
+            // Переносить нечего: всё содержимое `.new` уже есть в активном файле.
+            val deleted = deleteVerified(pending)
+            return "boundary_same=1 nothing_to_add deleted=$deleted"
+        }
         var syncError: String? = null
         val written = runCatching {
             java.io.FileOutputStream(active, true).use { out ->

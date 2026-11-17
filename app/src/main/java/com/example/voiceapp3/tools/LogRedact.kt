@@ -15,7 +15,10 @@ package com.example.voiceapp3.tools
  *  • тела литералов `'…'`/`"…"` → `'<N bytes>'`;
  *  • длинные base64/hex-подобные токены (≥ [BLOB_MIN]) → `<blob:N>`;
  *  • значения `key|token|secret|password|…=…` → `<redacted>`;
- *  • IPv4 — НЕ маскируются здесь (нужны в диагностике сети, см. предупреждение в отчёте).
+ *  • iter62 §B2: SSID/BSSID, MAC и IP-адреса тоже маскируются. Раньше IPv4 намеренно
+ *    оставались «для диагностики сети», но владелец запретил печатать IP/MAC/SSID где бы то ни
+ *    было; для диагностики достаточно ФАКТА адреса и семейства (`<ip4>`, `<ip6>`), а не его
+ *    значения. Имена хостов (`example.invalid`) остаются — это не секрет.
  *
  * Это уменьшение утечки, а не криптографическая гарантия: ни одна регулярка не даёт
  * обещания «секретов в логе не будет».
@@ -28,6 +31,12 @@ internal object LogRedact {
     /** Секретные ключи: значение вырезается целиком. */
     private val SECRET_KEYS =
         Regex("(?i)\\b(key|token|secret|password|passwd|pwd|auth|bearer|pin|sig|signature|apikey|api_key)\\s*=\\s*\\S+")
+
+    /** iter62 §B2: сетевые идентификаторы, которые нельзя печатать. */
+    private val SSID = Regex("(?i)\\b(ssid|bssid|wifi_ssid|wifi_bssid)\\s*=\\s*\\S+")
+    private val MAC = Regex("(?i)\\b[0-9a-f]{2}(:[0-9a-f]{2}){5}\\b")
+    private val IP4 = Regex("\\b(\\d{1,3}\\.){3}\\d{1,3}\\b")
+    private val IP6 = Regex("(?i)\\b([0-9a-f]{1,4}:){2,7}[0-9a-f]{0,4}\\b")
 
     /** Строковые литералы: остаётся только размер (в байтах UTF-8 — как в файле). */
     private val SINGLE_QUOTED = Regex("'[^']*'", RegexOption.DOT_MATCHES_ALL)
@@ -45,6 +54,11 @@ internal object LogRedact {
         s = DOUBLE_QUOTED.replace(s) { "\"<" + utf8Len(it.value) + "B>\"" }
         s = SECRET_KEYS.replace(s) { it.groupValues[1] + "=<redacted>" }
         s = BLOB.replace(s) { "<blob:" + it.value.length + ">" }
+        // Маскирование сетевых идентификаторов — ПОСЛЕ blob/литералов, чтобы не мешать им.
+        s = SSID.replace(s) { it.groupValues[1] + "=<redacted>" }
+        s = MAC.replace(s, "<mac>")
+        s = IP4.replace(s, "<ip4>")
+        s = IP6.replace(s, "<ip6>")
         return if (s.length <= maxLen) s else s.take(maxLen) + "…(len=${cmd.length})"
     }
 

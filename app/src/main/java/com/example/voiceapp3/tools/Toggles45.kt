@@ -37,6 +37,32 @@ object Toggles45 {
      */
     fun dependentVisible(ownerValue: Boolean?): Boolean = ownerValue != false
 
+    /**
+     * iter62 §B1 — видимость зависимой строки по ТОМУ ЖЕ состоянию, которое видит САМ тумблер.
+     *
+     * Дефект (ToolsPanel.kt:1132 `applyBattDependency`): видимость считалась по `boolState(key)` —
+     * то есть по значению из снимка. При `unknown` backend публикует вместо значения ВСТРОЕННЫЙ
+     * default (ToolsBackend.kt:169 `addProperty(t.key, tri ?: t.default)`, у `hvacBatt` это
+     * `false`) ⇒ «Цифровая наружная температура» исчезала из списка, хотя сохранённое намерение
+     * владельца могло быть включено. Второй дефект того же места: клик не перестраивал панель,
+     * поэтому строка оставалась видимой до следующего снимка.
+     *
+     * Теперь берётся ровно та же трёхзначная модель, что и у тумблера (§6.3):
+     * `pending` (выбор владельца до подтверждения) → подтверждённое `on/off` → последнее известное;
+     * `null` — «неизвестно», и это НЕ повод скрывать строку.
+     */
+    fun dependentVisible(confirmed: String?, pending: Boolean?, lastKnown: Boolean?): Boolean =
+        dependentVisible(effectiveOwner(confirmed, pending, lastKnown))
+
+    /**
+     * Положение владельца для зависимой строки: БЕЗ подстановки встроенного default.
+     *
+     * `knownPosition` уже возвращает `null` для `unknown`/мусора; именно этот `null` и означает
+     * «неизвестно», а не «выключено».
+     */
+    fun effectiveOwner(confirmed: String?, pending: Boolean?, lastKnown: Boolean?): Boolean? =
+        pending ?: knownPosition(confirmed) ?: lastKnown
+
     /** Скрытие зависимой строки не является записью: выбор владельца остаётся прежним. */
     const val dependentHidesChoice = false
 
@@ -246,7 +272,11 @@ object Toggles45 {
         val s = raw?.trim()?.lowercase() ?: return null
         return when (s) {
             "true", "1", "on", "yes" -> true
-            "false", "0", "off", "no", "" -> false
+            // iter62 §B1: пустая строка — это «значения нет», а НЕ «выключено». Прежняя ветка
+            // (`"" -> false`) превращала отсутствующее/нечитаемое значение в OFF, и владелец видел
+            // тумблер выключенным при работающей функции (жалоба «работает, а визуально OFF»).
+            "false", "0", "off", "no" -> false
+            "" -> null
             else -> null
         }
     }

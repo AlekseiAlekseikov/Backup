@@ -76,7 +76,9 @@ class Toggles45Test {
         assertEquals(false, Toggles45.boolOrNull("false"))
         assertEquals(false, Toggles45.boolOrNull("off"))
         assertEquals(false, Toggles45.boolOrNull("0"))
-        assertEquals(false, Toggles45.boolOrNull(""))
+        // iter62 §B1: пустая строка — это ОТСУТСТВИЕ значения, а не «выключено». Прежнее
+        // ожидание (`false`) и было причиной жалобы «работает, а визуально OFF».
+        assertNull(Toggles45.boolOrNull(""))
     }
 
     @Test

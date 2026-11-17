@@ -117,6 +117,8 @@ class ToolsPanel(
     private var jitSwitchListener: ((Boolean) -> Unit)? = null
     private var jitTitleView: TextView? = null
     private var jitTitleText: String = ""
+    /** Строка «Цифровая наружная температура» — пересчитывается при клике по «Проценту заряда». */
+    private var battDependentRow: android.view.View? = null
 
     init {
         view.visibility = View.GONE
@@ -431,6 +433,9 @@ class ToolsPanel(
         addToggle("hvacTemp", "Цифровой климат-контроль", "desc.hvacTemp", def = false)
         addDiv()
         val extRow = addToggle("hvacExtTemp", "Цифровая наружная температура", "desc.hvacExtTemp", def = false)
+        // iter62 §B1: ссылка на строку нужна, чтобы клик по «Проценту заряда» СРАЗУ менял её
+        // видимость (раньше — только после следующего снимка, то есть с задержкой и не всегда).
+        battDependentRow = extRow
         // iter55 §9: наружная температура показывается только при включённом проценте заряда;
         // её сохранённый выбор при этом сохраняется (см. [applyBattDependency]).
         applyBattDependency("hvacBatt", extRow)
@@ -1130,7 +1135,11 @@ class ToolsPanel(
         if (dependent == null) return
         // Скрываем только при ПОДТВЕРЖДЁННОМ «выключено»: неизвестность не выдаётся за выбор
         // владельца (тогда его сохранённая настройка просто перестала бы быть видна).
-        val visible = Toggles45.dependentVisible(boolState(battKey))
+        // iter62 §B1: та же трёхзначная модель, что у самого тумблера (pending → on/off →
+        // последнее известное). Значение из снимка (`boolState`) для этого не годится: при
+        // `unknown` backend кладёт туда встроенный default.
+        val pending = pendingClicks[battKey]?.value
+        val visible = Toggles45.dependentVisible(strState(battKey + "State"), pending, lastKnownOf(battKey))
         dependent.visibility = if (visible) android.view.View.VISIBLE else android.view.View.GONE
         AppLog.i("ToolsPanel", "UI_DEPENDENCY owner=$battKey dependent_visible=${if (visible) 1 else 0} " +
             "pref_kept=yes " +
@@ -1225,6 +1234,9 @@ class ToolsPanel(
             // iter54 §10: новый клик снимает подпись применения ПРОШЛОГО намерения.
             applyNotes.remove(key)
             state.addProperty(key, checked)
+            // iter62 §B1: зависимая строка пересчитывается сразу по выбору владельца, не дожидаясь
+            // подтверждения записи: иначе экран показывал бы устаревшую композицию.
+            if (key == "hvacBatt") applyBattDependency("hvacBatt", battDependentRow)
             send("settings.change", JsonObject().apply {
                 addProperty("key", key)
                 addProperty("value", checked)
