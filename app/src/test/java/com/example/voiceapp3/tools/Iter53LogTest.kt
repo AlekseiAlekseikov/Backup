@@ -192,19 +192,18 @@ class Iter53LogTest {
     }
 
     @Test
-    fun boundaryMatchIsDeduplicatedExactlyOnce() {
+    fun boundaryMatchKeepsBothRecordsIter63() {
         val d = setup()
         val name = "app.log"
         val active = File(d, name).apply { writeText("a\nb\n") }
-        // iter62 §B2 (контракт ИЗМЕНЁН по требованию владельца: «нет потери строк и нет ДУБЛЕЙ
-        // при crash на границе»). До iter62 совпадение только сообщалось, и граничная запись
-        // попадала в журнал дважды — именно этот дубль владелец и видел.
-        // Теперь выбрасывается РОВНО ОДНА граничная запись и только при точном совпадении с
-        // последней ЦЕЛОЙ записью активного файла; записи внутри `.new` не трогаются.
+        // iter63 §P0-1: контракт ВОЗВРАЩЁН к iter55 и усилен. iter62 выбрасывал запись `.new` по
+        // совпадению ТЕКСТА — это потеря настоящего события (аудит iter62). Теперь каждая запись
+        // несёт `rid` события, поэтому здесь (журнал прежней версии, без `rid`) сохраняется всё, а
+        // дедуп работает только по идентификатору (см. `Iter63LogIdentityTest` L1/L2).
         File(d, "$name.new").writeText("b\ne\n")
         FileLogCore.drainSpill(d, name)
         val lines = active.readLines().filter { it.isNotEmpty() }
-        assertEquals("граница не задвоена, новая запись на месте: $lines", listOf("a", "b", "e"), lines)
+        assertEquals("ни одна запись не потеряна: $lines", listOf("a", "b", "b", "e"), lines)
     }
 
     @Test

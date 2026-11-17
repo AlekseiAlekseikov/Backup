@@ -755,18 +755,28 @@ object WindowDoors {
         if (enabled) {
             initCarService(context)
         }
+        // iter63 §3.4: сохранение настройки — НЕ подтверждение работы функции. Если CarService
+        // недоступен, включённая настройка не сможет ничего сделать при открытии двери, и
+        // рапортовать «OK» нельзя: это BLOCKED с названной причиной (сам выбор владельца
+        // сохраняется — он не теряется и применится, когда сервис появится).
         val readback = isWindowDriverOnDoor(context)
+        val (status, reason) = windowToggleStatus(
+            enabled = enabled,
+            readback = readback,
+            carServiceReady = carPropertyManager != null
+        )
         val step = ToolsStep(
             step = "settings.windowDriverOnDoor",
             command = "prefs.putBoolean($PREF_WINDOW_DRIVER_ON_DOOR, $enabled)",
             startedAtMs = t0,
             finishedAtMs = SystemClock.uptimeMillis(),
-            exitCode = 0,
+            exitCode = if (status == ToolsStep.Status.FAILED) 1 else 0,
             stdout = "windowDriverOnDoor=$readback",
-            stderr = "",
+            stderr = reason,
             expected = enabled.toString(),
-            actual = readback.toString(),
-            status = ToolsStep.Status.OK
+            actual = if (status == ToolsStep.Status.OK) readback.toString()
+            else "readback=$readback reason=$reason",
+            status = status
         )
         return ToolsResult(
             action = "settings.windowDriverOnDoor",
@@ -781,18 +791,25 @@ object WindowDoors {
         if (enabled) {
             initCarService(context)
         }
+        // iter63 §3.4 — то же правило для противоположного стекла.
         val readback = isWindowOppositeOnDoor(context)
+        val (status, reason) = windowToggleStatus(
+            enabled = enabled,
+            readback = readback,
+            carServiceReady = carPropertyManager != null
+        )
         val step = ToolsStep(
             step = "settings.windowOppositeOnDoor",
             command = "prefs.putBoolean($PREF_WINDOW_OPPOSITE_ON_DOOR, $enabled)",
             startedAtMs = t0,
             finishedAtMs = SystemClock.uptimeMillis(),
-            exitCode = 0,
+            exitCode = if (status == ToolsStep.Status.FAILED) 1 else 0,
             stdout = "windowOppositeOnDoor=$readback",
-            stderr = "",
+            stderr = reason,
             expected = enabled.toString(),
-            actual = readback.toString(),
-            status = ToolsStep.Status.OK
+            actual = if (status == ToolsStep.Status.OK) readback.toString()
+            else "readback=$readback reason=$reason",
+            status = status
         )
         return ToolsResult(
             action = "settings.windowOppositeOnDoor",
@@ -800,6 +817,35 @@ object WindowDoors {
             steps = listOf(step)
         )
     }
+}
+
+// ─────────── iter63 §3.4: статус настройки стекла по ФАКТУ, а не по записи в prefs ───────────
+
+/**
+ * Решение о статусе шага `setWindow*OnDoor` (iter63 §3.4).
+ *
+ * Дефект iter62: обе функции возвращали `OK` сразу после `Prefs2.putBoolean`, не проверяя, что
+ * функция вообще способна работать. Владелец видел «OK», хотя CarService не был подключён и
+ * стекло при открытии двери не опустилось бы.
+ *
+ * Правила:
+ *  • readback не равен желаемому → [ToolsStep.Status.FAILED] (`readback_mismatch`): настройка
+ *    не сохранилась, это доказанная неудача, а не «частично»;
+ *  • включено, но CarService недоступен → [ToolsStep.Status.BLOCKED]
+ *    (`car_service_unavailable`): сохранено, но примениться сейчас не может — причина названа;
+ *  • выключено и сохранено → `OK`: снимать нечего, проверять нечего (эффект возникает при
+ *    открытии двери, а не в момент клика).
+ *
+ * «OK по записи в prefs» вместо этого намеренно НЕ используется: запись — не состояние функции.
+ */
+internal fun windowToggleStatus(
+    enabled: Boolean,
+    readback: Boolean,
+    carServiceReady: Boolean,
+): Pair<ToolsStep.Status, String> = when {
+    readback != enabled -> ToolsStep.Status.FAILED to "readback_mismatch"
+    enabled && !carServiceReady -> ToolsStep.Status.BLOCKED to "car_service_unavailable"
+    else -> ToolsStep.Status.OK to ""
 }
 
 // ─────────── iter32 §3.2/§3.4: ЧИСТАЯ логика закрытия окна (без Android/VHAL) ───────────

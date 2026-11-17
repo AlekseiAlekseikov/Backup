@@ -117,19 +117,54 @@ _gen_ok
 # «ещё не инициализировано», не приговор: первый скрипт сам публикует своё поколение с readback.
 TTL_SLOT_GEN='${safeGuard}'
 TTL_SLOT_FILE='${safeGenFile}'
-_gen_ok() {
-  _g_cur=${D}(cat "${D}TTL_SLOT_FILE" 2>/dev/null)
-  if [ -z "${D}_g_cur" ]; then
-    printf '%s' "${D}TTL_SLOT_GEN" > "${D}TTL_SLOT_FILE" 2>/dev/null
-    _g_cur=${D}(cat "${D}TTL_SLOT_FILE" 2>/dev/null)
-    echo "VAPP_TTL_GEN_INIT gen=${D}TTL_SLOT_GEN readback=${D}{_g_cur:-none}"
+# iter63 §P1-2 — ТРИ РАЗНЫХ СЛУЧАЯ ВМЕСТО ДВУХ.
+#
+# Дефект iter62: различались только «файла нет» и «значение не совпало». Если файл остался от
+# прежней версии/копии, от чужой прошивки или не читается (нет прав, каталог вместо файла), скрипт
+# уходил в вечный `exit 90` БЕЗ объяснения, и TTL молча не работал.
+#
+# Теперь:
+#   1) файла нет      → публикуем своё поколение с readback (`VAPP_TTL_GEN_INIT`);
+#   2) файл наш       → значение совпало (`VAPP_TTL_GEN_OK`);
+#   3) файл есть, но НЕ читается или содержит не наше значение → это «чужой/нечитаемый»:
+#      восстанавливаем своим поколением с readback (`VAPP_TTL_GEN_ADOPT`) и продолжаем.
+#      Такой файл не является доказательством чужого исполнения: доказательство — это собственная
+#      запись с readback, а не отсутствие прав на чтение.
+# Во всех трёх случаях в отчёт идёт ПУТЬ файла и прочитанное значение.
+_gen_owner_check() {
+  _g_path=${D}TTL_SLOT_FILE
+  _g_cur=
+  if [ -r "${D}_g_path" ]; then
+    _g_cur=${D}(cat "${D}_g_path" 2>/dev/null)
   fi
-  if [ "${D}_g_cur" != "${D}TTL_SLOT_GEN" ]; then
-    echo "VAPP_TTL_SUPERSEDED gen=${D}TTL_SLOT_GEN cur=${D}{_g_cur:-none}"
+  if [ -e "${D}_g_path" ] && [ ! -f "${D}_g_path" ]; then
+    _g_cur="<not_a_file>"
+  fi
+  if [ ! -e "${D}_g_path" ]; then
+    printf '%s' "${D}TTL_SLOT_GEN" > "${D}_g_path" 2>/dev/null
+    _g_rb=${D}(cat "${D}_g_path" 2>/dev/null)
+    echo "VAPP_TTL_GEN_INIT gen=${D}TTL_SLOT_GEN file=${D}_g_path readback=${D}{_g_rb:-none}"
+    [ "${D}_g_rb" = "${D}TTL_SLOT_GEN" ] && return 0
+    echo "VAPP_TTL_GEN_UNWRITABLE file=${D}_g_path readback=${D}{_g_rb:-none} action=refuse"
     exit 90
   fi
-  echo "VAPP_TTL_GEN_OK gen=${D}TTL_SLOT_GEN"
-  return 0
+  if [ "${D}_g_cur" = "${D}TTL_SLOT_GEN" ]; then
+    echo "VAPP_TTL_GEN_OK gen=${D}TTL_SLOT_GEN file=${D}_g_path"
+    return 0
+  fi
+  if [ -z "${D}_g_cur" ] || [ ! -r "${D}_g_path" ] || [ "${D}_g_cur" = "<not_a_file>" ]; then
+    printf '%s' "${D}TTL_SLOT_GEN" > "${D}_g_path" 2>/dev/null
+    _g_rb=${D}(cat "${D}_g_path" 2>/dev/null)
+    echo "VAPP_TTL_GEN_ADOPT gen=${D}TTL_SLOT_GEN file=${D}_g_path was=${D}{_g_cur:-unreadable} readback=${D}{_g_rb:-none}"
+    [ "${D}_g_rb" = "${D}TTL_SLOT_GEN" ] && return 0
+    echo "VAPP_TTL_GEN_UNWRITABLE file=${D}_g_path readback=${D}{_g_rb:-none} action=refuse"
+    exit 90
+  fi
+  echo "VAPP_TTL_SUPERSEDED gen=${D}TTL_SLOT_GEN file=${D}_g_path cur=${D}_g_cur"
+  exit 90
+}
+_gen_ok() {
+  _gen_owner_check
 }
 _gen_ok
 """

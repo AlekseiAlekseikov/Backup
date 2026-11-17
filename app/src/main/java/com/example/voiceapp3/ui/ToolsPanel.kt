@@ -165,6 +165,10 @@ class ToolsPanel(
         // iter53 §9.1: причинность разбирается production-функцией (та же, что в тестах).
         val meta = com.example.voiceapp3.tools.ToolsSnapshotFold.read(d)
         snapshotRev = meta.rev
+        // iter63 §P0-2: подтверждения из снимка восстанавливаются в память UI ДО любых решений.
+        // Раньше они жили только в процессе backend, поэтому после пересоздания панели решение
+        // по клику уходило в «не подтверждено», и экран перерисовывался по устаревшим признакам.
+        if (meta.acks.isNotEmpty()) com.example.voiceapp3.tools.ToolsStateCausality.applyAcks(meta.acks)
         val acks = meta.acks
         val nowMs = android.os.SystemClock.uptimeMillis()
         // Решения по КАЖДОМУ ключу отдельно — той же функцией, что проверяют тесты.

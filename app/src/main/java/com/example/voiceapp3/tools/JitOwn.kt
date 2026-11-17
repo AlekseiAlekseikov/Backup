@@ -623,6 +623,38 @@ _adm_refuse=""
 # ради совместимости старых тестов, которые её читают; production её не выставляет.
 _adm_violation=""
 
+# Уборка мёртвых временных файлов подготовки (`t.<pid>.<n>`). Один проход, без fork'ов там,
+# где можно: pid извлекается из имени встроенными средствами, смерть проверяется по identity из
+# СОДЕРЖИМОГО файла (там та же строка, что пошла бы в `ln`), а при отсутствии полей — по pid из имени.
+_adm_cleanup_stale_tmps() {
+  [ -n "${'$'}{_ADM_CLEANUP:-1}" ] || return 0
+  [ -d "${'$'}_adm_dir" ] || return 0
+  _acl_seen=0
+  for _acl_f in "${'$'}_adm_dir"/t.*; do
+    [ -f "${'$'}_acl_f" ] || continue
+    _acl_seen=${'$'}(( _acl_seen + 1 ))
+    # Не разбираем чужие форматы: только t.<digits>.<digits>
+    _acl_name=${'$'}{_acl_f##*/}
+    _acl_pid=${'$'}{_acl_name#t.}; _acl_pid=${'$'}{_acl_pid%%.*}
+    case "${'$'}_acl_pid" in ''|*[!0-9]*) continue ;; esac
+    _adm_read "${'$'}_acl_f"
+    if [ -n "${'$'}_ak_pid" ]; then
+      _adm_dead_proven "${'$'}_ak_line" || continue
+    else
+      # Содержимое не разобрано (падение между созданием и `printf`) — судим по pid из имени,
+      # но только при наличии boot-независимого доказательства: процесса нет.
+      [ -d "${'$'}{_adm_root:-/proc}/1" ] || continue
+      [ -d "${'$'}{_adm_root:-/proc}/${'$'}_acl_pid" ] && continue
+      _adm_stat_pstart "${'$'}_acl_pid" 2>/dev/null && continue
+    fi
+    rm -f "${'$'}_acl_f" 2>/dev/null
+  done
+  if [ "${'$'}_acl_seen" -gt 0 ]; then
+    echo "ADM_CLEANUP mode=stale_tmp seen=${'$'}_acl_seen"
+  fi
+  return 0
+}
+
 _jit_admin_enter() {
   _adm_dir="${lock}.own"
   mkdir -p "${'$'}_adm_dir" 2>/dev/null || return 1
@@ -663,6 +695,15 @@ _jit_admin_enter() {
     fi
     _ad_me=
   fi
+
+  # 2a) iter63 §P1-1 — УБОРКА МЁРТВЫХ `t.*`.
+  #
+  # `t.<pid>.<n>` — временный файл подготовки identity. Если процесс убит между `printf` и `ln`/`rm`,
+  # файл остаётся НАВСЕГДА: за месяцы их накопятся тысячи (проверено — 200 файлов не исчезают).
+  # Убираем только те, чей pid ДОКАЗАННО мёртв (`/proc` + 22-е поле stat + boot). `t.*` никогда не
+  # является владельцем секции, поэтому удаление НЕ может освободить чужую живую секцию — это
+  # отличает уборку от `_adm_reclaim`, где такая проверка обязательна.
+  _adm_cleanup_stale_tmps
 
   # 2) Захват: identity подготовлена ЗАРАНЕЕ, имя владельца появляется атомарно вместе с ней.
   _ad_line="inst=${'$'}_ad_inst;pid=${'$'}_ad_pid0;pstart=${'$'}_ad_pst0;boot=${'$'}_ad_boot0"

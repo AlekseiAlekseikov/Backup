@@ -65,20 +65,24 @@ class Iter62LogMarkerTest {
     // ───────────── 2. Восстановление `.new` без дублей ─────────────
 
     @Test
-    fun pendingNewIsMergedWithoutDuplicatingTheBoundaryLine() {
+    fun pendingNewIsMergedWithoutDuplicatingTheSameEvent() {
         val name = "voiceapp3.log"
         val active = File(dir, name)
-        active.writeText("M0001 a\nM0002 b\n")
-        // `.new` содержит ТУ ЖЕ последнюю строку (падение после записи в `.new`) и новую.
+        // iter63 §P0-1: дубль определяется по идентификатору СОБЫТИЯ (`rid`), а не по тексту.
+        // Одно событие, разорванное падением между записью в `.new` и переносом, несёт ТОТ ЖЕ rid
+        // (другой `try`) и должно появиться РОВНО ОДИН раз.
+        val ev = FileLogCore.stamp("M0002 b")
+        active.writeText(ev)
         val pending = File(dir, "$name.new")
-        pending.writeText("M0002 b\nM0003 c\n")
+        pending.writeText(FileLogCore.stamp(ev) + FileLogCore.stamp("M0003 c"))
 
         FileLogCore.recoverPendingNew(dir, name)
 
         val merged = linesOf(active)
-        assertTrue("новая строка перенесена: $merged", merged.contains("M0003 c"))
-        assertEquals("граничная строка не задвоена: $merged", 1, merged.count { it == "M0002 b" })
-        assertEquals("журнал содержит ровно три записи: $merged", 3, merged.size)
+        val bodies = merged.map { LogRecordId.parse(it).body }
+        assertTrue("новая строка перенесена: $bodies", bodies.contains("M0003 c"))
+        assertEquals("событие не задвоено: $bodies", 1, bodies.count { it == "M0002 b" })
+        assertEquals("журнал содержит ровно две записи: $bodies", 2, merged.size)
     }
 
     @Test

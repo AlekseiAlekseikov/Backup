@@ -122,11 +122,20 @@ object ToolsStateCausality {
         if (snapshotValue == null) return Decision.KEEP_CLICK
         if (pending == null) return Decision.APPLY_SNAPSHOT
 
-        // Подтверждение обязано быть НАШИМ и НЕ старее клика.
-        val ours = ack != null && ack.clickId == pending.clickId
+        // Подтверждение обязано быть НАШИМ: тот же КЛЮЧ и тот же номер клика.
+        //
+        // iter63 §P0-2 (cross-talk): раньше сравнивался только `clickId`, поэтому подтверждение
+        // ЛЮБОГО другого переключателя с большим номером объявляло наш выбор «перекрытым»
+        // (`APPLY_SNAPSHOT`) — и строка перерисовывалась по снимку, хотя её никто не трогал.
+        // Именно это выглядело у владельца как «клик одного включает другие».
+        val sameKey = ack != null && ack.key == pending.key
+        val ours = sameKey && ack!!.clickId == pending.clickId
         if (!ours) {
-            // Пришло подтверждение БОЛЕЕ ПОЗДНЕГО клика: наш выбор уже перекрыт владельцем.
-            if (ack != null && ack.clickId > pending.clickId) return Decision.APPLY_SNAPSHOT
+            // Пришло подтверждение БОЛЕЕ ПОЗДНЕГО клика ПО ЭТОМУ ЖЕ КЛЮЧУ: наш выбор перекрыт.
+            if (sameKey && ack!!.clickId > pending.clickId) return Decision.APPLY_SNAPSHOT
+            // iter63 §P0-2: подтверждение ДРУГОГО ключа (или отсутствие своего) не даёт права
+            // менять положение этой строки. Выбор владельца держим, и до истечения бюджета это
+            // НОРМАЛЬНОЕ состояние (`KEEP_CLICK`), а не «не подтверждено».
             return if (ageMs >= unconfirmedAfterMs) Decision.UNCONFIRMED else Decision.KEEP_CLICK
         }
         // iter54 §10: решает факт СОХРАНЕНИЯ намерения, а не успех side effect.
@@ -156,6 +165,26 @@ object ToolsStateCausality {
     }
 
     fun ackFor(key: String): WriteAck? = acks[key]
+
+    /**
+     * iter63 §P0-2 (B1) — ПОДТВЕРЖДЕНИЯ, ПРИШЕДШИЕ В СНИМКЕ, ВОССТАНАВЛИВАЮТСЯ В ПАМЯТЬ UI.
+     *
+     * Дефект, который это закрывает (cross-talk и «запись не подтверждена» после пересоздания):
+     * `recordAck` живёт в процессе backend. UI-процесс мог быть пересоздан (Activity/панель),
+     * тогда `ackFor(key) == null` для всех ключей; решение по клику уходило в
+     * `UNCONFIRMED`/`KEEP_CLICK` по возрасту, хотя подтверждение УЖЕ есть в снимке (`$acks`).
+     * Наблюдаемый симптом: сразу после клика по одному тумблеру экран перерисовывался по
+     * устаревшим признакам, и соседние строки меняли подпись/положение — «клик одного меняет
+     * другие».
+     *
+     * Правило приёма — то же, что у `recordAck`: побеждает подтверждение с БОЛЬШИМ `clickId`.
+     */
+    fun applyAcks(fromSnapshot: Map<String, WriteAck>) {
+        for ((k, a) in fromSnapshot) {
+            if (a.clickId < 0) continue
+            acks.merge(k, a) { old, new -> if (new.clickId >= old.clickId) new else old }
+        }
+    }
 
     /** Все подтверждения одним объектом для снимка (`$acks`). */
     fun acksJson(): JsonObject = JsonObject().apply {

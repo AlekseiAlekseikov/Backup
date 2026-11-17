@@ -26,6 +26,46 @@ import java.nio.channels.FileLock
  */
 object FileLogCore {
 
+    /**
+     * iter63 §P0-1 — счётчик идентификаторов событий.
+     *
+     * `rid` растёт монотонно в пределах процесса; `ts` (wall clock) и `try` позволяют отличить
+     * ДВА события с одинаковым текстом друг от друга и ОДНО событие, записанное повторно после
+     * отказа `fsync` (у повтора тот же `rid`, другой `try`).
+     */
+    private val ridSeq = java.util.concurrent.atomic.AtomicLong(0)
+
+    /**
+     * Следующий идентификатор для строки, у которой его ещё нет.
+     *
+     * Если строка УЖЕ несёт суффикс идентификатора (повторная запись той же записи после отказа
+     * `fsync`), возвращается ТОТ ЖЕ `rid` с увеличенным `try` — иначе повтор стал бы «вторым
+     * событием» и после слияния `.new` дал бы дубль.
+     */
+    /**
+     * Записать строку, выдав ей идентификатор события (production-путь [AppFileLogger]).
+     *
+     * Отдельная функция, а не параметр [append]: инструментальные и legacy-пути, которые уже
+     * передают готовую строку, продолжают работать без изменения семантики, а боевая запись
+     * получает `rid` всегда.
+     */
+    fun appendStamped(
+        dir: File,
+        name: String,
+        line: String,
+        maxBytes: Long = 256L * 1024,
+        lockWaitMs: Long = 0L
+    ): Result = append(dir, name, stamp(line), maxBytes, lockWaitMs)
+
+    internal fun stamp(line: String): String {
+        val body = line.trimEnd('\n')
+        val parsed = LogRecordId.parse(body)
+        val known = parsed.rid != 0L && body.endsWith("]") && body.contains(" [r=")
+        val rid = if (known) parsed.rid else ridSeq.incrementAndGet()
+        val tryNo = if (known) parsed.tryNo + 1 else 1
+        return LogRecordId.format(parsed.body, rid, System.currentTimeMillis(), tryNo) + "\n"
+    }
+
     /** Результат записи: подтверждённый факт, а не «вызов принят». */
     data class Result(
         val written: Boolean,
@@ -228,21 +268,40 @@ object FileLogCore {
             val prevIdx = bytes.copyOfRange(0, endIdx).indexOfLast { it == '\n'.code.toByte() }
             String(bytes, prevIdx + 1, endIdx - prevIdx - 1, Charsets.UTF_8)
         }.getOrNull()
-        // iter62 §B2 — ГРАНИЦА НЕ ДУБЛИРУЕТСЯ.
+        // iter63 §P0-1 — ДЕДУП ПО ИДЕНТИЧНОСТИ СОБЫТИЯ, А НЕ ПО ТЕКСТУ.
         //
-        // Сценарий падения: строка записана в `.new`, процесс умер, и та же строка уже лежит
-        // последней в активном файле (или наоборот — активный дописали после записи в `.new`).
-        // Раньше совпадение только СООБЩАЛОСЬ (`boundary_same=1`), а строка переносилась снова —
-        // то есть в журнале появлялся ровно один дубль, который владелец и видел.
-        // Теперь выбрасывается РОВНО ОДНА граничная запись и только при точном совпадении с
-        // последней ЦЕЛОЙ записью активного файла. Одинаковые записи внутри `.new` не трогаются:
-        // две действительно одинаковые строки — нормальный журнал, а не дубль.
+        // История: iter55 переносил граничную запись дважды (дубль одного события — то, что видел
+        // владелец); iter62 убрал дубль, выбрасывая ЛЮБУЮ совпавшую по тексту запись — то есть
+        // стал ТЕРЯТЬ реальные события (две одинаковые строки бывают: `TTL_TRY action=skip`,
+        // повторный `LOCKSOUND_RESTORE_RESULT`).
+        //
+        // Теперь каждая запись несёт `rid` события (см. [LogRecordId] и [stamp]). Из `.new`
+        // отбрасывается ТОЛЬКО та запись, чей `rid` уже присутствует в активном файле, — это ровно
+        // случай «одно событие, разорванное падением между `.new` и переносом». Две записи с
+        // одинаковым текстом и разными `rid` сохраняются обе.
+        val activeLines = runCatching { active.readLines().filter { it.isNotEmpty() } }.getOrDefault(emptyList())
+        // Журнал ПРЕЖНЕЙ версии (ни одной записи с явным `rid`): идентичности события нет, а
+        // выводить её из текста — это ровно та ошибка iter62, из-за которой терялись настоящие
+        // записи. Для такого журнала действует правило iter55: переносятся ВСЕ записи (потерь нет),
+        // дубль при этом возможен и назван в отчёте как цена отсутствия идентификатора.
+        val legacyJournal = activeLines.none { LogRecordId.isStamped(it) }
+        val activeIds = activeLines.mapIndexed { i, l -> LogRecordId.eventKey(LogRecordId.parse(l, i.toLong())) }
+            .toHashSet()
+        val toAdd = ArrayList<String>(lines.size)
+        var skippedAsDuplicate = 0
+        for ((i, l) in lines.withIndex()) {
+            val key = LogRecordId.eventKey(LogRecordId.parse(l, (activeLines.size + i).toLong()))
+            val explicit = LogRecordId.isStamped(l)
+            val duplicate = !legacyJournal && (if (explicit || activeLines.any { LogRecordId.isStamped(it) })
+                !activeIds.add(key) else false)
+            if (duplicate) skippedAsDuplicate++ else toAdd.add(l)
+        }
+        // Совпадение ТЕКСТА границы по-прежнему называется (это диагностика, а не повод удалять).
         val boundarySame = if (lastActive != null && lines.first() == lastActive) 1 else 0
-        val toAdd = if (boundarySame == 1) lines.drop(1) else lines
         if (toAdd.isEmpty()) {
-            // Переносить нечего: всё содержимое `.new` уже есть в активном файле.
             val deleted = deleteVerified(pending)
-            return "boundary_same=1 nothing_to_add deleted=$deleted"
+            return "boundary_same=$boundarySame skipped_as_duplicate=$skippedAsDuplicate " +
+                "nothing_to_add deleted=$deleted"
         }
         var syncError: String? = null
         val written = runCatching {

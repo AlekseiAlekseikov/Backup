@@ -132,7 +132,8 @@ object AppFileLogger {
      */
     private fun writeTo(f: File, line: String) {
         // Короткое ожидание: занятый лок — не повод терять строку, но и не повод писать вслепую.
-        val r = FileLogCore.append(f.parentFile, f.name, line, MAX_SIZE_BYTES.toLong(), lockWaitMs = 25L)
+        // iter63 §P0-1: боевая запись получает идентификатор события (дедуп по `rid`, не по тексту).
+        val r = FileLogCore.appendStamped(f.parentFile, f.name, line, MAX_SIZE_BYTES.toLong(), lockWaitMs = 25L)
         if (!r.written) {
             // Независимый канал: Log.e доступен даже когда файловая запись невозможна.
             Log.e(TAG, "LOG_WRITE_FAILED file=«${f.name}» ${r.wire()}")

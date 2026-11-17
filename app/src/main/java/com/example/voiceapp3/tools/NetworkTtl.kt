@@ -541,8 +541,13 @@ private fun buildScript(enable: Boolean, reg: TtlOwnership.Registry?,
         val ownOffReached = !want && status == ToolsStep.Status.PARTIAL
         val ok = status == ToolsStep.Status.OK || ownOffReached
         ttlLastRunAtMs = SystemClock.uptimeMillis()
+        // iter63 §P1-2: в отчёт идёт ПУТЬ файла поколения и прочитанное из него значение — без
+        // этого «чужой/нечитаемый» файл давал вечный отказ без объяснения.
+        val genFile = appCtxRef?.let { slotGenerationPath(it) } ?: GEN_SLOT_FILE_FALLBACK
+        val genSeen = TtlGenDiag.marker(output, genFile)
         AppLog.i(TAG, "TTL_APPLY_RESULT source=$source want=$want rc=$exitCode ok=$ok " +
-            "own_off_reached=$ownOffReached ms=${ttlLastRunAtMs - t0} reason=«${reason ?: ""}»")
+            "own_off_reached=$ownOffReached ms=${ttlLastRunAtMs - t0} reason=«${reason ?: ""}» " +
+            "gen_file=«$genFile» gen_seen=«${genSeen.ifEmpty { "none" }}»")
         return TtlRunner.Outcome(
             ok,
             reason ?: if (ok) "foreign_rules_remain" else status.wire,
@@ -723,20 +728,27 @@ private fun buildScript(enable: Boolean, reg: TtlOwnership.Registry?,
     }
 
     /**
+     * iter63 §P1-2 — опубликовать поколение, различая «файла нет / наш / чужой-нечитаемый».
+     *
+     * Возвращает пару (подтверждено чтением, строка для журнала). Различение состояния файла и
+     * разбор ответа — в [TtlGenDiag] (проверяются на JVM-стенде); здесь только исполнение команды.
+     * Чужое ЧИТАЕМОЕ значение по-прежнему перекрывается своим — иначе обновление приложения
+     * навсегда оставляло бы ограждение закрытым.
+     */
+    internal fun publishSlotGenerationEx(gen: Long, file: String): Pair<Boolean, String> {
+        val r = runCatching { AdbClient.execute(TtlGenDiag.publishCommand(gen, file), 8000, false) }
+            .getOrNull() ?: return false to "channel=absent file=$file action=not_published"
+        val (ok, why) = TtlGenDiag.parsePublish(r.second, gen, file)
+        if (ok) AppLog.i(TAG, "TTL_GEN publish=yes $why") else AppLog.w(TAG, "TTL_GEN publish=no $why")
+        return ok to why
+    }
+
+    /**
      * Записать durable-поколение на устройстве. Именно оно делает старые скрипты безвредными:
      * скрипт попытки читает файл и при несовпадении выходит с `exit 90` до любой мутации.
      */
-    private fun publishSlotGeneration(gen: Long, file: String = GEN_SLOT_FILE_FALLBACK): Boolean {
-        val cmd = "printf '%s' '$gen' > $file 2>/dev/null; cat $file 2>/dev/null"
-        val r = runCatching { AdbClient.execute(cmd, 8000, false) }.getOrNull() ?: return false
-        val back = r.second.trim()
-        if (back != gen.toString()) {
-            AppLog.w(TAG, "TTL_GEN publish=no gen=$gen readback=«${back.take(16)}»")
-            return false
-        }
-        AppLog.i(TAG, "TTL_GEN published gen=$gen file=$file")
-        return true
-    }
+    private fun publishSlotGeneration(gen: Long, file: String = GEN_SLOT_FILE_FALLBACK): Boolean =
+        publishSlotGenerationEx(gen, file).first
 
     /**
      * Путь файла поколения в `filesDir` приложения (iter62 §A2.4). `filesDir` переживает
