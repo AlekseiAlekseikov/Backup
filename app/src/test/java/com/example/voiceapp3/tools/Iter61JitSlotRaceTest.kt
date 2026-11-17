@@ -36,7 +36,8 @@ class Iter61JitSlotRaceTest {
 
     private val base: File = File.createTempFile("jit61", "").let { f -> f.delete(); f.mkdirs(); f }
     private val b: String get() = base.absolutePath
-    private val admDir: File get() = File(JitOwn.lockPath(b) + ".adm")
+    // iter62 §A1: у секции один владелец — файл `<lock>.own/o`; номеров `n.<k>` больше нет.
+    private val admDir: File get() = File(JitOwn.lockPath(b) + ".own")
     private val witness: File get() = File(base, "witness")
 
     // ───────────────────────── инфраструктура ─────────────────────────
@@ -143,39 +144,38 @@ class Iter61JitSlotRaceTest {
      * (он добавлял только барьеры, не меняя алгоритм). Логика протокола не меняется: без
      * переопределения барьер пуст.
      */
-    private fun instrumentedHelpers(): String {
-        val h = JitOwn.ownHelpersForTest(b)
-        if (h.contains("_adm_barrier_before_scan")) return h
-        // Точка остановки ставится ПЕРВОЙ инструкцией тела цикла — то есть ровно ПОСЛЕ того, как
-        // shell раскрыл список имён (`for ... in c.* p.*`). Именно этого места не хватало в iter60.
-        // Нужен именно цикл ОЖИДАНИЯ (он один раскрывает и `c.*`, и `p.*`), а не цикл вычисления
-        // тикета (`p.*`): вставка в первый по порядку ничего не проверяет.
-        val needle = "for _ad_f in "
-        var i = -1
-        var from = 0
-        while (true) {
-            val j = h.indexOf(needle, from)
-            if (j < 0) break
-            val line = h.substring(j, h.indexOf('\n', j))
-            if (line.contains("/c.*")) { i = j; break }
-            from = j + 1
-        }
-        check(i >= 0) { "не найден цикл ожидания с c.* для инструментирования" }
-        val at = h.indexOf('\n', i) + 1
-        val withBarrier = h.substring(0, at) + "      _adm_barrier_before_scan\n" + h.substring(at)
-        // Пустое определение, чтобы инструментирование ничего не меняло в остальных сценариях.
-        return withBarrier.replaceFirst("_adm_read() {", "_adm_barrier_before_scan() { :; }\n_adm_read() {")
-    }
+    /**
+     * iter62 §A1: инструментировать НЕЧЕГО.
+     *
+     * Прежний тест вставлял точку остановки внутрь цикла `for ... in c.* p.*` — то есть в место,
+     * где протокол раскрывал СНИМОК каталога. В §A1 снимка нет вообще: вход решается атомарным
+     * `ln` единственного имени владельца, поэтому «увидел устаревший список» невозможно по
+     * построению. Возвращаем production-хелперы без изменений — тест проверяет именно их.
+     */
+    private fun instrumentedHelpers(): String = JitOwn.ownHelpersForTest(b)
 
-    /** Барьер «участник занял номер и ждёт разрешения» — под обе версии протокола. */
+    /** Барьер «участник уже владеет секцией и ждёт разрешения теста». */
     private fun claimBarrier(path: String): String = """
-        _adm_barrier_after_ticket() {
+        _adm_barrier_after_claim() {
           : > "$path.scanned"
           _bw=0
           while [ ! -f "$path.go" ] && [ "${'$'}_bw" -lt 300000 ]; do _bw=${'$'}(( _bw + 1 )); done
           return 0
         }
-        _adm_barrier_after_slot() { _adm_barrier_after_ticket; }
+        _adm_barrier_after_ticket() { _adm_barrier_after_claim; }
+        _adm_barrier_after_slot() { _adm_barrier_after_claim; }
+    """.trimIndent()
+
+    /** Барьер «участник ещё НЕ пытался занять секцию» (однократный). */
+    private fun beforeClaimBarrier(path: String): String = """
+        _adm_barrier_before_claim() {
+          [ -f "$path.done" ] && return 0
+          : > "$path.scanned"
+          : > "$path.done"
+          _bw=0
+          while [ ! -f "$path.go" ] && [ "${'$'}_bw" -lt 300000 ]; do _bw=${'$'}(( _bw + 1 )); done
+          return 0
+        }
     """.trimIndent()
 
     private fun entries(): List<String> = admDir.listFiles()?.map { it.name }?.sorted() ?: emptyList()
@@ -184,51 +184,35 @@ class Iter61JitSlotRaceTest {
 
     @Test
     fun globSnapshotScheduleCannotProduceTwoOwners() {
+        // Расписание аудита iter60 «снимок каталога устарел» в §A1 невозможно ПО ПОСТРОЕНИЮ:
+        // нет ни каталога-реестра, ни момента «список раскрыт, обработка не началась». Проверяем
+        // то, что осталось проверить: пока владелец внутри, второй не входит НИ В КАКОМ порядке
+        // запуска, а после выхода — входит.
         val barA = File(base, "bar_a").absolutePath
         val barZ = File(base, "bar_z").absolutePath
-        // A: занял номер/тикет, но ещё не «опубликовал» его полностью — держится барьером.
         val a = start("a", body("a", holdMs = -1, barrier = claimBarrier(barA)))
-        assertTrue("A дошёл до точки после занятия номера: ${a.text()}", waitFor(File("$barA.scanned")))
+        assertTrue("A владеет секцией: ${a.text()}", waitFor(File("$barA.scanned")))
 
-        // Z: стартует и замирает ПЕРЕД обработкой имён — список имён (iter60) уже раскрыт,
-        // p.a в нём ещё нет, а c.a — есть.
-        val zBarrier = """
-            _adm_barrier_before_scan() {
-              [ -f "$barZ.scanned" ] && return 0
-              : > "$barZ.scanned"
-              _zw=0
-              while [ ! -f "$barZ.go" ] && [ "${'$'}_zw" -lt 600000 ]; do _zw=${'$'}(( _zw + 1 )); done
-              return 0
-            }
-        """.trimIndent()
-        val z = start("z", body("z", holdMs = -1, barrier = zBarrier))
-        assertTrue("Z замер перед обработкой списка: ${z.text()}", waitFor(File("$barZ.scanned")))
-
-        // Отпускаем A: он публикует свой тикет/номер и входит.
+        // Z стартует и замирает ДО первой попытки занять секцию.
+        val z = start("z", body("z", holdMs = 0, barrier = beforeClaimBarrier(barZ)))
+        assertTrue("Z замер перед попыткой входа: ${z.text()}", waitFor(File("$barZ.scanned")))
         File("$barA.go").createNewFile()
-        assertTrue("A вошёл: ${a.text()}", a.await("ENTER a"))
         assertTrue("A внутри: ${a.text()}", waitFor(File("$base/inside.a")))
 
-        // Отпускаем Z: он обязан увидеть живого A, а не старый список имён.
         File("$barZ.go").createNewFile()
-        // Даём Z шанс «войти по старому списку» (дефект iter60) — тогда A всё ещё внутри.
         val enteredWhileHeld = z.await("ENTER z", 3000)
-        // Если Z корректно ждёт, освобождаем A: ожидание обязано закончиться входом, а не отказом.
+        assertFalse("Z вошёл, пока A владел секцией: ${z.text()}", enteredWhileHeld)
+
+        // Освобождаем A: ожидание Z обязано закончиться входом, а не вечным отказом.
         File("$base/release.a").createNewFile()
-        if (!enteredWhileHeld) {
-            assertTrue("Z получил объяснимый исход: ${z.text()}",
-                z.await("ENTER z", 40_000) || z.await("REFUSE z", 5_000))
-        }
-        val zInsideWhileAHolds = z.text().contains("ENTER z") && File("$base/inside.a").exists()
-        val violation = (a.text() + z.text()).contains("VIOLATION")
+        assertTrue("Z получил объяснимый исход: ${z.text()}",
+            z.await("ENTER z", 40_000) || z.await("REFUSE z", 5_000))
+        assertTrue("Z дождался и вошёл: ${z.text()}", z.text().contains("ENTER z"))
         assertFalse("ДВА ВЛАДЕЛЬЦА ОДНОВРЕМЕННО. a=${a.text()} z=${z.text()}",
-            zInsideWhileAHolds || violation)
+            (a.text() + z.text()).contains("VIOLATION"))
         File("$base/release.z").createNewFile()
-        File("$base/release.a").createNewFile()
         a.stop(); z.stop()
     }
-
-    // ─────────── 2. Освобождение после выхода: конечное восстановление ───────────
 
     @Test
     fun waiterEntersAfterTheHolderLeaves() {
@@ -246,26 +230,21 @@ class Iter61JitSlotRaceTest {
 
     @Test
     fun laterParticipantNeverOvertakesAnEarlierLiveOne() {
-        val bar = File(base, "bar_early").absolutePath
-        val early = start("early", body("early", holdMs = 3000, barrier = claimBarrier(bar)))
-        assertTrue("ранний занял номер", waitFor(File("$bar.scanned")))
+        val early = start("early", body("early", holdMs = -1))
+        assertTrue("ранний владеет секцией", early.await("ENTER early"))
         val late = start("late", body("late", holdMs = 0))
         // Поздний обязан ждать, пока ранний не отпустит.
         Thread.sleep(600)
-        assertFalse("поздний не вошёл, пока ранний не отпущен: ${late.text()}",
+        assertFalse("поздний не вошёл, пока ранний держит секцию: ${late.text()}",
             late.text().contains("ENTER late"))
-        File("$bar.go").createNewFile()
-        assertTrue("ранний вошёл", early.await("ENTER early"))
-        assertTrue("поздний дождался своей очереди",
+        File("$base/release.early").createNewFile()
+        assertTrue("поздний получил исход: ${late.text()}",
             late.await("ENTER late") || late.await("REFUSE late"))
-        if (late.text().contains("ENTER late")) {
-            assertTrue("поздний вошёл только после выхода раннего: ${late.text()}",
-                late.text().indexOf("ENTER late") >= 0)
-        }
+        assertTrue("поздний вошёл только после выхода раннего: ${late.text()}",
+            late.text().contains("ENTER late"))
+        assertFalse("нарушений нет", (early.text() + late.text()).contains("VIOLATION"))
         early.stop(); late.stop()
     }
-
-    // ─────────── 4. Смерть участника в разных фазах → номер освобождается ───────────
 
     @Test
     fun slotOfAKilledParticipantIsReclaimed() {
@@ -274,42 +253,42 @@ class Iter61JitSlotRaceTest {
         dead.destroyForcibly(); dead.waitFor(30, TimeUnit.SECONDS)
 
         admDir.mkdirs()
-        // Запись «мёртвого владельца» номера — как после убийства процесса посреди секции.
-        File(admDir, "n.3").writeText("slot=3;inst=dead;pid=$dpid;pstart=1;boot=${bootId()}\n")
+        // Запись «мёртвого владельца» — как после убийства процесса посреди секции.
+        val owner = File(admDir, "o")
+        owner.writeText("inst=dead;pid=$dpid;pstart=1;boot=${bootId()}\n")
 
         val a = start("a", body("a", holdMs = 300))
         assertTrue("вход после смерти владельца: ${a.text()}", a.await("ENTER a"))
-        assertFalse("номер мёртвого освобождён: ${entries()}", File(admDir, "n.3").exists())
+        assertTrue("запись мёртвого заменена своей, а не оставлена: ${entries()}",
+            !owner.readText().contains("inst=dead"))
         assertFalse("нарушений нет: ${a.text()}", a.text().contains("VIOLATION"))
         a.stop()
     }
-
-    // ─────────── 5. Живой чужой номер не снимается ───────────
 
     @Test
     fun liveForeignSlotIsNeverRemoved() {
         val live = ProcessBuilder("sleep", "60").redirectErrorStream(true).start()
         try {
             admDir.mkdirs()
-            val f = File(admDir, "n.1")
-            f.writeText("slot=1;inst=other;pid=${live.pid()};pstart=${pstartOf(live.pid())};boot=${bootId()}\n")
+            val f = File(admDir, "o")
+            val line = "inst=other;pid=${live.pid()};pstart=${pstartOf(live.pid())};boot=${bootId()}"
+            f.writeText("$line\n")
             val a = start("a", body("a", holdMs = 0))
             assertTrue("участник получил исход: ${a.text()}",
                 a.await("ENTER a") || a.await("REFUSE a", 40_000))
-            assertTrue("при живом владельце номера входа нет: ${a.text()}", a.text().contains("REFUSE a"))
-            assertTrue("чужой номер не тронут: ${entries()}", f.exists())
+            assertTrue("при живом владельце входа нет: ${a.text()}", a.text().contains("REFUSE a"))
+            assertTrue("запись живого не тронута: ${entries()}", f.exists())
+            assertEquals("содержимое записи живого не изменено", "$line\n", f.readText())
             assertTrue("чужой процесс не тронут", live.isAlive)
         } finally {
             live.destroyForcibly()
         }
     }
 
-    // ─────────── 6. Битый/частичный номер не даёт секции, но и не снимается ───────────
-
     @Test
     fun corruptForeignSlotBlocksWithoutBeingDeleted() {
         admDir.mkdirs()
-        val f = File(admDir, "n.1")
+        val f = File(admDir, "o")
         f.writeText("много шума без полей\n")
         val a = start("a", body("a", holdMs = 0))
         assertTrue("участник получил исход: ${a.text()}",
@@ -320,34 +299,29 @@ class Iter61JitSlotRaceTest {
         a.stop()
     }
 
-    // ─────────── 7. Вложенный вход не занимает второй номер и не выпускает внешний ───────────
-
     @Test
     fun nestedEntryKeepsASingleSlotAndDoesNotReleaseItEarly() {
         val script = JitOwn.ownHelpersForTest(b) + "\n_me_inst=\"nested\"\n" + """
             _jit_admin_enter || { echo "OUTER_REFUSE"; exit 1; }
-            echo "OUTER slot=${'$'}{_ad_slot} depth=${'$'}{_ad_depth}"
+            echo "OUTER depth=${'$'}{_ad_depth} files=${'$'}(ls "${'$'}{_adm_dir}" 2>/dev/null | tr '\n' ' ')"
             _jit_admin_enter || { echo "INNER_REFUSE"; exit 1; }
-            echo "INNER slot=${'$'}{_ad_slot} depth=${'$'}{_ad_depth}"
+            echo "INNER depth=${'$'}{_ad_depth}"
             _jit_admin_exit
-            echo "AFTER_INNER depth=${'$'}{_ad_depth} files=${'$'}(ls "${'$'}ROOT/lock.adm" 2>/dev/null | tr '\n' ' ')"
+            echo "AFTER_INNER depth=${'$'}{_ad_depth} files=${'$'}(ls "${'$'}{_adm_dir}" 2>/dev/null | tr '\n' ' ')"
             _jit_admin_exit
-            echo "AFTER_OUTER depth=${'$'}{_ad_depth} files=${'$'}(ls "${'$'}ROOT/lock.adm" 2>/dev/null | tr '\n' ' ')"
+            echo "AFTER_OUTER depth=${'$'}{_ad_depth} files=${'$'}(ls "${'$'}{_adm_dir}" 2>/dev/null | tr '\n' ' ')"
         """.trimIndent()
         val r = start("nested", script)
-        assertTrue("участник завершился", r.await("AFTER_OUTER"))
+        assertTrue("участник завершился: ${r.text()}", r.await("AFTER_OUTER"))
         val t = r.text()
-        val outerSlot = Regex("OUTER slot=(\\d+)").find(t)?.groupValues?.get(1)
-        val innerSlot = Regex("INNER slot=(\\d+)").find(t)?.groupValues?.get(1)
-        assertEquals("вложенный вход использует ТОТ ЖЕ номер: $t", outerSlot, innerSlot)
-        assertTrue("глубина растёт: $t", t.contains("INNER slot=${outerSlot} depth=2"))
-        assertTrue("внутренний выход не выпускает секцию (номер ещё наш): $t",
-            t.contains("AFTER_INNER depth=1"))
-        assertTrue("внешний выход освобождает номер: $t", t.contains("AFTER_OUTER depth=0"))
+        assertTrue("глубина после внешнего входа: $t", t.contains("OUTER depth=1"))
+        assertTrue("вложенный вход не занимает второй файл: $t", t.contains("INNER depth=2"))
+        assertTrue("внутренний выход не выпускает секцию (владелец ещё наш): $t",
+            t.contains("AFTER_INNER depth=1") && Regex("AFTER_INNER[^\\n]*files=[^\\n]*o").containsMatchIn(t))
+        assertTrue("внешний выход освобождает запись: $t",
+            t.contains("AFTER_OUTER depth=0") && Regex("AFTER_OUTER[^\\n]*files=\\s*$").containsMatchIn(t))
         r.stop()
     }
-
-    // ─────────── 8. Legacy admin-файл: живой блокирует, мёртвый снимается ───────────
 
     @Test
     fun legacyAdminFileIsHonouredAndDeadOneIsMigrated() {

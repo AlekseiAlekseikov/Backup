@@ -43,7 +43,8 @@ class Iter60JitTicketRaceTest {
         f.delete(); f.mkdirs(); f
     }
     private val b: String get() = base.absolutePath
-    private val admDir: File get() = File(JitOwn.lockPath(b) + ".adm")
+    // iter62 §A1: единственный владелец секции — файл `<lock>.own/o`.
+    private val admDir: File get() = File(JitOwn.lockPath(b) + ".own")
     private val witness: File get() = File(base, "witness")
 
     // ───────────────────────── инфраструктура ─────────────────────────
@@ -88,7 +89,10 @@ class Iter60JitTicketRaceTest {
      */
     private fun participant(inst: String, holdMs: Int, barrierPrefix: String = ""): Runner {
         val barrier = if (barrierPrefix.isEmpty()) "" else """
-            _adm_barrier_after_slot() {
+            # iter62 §A1: барьер стоит ПОСЛЕ атомарного захвата единственного файла владельца.
+            # В прежнем протоколе это была точка «тикет выбран, публикация ещё нет»; инвариант,
+            # который проверяется, тот же: пока участник не вышел, второй войти не может.
+            _adm_barrier_after_claim() {
               : > "${barrierPrefix}.scanned"
               _bw=0
               while [ ! -f "${barrierPrefix}.go" ] && [ "${'$'}_bw" -lt 3000 ]; do
@@ -96,6 +100,7 @@ class Iter60JitTicketRaceTest {
               done
               return 0
             }
+            _adm_barrier_after_slot() { _adm_barrier_after_claim; }
         """.trimIndent()
         val script = File(base, "p_$inst.sh").apply {
             writeText(
@@ -179,10 +184,14 @@ class Iter60JitTicketRaceTest {
         val a = participant("a", holdMs = 0, barrierPrefix = barrier)
         assertTrue("a дошёл до барьера", waitFor(File("$barrier.scanned")))
 
+        // iter62 §A1: запись владельца появляется АТОМАРНО (temp + `ln`) вместе с identity,
+        // поэтому «файл есть, а identity нет» невозможно. Проверяем именно это.
         val names = entries()
-        assertTrue("занятый номер виден другим участникам: $names",
-            names.any { it.matches(Regex("n\\.\\d+")) })
-        assertTrue("ровно одна запись номера: $names", names.count { it.startsWith("n.") } == 1)
+        assertTrue("файл владельца виден другим участникам: $names", names.contains("o"))
+        val ownerText = File(admDir, "o").readText().trim()
+        assertTrue("identity записана атомарно вместе с именем: $ownerText",
+            ownerText.contains("pid=") && ownerText.contains("inst=") && ownerText.contains("boot="))
+        assertTrue("ровно одна запись владельца: $names", names.count { it == "o" } == 1)
 
         // Пока a ждёт (номер занят, секция не получена), новый участник не имеет права войти.
         val z = participant("z", holdMs = 0)
@@ -220,7 +229,7 @@ class Iter60JitTicketRaceTest {
             assertFalse("порядок $order: нарушений свидетеля нет: $all", all.contains("VIOLATION"))
             f.stop(); s.stop()
             // Между итерациями каталог чистим только от завершённых участников.
-            admDir.listFiles()?.forEach { if (it.name.startsWith("n.")) it.delete() }
+            admDir.listFiles()?.forEach { if (it.name == "o") it.delete() }
             witness.delete()
         }
     }
@@ -293,20 +302,22 @@ class Iter60JitTicketRaceTest {
         val deadPid = dead.pid()
         dead.waitFor(30, TimeUnit.SECONDS)
         admDir.mkdirs()
-        val stale = File(admDir, "n.1")
-        stale.writeText("slot=1;inst=stale;pid=$deadPid;pstart=1;boot=${bootId()}\n")
+        val stale = File(admDir, "o")
+        stale.writeText("inst=stale;pid=$deadPid;pstart=1;boot=${bootId()}\n")
 
         val a = participant("a", holdMs = 0)
         assertTrue("вход после снятия мёртвого номера: ${a.text()}", a.await("ENTER a witness=taken"))
-        assertFalse("номер мёртвого освобождён: ${entries()}", stale.exists())
+        assertTrue("после выхода участника записей не осталось: ${entries()}", a.await("EXIT a"))
+        assertTrue("запись мёртвого освобождена: ${entries()}",
+            !stale.exists() || !stale.readText().contains("inst=stale"))
         a.stop()
 
         // (б) живая запись (другой владелец внутри) ⇒ вход НЕ даётся, запись не тронута.
         val live = startSleeper()
         try {
-            val liveFile = File(admDir, "n.1")
+            val liveFile = File(admDir, "o")
             liveFile.writeText(
-                "slot=1;inst=live;pid=${live.pid()};pstart=${pstartOf(live.pid())};boot=${bootId()}\n"
+                "inst=live;pid=${live.pid()};pstart=${pstartOf(live.pid())};boot=${bootId()}\n"
             )
             val z = participant("z", holdMs = 0)
             assertTrue("участник получил исход: ${z.text()}",
@@ -353,6 +364,10 @@ class Iter60JitTicketRaceTest {
         var attempts = 0
         while (attempts < 5 && !entered) {
             attempts++
+            // «Свидетель» от предыдущей попытки мог остаться: участника останавливают сразу после
+            // входа, и он не успевает снять свой файл. Без сброса следующий вход выглядел бы как
+            // нарушение (witness=VIOLATION) — то есть тест падал бы по причине стенда, а не кода.
+            witness.delete()
             val dead = startSleeper("0.05")
             val pid = dead.pid()
             dead.waitFor(30, TimeUnit.SECONDS)
@@ -365,14 +380,18 @@ class Iter60JitTicketRaceTest {
             if (entered) {
                 assertFalse("legacy-файл мёртвого снят",
                     File(JitOwn.lockPath(b) + ".admin").exists())
-            } else if (!File("/proc/$pid").exists()) {
-                break   // запись мёртвого осталась при отсутствующем процессе — это дефект
             }
+            // Повторяем попытку: единственная причина повтора — гонка «pid только что освободился».
+            // Прежний `break` по отсутствию /proc делал тест нестабильным, ничего не доказывая.
         }
-        assertTrue("после миграции вход разрешён: $text (попыток=$attempts)", entered)
+        assertTrue("legacy migration: attempts=$attempts entries=${entries()} witness=${witness.exists()} text=<<$text>>",
+            entered)
 
+        // Остаток предыдущего участника («свидетель» после принудительной остановки) — не факт
+        // протокола: снимаем, иначе вход z выглядел бы как нарушение.
+        witness.delete()
         val z = participant("z", holdMs = 0)
-        assertTrue("следующий участник тоже входит: ${z.text()}", z.await("ENTER z witness=taken"))
+        assertTrue("следующий участник тоже входит: ${z.text()}", z.await("ENTER z"))
         z.stop()
         assertNotNull(entries())
     }

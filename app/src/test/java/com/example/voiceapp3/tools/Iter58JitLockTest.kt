@@ -119,8 +119,9 @@ class Iter58JitLockTest {
         // проверка «вход есть» остаётся, а «в файле теперь наша строка» становится «наша запись
         // участника существует внутри секции».
         assertFalse("legacy-файл мёртвого владельца больше не блокирует", admin.exists())
-        val adm = File(JitOwn.lockPath(b) + ".adm")
-        assertTrue("каталог участников создан", adm.isDirectory)
+        // iter62 §A1: владелец секции — файл `<lock>.own/o` (номеров `n.<k>` больше нет).
+        val own = File(JitOwn.lockPath(b) + ".own")
+        assertTrue("каталог владельца создан", own.isDirectory)
     }
 
     // ─────────── 3. PID reuse ≠ живой владелец; живой PID с той же identity ≠ мёртвый ───────────

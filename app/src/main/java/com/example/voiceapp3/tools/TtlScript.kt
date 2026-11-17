@@ -96,7 +96,17 @@ internal object TtlScript {
             .ifEmpty { LEGACY_CHAIN }
         val safeGuard = guardGen.filter { it.isLetterOrDigit() || it == '_' || it == '-' }.take(32)
         val safeGenFile = genFile.filter { it.isLetterOrDigit() || it == '/' || it == '_' || it == '.' || it == '-' }
-        val guard = if (safeGuard.isEmpty() || safeGenFile.isEmpty()) "" else """
+        // Ограждение выключено (старый вызов без поколения): `_gen_ok` обязан существовать —
+        // вызовы перед мутациями стоят в скрипте ВСЕГДА. Иначе `_gen_ok: not found` и rc 90 на
+        // каждом шаге, то есть TTL перестаёт работать не из-за смены поколения, а из-за
+        // отсутствующей функции (дефект, найденный прогоном Iter50TtlArgvTest).
+        val guard = if (safeGuard.isEmpty() || safeGenFile.isEmpty()) """
+# ---------- iter62 §A2: ограждение поколением не запрошено ----------
+# Скрипт собран без guardGen/genFile (совместимость со старыми вызовами). Проверки
+# `_gen_ok || exit 90` перед мутациями остаются, но ничего не запрещают.
+_gen_ok() { return 0; }
+_gen_ok
+""" else """
 # ---------- iter62 §A2: ОГРАЖДЕНИЕ ПОКОЛЕНИЕМ ----------
 # Дефекты iter61, воспроизведённые аудитом:
 #  1) проверка стояла ОДИН раз в заголовке ⇒ успевший скрипт применял правила после нового

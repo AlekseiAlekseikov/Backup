@@ -40,7 +40,8 @@ class Iter59JitAdminTest {
     }
     private val b: String get() = base.absolutePath
     private val lock: File get() = File(JitOwn.lockPath(b))
-    private val admDir: File get() = File(JitOwn.lockPath(b) + ".adm")
+    // iter62 §A1: у секции ОДИН владелец — файл `<lock>.own/o`, а не набор номеров `n.<k>`.
+    private val admDir: File get() = File(JitOwn.lockPath(b) + ".own")
     private val legacyAdmin: File get() = File(JitOwn.lockPath(b) + ".admin")
 
     // ───────────────────────── инфраструктура ─────────────────────────
@@ -69,17 +70,26 @@ class Iter59JitAdminTest {
     private fun startSleeper(sec: String = "30"): Process =
         ProcessBuilder("sleep", sec).redirectErrorStream(true).start()
 
-    private fun participantFile(slot: Int) = File(admDir, "n.$slot")
+    /** Файл владельца секции (в §A1 он единственный и не переиспользуется живым). */
+    private fun participantFile(slot: Int = 1) = File(admDir, "o")
 
     private fun writeParticipant(inst: String, pid: Long, pstart: String, slot: Int = 1) {
         admDir.mkdirs()
         participantFile(slot).writeText(
-            "slot=$slot;inst=$inst;pid=$pid;pstart=$pstart;boot=${bootId()}\n"
+            "inst=$inst;pid=$pid;pstart=$pstart;boot=${bootId()}\n"
         )
     }
 
+    /**
+     * Записи участников, оставшиеся в каталоге.
+     *
+     * В §A1 это `o` (владелец) и `retired.*` (снятые через `mv` перед сверкой — они появляются
+     * на мгновение). `t.*` — временные файлы подготовки; живой участник их не оставляет.
+     */
     private fun participantNames(): List<String> =
-        admDir.listFiles()?.filter { it.name.matches(Regex("n\\.\\d+")) }?.map { it.name }?.sorted()
+        admDir.listFiles()?.map { it.name }
+            ?.filter { !it.startsWith("t.") && !it.startsWith("retired.") }
+            ?.sorted()
             ?: emptyList()
 
     /** Содержимое всех записей номеров — по нему видно, чья запись осталась/снята. */
@@ -181,7 +191,7 @@ class Iter59JitAdminTest {
             assertEquals("запись живого участника не тронута", before, participantFile(1).readText())
             assertFalse("своей записи после отказа не осталось: ${participantContents()}",
                 participantContents().any { it.contains("inst=CONTENDER") })
-            assertEquals("лишних номеров не появилось: ${participantNames()}", 1, participantNames().size)
+            assertEquals("лишних записей не появилось: ${participantNames()}", 1, participantNames().size)
             assertTrue("живой процесс жив", live.isAlive)
         } finally {
             live.destroyForcibly()
@@ -196,7 +206,7 @@ class Iter59JitAdminTest {
         val env = mapOf("ROOT" to b)
         val body = """
             _me_inst="${'$'}{_me_inst}"
-            i=0; bad=0; ok=0
+            i=0; bad=0; ok=0; ref=0
             while [ "${'$'}i" -lt 15 ]; do
               i=${'$'}(( i + 1 ))
               if _jit_admin_enter; then
@@ -208,9 +218,13 @@ class Iter59JitAdminTest {
                 sleep 0.005
                 rm -f "${witness.absolutePath}" "${'$'}ROOT/wtmp.${'$'}${'$'}"
                 _jit_admin_exit
+              else
+                # §A1: честный отказ с причиной (`busy_alive`/`busy_timeout`) — допустимый исход,
+                # а не потерянный вход. Считаем его отдельно, чтобы отказ не выдавался за вход.
+                ref=${'$'}(( ref + 1 ))
               fi
             done
-            echo "RESULT inst=${'$'}{_me_inst} ok=${'$'}ok bad=${'$'}bad"
+            echo "RESULT inst=${'$'}{_me_inst} ok=${'$'}ok ref=${'$'}ref bad=${'$'}bad"
         """.trimIndent()
 
         val procs = listOf("A", "B", "C", "D").map { inst ->
@@ -227,10 +241,14 @@ class Iter59JitAdminTest {
             o
         }
         val total = outs.sumOf { o -> Regex("ok=(\\d+)").find(o)!!.groupValues[1].toInt() }
+        val refused = outs.sumOf { o -> Regex("ref=(\\d+)").find(o)!!.groupValues[1].toInt() }
         val violations = outs.sumOf { o -> Regex("bad=(\\d+)").find(o)!!.groupValues[1].toInt() }
 
         assertEquals("два участника в секции одновременно — ФАКТИЧЕСКИХ нарушений нет", 0, violations)
-        assertEquals("все входы состоялись (реальные побочные эффекты посчитаны)", 60, total)
+        // 4 участника × 15 попыток: каждая попытка либо вошла, либо получила явный отказ с
+        // причиной (§A1 разрешает отказ вместо бесконечного ожидания). Молча потерянных нет.
+        assertEquals("у каждой попытки есть исход", 60, total + refused)
+        assertTrue("входы реально состоялись: ok=$total ref=$refused", total > 0)
         assertTrue("после работы не осталось записей участников: ${participantNames()}",
             participantNames().isEmpty())
     }
@@ -342,7 +360,7 @@ class Iter59JitAdminTest {
     @Test
     fun corruptParticipantEntryIsNeverRemovedWithoutProofOfDeath() {
         admDir.mkdirs()
-        val corrupt = File(admDir, "n.1").apply { writeText("") }
+        val corrupt = File(admDir, "o").apply { writeText("") }
 
         val (_, out) = withHelpers("corrupt.sh", "NEW3",
             """
@@ -374,10 +392,14 @@ class Iter59JitAdminTest {
         assertTrue("отказ назван причиной", guard.contains("self_mark_failed"))
         assertTrue("опасная часть идёт ПОСЛЕ проверки",
             guard.indexOf("if ! _lock_self_mark; then") < guard.indexOf("START ts="))
-        // Админ-секция — уникальные имена участников, а не общий файл, удаляемый по имени.
+        // iter62 §A1: секция держится ЕДИНСТВЕННЫМ файлом владельца, создаваемым атомарно `ln`.
         val helpers = JitOwn.ownHelpersForTest(b)
-        assertTrue("номер занимается атомарным созданием noclobber: n.<k>",
-            helpers.contains("n.\${'$'}{_acs_k}") || helpers.contains("${'$'}{_adm_dir}/n."))
+        assertTrue("владелец — единственный файл <lock>.own/o",
+            helpers.contains("_adm_dir}/o") || helpers.contains(".own/o"))
+        assertTrue("имя владельца появляется атомарно (temp + ln), а не записью в общий файл",
+            helpers.contains("ln \"${'$'}_ad_tmp\" \"${'$'}_ad_owner\""))
+        assertTrue("снятие чужой записи идёт через mv в уникальное имя со сверкой",
+            helpers.contains("_adm_reclaim"))
         assertFalse("общий admin-файл больше не удаляется по имени",
             Regex("rm -f \"?\\$\\{lock\\}\\.admin").containsMatchIn(helpers))
     }
