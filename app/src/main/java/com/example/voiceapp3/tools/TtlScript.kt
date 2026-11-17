@@ -239,14 +239,21 @@ ownmark_ok() {
 }
 COMMENT_OK=0
 _gen_ok || exit 90
+# iter63 §P1-2: проба маркера — это тоже мутации таблицы (`-N`/`-A`/`-F`/`-X`). Раньше guard
+# стоял только перед `-N`, а `-A`/`-F`/`-X` пробы уходили при любом поколении: поздний скрипт
+# создавал и удалял пробную цепь после смены поколения. Guard — перед КАЖДОЙ из четырёх.
+_gen_ok || exit 90
 if iptables -t mangle -N VAPP_TTLPROBE 2>/dev/null; then
+  _gen_ok || exit 90
   if iptables -w 5 -t mangle -A VAPP_TTLPROBE -m comment --comment "${D}OWN_TAG" -j RETURN 2>/dev/null; then
     COMMENT_OK=1
     echo "OWN_MARKER self=${D}OWN_TAG probe=ok"
   else
     echo "OWN_MARKER self=${D}OWN_TAG probe=unsupported action=fallback_name"
   fi
+  _gen_ok || exit 90
   iptables -w 5 -t mangle -F VAPP_TTLPROBE 2>/dev/null
+  _gen_ok || exit 90
   iptables -w 5 -t mangle -X VAPP_TTLPROBE 2>/dev/null
 else
   echo "OWN_MARKER self=${D}OWN_TAG probe=unavailable action=fallback_name"
@@ -362,6 +369,10 @@ del_jump() {
   # Позиционные параметры функции заменяются токенами спецификации; каждая передаётся
   # ОТДЕЛЬНЫМ argv. Глоббинг исключён: символы *?[] отвергнуты split_spec.
   set -- ${D}d_spec
+  # iter63 §P1-2: guard СТОИТ И ЗДЕСЬ. `drop_family` вызывается из нескольких ветвей, и раньше
+  # удаление перехода уходило без проверки поколения: поздний скрипт мог снять наши правила уже
+  # после того, как владелец переключил поколение. Один guard в точке мутации закрывает все ветви.
+  _gen_ok || exit 90
   ${D}d_tool -w 5 -t mangle -D POSTROUTING "${D}@"
 }
 
@@ -547,7 +558,9 @@ EOF_SPECS
     echo "TTL_OWN family=${D}fam state=referenced action=keep refs=${D}refs_n reason=referenced_elsewhere note=\"цепочка очищена не полностью: на неё ссылаются из других мест\""
     echo "${D}fam:partial"; return 0
   fi
+  _gen_ok || exit 90
   ${D}tool -w 5 -t mangle -F "${D}OUR" 2>/dev/null; fl_rc=${D}?
+  _gen_ok || exit 90
   ${D}tool -w 5 -t mangle -X "${D}OUR" 2>/dev/null; x_rc=${D}?
   echo "TTL_DEL family=${D}fam chain_flush_rc=${D}fl_rc chain_del_rc=${D}x_rc jumps_deleted=${D}del_ok"
   if [ "${D}fam" = "v4" ]; then TOUCHED_v4=yes; else TOUCHED_v6=yes; fi
@@ -745,11 +758,13 @@ elif [ "${D}ENABLE" = "1" ]; then
         esac
       fi
       if [ "${D}V6_SUPPORTED" = "1" ] && [ "${D}TTL_STOP" = "0" ]; then
+        _gen_ok || exit 90
         ip6tables -w 5 -t mangle -N "${D}OUR" 2>/dev/null; rc_n6=${D}?
         # iter59 §6: создание v6-цепи БЕЗ маркера — неуправляемый объект (его нельзя доказать как
         # свой и нельзя безопасно снять). Раньше при отсутствии файла маркера это только
         # логировалось, и цепь оставалась.
         if [ "${D}rc_n6" = "0" ] && [ ! -f "${D}OWNMARK" ]; then
+          _gen_ok || exit 90
           ip6tables -w 5 -t mangle -X "${D}OUR" >/dev/null 2>&1; rc_xm6=${D}?
           echo "TTL_TRY action=stop reason=ownmark_absent family=v6 chain_delete_rc=${D}rc_xm6 " \
             "note=\"маркера создания нет: v6-правило не добавляется, созданная цепь убрана\""
@@ -770,8 +785,10 @@ elif [ "${D}ENABLE" = "1" ]; then
         fi
         if [ "${D}TTL_STOP" = "0" ]; then
         # shellcheck disable=SC2086
+        _gen_ok || exit 90
         ip6tables -w 5 -t mangle -A "${D}OUR" ${D}MARK_ARGS -j HL --hl-set 65 2>&1
         rc_a6=${D}?; echo "TTL_ADD family=v6 chain=${D}OUR marker=${D}COMMENT_OK rc=${D}rc_a6"
+        _gen_ok || exit 90
         ip6tables -w 5 -t mangle -A POSTROUTING -o "${D}UPLINK" -j "${D}OUR" 2>&1
         rc_j6=${D}?; echo "TTL_ADD family=v6 jump scope=\"-o ${D}UPLINK\" rc=${D}rc_j6"
         # iter56 §8: то же для v6 — учитывается любое состоявшееся добавление, не только `-N`.
@@ -786,8 +803,11 @@ elif [ "${D}ENABLE" = "1" ]; then
             # созданная этим проходом v6-цепь снимается (иначе она неуправляема), rc снятия
             # УЧИТЫВАЕТСЯ и печатается.
             echo "TTL_OWNMARK write=failed path=${D}OWNMARK family=v6 reason=family_line_not_persisted"
+            _gen_ok || exit 90
             ip6tables -w 5 -t mangle -D POSTROUTING -o "${D}UPLINK" -j "${D}OUR" >/dev/null 2>&1; rc_rj6=${D}?
+            _gen_ok || exit 90
             ip6tables -w 5 -t mangle -F "${D}OUR" >/dev/null 2>&1; rc_rf6=${D}?
+            _gen_ok || exit 90
             ip6tables -w 5 -t mangle -X "${D}OUR" >/dev/null 2>&1; rc_xm6=${D}?
             echo "TTL_TRY action=stop reason=ownmark_not_persisted family=v6 " \
               "jump_del_rc=${D}rc_rj6 chain_flush_rc=${D}rc_rf6 chain_delete_rc=${D}rc_xm6 " \
@@ -826,8 +846,11 @@ elif [ "${D}ENABLE" = "1" ]; then
       if [ "${D}need_rb" = "yes" ]; then
         echo "TTL_ROLLBACK reason=incomplete rc4=${D}rc_a/${D}rc_j rc6=${D}{rc_a6:-n}/${D}{rc_j6:-n}"
         if [ "${D}TOUCHED_v6" = "yes" ]; then
+          _gen_ok || exit 90
           ip6tables -w 5 -t mangle -D POSTROUTING -o "${D}UPLINK" -j "${D}OUR" >/dev/null 2>&1; rj6=${D}?
+          _gen_ok || exit 90
           ip6tables -w 5 -t mangle -F "${D}OUR" >/dev/null 2>&1; rf6=${D}?
+          _gen_ok || exit 90
           ip6tables -w 5 -t mangle -X "${D}OUR" >/dev/null 2>&1; rx6=${D}?
           echo "TTL_ROLLBACK family=v6 jump_del_rc=${D}rj6 chain_flush_rc=${D}rf6 chain_del_rc=${D}rx6"
           TOUCHED_v6=no
