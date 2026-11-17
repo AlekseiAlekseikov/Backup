@@ -26,6 +26,7 @@
 | то же до последнего коммита | `OK (1112 tests)` |
 | iter62 для сравнения | `OK (1072 tests)` |
 | `bash /home/user/typecheck_lock.sh /tmp/w63` | **53 → 53, новых ошибок нет** |
+| CI на handoff `9dea33c` | run **`44176650290`**, job `build` — **success**: `JDK 21`, `Gradle build (debug)`, `Upload APK` (все шаги success). Debug-CI ≠ unit ≠ release ≠ ГУ |
 | новые тестовые методы iter63 | **43** (7 + 5 + 4 + 8 + 10 + 6 + 3) |
 
 Локальная Gradle-сборка в этой среде **невозможна** (JDK 11, нет Android SDK и сети): единственная
@@ -181,4 +182,6 @@ iter63 (код там от iter48), исправлением он не явля�
 5. проверка: `git show HEAD:app/buildinfo.properties` и
    `git diff --name-only 27ffaaf..HEAD` — только `docs/agent/REPORT_iter63.md`, `WORKLOG.md`,
    `app/buildinfo.properties`;
-6. push `fix/v2` (без `--force`), CI на handoff-SHA — run/job/шаги указываются после завершения.
+6. push `fix/v2` (без `--force`) — выполнен: `faeaaae..9dea33c`;
+7. CI на handoff `9dea33c`: run **`44176650290`**, job `build` — **success** (`JDK 21`,
+   `Gradle build (debug)`, `Upload APK`).
