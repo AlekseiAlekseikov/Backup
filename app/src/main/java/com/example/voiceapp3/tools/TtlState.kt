@@ -301,9 +301,31 @@ internal object TtlState {
      *
      * @param slotGen поколение, подтверждённое записью на устройстве.
      */
-    fun supersede(a: Attempt, slotGen: String, now: Long): Attempt =
-        a.copy(phase = Phase.SUPERSEDED, payloadRc = Int.MIN_VALUE, ts = now,
-            id = a.id)
+    /**
+     * iter62 §A2.3 — ДОКАЗАТЕЛЬСТВО для снятия попытки. Дефект iter61: `supersede` принимал номер
+     * поколения и даже не записывал его в результат, поэтому «снятие» было намерением, а не фактом.
+     */
+    data class SupersedeProof(
+        /** Поколение, опубликованное на устройстве ПЕРЕД новой отправкой. */
+        val gen: Long,
+        /** Публикация подтверждена чтением файла с устройства (readback). */
+        val readbackConfirmed: Boolean,
+        /** Почему это доказательство (в журнал, для владельца). */
+        val why: String
+    )
+
+    /**
+     * Снять попытку можно ТОЛЬКО по доказательству: `exit 90` её скрипта либо подтверждённое
+     * чтением поколение на устройстве (тогда её скрипт откажется от ЛЮБОЙ мутации по `gen_ok`).
+     * Не подтверждено — `null`, попытка остаётся неразрешённой, новой мутации нет.
+     */
+    fun supersede(a: Attempt, proof: SupersedeProof, now: Long): Attempt? {
+        if (!proof.readbackConfirmed || proof.gen <= 0L) return null
+        val own = a.generation
+        if (own > 0L && proof.gen <= own) return null
+        return a.copy(phase = Phase.SUPERSEDED, payloadRc = Int.MIN_VALUE, ts = now,
+            reasonHint = "superseded_by_gen=${proof.gen}:" + proof.why.take(24))
+    }
 
     /** Что говорит durable-свидетельство на устройстве о прошлой попытке. */
     sealed class Evidence {

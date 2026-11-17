@@ -437,6 +437,9 @@ internal object LockOp {
      * 6. Restore завершился (rc известен) и terminal bind доказан → вердикт по целям:
      *    `STOCK_RESTORED` закрывает операцию, `FOREIGN_LEFT`/`UNPROVEN` — конфликт.
      */
+    /** Метка «автоматический повтор завершения уже был» в durable-причине операции. */
+    const val COMPLETION_USED = "restore_completion_used:"
+
     fun reconStep(op: BindOp, ports: ReconPorts): ReconStep {
         if (op.targets.isEmpty() || op.stage.isEmpty()) {
             return ReconStep(
@@ -493,14 +496,43 @@ internal object LockOp {
             journalProvesNotSent ||
                 (journalProvesNoHandoff && !evidenceContradicts)
             )
+        // iter62 §A3.2 — ОГРАНИЧЕННЫЙ БЕЗОПАСНЫЙ ПУТЬ ЗАВЕРШЕНИЯ для handoff-Unknown.
+        //
+        // Дефект iter61 (`:496–503`): crash ПОСЛЕ durable `restore_handoff` и до исполнения
+        // оставлял операцию навсегда `previous_restore_unresolved` с `deferReread` — владелец видел
+        // «звук не вернулся», и действия не было. Монтирования идемпотентны: повторный restore тех
+        // же целей — нормальная операция, поэтому разрешён РОВНО ОДИН автоматический повтор той же
+        // identity (новый handoff), после чего состояние становится названным, а не бесконечным:
+        // читающий проход может закрыть операцию по наблюдаемому стоку.
+        val prevIsHandoff = op.reason.startsWith("restore_handoff")
+        val completionUsed = op.reason.startsWith(COMPLETION_USED)
         if (prevEv.isNotEmpty() && !prevTerminal && !prevProvenNotSent) {
-            return ReconStep(
-                op.id, State.UNDEFINED, "previous_restore_unresolved",
-                conflict = "previous_restore_unresolved:" + op.id, unresolved = true,
-                lateShell = true, persist = op.copy(reason = "previous_restore_unresolved"),
-                deferReread = true,
-                note = "прежний restore не терминален: новая попытка не отправляется"
-            )
+            if (prevIsHandoff && !completionUsed) {
+                // Продолжаем ниже: одна идемпотентная попытка завершения.
+            } else if (ports.readOnly()) {
+                // Читающий проход: закрыть можно ТОЛЬКО по наблюдаемому стоку.
+                if (ports.observe(op) == Reconcile.STOCK_RESTORED) {
+                    return ReconStep(
+                        op.id, State.DONE, "observed_stock_after_unknown_restore",
+                        persist = op.copy(reason = ""),
+                        note = "слоёв нет по факту чтения: операция закрыта без mutation"
+                    )
+                }
+                return ReconStep(
+                    op.id, State.UNDEFINED, "previous_restore_unresolved",
+                    conflict = "previous_restore_unresolved:" + op.id, unresolved = true,
+                    lateShell = true, persist = op.copy(reason = "previous_restore_unresolved"),
+                    note = "прежний restore не терминален; сток не наблюдается"
+                )
+            } else {
+                return ReconStep(
+                    op.id, State.UNDEFINED, "previous_restore_unresolved",
+                    conflict = "previous_restore_unresolved:" + op.id, unresolved = true,
+                    lateShell = true, persist = op.copy(reason = "previous_restore_unresolved"),
+                    deferReread = true,
+                    note = "прежний restore не терминален: новая попытка не отправляется"
+                )
+            }
         }
 
         // ── 3) ЧИТАЮЩИЙ проход: mutation запрещены, но операция может быть ЗАКРЫТА по факту ──
@@ -540,7 +572,18 @@ internal object LockOp {
         // С этого места КАЖДАЯ запись журнала несёт identity этой попытки. Дефект iter58:
         // последующие ветки возвращали `persist = op.copy(...)` (старый/пустой `restoreEv`), и
         // последняя строка журнала затирала только что сохранённый путь (parseJournal = last wins).
-        val withAttempt = op.copy(restoreEv = attempt, reason = "")
+        // Попытка завершения handoff-Unknown помечается durable, чтобы автоматический повтор был
+        // РОВНО один (иначе «безопасный повтор» сам стал бы вечным pending).
+        val withAttempt = op.copy(
+            restoreEv = attempt,
+            reason = if (prevIsHandoff && !completionUsed) COMPLETION_USED + attempt else ""
+        )
+
+        // Метка «повтор завершения уже был» должна переживать НЕУДАЧНЫЙ исход: иначе следующий
+        // проход снова разрешил бы повтор, и «однократность» стала бы вечной.
+        fun keepMark(base: String): String =
+            if (withAttempt.reason.startsWith(COMPLETION_USED)) withAttempt.reason + " " + base
+            else base
 
         val out = ports.restore(op, attempt)
         if (!out.sent && !out.unknown) {
@@ -564,7 +607,7 @@ internal object LockOp {
             return ReconStep(
                 op.id, State.UNDEFINED, why, conflict = "restore_unknown:" + op.id,
                 unresolved = true, lateShell = true,
-                persist = withAttempt.copy(reason = why), deferReread = true,
+                persist = withAttempt.copy(reason = keepMark(why)), deferReread = true,
                 note = "поздний umount этой попытки возможен: новый bind не отправляется"
             )
         }
@@ -577,12 +620,12 @@ internal object LockOp {
             )
             Reconcile.FOREIGN_LEFT -> ReconStep(
                 op.id, State.UNDEFINED, "foreign_above_left", conflict = "foreign_above:" + op.id,
-                unresolved = true, persist = withAttempt.copy(reason = "foreign_above_left"),
+                unresolved = true, persist = withAttempt.copy(reason = keepMark("foreign_above_left")),
                 note = "поверх чужой слой: снимать нельзя"
             )
             Reconcile.UNPROVEN -> ReconStep(
                 op.id, State.UNDEFINED, "reconcile_unproven", conflict = "unproven:" + op.id,
-                unresolved = true, persist = withAttempt.copy(reason = "reconcile_unproven"),
+                unresolved = true, persist = withAttempt.copy(reason = keepMark("reconcile_unproven")),
                 note = "снятие не подтверждено по всем целям"
             )
         }

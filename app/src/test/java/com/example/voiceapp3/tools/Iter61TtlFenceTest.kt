@@ -65,7 +65,9 @@ class Iter61TtlFenceTest {
             TtlState.fence(records) is TtlState.Fence.Blocked)
 
         // Снимается только ограждением поколением — и это фаза, отличная от NotSent.
-        val sup = TtlState.supersede(records.first(), "9", 3L)
+        // iter62 §A2.3: снятие требует доказательства — подтверждённого чтением поколения.
+        val sup = TtlState.supersede(records.first(),
+            TtlState.SupersedeProof(9L, true, "test"), 3L)!!
         TtlState.record(journal, sup)
         val after = TtlState.parseJournal(journal.readText())
         assertTrue("после ограждения мутация разрешена", TtlState.fence(after) is TtlState.Fence.Clean)

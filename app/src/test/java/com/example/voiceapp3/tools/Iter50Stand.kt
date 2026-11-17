@@ -185,6 +185,12 @@ class Iter50Stand {
             putPassthrough(h)
         // ip: модель сети. UPLINK_IFACE/EMPTY_ROUTE управляют сценарием.
         put("ip", """
+            # iter62 §A2-2: детерминированное расписание «поколение сменилось ПОСЛЕ заголовка».
+            # Побочный эффект вызывается на каждом вызове `ip`, то есть между проверкой в header и
+            # мутацией таблицы. В обычных тестах переменные не заданы — ничего не происходит.
+            if [ -n "${'$'}GEN_FILE" ] && [ -f "${'$'}STATE/gen_bump" ]; then
+              cat "${'$'}STATE/gen_bump" > "${'$'}GEN_FILE" 2>/dev/null
+            fi
             case "${'$'}1${'$'}2" in
               "routeget") if [ "${'$'}NO_ROUTE" = "1" ]; then echo ""; else echo "1.1.1.1 dev ${'$'}{UPLINK_IFACE:-wlan0} src 10.0.0.5 uid 0"; fi ;;
               "routeshow"|"route") if [ "${'$'}NO_ROUTE" = "1" ]; then : ; else echo "default via 10.0.0.1 dev ${'$'}{UPLINK_IFACE:-wlan0}"; fi ;;

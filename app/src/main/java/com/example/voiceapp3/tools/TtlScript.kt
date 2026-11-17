@@ -97,15 +97,31 @@ internal object TtlScript {
         val safeGuard = guardGen.filter { it.isLetterOrDigit() || it == '_' || it == '-' }.take(32)
         val safeGenFile = genFile.filter { it.isLetterOrDigit() || it == '/' || it == '_' || it == '.' || it == '-' }
         val guard = if (safeGuard.isEmpty() || safeGenFile.isEmpty()) "" else """
-# ---------- iter61 §4.1: ОГРАЖДЕНИЕ ПОКОЛЕНИЕМ (до любой мутации таблицы) ----------
+# ---------- iter62 §A2: ОГРАЖДЕНИЕ ПОКОЛЕНИЕМ ----------
+# Дефекты iter61, воспроизведённые аудитом:
+#  1) проверка стояла ОДИН раз в заголовке ⇒ успевший скрипт применял правила после нового
+#     (новый OFF → поздний ON ⇒ итог ON при желании OFF);
+#  2) отсутствие файла поколения считалось «другим поколением» ⇒ на обновлённом устройстве TTL
+#     не включался ВООБЩЕ (rc 90).
+# Теперь: `gen_ok` вызывается ПЕРЕД КАЖДОЙ мутацией таблицы, а отсутствие файла — это
+# «ещё не инициализировано», не приговор: первый скрипт сам публикует своё поколение с readback.
 TTL_SLOT_GEN='${safeGuard}'
 TTL_SLOT_FILE='${safeGenFile}'
-_seen_gen=${D}(cat "${D}TTL_SLOT_FILE" 2>/dev/null)
-if [ "${D}_seen_gen" != "${D}TTL_SLOT_GEN" ]; then
-  echo "VAPP_TTL_SUPERSEDED gen=${D}TTL_SLOT_GEN cur=${D}{_seen_gen:-none}"
-  exit 90
-fi
-echo "VAPP_TTL_GEN_OK gen=${D}TTL_SLOT_GEN"
+_gen_ok() {
+  _g_cur=${D}(cat "${D}TTL_SLOT_FILE" 2>/dev/null)
+  if [ -z "${D}_g_cur" ]; then
+    printf '%s' "${D}TTL_SLOT_GEN" > "${D}TTL_SLOT_FILE" 2>/dev/null
+    _g_cur=${D}(cat "${D}TTL_SLOT_FILE" 2>/dev/null)
+    echo "VAPP_TTL_GEN_INIT gen=${D}TTL_SLOT_GEN readback=${D}{_g_cur:-none}"
+  fi
+  if [ "${D}_g_cur" != "${D}TTL_SLOT_GEN" ]; then
+    echo "VAPP_TTL_SUPERSEDED gen=${D}TTL_SLOT_GEN cur=${D}{_g_cur:-none}"
+    exit 90
+  fi
+  echo "VAPP_TTL_GEN_OK gen=${D}TTL_SLOT_GEN"
+  return 0
+}
+_gen_ok
 """
         return """
 set +e""" + guard + "\n" + """ENABLE=@ENABLE_VALUE@
@@ -177,6 +193,7 @@ ownmark_ok() {
   return 0
 }
 COMMENT_OK=0
+_gen_ok || exit 90
 if iptables -t mangle -N VAPP_TTLPROBE 2>/dev/null; then
   if iptables -w 5 -t mangle -A VAPP_TTLPROBE -m comment --comment "${D}OWN_TAG" -j RETURN 2>/dev/null; then
     COMMENT_OK=1
@@ -368,6 +385,7 @@ legacy_chain_report() {
       ours|absent|empty) return 0 ;;
     esac
   fi
+  _gen_ok || exit 90
   for lt in iptables ip6tables; do
     [ "${D}lt" = "ip6tables" ] && [ "${D}V6_SUPPORTED" != "1" ] && continue
     lout=${D}(${D}lt -t mangle -S "${D}LEGACY" 2>/dev/null) || continue
@@ -606,6 +624,7 @@ elif [ "${D}ENABLE" = "1" ]; then
       # iter55 §6.2: rc создания цепи ПРОВЕРЯЕТСЯ. Раньше `-N` игнорировался: если цепь уже
       # существовала (конкурент создал одноимённую чужую), следующий `-A` дописывал правило в
       # ЧУЖОЙ объект. Теперь дописывать можно только в СВОЮ доказанную цепь.
+      _gen_ok || exit 90
       iptables -w 5 -t mangle -N "${D}OUR" 2>/dev/null; rc_n=${D}?
       # iter57 §8.1: цепь создана НАМИ (rc=0) — фиксируем это на устройстве.
       if [ "${D}rc_n" = "0" ]; then
@@ -639,6 +658,7 @@ elif [ "${D}ENABLE" = "1" ]; then
             "readback_chain=${D}{mk_chain:-none} readback_gen=${D}{mk_gen:-none}"
           # Свою цепь, созданную этим проходом, убираем сразу: без подтверждённого маркера она
           # стала бы неуправляемой (её нельзя доказать как свою).
+          _gen_ok || exit 90
           iptables -w 5 -t mangle -X "${D}OUR" >/dev/null 2>&1; rc_xm=${D}?
           rm -f "${D}OWNMARK" 2>/dev/null
           echo "TTL_TRY action=stop reason=ownmark_not_persisted family=v4 chain_delete_rc=${D}rc_xm " \
@@ -659,8 +679,10 @@ elif [ "${D}ENABLE" = "1" ]; then
       fi
       if [ "${D}TTL_STOP" = "0" ]; then
       # shellcheck disable=SC2086
+      _gen_ok || exit 90
       iptables -w 5 -t mangle -A "${D}OUR" ${D}MARK_ARGS -j TTL --ttl-set 65 2>&1
       rc_a=${D}?; echo "TTL_ADD family=v4 chain=${D}OUR marker=${D}COMMENT_OK rc=${D}rc_a"
+      _gen_ok || exit 90
       iptables -w 5 -t mangle -A POSTROUTING -o "${D}UPLINK" -j "${D}OUR" 2>&1
       rc_j=${D}?; echo "TTL_ADD family=v4 jump scope=\"-o ${D}UPLINK\" rc=${D}rc_j"
       # iter56 §8: учёт КАЖДОГО успешного действия, а не только создания цепи. Раньше
@@ -766,8 +788,11 @@ elif [ "${D}ENABLE" = "1" ]; then
           TOUCHED_v6=no
         fi
         if [ "${D}TOUCHED_v4" = "yes" ]; then
+          _gen_ok || exit 90
           iptables -w 5 -t mangle -D POSTROUTING -o "${D}UPLINK" -j "${D}OUR" >/dev/null 2>&1; rj4=${D}?
+          _gen_ok || exit 90
           iptables -w 5 -t mangle -F "${D}OUR" >/dev/null 2>&1; rf4=${D}?
+          _gen_ok || exit 90
           iptables -w 5 -t mangle -X "${D}OUR" >/dev/null 2>&1; rx4=${D}?
           # Цепь снята — маркер создания больше не нужен (иначе он «доказывал» бы владение
           # несуществующей цепью и мог быть подхвачен чужой установкой с тем же gen).

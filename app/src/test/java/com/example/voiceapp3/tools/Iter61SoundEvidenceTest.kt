@@ -146,16 +146,29 @@ class Iter61SoundEvidenceTest {
     }
 
     @Test
-    fun crashAfterHandoffStaysFencedEvenWithoutDeviceTraces() {
+    fun crashAfterHandoffGetsAtMostOneCompletionAndIsNeverDeclaredClosed() {
+        // iter62 §A3: «вечный фенс» заменён ОДНОКРАТНЫМ безопасным завершением (restore идемпотентен).
+        // Свойство, которое обязано сохраниться: операция НЕ объявляется закрытой без terminal.
         val attempt = "/data/local/tmp/attempt_61h.sh"
-        val ports = Ports(bindTerminal() + (attempt to factsOf(attempt)))
+        val ports = Ports(bindTerminal() + (attempt to factsOf(attempt)),
+            outcome = LockOp.RestoreOutcome(true, false, 0, "PARTIAL", ""))
         val step = LockOp.reconStep(op(attempt, "restore_handoff:$attempt"), ports)
 
-        assertEquals("фенс: ${step.wire()}", "previous_restore_unresolved", step.reason)
-        assertEquals("отправки нет", 0, ports.restores)
-        assertTrue("операция не закрыта", step.unresolved)
-        assertTrue("поздний shell возможен", step.lateShell)
-        assertTrue("нужен read-only повтор", step.deferReread)
+        assertEquals("попытка завершения отправлена ровно один раз", 1, ports.restores)
+        assertNotEquals("операция не закрыта без terminal", LockOp.State.DONE, step.newState)
+        assertTrue("операция остаётся неразрешённой", step.unresolved)
+        val persist = step.persist ?: error("запись фазы обязательна")
+        assertTrue("однократность зафиксирована durable: ${persist.reason}",
+            persist.reason.startsWith(LockOp.COMPLETION_USED))
+
+        // Второй проход: повтора больше нет, состояние названо.
+        val second = Ports(bindTerminal() + (attempt to factsOf(attempt)),
+            outcome = LockOp.RestoreOutcome(true, false, 0, "PARTIAL", ""))
+        val step2 = LockOp.reconStep(persist.copy(restoreEv = attempt), second)
+        assertEquals("второго автоповтора нет", 0, second.restores)
+        assertEquals("состояние названо", "previous_restore_unresolved", step2.reason)
+        assertTrue(step2.unresolved)
+        assertTrue("поздний shell по-прежнему исключён как факт", step2.lateShell || step2.unresolved)
     }
 
     @Test

@@ -1854,6 +1854,33 @@ object LockSound {
                 return detail.verdict
             }
 
+            /**
+             * iter62 §A3.1 — восстановить подготовку отправки по durable-пути из журнала.
+             *
+             * Имя файла — `voiceapp3_<name>_<nonce>.sh`; nonce извлекается из имени, скрипт
+             * строится заново из операции (он детерминирован), и путь ОБЯЗАН совпасть с журнальным.
+             * Иначе — `null` (отправки не будет): подмена пути превратила бы terminal в догадку.
+             */
+            private fun rebuildPrepared(op: LockOp.BindOp, attempt: String): ScriptDelivery.Prepared? {
+                val base = attempt.substringAfterLast('/')
+                val name = "lock_restore"
+                val prefix = "voiceapp3_" + ScriptDelivery.sanitize(name) + "_"
+                if (!base.startsWith(prefix) || !base.endsWith(".sh")) return null
+                val nonce = base.removePrefix(prefix).removeSuffix(".sh")
+                if (nonce.isEmpty()) return null
+                val rebuilt = ScriptDelivery.prepare(
+                    name, LockMountScripts.restoreScript(op.targets.map { it to op.stage }), nonce
+                )
+                if (rebuilt.evidencePath != attempt) {
+                    AppLog.w(appCtx, TAG, "LOCKSOUND_RESTORE_REBUILD op=${op.id} " +
+                        "match=no want=$attempt got=${rebuilt.evidencePath} action=no_send")
+                    return null
+                }
+                AppLog.i(appCtx, TAG, "LOCKSOUND_RESTORE_REBUILD op=${op.id} match=yes " +
+                    "evidence=$attempt (подготовка восстановлена из журнала после рестарта)")
+                return rebuilt
+            }
+
             override fun prepareRestore(op: LockOp.BindOp): String {
                 if (readOnlyPass) return ""
                 val script = LockMountScripts.restoreScript(op.targets.map { it to op.stage })
@@ -1886,8 +1913,15 @@ object LockSound {
                 if (attempt.isEmpty()) {
                     return LockOp.RestoreOutcome(false, false, -1, "", "", "attempt_identity_empty")
                 }
+                // iter62 §A3.1: подготовка восстанавливается из ЖУРНАЛА, а не только из памяти
+                // процесса. Дефект iter61: `preparedRestore` — in-memory (`:1830`), поэтому после
+                // рестарта процесса restore с durable `restore_prepared` был невозможен
+                // (`attempt_not_prepared`), и звук не сходился к последнему выбору владельца.
+                // Скрипт детерминирован по операции, поэтому transport восстанавливается по
+                // имени из журнала; путь сверяется — отправляем РОВНО записанный путь.
                 val prep = preparedRestore.remove(attempt)
-                    ?: return LockOp.RestoreOutcome(false, false, -1, "", "", "attempt_not_prepared")
+                    ?: rebuildPrepared(op, attempt)
+                    ?: return LockOp.RestoreOutcome(false, false, -1, "", attempt, "attempt_not_prepared")
                 // iter61 §5.2: durable-фаза ПЕРЕДАЧИ транспорту пишется ДО вызова. Это и есть
                 // доказательство «отправка начиналась»: без неё запись `restore_prepared`
                 // означает «до транспорта не дошли» (crash до send) и повтор безопасен. Не

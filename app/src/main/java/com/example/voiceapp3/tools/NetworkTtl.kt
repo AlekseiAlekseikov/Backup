@@ -40,7 +40,11 @@ object NetworkTtl {
 
     /** §5 iter45: СОХРАНЁННОЕ НАМЕРЕНИЕ владельца. Только пользователь меняет его. */
     /** iter61 §4.1: durable-поколение на устройстве; старые скрипты читают его и отступают. */
-    const val GEN_SLOT_FILE = "/data/local/tmp/voiceapp3_ttl_gen"
+    /**
+     * iter62 §A2.4: файл поколения лежит в `filesDir` приложения — он переживает обновление и не
+     * чистится как `/data/local/tmp`. Значение ниже остаётся только как запасной путь для стенда.
+     */
+    const val GEN_SLOT_FILE_FALLBACK = "/data/local/tmp/voiceapp3_ttl_gen"
 
     const val PREF_TTL_65_ACTIVE = "ttl_65_ativo"
 
@@ -138,8 +142,9 @@ object NetworkTtl {
  * цепь, а прежняя оставалась бы висеть неуправляемой.
  */
 private fun buildScript(enable: Boolean, reg: TtlOwnership.Registry?,
-                            slotGen: Long = -1L): String {
-    val guardFile = if (slotGen >= 0) GEN_SLOT_FILE else ""
+                            slotGen: Long = -1L,
+                            slotFile: String = GEN_SLOT_FILE_FALLBACK): String {
+    val guardFile = if (slotGen >= 0) slotFile else ""
     val guardGen = if (slotGen >= 0) slotGen.toString() else ""
     val known = reg != null && reg.state == TtlOwnership.RegistryState.PRESENT && reg.chain != null
     if (!known) {
@@ -383,8 +388,23 @@ private fun buildScript(enable: Boolean, reg: TtlOwnership.Registry?,
                 "(намерение владельца не подтверждено записью: таблица не меняется)")
             return TtlRunner.Outcome(false, "desire_not_persisted", "")
         }
-        // Скрипт собирается ПОСЛЕ фиксации намерения: он несёт номер поколения (iter61 §4.1).
-        val script = buildScript(want, reg, desire.generation)
+        // iter62 §A2.1: ПОКОЛЕНИЕ ПУБЛИКУЕТСЯ ДО ПЕРВОЙ ОТПРАВКИ, а не только при незакрытых
+        // попытках. Дефект iter61: на обновлённом устройстве файла ещё нет, скрипт читал пустоту
+        // и выходил с `exit 90` ⇒ TTL не включался вообще. Публикация подтверждается readback;
+        // не подтвердили — не отправляем (иначе скрипт увидит чужое/старое поколение).
+        val ctx = appCtxRef ?: run {
+            AppLog.e(TAG, "TTL_GEN published=no action=no_send source=$source reason=no_context")
+            return TtlRunner.Outcome(false, "no_context", "")
+        }
+        val slotFile = slotGenerationPath(ctx)
+        if (!publishSlotGeneration(desire.generation, slotFile)) {
+            AppLog.e(TAG, "TTL_GEN published=no action=no_send gen=${desire.generation} " +
+                "file=$slotFile source=$source (поколение не подтверждено чтением)")
+            return TtlRunner.Outcome(false, "gen_not_published", "")
+        }
+        // Скрипт собирается ПОСЛЕ фиксации намерения И публикации поколения: он несёт и номер
+        // поколения, и путь файла (iter61 §4.1 / iter62 §A2.1).
+        val script = buildScript(want, reg, desire.generation, slotFile)
         // iter61 §4.2: СНАЧАЛА миграция legacy iter59 → журнал iter60/61 и ПОДТВЕРЖДЕНИЕ записи,
         // и только потом fence. Дефект iter60: миграция вызывалась из `recordAttempt`, то есть
         // ПОСЛЕ fence — первый проход после обновления видел пустой новый журнал, разрешал send и
@@ -658,7 +678,10 @@ private fun buildScript(enable: Boolean, reg: TtlOwnership.Registry?,
         }
         val pending = TtlState.unresolved(journal.records)
         if (pending.isEmpty()) return true
-        if (!publishSlotGeneration(slotGen)) {
+        // iter62 §A2.3: доказательство для снятия — ПОДТВЕРЖДЁННОЕ ЧТЕНИЕМ поколение на устройстве
+        // (readback) плюс генерация строго новее поколения самой попытки. «Прошло N секунд»,
+        // timeout и отсутствие файлов доказательством не считаются.
+        if (!publishSlotGeneration(slotGen, slotGenerationPath(appCtxRef ?: return false))) {
             AppLog.w(TAG, "TTL_FENCE gen=$slotGen published=no action=wait")
             return false
         }
@@ -679,7 +702,15 @@ private fun buildScript(enable: Boolean, reg: TtlOwnership.Registry?,
                     "payload_rc=${resolved.payloadRc}")
                 continue
             }
-            val sup = TtlState.supersede(a, slotGen.toString(), System.currentTimeMillis())
+            val proof = TtlState.SupersedeProof(
+                gen = slotGen, readbackConfirmed = true,
+                why = "gen_published_before_this_send"
+            )
+            val sup = TtlState.supersede(a, proof, System.currentTimeMillis())
+            if (sup == null) {
+                AppLog.w(TAG, "TTL_FENCE attempt=${a.id} supersede=refused reason=no_proof action=wait")
+                return false
+            }
             if (!TtlState.transition(j, sup)) {
                 AppLog.e(TAG, "TTL_FENCE attempt=${a.id} persisted=no action=wait")
                 return false
@@ -695,17 +726,26 @@ private fun buildScript(enable: Boolean, reg: TtlOwnership.Registry?,
      * Записать durable-поколение на устройстве. Именно оно делает старые скрипты безвредными:
      * скрипт попытки читает файл и при несовпадении выходит с `exit 90` до любой мутации.
      */
-    private fun publishSlotGeneration(gen: Long): Boolean {
-        val cmd = "printf '%s' '$gen' > $GEN_SLOT_FILE 2>/dev/null; cat $GEN_SLOT_FILE 2>/dev/null"
+    private fun publishSlotGeneration(gen: Long, file: String = GEN_SLOT_FILE_FALLBACK): Boolean {
+        val cmd = "printf '%s' '$gen' > $file 2>/dev/null; cat $file 2>/dev/null"
         val r = runCatching { AdbClient.execute(cmd, 8000, false) }.getOrNull() ?: return false
         val back = r.second.trim()
         if (back != gen.toString()) {
             AppLog.w(TAG, "TTL_GEN publish=no gen=$gen readback=«${back.take(16)}»")
             return false
         }
-        AppLog.i(TAG, "TTL_GEN published gen=$gen file=$GEN_SLOT_FILE")
+        AppLog.i(TAG, "TTL_GEN published gen=$gen file=$file")
         return true
     }
+
+    /**
+     * Путь файла поколения в `filesDir` приложения (iter62 §A2.4). `filesDir` переживает
+     * обновление приложения; `/data/local/tmp` — нет, поэтому поколение там было бы потеряно
+     * именно в момент обновления, когда fencing и нужен.
+     */
+    internal fun slotGenerationPath(context: Context): String =
+        runCatching { File(context.filesDir, "ttl_slot_gen").absolutePath }
+            .getOrDefault(GEN_SLOT_FILE_FALLBACK)
 
     /** Факт применения: значение + поколение + загрузка (все три проверяются при чтении). */
     private fun markAppliedInternal(context: Context, applied: Boolean, reason: String, gen: Long) {

@@ -213,17 +213,23 @@ class Iter60TtlFenceTest {
             back.isEmpty() || !TtlState.sameFields(a, back.last()))
     }
 
+    /**
+     * iter62 §A2.5: `forceAbandon` удалён (мёртвый путь без production-вызовов). Его роль — «снять
+     * попытку, не выдавая отказ за NotSent» — теперь выполняет ТОЛЬКО `supersede` с доказательством.
+     * Здесь то же свойство проверяется сильнее: без доказательства попытка не снимается вовсе.
+     */
     @Test
-    fun forceAbandonNeverPretendsToBeNotSentAndKeepsTheId() {
+    fun anAttemptIsOnlyClosedByProofAndNeverPretendsToBeNotSent() {
         val a = attempt("a", true, 1, TtlState.Phase.MAY_HAVE_RUN)
-        val ab = TtlState.forceAbandon(a, "owner_cancelled", now = 9L)
+        assertNull("без доказательства снятия нет",
+            TtlState.supersede(a, TtlState.SupersedeProof(2L, false, "no_readback"), 9L))
+        val ab = TtlState.supersede(a, TtlState.SupersedeProof(2L, true, "published"), 9L)!!
         assertFalse("попытка больше не блокирует", ab.unresolved)
         assertEquals("код НЕ выдуман", Int.MIN_VALUE, ab.payloadRc)
-        // iter61 §4.4: отказ владельца — не доказанное «не отправлено», и id НЕ меняется,
-        // иначе из-за last-wins старая запись могла бы всплыть или потеряться.
         assertEquals("id не меняется", "a", ab.id)
         assertNotEquals("и это не PROVEN_NOT_SENT", TtlState.Phase.PROVEN_NOT_SENT, ab.phase)
-        assertTrue("причина названа", ab.reasonHint.startsWith("owner_resolved_unprovable"))
+        assertTrue("доказательство названо: ${ab.reasonHint}",
+            ab.reasonHint.startsWith("superseded_by_gen=2"))
     }
 
     // ─────────────── 8. свидетельство с устройства: что можно утверждать ───────────────
@@ -253,7 +259,9 @@ class Iter60TtlFenceTest {
             TtlState.fence(listOf(attempt("a", true, 1, TtlState.Phase.MAY_HAVE_RUN)))
                 is TtlState.Fence.Blocked)
         // Снять её может только ограждение поколением (её скрипт уже не применит правила).
-        val sup = TtlState.supersede(attempt("a", true, 1, TtlState.Phase.MAY_HAVE_RUN), "7", 5L)
+        // iter62 §A2.3: снятие — только по доказательству поколения (readback с устройства).
+        val sup = TtlState.supersede(attempt("a", true, 1, TtlState.Phase.MAY_HAVE_RUN),
+            TtlState.SupersedeProof(7L, true, "test"), 5L)!!
         assertEquals("ограждение — отдельная фаза", TtlState.Phase.SUPERSEDED, sup.phase)
         assertEquals("после ограждения fence снят", TtlState.Fence.Clean, TtlState.fence(listOf(sup)))
 
