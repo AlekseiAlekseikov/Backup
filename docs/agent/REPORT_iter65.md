@@ -11,7 +11,7 @@ CODE_SHA iter64 `04a4242bb1f5fd0cec83162c9ea654be2c3e21a3`, `SOURCE_SHA` сов�
 |---|---|
 | база | `917ae523e9bb86692632e0f40dd70a0aa722f72a` |
 | **CODE_SHA** = **SOURCE_SHA** | `60d3f17326eb7460a5af17909d24e1da836b83c2` |
-| HANDOFF_SHA | `94298d6d747bea5d1b70bc73882dc0d54e7cd4d0` |
+| HANDOFF_SHA | `744ef6eb49233d0e2fa266ada697780e5937fb9e` (отчёт с CI — `94298d6` ниже) |
 
 ## 2. Прогоны
 
@@ -291,7 +291,7 @@ adb pull /sdcard/Android/data/<pkg>/files/logs ./logs_machine
 1. код + тесты → `60d3f17` (**SOURCE_SHA**);
 2. `app/buildinfo.properties` → `SOURCE_SHA=60d3f17326eb7460a5af17909d24e1da836b83c2`;
 3. этот отчёт + 3 строки в `WORKLOG.md`;
-4. handoff-коммит → `94298d6d747bea5d1b70bc73882dc0d54e7cd4d0`;
+4. handoff-коммит → `744ef6eb49233d0e2fa266ada697780e5937fb9e`;
 5. `git show HEAD:app/buildinfo.properties` — совпадает; `git diff --name-only 60d3f17..HEAD` — только
    `docs/agent/REPORT_iter65.md`, `WORKLOG.md`, `app/buildinfo.properties`;
 6. push `fix/v2` (`917ae52..94298d6`), CI на handoff: run **`44329443616`**, job `build` — success
