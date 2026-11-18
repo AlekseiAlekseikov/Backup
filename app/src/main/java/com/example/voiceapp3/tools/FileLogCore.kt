@@ -27,27 +27,11 @@ import java.nio.channels.FileLock
 object FileLogCore {
 
     /**
-     * iter63 §P0-1 — счётчик идентификаторов событий.
-     *
-     * `rid` растёт монотонно в пределах процесса; `ts` (wall clock) и `try` позволяют отличить
-     * ДВА события с одинаковым текстом друг от друга и ОДНО событие, записанное повторно после
-     * отказа `fsync` (у повтора тот же `rid`, другой `try`).
-     */
-    private val ridSeq = java.util.concurrent.atomic.AtomicLong(0)
-
-    /**
-     * Следующий идентификатор для строки, у которой его ещё нет.
-     *
-     * Если строка УЖЕ несёт суффикс идентификатора (повторная запись той же записи после отказа
-     * `fsync`), возвращается ТОТ ЖЕ `rid` с увеличенным `try` — иначе повтор стал бы «вторым
-     * событием» и после слияния `.new` дал бы дубль.
-     */
-    /**
      * Записать строку, выдав ей идентификатор события (production-путь [AppFileLogger]).
      *
      * Отдельная функция, а не параметр [append]: инструментальные и legacy-пути, которые уже
      * передают готовую строку, продолжают работать без изменения семантики, а боевая запись
-     * получает `rid` всегда.
+     * получает ключ события всегда.
      */
     fun appendStamped(
         dir: File,
@@ -57,13 +41,35 @@ object FileLogCore {
         lockWaitMs: Long = 0L
     ): Result = append(dir, name, stamp(line), maxBytes, lockWaitMs)
 
-    internal fun stamp(line: String): String {
+    /**
+     * Выдать строке идентификатор события.
+     *
+     * iter64 — ПОЧЕМУ ИМЕННО ТАК. В iter63 `rid` был счётчиком процесса (`AtomicLong(0)`), поэтому
+     * второй процесс APK (JIT/TTL живут в нём) начинал с 1 и его записи выбрасывались при слиянии
+     * `.new` как «уже существующие»; рестарт процесса (`ctl.restart zygote` по клику JIT) давал то
+     * же самое. Теперь `rid` = время + метка писателя ([EventKeyGen.State]), а в суффикс входит
+     * сам писатель: ключ события (rid, writer) уникален между потоками, процессами и запусками.
+     *
+     * Повторная запись ТОЙ ЖЕ строки (после отказа `fsync`) сохраняет ключ события и увеличивает
+     * только `try` — иначе повтор стал бы «вторым событием» и дал дубль.
+     *
+     * @param writer состояние писателя; по умолчанию — состояние этого процесса. Параметр нужен,
+     *        чтобы второй экземпляр (эмуляция другого процесса) проверялся тем же кодом.
+     * @param nowMs часы (подменяются в тестах для проверки перевода времени назад).
+     */
+    internal fun stamp(
+        line: String,
+        writer: EventKeyGen.State = EventKeyGen.selfState,
+        nowMs: () -> Long = { System.currentTimeMillis() }
+    ): String {
         val body = line.trimEnd('\n')
         val parsed = LogRecordId.parse(body)
-        val known = parsed.rid != 0L && body.endsWith("]") && body.contains(" [r=")
-        val rid = if (known) parsed.rid else ridSeq.incrementAndGet()
+        val known = LogRecordId.isWriterStamped(body)
+        val ts = nowMs()
+        val rid = if (known) parsed.rid else writer.next(ts)
         val tryNo = if (known) parsed.tryNo + 1 else 1
-        return LogRecordId.format(parsed.body, rid, System.currentTimeMillis(), tryNo) + "\n"
+        val tag = if (known && parsed.writer.isNotEmpty()) parsed.writer else writer.writer
+        return LogRecordId.format(parsed.body, rid, ts, tryNo, tag) + "\n"
     }
 
     /** Результат записи: подтверждённый факт, а не «вызов принят». */
@@ -280,21 +286,16 @@ object FileLogCore {
         // случай «одно событие, разорванное падением между `.new` и переносом». Две записи с
         // одинаковым текстом и разными `rid` сохраняются обе.
         val activeLines = runCatching { active.readLines().filter { it.isNotEmpty() } }.getOrDefault(emptyList())
-        // Журнал ПРЕЖНЕЙ версии (ни одной записи с явным `rid`): идентичности события нет, а
-        // выводить её из текста — это ровно та ошибка iter62, из-за которой терялись настоящие
-        // записи. Для такого журнала действует правило iter55: переносятся ВСЕ записи (потерь нет),
-        // дубль при этом возможен и назван в отчёте как цена отсутствия идентификатора.
-        val legacyJournal = activeLines.none { LogRecordId.isStamped(it) }
-        val activeIds = activeLines.mapIndexed { i, l -> LogRecordId.eventKey(LogRecordId.parse(l, i.toLong())) }
-            .toHashSet()
+        // ЕДИНСТВЕННОЕ правило приёма записей — [LogRecordId.addNew]: запись с явным ключом
+        // (rid + писатель) отбрасывается только если такой ключ уже принят; строка журнала прежней
+        // версии (без суффикса) принимается всегда — потеря невозможна, возможный дубль назван.
+        // Тот же ключ используется для spill и work-файлов (см. mergeWork), отдельного дедупа нет.
+        val seen = LogRecordId.seenOf(activeLines)
         val toAdd = ArrayList<String>(lines.size)
         var skippedAsDuplicate = 0
         for ((i, l) in lines.withIndex()) {
-            val key = LogRecordId.eventKey(LogRecordId.parse(l, (activeLines.size + i).toLong()))
-            val explicit = LogRecordId.isStamped(l)
-            val duplicate = !legacyJournal && (if (explicit || activeLines.any { LogRecordId.isStamped(it) })
-                !activeIds.add(key) else false)
-            if (duplicate) skippedAsDuplicate++ else toAdd.add(l)
+            if (LogRecordId.addNew(toAdd, seen, l, (activeLines.size + i).toLong())) continue
+            skippedAsDuplicate++
         }
         // Совпадение ТЕКСТА границы по-прежнему называется (это диагностика, а не повод удалять).
         val boundarySame = if (lastActive != null && lines.first() == lastActive) 1 else 0
@@ -1044,11 +1045,30 @@ object FileLogCore {
                 WorkReadKind.TEXT -> Unit
             }
             val text = read.text ?: ""
-            val r = append(dir, name, text, maxBytes = Long.MAX_VALUE)
+            // iter64 §1.4: тот же ключ события, что у `.new`, — иначе повторный перенос одного и
+            // того же work-файла (два процесса/повтор после отказа) задваивал бы записи, а
+            // «своя» логика дедупа разошлась бы с основной.
+            val activeLines = runCatching { active.readLines().filter { it.isNotEmpty() } }
+                .getOrDefault(emptyList())
+            val seen = LogRecordId.seenOf(activeLines)
+            val out = ArrayList<String>()
+            var duplicates = 0
+            text.split('\n').filter { it.isNotEmpty() }.forEachIndexed { i, l ->
+                if (!LogRecordId.addNew(out, seen, l, (activeLines.size + i).toLong())) duplicates++
+            }
+            if (out.isEmpty()) {
+                // Всё уже есть в журнале — это успех переноса, а не потеря: файл можно удалять.
+                if (duplicates > 0) notes += "work_duplicates=$duplicates:«${work.name}»"
+                if (!deleteVerified(work)) notes += "work_delete_failed:«${work.name}»"
+                return@withLock 0
+            }
+            val payload = out.joinToString("\n") + "\n"
+            val r = append(dir, name, payload, maxBytes = Long.MAX_VALUE)
             if (!r.written || r.spilled) {
                 // Не удалось — work остаётся как есть (данные не теряются).
                 return@withLock -1
             }
+            if (duplicates > 0) notes += "work_duplicates=$duplicates:«${work.name}»"
             // §8.1(2): исходник удаляется только после подтверждённой дозаписи; неудача не
             // скрывается — при повторе возможны дубли, и это сказано прямо.
             if (!deleteVerified(work)) {
@@ -1058,7 +1078,7 @@ object FileLogCore {
             // позволяло другому процессу создать новый файл с тем же именем и войти в критическую
             // секцию параллельно. Лок-файл крошечный — оставляем его навсегда (это стабильный
             // межпроцессный замок, а не мусор).
-            text.count { it == '\n' }
+            out.size
         }
         if (!outcome.executed) return Int.MIN_VALUE
         return outcome.value ?: -1
