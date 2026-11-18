@@ -10,8 +10,9 @@ CODE_SHA iter64 `04a4242bb1f5fd0cec83162c9ea654be2c3e21a3`, `SOURCE_SHA` сов�
 | что | SHA |
 |---|---|
 | база | `917ae523e9bb86692632e0f40dd70a0aa722f72a` |
-| **CODE_SHA** = **SOURCE_SHA** | `60d3f17326eb7460a5af17909d24e1da836b83c2` |
-| HANDOFF_SHA | `744ef6eb49233d0e2fa266ada697780e5937fb9e` (отчёт с CI — `94298d6` ниже) |
+| CODE_SHA (первый заход) | `60d3f17326eb7460a5af17909d24e1da836b83c2` — CI **упал** (см. §4a) |
+| **CODE_SHA** = **SOURCE_SHA** (после исправления) | `b8914b2cbd4ffbce1f4323a8341acc8311712112` |
+| HANDOFF_SHA | указывается в конце §8 после коммита |
 
 ## 2. Прогоны
 
@@ -21,7 +22,8 @@ CODE_SHA iter64 `04a4242bb1f5fd0cec83162c9ea654be2c3e21a3`, `SOURCE_SHA` сов�
 | `Iter64EventIdTest` (класс, в котором обе правки) | `OK (15 tests)` |
 | iter64 для сравнения | `OK (1128 tests)` |
 | `typecheck_lock.sh /home/user/w64` | **53 → 53, новых ошибок нет** |
-| CI на handoff `94298d6` | run **`44329443616`**, job `build` — **success** (`JDK 21`, `Gradle build (debug)`, `Upload APK`) |
+| CI на `60d3f17` | run **`44325291407`**, job `build` — **failure**: `Gradle build (debug)` упал (см. §4a) |
+| CI на handoff `b8914b2` | run указывается в §8 |
 
 Локальная Gradle-сборка невозможна (JDK 11, нет Android SDK/сети): единственная настоящая сборка — CI (debug).
 Debug-CI ≠ unit-тесты ≠ release ≠ проверка на ГУ.
@@ -103,6 +105,24 @@ java.lang.AssertionError: метка не 64-битная: dd59afc7r (9 симв
 ```text
 writer=… no_proc=true …   (два процесса, метки различаются, потери нет)
 ```
+
+## 4a. CI поймал мою ошибку в правке B (и это хорошо)
+
+Первый push (`60d3f17`) дал **красный** CI: run `44325291407`, job `build`, шаг `Gradle build (debug)` — failure:
+
+```text
+e: …/tools/EventKeyGen.kt:131:19 Cannot infer type for type parameter 'R'. Specify it explicitly.
+e: …/tools/EventKeyGen.kt:131:33 Unresolved reference 'ProcessHandle'.
+```
+
+Причина: `ProcessHandle.current().pid()` — **Java 9 API, которого нет в Android**. Локальный прогон этого не
+видит (JDK 11 + стабы), Android-компилятор CI — видит. Исправлено: pid берётся тем же способом, что и во всём
+пакете (`FileLogCore.readPid()` → `/proc/self`), без `ProcessHandle`; при недоступном `/proc` pid = 0, а
+уникальность даёт 64-битный `SecureRandom` + `nanoTime`. После исправления — CODE_SHA `b8914b2`, все 1130
+тестов локально зелёные, CI на handoff — в §8.
+
+Урок зафиксирован в отчёте: локальный JVM-стенд **не** проверяет доступность API на Android; единственная
+настоящая проверка компиляции — CI.
 
 ## 5. Формальности (§3 задания) — четыре строки
 
