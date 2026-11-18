@@ -11,7 +11,7 @@
 |---|---|
 | база (iter63 handoff) | `6ca7e183e03325e18b675eb15a8f9b4ccccfa953` |
 | **CODE_SHA** = **SOURCE_SHA** (код + тесты) | `04a4242bb1f5fd0cec83162c9ea654be2c3e21a3` |
-| handoff (этот отчёт + WORKLOG + buildinfo) | указывается ниже, в §9 |
+| **HANDOFF_SHA** (этот отчёт + WORKLOG + buildinfo) | `0997860ea20526fc3aaec37d1204f43406ed8df8` |
 
 ## 2. Прогоны
 
@@ -21,6 +21,7 @@
 | из них новый класс `Iter64EventIdTest` | `OK (13 tests)` |
 | iter63 для сравнения | `OK (1115 tests)` |
 | `bash /home/user/typecheck_lock.sh /home/user/w64` | **53 → 53, новых ошибок нет** |
+| CI на handoff `0997860` | run **`44318084831`**, job `build` — **success**: `JDK 21`, `Gradle build (debug)`, `Upload APK` (все шаги success) |
 
 Локальная Gradle-сборка в этой среде невозможна (JDK 11, нет Android SDK) — единственная настоящая
 сборка CI (debug). Debug-CI ≠ unit-тесты ≠ release ≠ проверка на ГУ — ⛔.
@@ -112,7 +113,8 @@ R9 (spill другого процесса вливается ровно один
 1. код + тесты → `04a4242` (**SOURCE_SHA**);
 2. `app/buildinfo.properties` → `SOURCE_SHA=04a4242bb1f5fd0cec83162c9ea654be2c3e21a3`;
 3. этот отчёт + 3 строки в `WORKLOG.md`;
-4. handoff-коммит → HANDOFF_SHA (указывается после коммита);
+4. handoff-коммит → `0997860ea20526fc3aaec37d1204f43406ed8df8`;
 5. проверка: `git show HEAD:app/buildinfo.properties` и `git diff --name-only 04a4242..HEAD` —
    только `docs/agent/REPORT_iter64.md`, `WORKLOG.md`, `app/buildinfo.properties`;
-6. push `fix/v2` (без `--force`) + CI на handoff-SHA (SHA/run/job/шаги — после завершения).
+6. push `fix/v2` выполнен (`6ca7e18..0997860`), CI на handoff: run **`44318084831`**, job `build` —
+   **success** (`JDK 21`, `Gradle build (debug)`, `Upload APK`). Debug-CI ≠ unit ≠ release ≠ ГУ.
