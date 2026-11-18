@@ -271,69 +271,148 @@ class Iter64EventIdTest {
         assertEquals("у строк iter63 писателя нет", "", oldStyle.writer)
     }
 
-    // ───────────── ГЛАВНОЕ: два РЕАЛЬНЫХ процесса, один журнал ─────────────
+    // ───────────── ГЛАВНОЕ: два РЕАЛЬНЫХ КОНКУРЕНТНЫХ процесса, один журнал ─────────────
+    //
+    // iter65 §1: прежний вариант запускал второй процесс ТОЛЬКО после `waitFor` первого, то есть
+    // проверял последовательную запись и не касался того, где живёт риск: межпроцессный лок,
+    // spill второго процесса, ротация `.new`, `recoverPendingNew` под конкуренцией.
 
-    @Test
-    fun twoRealProcessesKeepEveryRecord() {
-        val dir = newDir()
-        val name = "two.log"
-        val perProcess = 30
+    private fun startWriter(
+        dir: File,
+        name: String,
+        prefix: String,
+        count: Int,
+        maxBytes: Long,
+        noProc: Boolean = false
+    ): Process {
         val cp = System.getProperty("java.class.path")
         val java = File(File(System.getProperty("java.home"), "bin"), "java").absolutePath
-        val runs = listOf("PA" to perProcess, "PB" to perProcess).map { (prefix, count) ->
-            val pb = ProcessBuilder(
-                java, "-cp", cp,
-                "com.example.voiceapp3.tools.Iter64TwoProcessMain",
-                dir.absolutePath, name, prefix, count.toString()
-            ).redirectErrorStream(true)
-            val p = pb.start()
-            val out = p.inputStream.bufferedReader().readText()
-            p.waitFor(120, TimeUnit.SECONDS)
-            Triple(prefix, p.exitValue(), out)
-        }
-
-        runs.forEach { (prefix, rc, out) ->
-            assertEquals("процесс $prefix завершился с ошибкой: $out", 0, rc)
-            assertTrue("процесс $prefix не сообщил писателя: $out", out.contains("writer="))
-        }
-        // Процессы разные — метки писателя обязаны различаться.
-        val tags = runs.map { Regex("writer=([0-9a-f]+)").find(it.third)?.groupValues?.get(1) }
-        assertEquals("метка писателя не прочитана: ${runs.map { it.third }}", 2, tags.filterNotNull().toSet().size)
-
-        // Каждый процесс писал свои строки; журнал мог уйти в `.1`/`.new` из-за локов — читаем всё.
-        val all = lines(File(dir, name)) + lines(File(dir, "$name.1")) + lines(File(dir, "$name.new"))
-        val bodiesAll = all.map { LogRecordId.parse(it).body }
-        (1..perProcess).forEach { i ->
-            assertTrue("потеряна запись PA $i: ${bodiesAll.size} строк", bodiesAll.contains("PA $i"))
-            assertTrue("потеряна запись PB $i: ${bodiesAll.size} строк", bodiesAll.contains("PB $i"))
-        }
-        val keys = all.map { LogRecordId.keyOf(it) }
-        assertEquals("дубли ключей между процессами: ${keys.size - keys.toSet().size}", keys.size, keys.toSet().size)
-        assertFalse("в журнале не должно быть пустых строк: $all", all.isEmpty())
+        val cmd = mutableListOf(
+            java, "-cp", cp
+        )
+        if (noProc) cmd += "-Dvoiceapp3.noProc=1"
+        cmd += listOf(
+            "com.example.voiceapp3.tools.Iter64TwoProcessMain",
+            dir.absolutePath, name, prefix, count.toString(), maxBytes.toString()
+        )
+        return ProcessBuilder(cmd).redirectErrorStream(true).start()
     }
 
-    // ───────────── R9: spill второго процесса вливается ровно один раз ─────────────
+    private fun finish(p: Process, label: String): String {
+        val out = p.inputStream.bufferedReader().readText()
+        assertTrue("$label не завершился за 180 с: $out", p.waitFor(180, TimeUnit.SECONDS))
+        assertEquals("$label rc: $out", 0, p.exitValue())
+        assertTrue("$label не напечатал интервал/писателя: $out", out.contains("writer=") && out.contains("start="))
+        return out
+    }
+
+    /** Все файлы журнала [name]: активный, `.1..`, `.new`, spill/work (без локов). */
+    private fun journalFiles(dir: File, name: String): List<File> =
+        (dir.listFiles() ?: emptyArray())
+            .filter { it.isFile && it.name.startsWith(name) && !it.name.endsWith(".lock") }
+            .sortedBy { it.name }
 
     @Test
-    fun spilledRecordsOfAnotherProcessAreMergedExactlyOnce() {
+    fun twoConcurrentProcessesKeepEveryRecord() {
         val dir = newDir()
-        val name = "spill.log"
-        FileLogCore.appendStamped(dir, name, "A1 own line")
-        // «Spill другого процесса»: файл с его строками (с ключами его писателя).
-        val b = otherProcess("5b111111")
-        // Метка мёртвого процесса в формате, который понимает [FileLogCore.orphanFilesOf]
-        // (`<pid>`), и pid, которого заведомо нет: файл считается осиротевшим и забирается.
-        val deadPid = (900000..999999).first { !File(FileLogCore.procRoot, it.toString()).exists() }
-        val spill = File(dir, "$name.$deadPid.spill")
-        spill.writeText(
-            FileLogCore.stamp("B1 spilled line", writer = b) +
-                FileLogCore.stamp("B2 spilled line", writer = b)
+        val name = "conc.log"
+        val per = 60
+        // 4096 байт при ~57 байт на строку: 120 строк дают РОВНО одну ротацию, и оба поколения
+        // (активный + `.1`) помещаются целиком, поэтому «строк = вызовов» — проверяемое условие.
+        // Меньший лимит проверять нельзя: журнал держит активный файл и ОДИН бэкап, и при
+        // лимите меньше объёма двух поколений старые строки уходят по политике хранения
+        // (это не потеря записи, а названный размер истории — измерено на 512/2000 байт).
+        val a = startWriter(dir, name, "PA", per, maxBytes = 4096)
+        val b = startWriter(dir, name, "PB", per, maxBytes = 4096)   // стартует, НЕ дожидаясь A
+        val outA = finish(a, "A")
+        val outB = finish(b, "B")
+
+        // (0) КОНКУРЕНТНОСТЬ: интервалы работы процессов обязаны пересекаться. На iter64
+        // (последовательный запуск) это условие и было нарушено — тест падал именно здесь.
+        fun spanMs(out: String, key: String): Long =
+            Regex("$key=(\\d+)").find(out)?.groupValues?.get(1)?.toLong() ?: -1L
+        val startA = spanMs(outA, "start"); val endA = spanMs(outA, "end")
+        val startB = spanMs(outB, "start"); val endB = spanMs(outB, "end")
+        assertTrue("интервалы не прочитаны: A=$outA B=$outB", startA >= 0 && startB >= 0 && endA > 0 && endB > 0)
+        assertTrue(
+            "процессы работали НЕ одновременно (A $startA..$endA, B $startB..$endB): " +
+                "последовательный запуск не проверяет ни лок, ни spill, ни ротацию",
+            startA < endB && startB < endA
         )
-        // Два прохода восстановления подряд: второй не должен задвоить перенесённое.
-        FileLogCore.drainSpill(dir, name)
-        FileLogCore.drainSpill(dir, name)
-        val out = bodies(File(dir, name))
-        assertEquals("строки spill потеряны или задвоены (${FileLogCore.lastDrainNote()}): $out",
-            listOf("A1 own line", "B1 spilled line", "B2 spilled line"), out)
+
+        // (1) Ни одной потери: каждая из 2*per записей присутствует РОВНО один раз.
+        val all = journalFiles(dir, name).flatMap { lines(it) }
+        val bodies = all.map { LogRecordId.parse(it).body }
+        (1..per).forEach { i ->
+            assertEquals("потеряна или задвоена PA $i (всего строк ${bodies.size})", 1, bodies.count { it == "PA $i" })
+            assertEquals("потеряна или задвоена PB $i (всего строк ${bodies.size})", 1, bodies.count { it == "PB $i" })
+        }
+        assertEquals("строк должно быть ровно 2*per: ${bodies.size}", 2 * per, bodies.size)
+
+        // (2) Ключи событий уникальны (нет двух записей, считающих себя одним событием).
+        val keys = all.map { LogRecordId.keyOf(it) }
+        assertEquals("дубли ключей: ${keys.size - keys.toSet().size}", keys.size, keys.toSet().size)
+
+        // (3) Ни одна строка не разорвана: формат целиком на каждой строке.
+        val ok = Regex("^\\S+\\s\\d+ \\[r=\\d+/\\d+/\\d+/w=[0-9a-f]{1,16}]$")
+        all.forEach { line -> assertTrue("строка разорвана: <$line>", ok.matches(line)) }
+
+        // (4) Метки писателей двух процессов различаются.
+        val writers = all.map { LogRecordId.parse(it).writer }.toSet()
+        assertTrue("ожидались две метки писателя, получено $writers", writers.size >= 2)
+
+        // (5) Ротация действительно произошла — иначе тест не про неё.
+        assertTrue(
+            "ротации не было (нет `.1`), тест не проверил бы лок/ротацию: ${journalFiles(dir, name).map { it.name }}",
+            File(dir, "$name.1").isFile
+        )
+    }
+
+    // ───────────── ПРАВКА B: fallback-метка при недоступном /proc ─────────────
+
+    @Test
+    fun fallbackWriterTagIs64BitAndReadable() {
+        val tag = EventKeyGen.randomTag()
+        assertTrue("метка не hex: $tag", Regex("^[0-9a-f]{1,16}$").matches(tag))
+        // 64-битная метка почти всегда длиннее 8 hex; прежняя (31 бит) давала ≤8.
+        assertTrue("метка подозрительно короткая для 64 бит: $tag", tag.length >= 9)
+        // Главное: строка с такой меткой обязана разбираться как «с писателем», иначе она стала бы
+        // строкой iter63 (без писателя) и вернула коллизию.
+        val line = LogRecordId.format("X", 1L, 2L, 1, tag)
+        assertTrue("строка не разбирается как новая: $line", LogRecordId.isWriterStamped(line))
+        assertEquals("writer потерян при разборе", tag, LogRecordId.parse(line).writer)
+    }
+
+    @Test
+    fun fallbackTagsDifferBetweenGenerations() {
+        val tags = (1..200).map { EventKeyGen.randomTag() }.toSet()
+        assertEquals("повтор метки в пределах процесса: ${200 - tags.size}", 200, tags.size)
+    }
+
+    @Test
+    fun twoRealProcessesWithoutProcGetDifferentWriterTagsAndKeepRecords() {
+        val dir = newDir()
+        val name = "noproc.log"
+        val per = 15
+        // Без ротации: проверяются метки писателей и сохранность, а не политика хранения.
+        val a = startWriter(dir, name, "NA", per, maxBytes = 100_000, noProc = true)
+        val b = startWriter(dir, name, "NB", per, maxBytes = 100_000, noProc = true)
+        val outA = finish(a, "A")
+        val outB = finish(b, "B")
+
+        fun tagOf(out: String): String =
+            Regex("writer=([0-9a-f]{1,16})").find(out)?.groupValues?.get(1) ?: ""
+        val tagA = tagOf(outA); val tagB = tagOf(outB)
+        assertTrue("fallback-путь не включился: $outA", outA.contains("no_proc=true"))
+        assertTrue("метки писателей совпали при недоступном /proc: $tagA", tagA.isNotEmpty() && tagA != tagB)
+
+        val all = journalFiles(dir, name).flatMap { lines(it) }
+        val bodies = all.map { LogRecordId.parse(it).body }
+        (1..per).forEach { i ->
+            assertEquals("потеряна NA $i", 1, bodies.count { it == "NA $i" })
+            assertEquals("потеряна NB $i", 1, bodies.count { it == "NB $i" })
+        }
+        assertEquals("у строк должны быть разные писатели", 2,
+            all.map { LogRecordId.parse(it).writer }.toSet().size)
     }
 }

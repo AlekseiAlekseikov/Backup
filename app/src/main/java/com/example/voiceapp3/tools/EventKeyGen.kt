@@ -95,16 +95,46 @@ object EventKeyGen {
 
     /** Метка писателя ТЕКУЩЕГО процесса (одна на процесс, считается один раз). */
     val self: String by lazy {
-        val pid = FileLogCore.readPid()
-        writerTag(pid, FileLogCore.readBootId(), FileLogCore.readStartTime(pid), randomTag())
+        if (procDisabled()) {
+            // iter65 §2: проверяемый fallback-путь. Раньше эта ветка была недостижима в тестах,
+            // поэтому её «случайность» никто не измерял.
+            randomTag()
+        } else {
+            val pid = FileLogCore.readPid()
+            writerTag(pid, FileLogCore.readBootId(), FileLogCore.readStartTime(pid), randomTag())
+        }
     }
 
-    /** Случайная метка на случай недоступного `/proc` (уникальность между запусками сохраняется). */
-    fun randomTag(): String =
-        Integer.toHexString(
-            (System.nanoTime() xor System.identityHashCode(Any()).toLong() xor
-                Runtime.getRuntime().hashCode().toLong()).toInt()
-        ) + "r"
+    /**
+     * iter65 §2.2 — считается ли `/proc` недоступным.
+     *
+     * Переключатель существует ровно для того, чтобы проверить fallback-метку тем же
+     * production-кодом (без подмены объекта тестом). В бою он не выставляется.
+     */
+    fun procDisabled(): Boolean =
+        runCatching { System.getProperty("voiceapp3.noProc") == "1" }.getOrDefault(false)
+
+    /**
+     * Fallback-метка писателя, когда `/proc` недоступен.
+     *
+     * iter65 §2 — ЧТО БЫЛО НЕ ТАК: прежняя версия склеивала `nanoTime xor identityHashCode xor
+     * hashCode` в **Int** (~31 бит) и не включала pid. Именно эта метка работает ТАМ, где ничего
+     * предсказать нельзя; два процесса, стартовавших одновременно на разных ядрах, могли получить
+     * одинаковую метку, и при совпадении миллисекунды совпал бы ключ `(rid, writer)` — та же
+     * потеря записи, которую закрывали в iter64.
+     *
+     * Теперь: 64 бита из `SecureRandom` + pid + `nanoTime`, до 16 hex (парсер `[0-9a-f]{1,16}`).
+     * Метка стабильна внутри процесса — её кеширует `self` (`by lazy`).
+     */
+    fun randomTag(): String {
+        val rnd = SECURE.nextLong()
+        val pid = runCatching { ProcessHandle.current().pid() }.getOrDefault(0L)
+        val nano = System.nanoTime()
+        return java.lang.Long.toHexString(rnd xor (pid shl 32) xor nano)
+    }
+
+    /** Один генератор на процесс: `SecureRandom` инициализируется небесплатно. */
+    private val SECURE: java.security.SecureRandom by lazy { java.security.SecureRandom() }
 
     /** Состояние текущего процесса (единственный экземпляр, которым пользуется боевая запись). */
     val selfState: State by lazy { State(self) }
