@@ -128,7 +128,11 @@ object EventKeyGen {
      */
     fun randomTag(): String {
         val rnd = SECURE.nextLong()
-        val pid = runCatching { ProcessHandle.current().pid() }.getOrDefault(0L)
+        // pid берётся тем же способом, что и везде в этом пакете (`/proc/self`), БЕЗ
+        // `ProcessHandle`: это Java 9 API, которого на Android нет — CI iter65 поймал ровно это
+        // (`Unresolved reference 'ProcessHandle'` в `:131`). Недоступен `/proc` — pid = 0,
+        // уникальность даёт 64-битный SecureRandom + nanoTime.
+        val pid = FileLogCore.readPid()?.toLongOrNull() ?: 0L
         val nano = System.nanoTime()
         return java.lang.Long.toHexString(rnd xor (pid shl 32) xor nano)
     }
