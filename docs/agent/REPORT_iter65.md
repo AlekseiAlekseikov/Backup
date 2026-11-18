@@ -12,7 +12,7 @@ CODE_SHA iter64 `04a4242bb1f5fd0cec83162c9ea654be2c3e21a3`, `SOURCE_SHA` сов�
 | база | `917ae523e9bb86692632e0f40dd70a0aa722f72a` |
 | CODE_SHA (первый заход) | `60d3f17326eb7460a5af17909d24e1da836b83c2` — CI **упал** (см. §4a) |
 | **CODE_SHA** = **SOURCE_SHA** (после исправления) | `b8914b2cbd4ffbce1f4323a8341acc8311712112` |
-| HANDOFF_SHA | указывается в конце §8 после коммита |
+| **HANDOFF_SHA** | `3504668e279e537b6d77f9869477040894b3ab0b` |
 
 ## 2. Прогоны
 
@@ -23,7 +23,7 @@ CODE_SHA iter64 `04a4242bb1f5fd0cec83162c9ea654be2c3e21a3`, `SOURCE_SHA` сов�
 | iter64 для сравнения | `OK (1128 tests)` |
 | `typecheck_lock.sh /home/user/w64` | **53 → 53, новых ошибок нет** |
 | CI на `60d3f17` | run **`44325291407`**, job `build` — **failure**: `Gradle build (debug)` упал (см. §4a) |
-| CI на handoff `b8914b2` | run указывается в §8 |
+| CI на handoff `3504668` | run **`44331108667`**, job `build` — **success** (`JDK 21`, `Gradle build (debug)`, `Upload APK`) |
 
 Локальная Gradle-сборка невозможна (JDK 11, нет Android SDK/сети): единственная настоящая сборка — CI (debug).
 Debug-CI ≠ unit-тесты ≠ release ≠ проверка на ГУ.
@@ -311,10 +311,11 @@ adb pull /sdcard/Android/data/<pkg>/files/logs ./logs_machine
 1. код + тесты → `60d3f17` (**SOURCE_SHA**);
 2. `app/buildinfo.properties` → `SOURCE_SHA=60d3f17326eb7460a5af17909d24e1da836b83c2`;
 3. этот отчёт + 3 строки в `WORKLOG.md`;
-4. handoff-коммит → `744ef6eb49233d0e2fa266ada697780e5937fb9e`;
-5. `git show HEAD:app/buildinfo.properties` — совпадает; `git diff --name-only 60d3f17..HEAD` — только
-   `docs/agent/REPORT_iter65.md`, `WORKLOG.md`, `app/buildinfo.properties`;
-6. push `fix/v2` (`917ae52..94298d6`), CI на handoff: run **`44329443616`**, job `build` — success
-   (`JDK 21`, `Gradle build (debug)`, `Upload APK`).
+4. handoff-коммит → `3504668e279e537b6d77f9869477040894b3ab0b`;
+5. `git show HEAD:app/buildinfo.properties` — `SOURCE_SHA=b8914b2…` (совпадает); `git diff --name-only
+   b8914b2..HEAD` — только `app/buildinfo.properties`, `docs/agent/REPORT_iter65.md`;
+6. push `fix/v2`: `917ae52..3504668`; CI на handoff: run **`44331108667`**, job `build` — **success**
+   (`JDK 21`, `Gradle build (debug)`, `Upload APK`). Предыдущий прогон `44325291407` на `60d3f17` был
+   красным — причина и исправление в §4a, это не скрывается.
 
 Дальше — **стоп песочницы**: остаётся только сессия на ГУ по §6.
