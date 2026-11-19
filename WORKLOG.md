@@ -1,5 +1,29 @@
 # WORKLOG — iter54 (JIT, доставка, TTL, звук, окна, логи, тумблеры)
 
+## iter67 — A–K (отметка, яркость, хранилища, цепочка, сеть, UI, аудит команд)
+
+Ветка `fix/v2`, `versionCode=63`/`versionName=1.0.63` без изменений, `--force` не применялся, `main` не пушился.
+Полный отчёт — `docs/agent/REPORT_iter67.md`. Локально: `bash /home/user/runtests67.sh` → `OK (1222 tests)`;
+`typecheck_lock.sh` → `53/53`, новых ошибок нет. `SOURCE_SHA=d5a22b7987697b2be4107e6e90cc124ca1705cc2`.
+Красные прогоны ДО получены на `git worktree` от базы `93734b7` (`/home/user/wbaseB`); Gradle локально недоступен.
+
+| Шаг | Что сделано | Проверка | Коммит |
+|---|---|---|---|
+| A | `WriteResult(writeAccepted, readbackOk)`, `AdbClient.execExpect`, `getprop` сравнивается с ожиданием; `writeProp` читает факт одним `getprop` | `Iter67WriteVerdictTest` (11): до — 3 падения, после — `OK` | `1ad8a2b`, `44ea55e` |
+| B | `SyncState`/`syncPlan`/`BrightRestorer`: пишется только расходящееся, `setprop` с тика убран, серия `SYSFS_UNREADABLE` → один лог и запрет записи | `Iter67BrightSyncTest` (10): до — 2 падения | `0cd27fb` |
+| C | `attempt`/`boot` в отметке, `ts` = время последней попытки ДО `JIT_CHAIN_SENT` в оба хранилища, `JIT_UNBLOCK … exit=` | `Iter67UnblockTest` (15): до — 1 падение + не компилируется | `002cdb4` |
+| K | `PairDiag`/`classifyPair` (блокирует только `OP_DIFF`), согласование «хуже» `repair=rewrite_worse`, удаление всего набора ключей одним `commit()` | `Iter67PairTest` (13): до — 2 падения | `a0884bc`, `8446add`, `8921573` |
+| E | `JIT_OP_PHASE` всегда, `JIT_OP_PROBE result=absent`, `JIT_CHAIN_LOST action=no_resend`, перечитывание terminal через 5 с | `Iter67ChainDiagTest` (5): до — 2 падения | `9abcb11` |
+| J | `trap EXIT` до первого side effect, свой каталог через `pm path`+`dirname` исключён из `umount`, `UMOUNT_*` до `setprop` | `Iter67ChainScriptTest` (8): до — 4 падения | `9667c11` |
+| I | флаг «сеть сняли мы», `restoreDecision` (возраст не смотрится, нет claim ≠ чужой), `uiReason`, свойства `wifiRestoreState`/`wifiRestoreNotice` | `Iter67NetRestoreTest` (11): до — 2 падения | `ccc4750`, `d5a22b7` |
+| G+D | `JitUiState` + `perfJitState/Runtime/RuntimeRaw/Why/Text`, `pending_restart` сохраняет намерение и не блокирует клик, `JIT_STATE` | `Iter67UiStateTest` (11): до — 2 падения | `564c91d` |
+| H | `Toggles45.staleness` с классом отметки, `JIT_MARK_INVALID … clicks=allowed`, арифметика времени в `sh` проверена | `Iter67UnblockTest` (кейсы H): до — нет строки | `636c1bd` |
+| F | `CommandAudit.missingSeparators` (склейка не отправляется), `setprop/getprop` в журнале не усекаются | `Iter67CommandAuditTest` (8): до — 2 падения | `d715b68` |
+
+Согласованы с новыми правилами: `JitIter41Test` (3 кейса), `Iter51JitOwnershipTest` и
+`Iter54JitConcurrencyTest` (по 1 формулировке) — причины в отчёте, §3.
+
+
 Ветка `fix/v2`. `main` не пушился, `--force` не применялся. Версия не менялась: `versionCode=63`, `versionName=1.0.63`.
 Локальный прогон: `bash /home/user/runtests.sh` (kotlinc 1.9.24 + `android.jar`-стабы + JUnit 4.13.2), полный отчёт — `REPORT_iter54.md`.
 
