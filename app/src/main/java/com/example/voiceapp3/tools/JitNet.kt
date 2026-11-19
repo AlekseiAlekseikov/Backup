@@ -569,14 +569,23 @@ object JitNet {
                         .append("$name:skip(${cur?.op ?: "no_mark"})")
                     continue
                 }
+                // iter67 §K.1: удаляется ВЕСЬ набор ключей операции (намерение + снимок + отметка)
+                // ОДНИМ `commit()` на хранилище, и каждый ключ проверяется чтением после удаления.
+                // Дефект: `jit_pedido` оставался, и следующая сверка снова печатала
+                // `JIT_PEDIDO kept` — на живой ГУ это повторялось 147 и 279 раз.
+                val keys = JitRef.OWNED_KEYS
                 val ok = try {
-                    s.edit().remove(KEY_RESTORE).remove(KEY_MARK).commit()
+                    val e = s.edit()
+                    for (k in keys) e.remove(k)
+                    e.commit()
                 } catch (t: Throwable) {
                     log("JIT_STORE remove_owned store=$name exception=${t.javaClass.simpleName}")
                     false
                 }
-                val restoreGone = try { !s.contains(KEY_RESTORE) } catch (t: Throwable) { false }
-                val markGone = try { !s.contains(KEY_MARK) } catch (t: Throwable) { false }
+                val restoreGone = keys.filter { it == KEY_RESTORE }
+                    .all { try { !s.contains(it) } catch (t: Throwable) { false } }
+                val markGone = keys.filter { it != KEY_RESTORE }
+                    .all { try { !s.contains(it) } catch (t: Throwable) { false } }
                 if (ok && restoreGone && markGone) {
                     clean++
                 } else {
