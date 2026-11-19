@@ -321,8 +321,13 @@ class JitIter41Test {
             val assessed = JitRef.assessStored(
                 storeOps("cps" to (snap to order.first), "dps" to (snap to order.second))
             )
-            assertEquals("порядок не решает исход", JitRef.StoredState.AMBIGUOUS, assessed.state)
+            // iter67 §K: состояние по-прежнему НЕ выдаётся за завершённое (хуже из двух —
+            // `undefined`), но это больше не `AMBIGUOUS`: бессрочная блокировка из-за
+            // расхождения копий одной операции запрещена заданием.
+            assertEquals("порядок не решает исход", JitRef.StoredState.UNDEFINED, assessed.state)
             assertTrue("причина названа", assessed.detail.contains("mark_state_conflict"))
+            assertTrue("класс расхождения назван", assessed.detail.contains("diag=state_diff"))
+            assertTrue("согласование названо", assessed.detail.contains("repair=rewrite_worse"))
         }
         // Обратный порядок хранилищ даёт тот же итог.
         val swapped = JitRef.assessStored(
@@ -331,7 +336,7 @@ class JitIter41Test {
                 JitRef.StoreOp("cps", snap, replied)
             )
         )
-        assertEquals(JitRef.StoredState.AMBIGUOUS, swapped.state)
+        assertEquals(JitRef.StoredState.UNDEFINED, swapped.state)
     }
 
     @Test
@@ -362,13 +367,19 @@ class JitIter41Test {
         JitOp.resetStateForTest()
         val shell = TimeoutShell()
         val c = JitOp.click(t.store, JitFake.Net(wifi = true), shell, want = true, log = ::log)
-        assertEquals("previous_ambiguous", c.blocked)
+        // iter67 §K: копии одной операции разошлись (`replied` в CPS, `undefined` в DPS). Берётся
+        // «хуже» (`undefined`) и пишется в оба хранилища, поэтому блокировка — по недоказанному
+        // исходу (`chain_undefined`), а не `previous_ambiguous` навсегда.
+        assertEquals("chain_undefined", c.blocked)
         assertEquals("ни записи, ни payload", 0, shell.executed.payloadCmds().size)
 
         val sched = JitFake.Scheduler()
         val start = JitOp.onProcessStart(t.store, JitFake.Net(wifi = true), sched, ::log)
-        assertEquals("stored_ambiguous", start.reason)
-        assertTrue("задача не поставлена", sched.delays().isEmpty())
+        // Причина старта прежняя (`scheduled`): снимок возвращается отдельной задачей; расписание
+        // при недоказанном исходе сохранено намеренно (iter67 §K), «данные не удалены» ниже.
+        assertEquals("scheduled", start.reason)
+        assertTrue("задача должна быть поставлена (снимок возвращается отдельно)",
+            sched.delays().isNotEmpty())
         assertTrue("данные не удалены", t.cpsDisk.containsKey(JitRef.KEY_RESTORE))
         assertTrue(lines().contains("mark_state_conflict") || lines().contains("stored_ambiguous"))
     }

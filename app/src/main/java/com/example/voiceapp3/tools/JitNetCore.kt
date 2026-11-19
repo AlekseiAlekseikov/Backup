@@ -76,6 +76,13 @@ object JitRef {
      * iter56 §4.3: монотонное поколение намерения JIT (порядок кликов, а не показание часов).
      * Собственный ключ; в референсе его нет и на его ключи он не влияет.
      */
+    /**
+     * iter67 §K — ключи, которые принадлежат ОПЕРАЦИИ и удаляются только вместе и только в оба
+     * хранилища. `KEY_INTENT_SEQ` сюда НЕ входит: монотонное поколение намерений не должно
+     * откатываться удалением операции.
+     */
+    internal val OWNED_KEYS: List<String> = listOf(KEY_PEDIDO, KEY_AUTO, KEY_RESTORE, KEY_MARK)
+
     internal const val KEY_INTENT_SEQ = "jit_intent_seq"
     /** iter57 §7.2: токен эпохи счётчика (только для честного лога, порядок не задаёт). */
     internal const val KEY_INTENT_EPOCH = "jit_intent_epoch"
@@ -663,6 +670,29 @@ object JitRef {
         }
         val marks = used.mapNotNull { OpMark.parse(it.mark) }
         if (marks.size != used.size) {
+            // iter67 §K: если хоть ОДНА копия разбирается — берём её (класс `invalid_one` в журнал),
+            // а не объявляем неоднозначность навсегда. Живой случай: `ts=` в `cps` и валидный `ts`
+            // в `dps` давали `mark_unparsable` и бессрочную блокировку.
+            val valid = used.firstOrNull { OpMark.parse(it.mark) != null }
+            if (valid != null && marks.isNotEmpty()) {
+                val restoresV = used.mapNotNull { parseSnapshot(it.snapshot) }
+                if (restoresV.isEmpty()) {
+                    return StoredOp(
+                        StoredState.BROKEN_SNAPSHOT,
+                        detail = "snapshot_unparsable " + used.joinToString(",") { it.brief() },
+                        readable = readable, total = reads.size
+                    )
+                }
+                val markV = OpMark.parse(valid.mark)!!
+                val stateV = if (markV.state == OpMark.SENDING || markV.state == OpMark.UNDEFINED)
+                    StoredState.UNDEFINED else StoredState.PENDING
+                return StoredOp(
+                    stateV, restoresV.first(), markV,
+                    detail = "pair diag=invalid_one used=${valid.name} " +
+                        JitPair.line(PairDiag.INVALID_ONE, valid.name),
+                    readable = readable, total = reads.size
+                )
+            }
             return StoredOp(
                 StoredState.AMBIGUOUS, detail = "mark_unparsable " + used.joinToString(",") { it.brief() },
                 readable = readable, total = reads.size
@@ -678,8 +708,12 @@ object JitRef {
         }
         val ops = marks.map { it.op }.distinct()
         if (ops.size > 1) {
+            // iter67 §K: разные операции в копиях — единственный случай, который блокирует клик
+            // (`OP_DIFF`): какая операция и какой снимок верны — неизвестно.
             return StoredOp(
-                StoredState.AMBIGUOUS, detail = "op_conflict ops=${ops.joinToString("/")}",
+                StoredState.AMBIGUOUS,
+                detail = "op_conflict ops=${ops.joinToString("/")} " +
+                    JitPair.line(PairDiag.OP_DIFF, reads.first().name),
                 readable = readable, total = reads.size
             )
         }
@@ -695,11 +729,28 @@ object JitRef {
         // отметка обновляется ОТДЕЛЬНЫМИ `commit()` в CPS и DPS, поэтому копии одной операции
         // могут разойтись. Если они разошлись, какая из них верна — неизвестно: это конфликт,
         // а не «берём первую по порядку чтения».
+        // iter67 §K: расхождение `state`/`ts` при ОДНОЙ операции — не приговор. Раньше оно давало
+        // `AMBIGUOUS`, а тот был терминальным: после правки только `cps` блокировка становилась
+        // бессрочной (`mark_unparsable … ts=` / `ts=1794577045082`). Теперь берётся копия «хуже»
+        // (SENDING/UNDEFINED), класс называется строкой `JIT_PAIR`, а выход дают правки C и H.
         val states = marks.map { it.state }.distinct()
         if (states.size > 1) {
+            val pair = JitPair.classifyPair(
+                PairOp(used[0].name, used[0].snapshot, used[0].mark),
+                PairOp(used[1].name, used[1].snapshot, used[1].mark)
+            )
+            val worse = JitPair.worseOf(
+                PairOp(used[0].name, used[0].snapshot, used[0].mark),
+                PairOp(used[1].name, used[1].snapshot, used[1].mark)
+            )
+            val wm = OpMark.parse(worse.mark)
+            val st = if (wm?.state == OpMark.SENDING || wm?.state == OpMark.UNDEFINED)
+                StoredState.UNDEFINED else StoredState.PENDING
             return StoredOp(
-                StoredState.AMBIGUOUS,
-                detail = "mark_state_conflict states=${states.joinToString("/")}",
+                st, restores.filterNotNull().first(), wm,
+                detail = "mark_state_conflict pair diag=${pair.name.lowercase()} used=${worse.name} " +
+                    "states=${states.joinToString("/")} repair=rewrite_worse " +
+                    JitPair.line(pair, worse.name),
                 readable = readable, total = reads.size
             )
         }
@@ -713,9 +764,14 @@ object JitRef {
         }
         val stamps = marks.map { it.tsMs }.distinct()
         if (stamps.size > 1) {
+            // iter67 §K: возраст берётся по САМОЙ СВЕЖЕЙ копии — иначе старая копия держала бы
+            // операцию «вечно старой» (и блокировка не снималась бы никогда).
+            val newest = marks.maxByOrNull { it.tsMs }!!
             return StoredOp(
-                StoredState.AMBIGUOUS,
-                detail = "mark_ts_conflict ts=${stamps.joinToString("/")}",
+                StoredState.UNDEFINED, restores.filterNotNull().first(), newest,
+                detail = "mark_ts_conflict pair diag=ts_diff used=ts:${newest.tsMs} " +
+                    "ts=${stamps.joinToString("/")} repair=rewrite_worse " +
+                    JitPair.line(PairDiag.TS_DIFF, "newest"),
                 readable = readable, total = reads.size
             )
         }
@@ -1762,6 +1818,23 @@ object JitOp {
                     listOf(JitRef.StoreOp("read", null, null, "exception:" + t.javaClass.simpleName))
                 }
                 stored = JitRef.assessStored(reads)
+                // iter67 §K: разошедшиеся копии ОДНОЙ операции согласуются здесь же — «хуже» из
+                // двух (SENDING/UNDEFINED) записывается в ОБА хранилища ОДНИМ `commit()` на
+                // хранилище. Это не выдаёт неизвестный исход за известный: состояние остаётся
+                // `sending`/`undefined`, а возраст считается от самой свежей копии, поэтому
+                // следующее решение (правки C/H) снова имеет вход, а не молчит вечно.
+                val repairMark = stored.mark
+                if (repairMark != null && stored.detail.contains("repair=rewrite_worse")) {
+                    val w = runCatching { store.updateMark(repairMark) }
+                        .getOrElse { t -> JitRef.WriteResult.none("exception:" + t.javaClass.simpleName) }
+                    log(
+                        "JIT_PAIR_REPAIR op=${repairMark.op} attempt=${repairMark.attempt} " +
+                            "stores=${w.ok}/${w.attempted} detail=«${w.detail}» " +
+                            "state=${repairMark.state} ts_ms=${repairMark.tsMs} " +
+                            "(копии одной операции приведены к «худшему» состоянию: исход не " +
+                            "выдаётся за известный, но бессрочной блокировки больше нет)"
+                    )
+                }
             }
             // §7.2 iter45: за границей STALE_MARK_MS неопределённость больше не блокирует НОВЫЙ
             // клик владельца: команда уже не может быть в очереди, а старый снимок не применяется

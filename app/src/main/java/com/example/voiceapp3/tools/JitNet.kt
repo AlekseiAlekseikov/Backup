@@ -719,6 +719,20 @@ object JitNet {
             )
             return r
         }
+
+        /**
+         * iter67 §K.1 — СОГЛАСОВАННОЕ удаление операции: все её ключи, в КАЖДОЕ доступное
+         * хранилище, одним `commit()` на хранилище и с проверкой «прочитано после удаления».
+         *
+         * Дефект: удаление шло по одному ключу за вызов, поэтому после правки только `cps`
+         * оставался «полуудалённый» набор, и следующее чтение давало `AMBIGUOUS` навсегда.
+         */
+        fun removeOwnedEverywhere(): PairRemoval {
+            val all = stores()
+            val removal = OwnedRemover.removeOwnedEverywhereForTest(all.map { it.second }, JitRef.OWNED_KEYS)
+            log("JIT_STORE remove_owned_everywhere ${removal.wire()} keys=${JitRef.OWNED_KEYS.joinToString(",")}")
+            return removal
+        }
     }
 
     // ─────────────────────────── состояние клиентского Wi-Fi ───────────────────────────
