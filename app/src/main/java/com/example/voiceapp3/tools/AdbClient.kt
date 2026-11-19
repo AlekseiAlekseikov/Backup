@@ -2008,6 +2008,12 @@ object AdbClient {
         // iter39 §3.1: пассивный путь решается ДО любых веток восстановления канала.
         if (passive) return runPassive(cmd, timeoutMs)
         // iter43 §1.4: тип команды/rc/время — да; содержимое payload — нет.
+        // iter67 §F: склейка шагов без разделителя — в журнал и НЕ отправляем: `setprop` получил бы
+        // лишние аргументы, а `rc=0` от последнего `echo` дал бы ложный успех.
+        CommandAudit.suspectLine(cmd)?.let { line ->
+            AppLog.e(TAG, line)
+            return Pair(1, "ERR_CMD_MISSING_SEPARATOR (команда не отправлена: потерян разделитель шагов)")
+        }
         val shortCmd = LogKit.redactCmd(cmd, 120)
         noteCmd(cmd)
         val st = state.get()

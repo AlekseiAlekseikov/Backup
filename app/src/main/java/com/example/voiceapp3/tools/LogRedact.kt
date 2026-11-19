@@ -67,7 +67,17 @@ internal object LogRedact {
     internal fun utf8Len(s: String): Int = s.toByteArray(Charsets.UTF_8).size
 
     /** Безопасная форма команды/строки вывода. Детерминированная (тестируемая). */
+    /**
+     * iter67 §F.3 — для команд, где встречаются `setprop`/`getprop`, длина НЕ усекается до 120:
+     * именно усечение мешало увидеть потерю разделителя (`… echo PS=$(getprop persist.dalvik…`).
+     * Значения по-прежнему маскируются: печатается вид команды, а не её payload.
+     */
     fun cmd(cmd: String, maxLen: Int = 120): String {
+        val limit = if (cmd.contains("setprop") || cmd.contains("getprop")) 600 else maxLen
+        return cmdWithLimit(cmd, limit)
+    }
+
+    private fun cmdWithLimit(cmd: String, maxLen: Int): String {
         var s = cmd.replace(Regex("\\s+"), " ").trim()
         s = SINGLE_QUOTED.replace(s) { "'<" + utf8Len(it.value) + "B>'" }
         s = DOUBLE_QUOTED.replace(s) { "\"<" + utf8Len(it.value) + "B>\"" }
