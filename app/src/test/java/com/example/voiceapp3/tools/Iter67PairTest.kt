@@ -218,4 +218,22 @@ class Iter67PairTest {
         assertEquals(JitRef.StoredState.AMBIGUOUS, assessed.state)
         assertTrue(assessed.detail.contains("op_conflict"))
     }
+
+    @Test
+    fun `очистка операции снимает и намерение, а не только снимок и отметку`() {
+        val a = Store(); val b = Store()
+        for (k in JitRef.OWNED_KEYS) { a.put(k, "1"); b.put(k, "1") }
+        // Поколение намерения — НЕ ключ операции: удаление не должно его откатывать.
+        a.put(JitRef.KEY_INTENT_SEQ, 7L); b.put(JitRef.KEY_INTENT_SEQ, 7L)
+        val r = OwnedRemover.removeOwnedEverywhereForTest(listOf(a, b), JitRef.OWNED_KEYS)
+        assertEquals(2, r.ok)
+        assertTrue(r.clean)
+        assertFalse("jit_pedido должен исчезнуть: ${a.map}", a.map.containsKey(JitRef.KEY_PEDIDO))
+        assertEquals("поколение намерения не трогаем", 7L, a.map[JitRef.KEY_INTENT_SEQ])
+        // fail-before: удалялись только `jit_restaurar` и `jit_restore_marker`, `jit_pedido`
+        // оставался и следующая сверка снова печатала `JIT_PEDIDO kept`.
+        val jar = java.io.File("app/src/main/java/com/example/voiceapp3/tools/JitNet.kt").readText()
+        assertTrue("очистка операции не удаляет весь набор ключей",
+            jar.contains("val keys = JitRef.OWNED_KEYS"))
+    }
 }
