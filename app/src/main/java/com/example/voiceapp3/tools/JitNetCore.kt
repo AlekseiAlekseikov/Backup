@@ -78,6 +78,8 @@ object JitRef {
      */
     internal const val KEY_MARK = "jit_restore_marker"
 
+
+
     /**
      * iter56 §4.3: монотонное поколение намерения JIT (порядок кликов, а не показание часов).
      * Собственный ключ; в референсе его нет и на его ключи он не влияет.
@@ -324,6 +326,13 @@ object JitRef {
         fun bumpIntentSeq(): Long? = null
 
         fun getString(key: String): String?
+
+        /**
+         * iter67 §I.1 — записать флаг-факт в КАЖДОЕ доступное хранилище одним `commit()` и
+         * подтвердить чтением. `true` — подтверждено хотя бы в одной копии.
+         */
+        fun putBool(key: String, value: Boolean): Boolean = false
+
         fun getBool(key: String): Boolean?
         fun contains(key: String): Boolean
 
@@ -2090,6 +2099,19 @@ object JitOp {
                 )
                 return Click(want, snap, write, read, -1, "", "prev_unknown", previousUndefined)
             }
+            // iter67 §I.1: «сеть выключили МЫ». Флаг ставится ДО отправки цепочки: скрипт
+            // начинается с `svc wifi disable`, и если он умрёт на `umount`/`setprop`, вернуть сеть
+            // будет нечем, кроме этого флага.
+            if (want && snap.wifi) {
+                val flagOk = runCatching { store.putBool(JitNetDecision.KEY_NET_CUT_BY_US, true) }
+                    .getOrDefault(false)
+                log(
+                    "JIT_WE_CUT_NET op=$opId value=1 confirmed=${if (flagOk) 1 else 0} " +
+                        "(скрипт выключает клиентский Wi-Fi: возврат сети больше не зависит от " +
+                        "возраста отметки и от наличия claim; флаг снимется только после " +
+                        "подтверждённого включения сети)"
+                )
+            }
             log(
                 "JIT_CLICK want=$want op=$opId restore=${snap.wire()} attempted=${write.attempted} " +
                     "committed=${write.committed} confirmed=${write.confirmed} " +
@@ -2908,14 +2930,36 @@ object JitOp {
         }
         var report: WifiRestoreReport? = null
         try {
-            val (allowEnable, enableWhy) = restoreMayEnableWifi(
-                runCatching { JitRef.assessStored(store.readOperation()).mark }.getOrNull(),
-                System.currentTimeMillis()
+            // iter67 §I.2/§I.3: решение о возврате — по двум независимым фактам. «Мы сняли сеть»
+            // отменяет и возраст отметки, и отсутствие claim; «нет claim» ≠ «чужой claim».
+            val curMark = runCatching { JitRef.assessStored(store.readOperation()).mark }.getOrNull()
+            val weDisarmed = runCatching { store.getBool(JitNetDecision.KEY_NET_CUT_BY_US) == true }
+                .getOrDefault(false)
+            val claimNote = runCatching { claimGuard?.invoke()?.second ?: "" }.getOrDefault("")
+            val claimKnown = !claimNote.contains("absent")
+            val nowEnabled = runCatching { netState.wifiOn() }.getOrNull()
+            val decision = JitNetDecision.restoreDecision(
+                snap = snap,
+                weDisarmed = weDisarmed,
+                markAgeMs = curMark?.let { System.currentTimeMillis() - it.tsMs },
+                claimKnown = claimKnown,
+                nowEnabled = nowEnabled
+            )
+            val allowEnable = decision.restoreNetwork
+            val enableWhy = decision.why
+            log(
+                "JIT_RESTORE_DECISION op=$opId restore=${if (allowEnable) 1 else 0} why=$enableWhy " +
+                    "we_disarmed=${if (weDisarmed) 1 else 0} claim_known=${if (claimKnown) 1 else 0} " +
+                    "claim=«${claimNote.take(40)}» now_enabled=${nowEnabled ?: "unread"} " +
+                    "chain_resolved=${if (decision.chainResolved) 1 else 0} " +
+                    "(сеть и исход цепочки — разные факты: решение о включении НЕ доказывает " +
+                    "выполнения setprop)"
             )
             if (!allowEnable) {
                 log(
                     "JIT_NET_RESTORE op=$opId wifi_enable=denied reason=$enableWhy " +
-                        "(возврат выполняется без включения Wi-Fi; см. WIFI_ENABLE_MAX_AGE_MS)"
+                        "ui=«${JitNetDecision.deniedText(enableWhy)}» " +
+                        "(возврат выполняется без включения Wi-Fi)"
                 )
             }
             report = runCatching {
@@ -2932,6 +2976,16 @@ object JitOp {
                 RESTORE_SLOT.compareAndSet(token, null)
                 if (scheduledTask === token) scheduledTask = null
                 val completion = report?.completion
+                // iter67 §I.1: флаг снимается ТОЛЬКО после подтверждённого включения
+                // (`WifiManager.isWifiEnabled == true`, то есть COMPLETE).
+                if (completion == JitRef.RestoreCompletion.COMPLETE) {
+                    val cleared = runCatching { store.putBool(JitNetDecision.KEY_NET_CUT_BY_US, false) }
+                        .getOrDefault(false)
+                    log(
+                        "JIT_WE_CUT_NET op=$opId value=0 confirmed=${if (cleared) 1 else 0} " +
+                            "(включение сети подтверждено чтением WifiManager.isWifiEnabled)"
+                    )
+                }
                 if (completion == JitRef.RestoreCompletion.COMPLETE ||
                     completion == JitRef.RestoreCompletion.COMPLETE_WAS_OFF
                 ) {

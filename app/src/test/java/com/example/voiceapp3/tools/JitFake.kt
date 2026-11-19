@@ -188,6 +188,13 @@ object JitFake {
         override fun getBool(key: String): Boolean? =
             readOrder.firstNotNullOfOrNull { i -> maps[i][key] as? Boolean }
 
+        /** iter67 §I.1: флаг пишется в оба хранилища (в фейке — во все карты). */
+        override fun putBool(key: String, value: Boolean): Boolean {
+            for (m in maps) m[key] = value
+            ops += "bool:$key=$value"
+            return true
+        }
+
         override fun contains(key: String): Boolean = maps.any { it.containsKey(key) }
 
         /** Хранилища, у которых чтение прежних значений «не удаётся» (проверка §2.5). */

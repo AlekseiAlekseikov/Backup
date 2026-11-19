@@ -371,6 +371,24 @@ object JitNet {
             return a ?: b
         }
 
+        /**
+         * iter67 §I.1 — флаг «сеть выключили МЫ» в оба хранилища, одним `commit()` на хранилище,
+         * с проверкой чтением. Ошибка одной копии не отменяет вторую: цель флага — вернуть сеть.
+         */
+        override fun putBool(key: String, value: Boolean): Boolean {
+            val all = stores()
+            if (all.isEmpty()) return false
+            var confirmed = false
+            for ((name, s) in all) {
+                val ok = runCatching { s.edit().putBoolean(key, value).commit() }.getOrDefault(false)
+                val back = runCatching { s.getBoolean(key, !value) == value }.getOrDefault(false)
+                if (ok && back) confirmed = true
+                if (!ok || !back) log("JIT_STORE put_bool key=$key store=$name commit=$ok readback=$back")
+            }
+            log("JIT_STORE put_bool key=$key value=$value confirmed=$confirmed stores=${all.size}")
+            return confirmed
+        }
+
         override fun getBool(key: String): Boolean? {
             val a = runCatching { cps()?.let { if (it.contains(key)) it.getBoolean(key, false) else null } }
                 .getOrNull()
