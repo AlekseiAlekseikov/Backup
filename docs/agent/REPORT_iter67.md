@@ -170,7 +170,7 @@ a0884bc iter67: K — согласованное чтение пары (PairDiag
 `https://github.com/AlekseiAlekseikov/Backup.git`, в окружении нет ни креденшелов, ни токена
 (`fatal: could not read Username for 'https://github.com': No such device or address`). Поэтому:
 
-- все коммиты лежат в `/home/user/w67` (ветка `fix/v2`, HEAD `4a00687`);
+- все коммиты лежат в `/home/user/w67` (ветка `fix/v2`, HEAD `2993caf` — после этого коммита менялся только отчёт);
 - готовый пакет для переноса: `/home/user/iter67_fix_v2_93734b7..4a00687.bundle` (90 КБ, от базы
   `93734b7`). Применение у себя:
   `git fetch /path/iter67_fix_v2_93734b7..4a00687.bundle fix/v2:fix/v2` (или `git bundle unbundle`).
