@@ -1793,7 +1793,13 @@ object JitOp {
         netState: JitRef.JitNetState,
         shell: JitRef.JitShell,
         want: Boolean,
-        log: (String) -> Unit = {}
+        log: (String) -> Unit = {},
+        /**
+         * iter67 §E.4 — планировщик отложенного перечитывания terminal (через 5 с после
+         * `JIT_CHAIN_SENT`). `null` — планировщика нет (JVM-тест): перечитывание выполняется сразу
+         * помеченным `attempt=immediate`, чтобы факт не терялся.
+         */
+        scheduler: JitRef.JitScheduler? = null
     ): Click {
         val token = Any()
         if (!CLICK_SLOT.compareAndSet(null, token)) {
@@ -2296,6 +2302,37 @@ object JitOp {
             // ИМЕННО нашей операции — это доказанный no-op, а не неизвестность.
             val phase = if (myTerm == null && JitOwn.refusedInOutput(opId, out)) JitOwn.State.REFUSED
                         else JitOwn.classify(outcome == JitRef.ChainOutcome.REPLY_RECEIVED, myTerm)
+            // iter67 §E.1: `JIT_OP_PHASE` печатается ВСЕГДА и ДО любых выводов о состоянии
+            // (на живой ГУ таких строк было ноль за всю историю: понять, где оборвалась цепочка,
+            // было нельзя). `term=absent` — отдельный факт, который ниже называется строкой
+            // `JIT_OP_PROBE`.
+            log(
+                "JIT_OP_PHASE op=$opId phase=${phase.name.lowercase()} " +
+                    "term=${myTerm?.wire() ?: "absent"} rc=$rc outcome=${JitRef.chainOutcomeLabel(outcome)} " +
+                    "out_tail=«${out.takeLast(120).trim()}»"
+            )
+            // iter67 §E.2: отсутствие terminal — ОТДЕЛЬНАЯ строка и НЕ доказательство «не выполнялось».
+            // `result=absent` ставится и когда файла нет, и когда он прочитан, но НЕ доказывает
+            // ничего (ни START, ни END, ни отказа): «нет улики» — это отдельный факт.
+            run {
+                val proves = myTerm != null &&
+                    (myTerm.started || myTerm.finished || myTerm.refused)
+                val result = if (proves) "ok" else "absent"
+                log(
+                    "JIT_OP_PROBE op=$opId result=$result file=${JitOwn.termPath(opId)} " +
+                        "attempt=after_payload rc=$rc read=${if (myTerm == null) "unreadable" else "parsed"} " +
+                        (if (proves) "" else
+                            "(payload не начинался ИЛИ файл недоступен — это НЕ доказательство «не выполнялось»)")
+                )
+            }
+            // iter67 §E.3: потеря канала во время payload — строка ДО восстановления и БЕЗ
+            // повторной отправки: payload мог выполниться наполовину.
+            if (outcome == JitRef.ChainOutcome.CHANNEL_LOST) {
+                log(
+                    "JIT_CHAIN_LOST op=$opId cause=$rc payload_maybe_running=1 commands_sent=1 " +
+                        "action=no_resend (второй payload не отправляем)"
+                )
+            }
             // §7: «ответ транспорта есть, terminal не прочитан» — это SENT, как и на HEAD
             // (исход не доказан, но и канал не потерян). Неопределённость — только UNKNOWN и
             // STARTED (payload начался и не оставил END).
@@ -2305,6 +2342,24 @@ object JitOp {
                     myTerm?.wire() ?: "unreadable"
                 }» — ${JitOwn.stateNote(phase)}"
             )
+            // iter67 §E.4: один отложенный перечитыватель terminal (короткая команда, НЕ payload).
+            // Нужен потому, что `END` пишется на устройстве после `ctl.restart zygote`: сразу после
+            // ответа транспорта файла может ещё не быть, и без перечитывания исход остаётся
+            // «неизвестным» навсегда.
+            val rereadOp = opId
+            val rereadInst = opInst
+            val rereadTask = { probeTerminalDelayed(shell, rereadOp, log, rereadInst) }
+            if (scheduler != null) {
+                runCatching { scheduler.postDelayed(PROBE_DELAY_MS, rereadTask) }
+                    .onFailure { t ->
+                        log(
+                            "JIT_OP_PROBE op=$opId result=not_scheduled reason=${t.javaClass.simpleName} " +
+                                "(перечитывание terminal не поставлено)"
+                        )
+                    }
+            } else {
+                rereadTask()
+            }
             CHAIN_UNDEFINED.set(undefined)
             val state = if (undefined) JitRef.OpMark.UNDEFINED else JitRef.OpMark.REPLIED
             val markUpd = runCatching { store.updateMark(mark.copy(state = state)) }
@@ -2392,6 +2447,46 @@ object JitOp {
             log("JIT_OP_PROBE op=$opId read=ok ${term.wire()} note=${term.note}")
         }
         return term
+    }
+
+    /** iter67 §E.4: задержка отложенного перечитывания terminal (как в референсе продолжения). */
+    private const val PROBE_DELAY_MS = 5_000L
+
+    /**
+     * iter67 §E.4 — ОДНО отложенное перечитывание terminal. Ничего не меняет: только факт.
+     *
+     * `result=ok` — файл прочитан и разобран (дальше его состояние называет `JIT_OP_PROBE`),
+     * `result=absent` — файла нет/не читается. Второй раз не переспрашиваем: это диагностика, а не
+     * механизм разрешения операции (разрешение — только по доказанному terminal или выходу правок C/H).
+     */
+    private fun probeTerminalDelayed(
+        shell: JitRef.JitShell,
+        opId: String,
+        log: (String) -> Unit,
+        expectInst: String?
+    ) {
+        val r = runCatching { shell.exec(JitOwn.readCmd(opId), 8_000) }.getOrElse { t ->
+            log(
+                "JIT_OP_PROBE op=$opId result=absent file=${JitOwn.termPath(opId)} " +
+                    "attempt=delayed reason=${t.javaClass.simpleName}"
+            )
+            return
+        }
+        val term = JitOwn.parseTerminal(opId, r.second, r.first, expectInst)
+        val proves = term != null && (term.started || term.finished || term.refused)
+        if (!proves) {
+            log(
+                "JIT_OP_PROBE op=$opId result=absent file=${JitOwn.termPath(opId)} " +
+                    "attempt=delayed rc=${r.first} out=«${r.second.trim().take(120)}» " +
+                    "(файла нет ИЛИ он не доказывает исполнения — исход по-прежнему не доказан)"
+            )
+        } else {
+            log(
+                "JIT_OP_PROBE op=$opId result=ok file=${JitOwn.termPath(opId)} attempt=delayed " +
+                    "started=${term!!.started} finished=${term.finished} refused=${term.refused} " +
+                    "«${term.wire()}»"
+            )
+        }
     }
 
     /**

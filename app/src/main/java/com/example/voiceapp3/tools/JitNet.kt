@@ -794,7 +794,9 @@ object JitNet {
         netState = AndroidNetState(app),
         shell = AndroidShell,
         want = want,
-        log = log
+        log = log,
+        // iter67 §E.4: отложенное перечитывание terminal — через тот же планировщик, что и возврат.
+        scheduler = AndroidScheduler
     )
 
     /**
