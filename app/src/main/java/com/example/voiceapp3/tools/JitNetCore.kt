@@ -431,14 +431,36 @@ object JitRef {
          * того же payload выглядел как завершение текущего исполнения. `null` — отметка прежних
          * версий; тогда факты берутся только при однозначной атрибуции (см. JitOwn.parseTerminal).
          */
-        val inst: String? = null
+        val inst: String? = null,
+        /**
+         * iter67 §C — номер ПОПЫТКИ для этой же операции.
+         *
+         * Дефект: `ts` в отметке при повторной отправке не обновлялся, поэтому возраст считался
+         * от первой попытки и операция «старела» вечно (`JIT_PEDIDO kept` 147 и 279 раз), а
+         * разблокировка молчала. Теперь `ts` = время ПОСЛЕДНЕЙ попытки, и номер попытки виден
+         * отдельным полем (в id он уже был строкой `-<attempt>-`, но полем не был).
+         * `0` — отметка прежних версий (поля не было): тогда номер попытки неизвестен.
+         */
+        val attempt: Int = 0,
+        /**
+         * iter67 §C.3 — идентификатор загрузки, при которой сделана отметка.
+         *
+         * `null` — отметка прежних версий (сравнивать не с чем: окно остаётся временным).
+         * Смена загрузки закрывает окно по определению: команда, отправленная в прошлой загрузке,
+         * в этой выполниться не может. Значение читает и сравнивает [JitUnblock] — сам разбор
+         * остаётся вне ядра (правило `noOwnMechanismsLeftInCore`).
+         */
+        val boot: String? = null
     ) {
         fun wire(): String =
             "op=$op;ts_ms=$tsMs;ts_s=${JitOwn.msToS(tsMs)};want=${if (want) 1 else 0};state=$state" +
                 (inst?.takeIf { it.isNotBlank() }?.let { ";inst=$it" } ?: "") +
                 // iter56 §4.3: поколение дописывается ТОЛЬКО когда оно есть — отметки прежних
                 // версий и тестовые записи остаются байт-в-байт теми же (совместимость чтения).
-                (if (seq > 0L) ";seq=$seq" else "")
+                (if (seq > 0L) ";seq=$seq" else "") +
+                // iter67 §C: попытка и загрузка — тоже только когда известны.
+                (if (attempt > 0) ";attempt=$attempt" else "") +
+                (boot?.takeIf { it.isNotBlank() }?.let { ";boot=$it" } ?: "")
 
         companion object {
             const val SENDING = "sending"
@@ -451,9 +473,12 @@ object JitRef {
                 "^op=([A-Za-z0-9_.-]{1,48});" +
                     "(?:ts_ms=\\d{1,19};ts_s=\\d{1,19}|ts_ms=\\d{1,19}|ts_s=\\d{1,19}|ts=\\d{1,19})" +
                     ";want=([01]);state=(sending|replied|undefined)" +
-                    // порядок полей фиксирован; оба хвоста необязательны (совместимость чтения)
+                    // порядок полей фиксирован; хвосты необязательны (совместимость чтения:
+                    // отметки прежних версий читаются без `attempt`/`boot`)
                     "(?:;inst=[A-Za-z0-9_.-]{1,80})?" +
-                    "(?:;seq=\\d{1,19})?$"
+                    "(?:;seq=\\d{1,19})?" +
+                    "(?:;attempt=\\d{1,6})?" +
+                    "(?:;boot=[A-Za-z0-9_.-]{1,64})?$"
             )
 
             /**
@@ -475,7 +500,11 @@ object JitRef {
                     want = m.groupValues[2] == "1",
                     state = m.groupValues[3],
                     seq = Regex("(?:^|;)seq=(\\d{1,19})(?=;|$)")
-                        .find(raw.trim())?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+                        .find(raw.trim())?.groupValues?.get(1)?.toLongOrNull() ?: 0L,
+                    attempt = Regex("(?:^|;)attempt=(\\d{1,6})(?=;|$)")
+                        .find(raw.trim())?.groupValues?.get(1)?.toIntOrNull() ?: 0,
+                    boot = Regex("(?:^|;)boot=([A-Za-z0-9_.-]{1,64})(?=;|$)")
+                        .find(raw.trim())?.groupValues?.get(1)
                 )
             }
 
@@ -1811,6 +1840,23 @@ object JitOp {
                 )
             }
 
+            // iter67 §C: решение о разблокировке — ВСЕГДА строкой `JIT_UNBLOCK` с явным `exit=`.
+            // До правки выход был, а строки не было (`JIT_OP_ABANDONED = 0` при 426 `JIT_PEDIDO kept`).
+            runCatching {
+                val dec = JitUnblock.decide(
+                    markTsMs = stored.mark?.tsMs,
+                    markBoot = stored.mark?.boot,
+                    currentBootId = JitUnblock.currentBootId(),
+                    nowMs = System.currentTimeMillis(),
+                    limitMs = STALE_MARK_MS,
+                    zygoteStartMs = zygoteStart,
+                    terminalFinished = prevResolved
+                )
+                if (dec.exit != "none" || stored.state == JitRef.StoredState.UNDEFINED) {
+                    log(dec.line(stored.mark?.op ?: "none", STALE_MARK_MS,
+                        JitUnblock.bootSame(stored.mark?.boot, JitUnblock.currentBootId())))
+                }
+            }
             val blockedReason = when {
                 // Неопределённость в RAM — то же состояние, что и в отметке; порядок важен.
                 (!staleOp && CHAIN_UNDEFINED.get() && !prevResolved) ||
@@ -2142,9 +2188,28 @@ object JitOp {
                     attempt = 1, stored = stored
                 )
             }
+            // iter67 §C.1: НОВАЯ ПОПЫТКА. `ts` отметки = время ЭТОЙ попытки (иначе возраст считался
+            // от первой и окно не наступало никогда), номер попытки +1, загрузка записана.
+            // Вызывается ровно один раз и ДО `JIT_CHAIN_SENT`; пишется в ОБА хранилища.
+            var sentMark = mark
+            runCatching {
+                val now = System.currentTimeMillis()
+                val (ts, att) = JitUnblock.nextAttempt(mark.tsMs, mark.attempt, now)
+                sentMark = mark.copy(tsMs = ts, attempt = att, state = JitRef.OpMark.SENDING,
+                    boot = JitUnblock.currentBootId())
+                val putRes = store.updateMark(sentMark)
+                log(
+                    "JIT_ATTEMPT op=$opId attempt=${sentMark.attempt} ts_ms=${sentMark.tsMs} " +
+                        "boot=${sentMark.boot ?: "unknown"} stores=${putRes.ok}/${putRes.attempted} " +
+                        "detail=«${putRes.detail}» " +
+                        "(отметка обновлена ДО отправки: возраст следующего решения считается от " +
+                        "этой попытки, а не от первой)"
+                )
+            }
             log("dalvik.vm.usejit -> $want; reiniciando o framework")
             log(
                 "JIT_CHAIN_SENT op=$opId ${JitRef.mountStepNote()} timeout_ms=${JitRef.CHAIN_TIMEOUT_MS} " +
+                    "attempt=${sentMark.attempt} ts_ms=${sentMark.tsMs} " +
                     "restart=not_claimed command=w0/la.run (литерал референса)"
             )
             val (rc, out) = shell.exec(JitRef.chainScript(want, JitOwn.guard(opState)),
