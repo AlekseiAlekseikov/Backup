@@ -121,36 +121,53 @@ object ScreenBrightness {
     } catch (_: Throwable) { null }
 
     fun writeSystemInt(ctx: Context, key: String, value: Int): WriteResult = try {
-        val ok = Settings.System.putInt(ctx.contentResolver, key, value)
-        // P8 VERIFY: readback через settings get после записи
+        val accepted = Settings.System.putInt(ctx.contentResolver, key, value)
+        // iter67 §A: readback читается ContentResolver'ом, НЕ через `settings get` (под root на этой
+        // машине он падает с «Failed transaction»). Доказательства два: приняла ли запись API и
+        // совпал ли фактически прочитанный результат.
         val got = readSystem(ctx, key)
-        val verified = got == value
-        if (verified) {
-            AppLog.i(TAG, "VERIFY settings write: key=$key expected=$value got=$got → SUCCESS")
-        } else {
-            AppLog.w(TAG, "VERIFY settings write: key=$key expected=$value got=$got (setProp ok=$ok) → FAILED")
-        }
-        WriteResult(ok && verified, got, if (!verified) "readback=$got expected=$value" else null)
-    } catch (t: Throwable) { WriteResult(false, null, t.message) }
+        val readbackOk = got == value
+        val r = WriteResult(accepted, readbackOk, got,
+            if (!readbackOk) "readback=$got expected=$value" else if (!accepted) "api=false" else null)
+        val line = "VERIFY settings write: key=$key expected=$value got=$got write=$accepted " +
+            "readback_ok=$readbackOk"
+        if (r.ok) AppLog.i(TAG, "$line → ${r.logLabel()}")
+        else AppLog.w(TAG, "$line → ${r.logLabel()}")
+        r
+    } catch (t: Throwable) { WriteResult(false, false, null, t.message) }
 
     fun readSysfs(): Int? = try { File(SYSFS_PATH).readText().trim().toIntOrNull() } catch (_: Throwable) { null }
     fun writeSysfs(level: Int): WriteResult {
         val clamped = level.coerceIn(0,255)
         return try {
             File(SYSFS_PATH).writeText(clamped.toString())
-            WriteResult(true, readSysfs(), null)
+            val got = readSysfs()
+            WriteResult(true, got == clamped, got, if (got != clamped) "readback=$got expected=$clamped" else null)
         } catch (t: Throwable) {
             try {
                 val p = Runtime.getRuntime().exec(arrayOf("sh","-c","echo $clamped > $SYSFS_PATH"))
                 p.waitFor()
-                WriteResult(p.exitValue()==0, readSysfs(), null)
-            } catch (ex: Throwable) { WriteResult(false, null, ex.message) }
+                val got = readSysfs()
+                WriteResult(p.exitValue()==0, got == clamped, got,
+                    if (got != clamped) "readback=$got expected=$clamped" else null)
+            } catch (ex: Throwable) { WriteResult(false, false, null, ex.message) }
         }
     }
+    /** `setprop` не имеет чтения: второй факт — фактический `getprop` того же свойства. */
     fun writeProp(level: Int): WriteResult = try {
         val p = Runtime.getRuntime().exec(arrayOf("sh","-c","setprop $PERSIST_PROP $level"))
-        p.waitFor(); WriteResult(p.exitValue()==0, level, null)
-    } catch (t: Throwable) { WriteResult(false, null, t.message) }
+        p.waitFor()
+        val got = ExecExpect.evaluate(0, readProp(), level.toString())
+        WriteResult(p.exitValue()==0, got, readProp()?.toIntOrNull(),
+            if (!got) "readback=«${readProp()}» expected=$level" else null)
+    } catch (t: Throwable) { WriteResult(false, false, null, t.message) }
+
+    /** Фактическое значение своего свойства (`null` — прочитать не удалось). */
+    fun readProp(): String? = try {
+        val p = Runtime.getRuntime().exec(arrayOf("sh","-c","getprop $PERSIST_PROP"))
+        p.waitFor()
+        p.inputStream.bufferedReader().readText().trim().ifEmpty { null }
+    } catch (_: Throwable) { null }
 
     fun captureLevel(ctx: Context) {
         if (!Prefs2.getBoolean(ctx, PREF_REMEMBER, false)) return
@@ -199,8 +216,6 @@ object ScreenBrightness {
     } catch (t: Throwable) {
         RestOutcome(false, null, null, t.message, null)
     }
-
-    data class WriteResult(val ok: Boolean, val readback: Int?, val error: String?)
 
     /**
      * Результат детекции серийника: значение + какой источник его дал.

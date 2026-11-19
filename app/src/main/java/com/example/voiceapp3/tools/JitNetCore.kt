@@ -860,10 +860,17 @@ object JitRef {
 
     enum class Prop { TRUE, FALSE, UNKNOWN }
 
-    data class PropFact(val value: Prop, val raw: String, val rc: Int, val reason: String) {
+    data class PropFact(
+        val value: Prop,
+        val raw: String,
+        val rc: Int,
+        val reason: String,
+        /** iter67 §A: вывод совпал с ожидаемым (`rc==0 && got==expect`). Без ожидания — `false`. */
+        val expectOk: Boolean = false
+    ) {
         val log: String
             get() = "getprop=${if (raw.isEmpty()) "empty" else raw} rc=$rc " +
-                "fact=${value.name.lowercase()} reason=$reason"
+                "fact=${value.name.lowercase()} reason=$reason expect_ok=$expectOk"
     }
 
     /**
@@ -2982,8 +2989,34 @@ object JitOp {
         }
     }
 
+    /**
+     * iter67 §A.3 — `getprop` читается только «с ожиданием».
+     *
+     * Дефект (измерено): `rc=0` у `getprop dalvik.vm.usejit` печатался как `→ SUCCESS`, хотя
+     * значение было `false`, и UI показывал «включён». Теперь вывод сравнивается с ожидаемым
+     * ([ExecExpect]: `rc==0 && out.trim()==expect`), и в журнал идёт строка `EXEC_EXPECT` со
+     * значениями `expect=`/`got=`; `PropFact` получает флаг [JitRef.PropFact.expectOk].
+     */
     fun readProp(shell: JitRef.JitShell): JitRef.PropFact {
         val (rc, out) = shell.exec("getprop ${JitRef.PROP_USEJIT}", JitRef.GETPROP_TIMEOUT_MS)
-        return JitRef.parseProp(rc, out)
+        val expected = readPropExpectation()
+        val fact = JitRef.parseProp(rc, out)
+        val expectOk = expected != null && ExecExpect.evaluate(rc, out, expected)
+        // Журнал ядра — строкой через AppLog (сам модуль Android-независим и лог не держит).
+        runCatching {
+            AppLog.i("JitRef",
+                ExecExpect.logLine(rc, out, expected ?: "<unread>", "getprop ${JitRef.PROP_USEJIT}") +
+                    " expect_source=${if (expected == null) "none" else "caller"}")
+        }
+        return fact.copy(expectOk = expectOk)
     }
+
+    /**
+     * Ожидаемое значение для следующего чтения `getprop` — то, что мы записали и обязались
+     * прочитать обратно (`null` — ожидания нет, тогда сравнение невозможно и `expectOk=false`).
+     */
+    @Volatile
+    var propExpectation: String? = null
+
+    fun readPropExpectation(): String? = propExpectation
 }

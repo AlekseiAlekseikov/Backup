@@ -465,6 +465,32 @@ object AdbClient {
     }
 
     /**
+     * iter67 §A — «команда отработала» ≠ «получилось то, что хотели».
+     *
+     * Дефект (измерено на ГУ): `getprop dalvik.vm.usejit` при `rc=0` и значении `false` печатался
+     * как `→ SUCCESS`, а `svc wifi disable` без `setprop` считался успешной цепочкой. Проверка
+     * `rc` отвечает только на первый вопрос. Этот метод требует второго доказательства — что
+     * вывод совпал с ожидаемым ([ExecExpect]: `rc==0 && out.trim()==expect`), и всегда пишет в
+     * журнал строку с `expect=`/`got=`.
+     */
+    @JvmStatic
+    fun execExpect(
+        command: String,
+        expect: String,
+        timeoutMs: Int = 8000,
+        expectRoot: Boolean = true
+    ): ExecResult {
+        val (rc, out) = execute(command, timeoutMs, expectRoot)
+        val ok = ExecExpect.evaluate(rc, out, expect)
+        val line = ExecExpect.logLine(rc, out, expect, command)
+        if (ok) AppLog.i(TAG, line) else AppLog.w(TAG, line)
+        return ExecResult(rc, out, expect, ok)
+    }
+
+    /** Результат [execExpect]: оба факта плюс вывод как есть. */
+    data class ExecResult(val rc: Int, val out: String, val expect: String, val expectOk: Boolean)
+
+    /**
      * iter39 §3.1 — пассивный read-only путь для диагностики: без восстановления канала.
      *
      * Отличия от [execute] (и это единственные отличия):
