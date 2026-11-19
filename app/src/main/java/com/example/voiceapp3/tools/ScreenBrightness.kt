@@ -157,9 +157,12 @@ object ScreenBrightness {
     fun writeProp(level: Int): WriteResult = try {
         val p = Runtime.getRuntime().exec(arrayOf("sh","-c","setprop $PERSIST_PROP $level"))
         p.waitFor()
-        val got = ExecExpect.evaluate(0, readProp(), level.toString())
-        WriteResult(p.exitValue()==0, got, readProp()?.toIntOrNull(),
-            if (!got) "readback=«${readProp()}» expected=$level" else null)
+        // Один `getprop` на проверку: читаем ФАКТ, а не дважды (второй запуск мог бы дать другое
+        // значение и «доказательство» разошлось бы с тем, что попало в журнал).
+        val raw: String = readProp() ?: ""
+        val got = ExecExpect.evaluate(0, raw, level.toString())
+        WriteResult(p.exitValue()==0, got, raw.toIntOrNull(),
+            if (!got) "readback=«$raw» expected=$level" else null)
     } catch (t: Throwable) { WriteResult(false, false, null, t.message) }
 
     /** Фактическое значение своего свойства (`null` — прочитать не удалось). */
