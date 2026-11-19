@@ -175,19 +175,46 @@ object ScreenBrightness {
         if (lvl > 0) { Prefs2.putInt(ctx, bucketPref(ctx), lvl); AppLog.d(TAG, "captureLevel saved $lvl to ${bucketPref(ctx)}") }
     }
 
+    /**
+     * iter67 §B — восстановление уровня яркости без пустых записей.
+     *
+     * Было: при любом расхождении — три записи (`settings put`, `sysfs`, `setprop`), а расхождение
+     * на этой машине возникало каждые 2–3 секунды (1593 записи за 8 ч 20 мин). `setprop` давал по
+     * одному `exec` на каждый тик, даже когда значение уже совпадало.
+     *
+     * Стало: состояние называется ([syncState]), пишется ТОЛЬКО расходящееся, при `IN_SYNC` и
+     * `SYSFS_UNREADABLE` — ноль записей и ноль строк. `settings` читается исключительно через
+     * `Settings.System.getInt`: `settings get` под root на этой машине падает с
+     * `Failed transaction (2147483646)` и доказательством быть не может.
+     */
+    private val restorer = BrightRestorer()
+
+    private fun brightWriters(ctx: Context): BrightWriters = object : BrightWriters {
+        override fun writeSettings(value: Int) { writeSystemInt(ctx, SETTINGS_KEY, value) }
+        override fun writeSysfs(value: Int) { writeSysfsOnly(value) }
+        override fun log(line: String) { AppLog.d(TAG, line) }
+    }
+
+    /** Запись только в узел (без `setprop`: он не доказательство и стоил один exec на тик). */
+    fun writeSysfsOnly(level: Int): WriteResult = writeSysfs(level)
+
     fun restoreIfEnabled(ctx: Context) {
         if (!Prefs2.getBoolean(ctx, PREF_REMEMBER, false)) return
-        val lvl = Prefs2.cps(ctx).getInt(bucketPref(ctx), -1)
-        if (lvl !in MIN_LEVEL..MAX_LEVEL) return
-        // iter33b: сначала ЧИТАЕМ. Раньше каждый тик watchdog'а писал три значения
-        // (settings put + sysfs + setprop) и печатал два VERIFY — даже когда всё уже равно.
-        // Теперь при совпадении — ни одной записи, ни одной строки (бюджет C1/H: ≈1 exec/min).
-        val settingsOk = readSystem(ctx, SETTINGS_KEY) == lvl
-        val sysfsOk = readSysfs() == lvl
-        if (settingsOk && sysfsOk) return
-        writeSystemInt(ctx, SETTINGS_KEY, lvl); writeSysfs(lvl); writeProp(lvl)
-        AppLog.d(TAG, "restoreIfEnabled: $lvl for ${bucketPref(ctx)} (было расхождение: settings=$settingsOk sysfs=$sysfsOk)")
+        val want = Prefs2.cps(ctx).getInt(bucketPref(ctx), -1)
+        if (want !in MIN_LEVEL..MAX_LEVEL) return
+        val settings = readSystem(ctx, SETTINGS_KEY)
+        val sysfs = readSysfs()
+        val out = restorer.runOnce(want, settings, sysfs, brightWriters(ctx), SYSFS_PATH, sysfsErrno())
+        if (out.state == SyncState.SYSFS_UNREADABLE) {
+            // Одна строка на серию — уже напечатана внутри; здесь ничего не пишем.
+            return
+        }
     }
+
+    /** Причина, по которой узел не читается: `errno` из исключения (для строки §B.4). */
+    private fun sysfsErrno(): String? = try {
+        File(SYSFS_PATH).readText(); null
+    } catch (t: Throwable) { t.javaClass.simpleName + ":" + (t.message ?: "") }
 
     fun syncOnContext(ctx: Context) {
         val app = ctx.applicationContext
