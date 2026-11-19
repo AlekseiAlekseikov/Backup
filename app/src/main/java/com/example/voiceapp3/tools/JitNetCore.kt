@@ -58,6 +58,12 @@ object JitRef {
     internal const val PROP_USEJIT = "dalvik.vm.usejit"
 
     /**
+     * iter67 §J.2 — `applicationId` для `pm path` в скрипте. Значение ОБЯЗАНО совпадать с
+     * `app/build.gradle.kts` (проверяется тестом); сам `applicationId` не меняется.
+     */
+    internal const val APP_ID = "com.example.voiceapp3"
+
+    /**
      * Отметка КОНКРЕТНОЙ операции — наш собственный ключ, в референсе его нет.
      *
      * Зачем он нужен (iter38 §1.2/§1.4/§4): `jit_restaurar` — просто строка `wifi=0|1`, одинаковая
@@ -872,20 +878,56 @@ object JitRef {
 
     // ─────────────────────────── скрипт: `w0/la.run` ───────────────────────────
 
-    private fun scriptBody(want: Boolean, guard: String = ""): String {
+    /**
+     * Литерал `w0/la.run` (референс) + безопасность `umount` и диагностика iter67 §J.
+     *
+     * Дефект (живая ГУ): `umount -l` снимал и точку, из которой исполняется СОБСТВЕННЫЙ APK
+     * (`/data/app/…`), процесс терял файлы и умирал ДО `setprop`: `zygote_pid` не менялся,
+     * `dalvik.vm.usejit=false`, файлов `claim/lock/term` нет, `JIT_OP_PHASE`/`JIT_OP_PROBE` = 0.
+     *
+     * Что добавлено (порядок шагов референса сохранён: `svc wifi disable` → слив `ip rule` →
+     * `umount` → `setprop` → `ctl.restart zygote`):
+     *  1. `trap EXIT` ставится ДО первого side effect и пишет в `/data/local/tmp` (не в `/data/app`);
+     *  2. свой каталог определяется через `pm path` + `dirname` и ИСКЛЮЧАЕТСЯ из `umount`;
+     *  3. при неизвестном `pm path` размонтирование не выполняется (`UMOUNT_SKIPPED self_unknown`);
+     *  4. строки `UMOUNT_*` пишутся ДО `setprop`.
+     */
+    private fun scriptBody(want: Boolean, guard: String = "", termPath: String? = null): String {
         val D = "$"
+        // iter67 §J.1: `trap EXIT` — ДО первого side effect, в /data/local/tmp (свой каталог
+        // операции), а не в /data/app, который сам же и размонтируется.
+        val trap = if (termPath == null) "" else
+            "    _term=\"$termPath\"\n" +
+                "    trap 'rc=${D}?; echo \"TRAP rc=${D}rc pid=${D}${D} pstart=${D}(cut -d\" \" -f22 /proc/${D}${D}/stat 2>/dev/null)\" >> \"${D}_term\" 2>/dev/null' EXIT\n"
         val drain = "        svc wifi disable\n" +
             "        _n=0\n" +
             "        while [ ${D}_n -lt $DRAIN_LOOP_MAX ]; do\n" +
             "          [ \"${D}(ip rule show | grep -c 'oif wlan0')\" = \"0\" ] && break\n" +
             "          sleep 1; _n=${D}((_n + 1))\n" +
             "        done\n"
-        val mount = "        for _m in ${D}(grep ' /data/app/' /proc/mounts | awk '{print ${D}2}'); do\n" +
-            "          umount -l \"${D}_m\" 2>/dev/null\n" +
-            "        done\n"
+        // iter67 §J.2/§J.3: исключить точку установки СВОЕГО APK; отчёт — в terminal-файл.
+        val mount = if (termPath == null) {
+            "        for _m in ${D}(grep ' /data/app/' /proc/mounts | awk '{print ${D}2}'); do\n" +
+                "          umount -l \"${D}_m\" 2>/dev/null\n" +
+                "        done\n"
+        } else {
+            "        _self_apk=${D}(pm path " + APP_ID + " 2>/dev/null | sed -n 's/^package://p' | head -1)\n" +
+                "        _self_dir=${D}(dirname \"${D}_self_apk\" 2>/dev/null)\n" +
+                "        if [ -z \"${D}_self_dir\" ] || [ \"${D}_self_dir\" = \".\" ]; then\n" +
+                "          echo \"UMOUNT_SKIPPED reason=self_unknown\" >> \"${D}_term\" 2>/dev/null\n" +
+                "        else\n" +
+                "          for _m in ${D}(grep ' /data/app/' /proc/mounts | awk '{print ${D}2}'); do\n" +
+                "            case \"${D}_m/\" in\n" +
+                "              \"${D}_self_dir\"/*) echo \"UMOUNT_SKIP self=${D}_m\" >> \"${D}_term\" 2>/dev/null ;;\n" +
+                "              *) umount -l \"${D}_m\" 2>/dev/null && echo \"UMOUNT_DONE path=${D}_m\" >> \"${D}_term\" 2>/dev/null" +
+                " || echo \"UMOUNT_FAIL path=${D}_m\" >> \"${D}_term\" 2>/dev/null ;;\n" +
+                "            esac\n" +
+                "          done\n" +
+                "        fi\n"
+        }
         val props = "        setprop $PROP_USEJIT ${if (want) "true" else "false"}\n" +
             "        setprop ctl.restart zygote\n    "
-        return guard + "\n" + drain + mount + props
+        return guard + "\n" + trap + drain + mount + props
     }
 
     /** Литерал `w0/la.run` целиком, включая шаг монтирований — эталон для сверки. */
@@ -898,13 +940,18 @@ object JitRef {
      * `JIT_REFUSED` и выходит, ничего не меняя. Она же пишет `START`/`END` в terminal-файл
      * операции — это единственный факт исхода, привязанный к id самой операции.
      */
-    fun chainScript(want: Boolean, guard: String = ""): String = scriptBody(want, guard)
+    fun chainScript(want: Boolean, guard: String = "", termPath: String? = null): String =
+        scriptBody(want, guard, termPath)
 
     /** iter51 §7: тестовый фасад на литерал референса (без гвардии). */
     internal fun referenceScriptForTest(want: Boolean): String = referenceScript(want)
 
     /** iter51 §7: тестовый фасад на отправляемый скрипт (с гвардией). */
-    internal fun chainScriptForTest(want: Boolean, guard: String): String = chainScript(want, guard)
+    internal fun chainScriptForTest(want: Boolean, guard: String): String =
+        chainScript(want, guard, JitOwn.termPath("test"))
+
+    /** iter51 §7: литерал референса БЕЗ добавок iter67 §J (для сверки с `w0/la.run`). */
+    internal fun referenceScriptNoTrapForTest(want: Boolean): String = scriptBody(want, "", null)
 
     /** Значение свойства JIT (для проверки, что литерал референса не подменён). */
     internal const val PROP_USEJIT_VALUE_TEST = PROP_USEJIT
@@ -2291,7 +2338,8 @@ object JitOp {
                     "attempt=${sentMark.attempt} ts_ms=${sentMark.tsMs} " +
                     "restart=not_claimed command=w0/la.run (литерал референса)"
             )
-            val (rc, out) = shell.exec(JitRef.chainScript(want, JitOwn.guard(opState)),
+            val (rc, out) = shell.exec(
+                JitRef.chainScript(want, JitOwn.guard(opState), JitOwn.termPath(opId)),
                 JitRef.CHAIN_TIMEOUT_MS)
             val outcome = JitRef.chainOutcome(rc, out)
             // §7 iter51: ФАЗА по фактам устройства. Ответ транспорта — не доказательство исхода;

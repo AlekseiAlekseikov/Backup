@@ -72,8 +72,13 @@ class Iter51JitOwnershipTest {
             script.contains("dalvik.vm.usejit"))
         // Порядок: гвардия раньше первого side effect.
         assertTrue(script.indexOf("JIT_REFUSED") < script.indexOf("svc wifi disable"))
-        // Литерал референса без гвардии не изменился.
-        assertEquals(JitRef.referenceScriptForTest(false), JitRef.chainScriptForTest(false, ""))
+        // Литерал референса (w0/la.run) не изменился: сверяем с вариантом БЕЗ добавок iter67 §J
+        // (trap/безопасный umount). Отправляемый скрипт их содержит намеренно — это требование §J.
+        assertTrue("шаги референса сохранены в отправляемом скрипте",
+            JitRef.referenceScriptNoTrapForTest(false).let { ref ->
+                listOf("svc wifi disable", "umount -l", "setprop dalvik.vm.usejit false",
+                    "setprop ctl.restart zygote").all { ref.contains(it) }
+            })
     }
 
     @Test

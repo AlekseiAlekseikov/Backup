@@ -247,7 +247,9 @@ class Iter54JitConcurrencyTest {
         assertTrue("страховка перед отправкой цепочки", src.contains("JIT_CLAIM_GATE"))
         // Порядок: гейт вычисляется ДО отправки скрипта.
         val gateAt = src.indexOf("JitOwn.claimGate(claimWrite)")
-        val sendAt = src.indexOf("JitRef.chainScript(want, JitOwn.guard(opState))")
+        // iter67 §J: вызов скрипта стал многострочным (передаётся путь terminal-файла), поэтому
+        // ищем имя функции, а не точную строку.
+        val sendAt = src.indexOf("JitRef.chainScript(want, JitOwn.guard(opState)")
         assertTrue("гейт стоит до отправки payload", gateAt in 0 until sendAt)
         assertNotNull("порядок найден", sendAt)
     }
