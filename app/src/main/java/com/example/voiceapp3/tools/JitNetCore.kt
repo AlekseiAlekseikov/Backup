@@ -1902,6 +1902,25 @@ object JitOp {
             // клик владельца: команда уже не может быть в очереди, а старый снимок не применяется
             // (см. `staleOp` ниже). Автоматики нет — только пользовательский клик.
             val age = markAgeMs(stored.mark)
+            // iter67 §H.2: невалидное время отметки — ЭТО ДОКАЗАННЫЙ РАЗРЫВ ЦЕПОЧКИ, отдельная
+            // строка и разрешённый клик. Живой случай: `ts=-196980728` давал `isStale == false`,
+            // окно не истекало никогда, блокировка держалась 6 суток.
+            run {
+                val ts = stored.mark?.tsMs
+                if (ts != null) {
+                    val verdict = JitUnblock.classifyMark(ts, System.currentTimeMillis())
+                    if (verdict != MarkVerdict.OK) {
+                        log(
+                            "JIT_MARK_INVALID op=${stored.mark?.op} ts_ms=$ts class=${verdict.name.lowercase()} " +
+                                "exit=mark_invalid_${verdict.name.lowercase()} " +
+                                "clicks=allowed snapshot_applied=no " +
+                                "(время отметки не может быть настоящим: возраст не вычисляется, " +
+                                "держать владельца дальше нельзя; снимок Wi-Fi этим НЕ применяется " +
+                                "и НЕ удаляется — возврат сети решает отдельное правило)"
+                        )
+                    }
+                }
+            }
             // §7.3 iter47: сначала ПРОВЕРЯЕМЫЙ признак (перезапуск zygote после отметки),
             // и только потом — временное окно как резервная граница.
             val zygoteStart = runCatching { netState.zygoteStartMs() }.getOrNull()

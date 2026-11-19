@@ -227,11 +227,27 @@ object Toggles45 {
      * Возвращает `true` только при ДОКАЗАННО известной и достаточно старой отметке: неизвестное
      * время окно не открывает.
      */
-    fun isStale(markTs: Long?, now: Long, limitMs: Long): Boolean {
-        if (markTs == null || markTs <= 0L) return false
-        if (limitMs <= 0L) return false
-        val age = now - markTs
-        return age >= limitMs
+    fun isStale(markTs: Long?, now: Long, limitMs: Long): Boolean = staleness(markTs, now, limitMs).first
+
+    /**
+     * iter67 §H.3 — `isStale` ВМЕСТЕ С КЛАССОМ отметки.
+     *
+     * Дефект (живая ГУ): `ts=-196980728` давал `isStale == false`, окно не истекало никогда, и
+     * блокировка держалась 6 суток. Причина — `isStale` отвечал только «истекло/нет» и не называл,
+     * что со временем отметки что-то не так.
+     *
+     * Теперь вызывающий ОБЯЗАН видеть класс ([MarkVerdict]) и логировать его: `mark_invalid_*` —
+     * это доказанный разрыв цепочки, а не «ещё не истекло». Правило истёкшести не меняется
+     * (ради совместимости с прежними вызовами): `true` — только при доказанно известной и
+     * достаточно старой отметке.
+     */
+    fun staleness(markTs: Long?, now: Long, limitMs: Long): Pair<Boolean, MarkVerdict> {
+        val ts = markTs ?: return false to MarkVerdict.UNREADABLE
+        val verdict = JitUnblock.classifyMark(ts, now)
+        if (verdict != MarkVerdict.OK) return false to verdict
+        if (limitMs <= 0L) return false to verdict
+        val age = now - ts
+        return (age >= limitMs) to verdict
     }
 
     /**

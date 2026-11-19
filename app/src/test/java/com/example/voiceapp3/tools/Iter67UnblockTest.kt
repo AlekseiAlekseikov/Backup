@@ -138,4 +138,50 @@ class Iter67UnblockTest {
         assertTrue("отметка не пишется в хранилища", src.contains("store.updateMark(sentMark)"))
         assertTrue("строка решения о разблокировке не пишется", src.contains("dec.line("))
     }
+
+    // ───────────────────────── §H: невалидное время отметки ─────────────────────────
+
+    @Test
+    fun `staleness возвращает класс отметки, а не только флаг`() {
+        val now = 1_795_099_468_000L
+        val limit = 15 * 60_000L
+        // Живой случай: отрицательная отметка. fail-before: `isStale` молчал (false) без класса.
+        val (staleNeg, clsNeg) = Toggles45.staleness(-196_980_728L, now, limit)
+        assertFalse("окно не должно считаться истёкшим по мусорному времени", staleNeg)
+        assertEquals(MarkVerdict.NEGATIVE, clsNeg)
+
+        val (staleSec, clsSec) = Toggles45.staleness(1_795_099_468L, now, limit)
+        assertFalse(staleSec)
+        assertEquals(MarkVerdict.UNIT_MISMATCH, clsSec)
+
+        val (staleOk, clsOk) = Toggles45.staleness(now - 20 * 60_000L, now, limit)
+        assertTrue("старая валидная отметка истекает как раньше", staleOk)
+        assertEquals(MarkVerdict.OK, clsOk)
+
+        val (_, clsNull) = Toggles45.staleness(null, now, limit)
+        assertEquals(MarkVerdict.UNREADABLE, clsNull)
+    }
+
+    @Test
+    fun `невалидная отметка печатается строкой JIT_MARK_INVALID с clicks=allowed`() {
+        val src = java.io.File("app/src/main/java/com/example/voiceapp3/tools/JitNetCore.kt").readText()
+        // fail-before: строки не было вовсе — владелец видел только «заблокировано».
+        assertTrue("нет строки JIT_MARK_INVALID", src.contains("JIT_MARK_INVALID op="))
+        assertTrue("нет разрешения клика", src.contains("clicks=allowed snapshot_applied=no"))
+        assertTrue("класс должен вычисляться из времени отметки",
+            src.contains("JitUnblock.classifyMark(ts, System.currentTimeMillis())"))
+    }
+
+    @Test
+    fun `время в миллисекундах не вычисляется арифметикой в sh`() {
+        // §H.4: `ts_ms` в отметке — конкатенация, а не `$(( ))` в shell; иначе появляются
+        // значения вроде `ts=-196980728` (переполнение 32-бит).
+        val wire = JitRef.OpMark("x", 1_795_099_468_000L, true, JitRef.OpMark.SENDING).wire()
+        assertTrue("нет ts_ms в записи: $wire", wire.contains("ts_ms=1795099468000"))
+        assertFalse("в записи появилась арифметика shell", wire.contains("$(("))
+        val own = java.io.File("app/src/main/java/com/example/voiceapp3/tools/JitOwn.kt").readText()
+        // Единственная допустимая арифметика — разница секунд для ДИАГНОСТИКИ возраста lock.
+        val arithmetic = Regex("\\$\\(\\( ").findAll(own).count()
+        assertTrue("арифметики в shell стало больше одной: $arithmetic", arithmetic <= 2)
+    }
 }
