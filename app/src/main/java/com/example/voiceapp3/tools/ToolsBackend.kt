@@ -213,6 +213,20 @@ enum class Choice(
         addProperty("lockSoundName", LockSound.getDisplayName(appContext))
         addProperty("lockSoundVol", LockSound.getVolume(appContext))
         addProperty("lockSoundDelay", LockSound.getDelayMs(appContext).toString())
+        /* iter67 §I.4: если сеть снял наш клик, а автоматический возврат не выполнен — владелец
+           видит это отдельным свойством (без красного), а не только строкой журнала. */
+        run {
+            val weCut = runCatching {
+                Prefs2.cps(appContext).getBoolean(JitNetDecision.KEY_NET_CUT_BY_US, false)
+            }.getOrDefault(false)
+            val enabled = runCatching {
+                (appContext.getSystemService(android.content.Context.WIFI_SERVICE)
+                    as? android.net.wifi.WifiManager)?.isWifiEnabled
+            }.getOrNull()
+            val notice = JitNetDecision.ownerNotice(weCut, enabled, snapWifi = true)
+            addProperty("wifiRestoreState", notice?.first ?: "none")
+            addProperty("wifiRestoreNotice", notice?.second ?: "")
+        }
         addProperty("unlockSound", LockSound.isUnlockSoundEnabled(appContext))
         addProperty("unlockSoundPath", LockSound.getUnlockSelectedPath(appContext))
         addProperty("unlockSoundName", LockSound.getUnlockDisplayName(appContext))

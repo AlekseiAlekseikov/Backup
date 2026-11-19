@@ -70,6 +70,21 @@ object JitNetDecision {
         else -> "not_sent"
     }
 
+    /**
+     * §I.4 — что показать владельцу, если сеть снял наш клик, а автоматический возврат не выполнен.
+     * `null` — показывать нечего (сеть не наша забота или уже включена).
+     *
+     * Возвращается МАШИННАЯ пара `state`/`text`: панель не парсит русский текст, а состояние
+     * различается программно. Красного цвета в UI нет — это требование мандата.
+     */
+    fun ownerNotice(weDisarmed: Boolean, nowEnabled: Boolean?, snapWifi: Boolean?): Pair<String, String>? {
+        if (!weDisarmed) return null
+        if (nowEnabled == true) return null
+        val state = if (nowEnabled == null) "unread" else "denied"
+        return state to "Wi-Fi был выключен кликом; автоматический возврат сети не выполнен " +
+            "(состояние сети: " + if (nowEnabled == null) "прочитать нельзя" else "выключена" + ")"
+    }
+
     /** Текст для владельца по причине отказа от автоматического включения (без красного). */
     fun deniedText(why: String): String =
         "Wi-Fi был выключен кликом; автоматический возврат сети не выполнен: причина $why"

@@ -107,4 +107,24 @@ class Iter67NetRestoreTest {
         assertTrue("решение должно логироваться строкой",
             src.contains("JIT_RESTORE_DECISION op="))
     }
+
+    @Test
+    fun `владелец видит отказ, а не только строку журнала`() {
+        // fail-before: причина уходила только в журнал; на панели ничего не менялось.
+        val notice = JitNetDecision.ownerNotice(weDisarmed = true, nowEnabled = false, snapWifi = true)
+        assertTrue("предупреждения нет", notice != null)
+        assertEquals("denied", notice!!.first)
+        assertTrue("нет причины в тексте: ${notice.second}", notice.second.contains("Wi-Fi был выключен кликом"))
+
+        // Сеть включена — показывать нечего.
+        assertTrue(JitNetDecision.ownerNotice(true, true, true) == null)
+        // Сеть снимали не мы — тоже нечего.
+        assertTrue(JitNetDecision.ownerNotice(false, false, true) == null)
+        // Прочитать нельзя — честное «неизвестно», а не «выключена».
+        assertEquals("unread", JitNetDecision.ownerNotice(true, null, true)!!.first)
+
+        val src = java.io.File("app/src/main/java/com/example/voiceapp3/tools/ToolsBackend.kt").readText()
+        assertTrue("панель не получает состояние возврата сети",
+            src.contains("addProperty(\"wifiRestoreState\""))
+    }
 }
