@@ -164,6 +164,19 @@ a0884bc iter67: K — согласованное чтение пары (PairDiag
 1ad8a2b iter67: A — WriteResult(writeAccepted, readbackOk) и AdbClient.execExpect: SUCCESS только при двух доказательствах
 ```
 
+## 7.1 Пуш
+
+`git push origin fix/v2` из этой песочницы **не выполнен**: удалённый репозиторий — приватный
+`https://github.com/AlekseiAlekseikov/Backup.git`, в окружении нет ни креденшелов, ни токена
+(`fatal: could not read Username for 'https://github.com': No such device or address`). Поэтому:
+
+- все коммиты лежат в `/home/user/w67` (ветка `fix/v2`, HEAD `4a00687`);
+- готовый пакет для переноса: `/home/user/iter67_fix_v2_93734b7..4a00687.bundle` (90 КБ, от базы
+  `93734b7`). Применение у себя:
+  `git fetch /path/iter67_fix_v2_93734b7..4a00687.bundle fix/v2:fix/v2` (или `git bundle unbundle`).
+
+Ни `--force`, ни `main` не затрагивались.
+
 ## 8. Короткий итог для владельца
 
 1. Яркость больше не пишет `settings`/`sysfs`/`setprop` каждые 2–3 секунды: пишется только то, что
