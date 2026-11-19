@@ -3267,11 +3267,31 @@ object JitOp {
         val prop = JitRef.parseProp(rc, out)
         val cache = runCatching { JitRef.cacheExecutableFromMaps(shell.mapsExcerpt()) }.getOrNull()
         val verdict = JitRef.verify(pedido ?: false, prop, cache)
+        // iter67 §G: три различимых исхода. `pending_restart` (свойство выставлено, кэша нет) —
+        // это НЕ провал и НЕ повод снимать намерение: не хватает только старта zygote.
+        val outcome = JitUi.verifyOutcome(pedido ?: false, prop.value, cache)
+        log(JitUi.stateLine(pedido, prop.raw, cache, outcome))
         log(
             "JIT pedido=$pedido getprop=${prop.raw.ifEmpty { "empty" }} " +
                 "code-cache-executavel=${cache?.toString() ?: "unknown"} " +
-                "result=${JitRef.verifyLabel(verdict)} restart=not_claimed"
+                "result=${JitRef.verifyLabel(verdict)} outcome=${JitUi.outcomeWire(outcome)} " +
+                "restart=not_claimed"
         )
+        if (JitUi.keepPedido(outcome)) {
+            val pending = outcome == VerifyOutcome.PENDING_RESTART
+            val why = if (pending) "zygote_not_restarted" else "prop_unreadable"
+            val note = if (pending)
+                "свойство выставлено, но фреймворк ещё не перезапускался — ждём старта zygote, " +
+                    "клик владельца не блокируется"
+            else
+                "свойство прочитать нельзя — запрос не выдаём за выполненный"
+            log(
+                "JIT_PEDIDO kept reason=${JitUi.outcomeWire(outcome)} why=$why " +
+                    "write=none clicks=allowed (намерение сохранено: $note)"
+            )
+            return VerifyState(pedido, prop, cache, verdict, null, true,
+                JitUi.outcomeWire(outcome))
+        }
         if (verdict == JitRef.Verify.UNKNOWN) {
             log(
                 "JIT_PEDIDO kept reason=property_unreadable ${prop.log} write=none " +

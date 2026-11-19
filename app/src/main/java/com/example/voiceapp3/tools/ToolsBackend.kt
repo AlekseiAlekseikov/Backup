@@ -244,6 +244,25 @@ enum class Choice(
         addProperty("perfJitRuntimeRaw", jitFact?.raw ?: "")
         addProperty("perfJitRuntimeReason", jitFact?.reason ?: "not_read_yet")
         addProperty("perfJitConfirmed", AppPerformance.jitConfirmedState(appContext))
+        /* iter67 §D: ЯВНАЯ модель состояния. Намерение (`perfJit`) отвечает только за выбранное
+           владельцем; рядом обязательные свойства: машинное состояние, факт, сырой факт и причина.
+           «Включено, не применено» и «включено, ждёт перезапуска» видны отдельно и без красного. */
+        run {
+            val st = JitUi.jitUiState(
+                intent = AppPerformance.isAutoOptimizeEnabled(appContext),
+                propValue = jitFact?.value,
+                cache = AppPerformance.jitCodeCacheExecutable()
+            )
+            addProperty("perfJitState", JitUi.wire(st))
+            addProperty("perfJitRuntime", when (jitFact?.value) {
+                JitRef.Prop.TRUE -> "true"
+                JitRef.Prop.FALSE -> "false"
+                else -> "unknown"
+            })
+            addProperty("perfJitRuntimeRaw", jitFact?.raw ?: "")
+            addProperty("perfJitWhy", JitUi.why(st))
+            addProperty("perfJitText", JitUi.text(st))
+        }
         addProperty("unlockSound", LockSound.isUnlockSoundEnabled(appContext))
         addProperty("unlockSoundPath", LockSound.getUnlockSelectedPath(appContext))
         add("keepAliveApps", AppPerformance.getKeepAliveAppsJson(appContext))

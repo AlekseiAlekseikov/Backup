@@ -871,6 +871,16 @@ object AppPerformance {
     fun jitConfirmedState(context: Context): String = JitRef.confirmedState(LAST_JIT_FACT)
 
     /**
+     * iter67 §D — исполняемый JIT-кэш в карте ЭТОГО процесса (как `w0/j5.d`).
+     *
+     * Читается только из фонового потока: `/proc/self/maps` — файл, а панель не должна ходить в
+     * файловую систему с main-потока. `null` — прочитать/разобрать не удалось (это НЕ «кэша нет»).
+     */
+    fun jitCodeCacheExecutable(): Boolean? = runCatching {
+        JitRef.cacheExecutableFromMaps(java.io.File("/proc/self/maps").readText())
+    }.getOrNull()
+
+    /**
      * Асинхронное чтение факта с гарантированным обновлением UI.
      *
      * Раньше панель запускала фоновое чтение и больше ничего не делала (REVIEW 3-го захода, п.5):
