@@ -18,9 +18,9 @@ class BuildMarkerTest {
 
     @Test
     fun versionIs61() {
-        // iter45: по решению владельца следующая сборка — 1.0.63 (мандат iter45 §0).
-        assertEquals("versionCode", 63, BuildConfig.VERSION_CODE)
-        assertEquals("versionName", "1.0.63", BuildConfig.VERSION_NAME)
+        // iter67c §0.2/§8.10: версию 63 → 64 поднимает агент в этой итерации (сдача после 1.0.63).
+        assertEquals("versionCode", 64, BuildConfig.VERSION_CODE)
+        assertEquals("versionName", "1.0.64", BuildConfig.VERSION_NAME)
     }
 
     @Test
