@@ -85,6 +85,15 @@ object JitNet {
          * `w0/bb`: `BufferedReader(FileInputStream("/proc/self/maps"))` → строки.
          * Ошибка чтения ⇒ `null` (в референсе `catchall_67`).
          */
+        /**
+         * iter67c §1: длинный текст идёт тем же путём, что payload — файлом через
+         * `AdbClient.executeScript` (запись base64 + сверка размера + запуск `sh <path>`).
+         * Лимит одного пакета 4096 к этому пути не применяется.
+         */
+        override fun execScript(name: String, text: String, timeoutMs: Int): Pair<Int, String> =
+            runCatching { AdbClient.executeScript(name, text, timeoutMs) }
+                .getOrElse { t -> Pair(1, "ERR_EXCEPTION:${t.javaClass.simpleName}") }
+
         override fun mapsExcerpt(): String? = runCatching {
             java.io.File("/proc/self/maps").readText()
         }.getOrNull()
@@ -106,6 +115,15 @@ object JitNet {
             Pair(AdbPassive.RC_UNAVAILABLE,
                 "ERR_ADB_PASSIVE_UNAVAILABLE reason=exception:${t.javaClass.simpleName}")
         }
+
+        /**
+         * iter67c §1: пассивный канал НЕ умеет доставлять скрипты — и не должен уметь.
+         * Явный отказ с названной причиной, а не исключение и не молчаливый инлайн: иначе
+         * диагностика могла бы выполнить длинную команду в обход своей же политики.
+         */
+        override fun execScript(name: String, text: String, timeoutMs: Int): Pair<Int, String> =
+            Pair(AdbPassive.RC_UNAVAILABLE,
+                "ERR_ADB_PASSIVE_UNAVAILABLE reason=script_not_supported")
 
         /** `/proc/self/maps` читающего процесса — к диагностике сети/монтирований не относится. */
         override fun mapsExcerpt(): String? = null

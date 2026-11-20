@@ -2191,6 +2191,10 @@ object AdbClient {
         val payload = ("shell:$wrapped\u0000").toByteArray(StandardCharsets.UTF_8)
         // iter21 §1.3: не валим IllegalArgumentException в общий поток — возвращаем ERR_ADB_TOO_LONG.
         if (payload.size > 4096) {
+            // iter67c §1: раньше здесь был МОЛЧАЛИВЫЙ обход — команда уезжала файлом через
+            // executeScript, и вызывающий не узнавал, что не влезла в один пакет (на этом
+            // 20.11.2026 держался разбор: claim не дошёл, а причина не называлась). Теперь
+            // решение о доставке принимает вызывающий ДО вызова, а здесь отказ громкий.
             return Pair(1, "ERR_ADB_TOO_LONG: cmd_len=${payload.size} > 4096 (use executeScript for long scripts)")
         }
         val deadline = System.currentTimeMillis() + timeoutMs
@@ -2259,6 +2263,18 @@ object AdbClient {
      * Минус: одна лишняя строка в выводе, которую мы же и убираем.
      */
     private const val RC_MARK = "__ADB_RC="
+
+    /**
+     * iter67c §1 — сколько байт займёт команда В ОДНОМ ADB-пакете, если пойдёт через [execute].
+     *
+     * Считается РОВНО так же, как в [execute] (обёртка `wrapForRc` + `shell:` + `\u0000`), чтобы
+     * решение «инлайн или файлом» и фактическая отправка не расходились. Публичная — потому что
+     * решение принимает вызывающий (JIT), а не транспорт.
+     */
+    fun inlinePayloadBytes(cmd: String): Int {
+        val wrapped = wrapForRc(cmd)
+        return ("shell:$wrapped\u0000").toByteArray(StandardCharsets.UTF_8).size
+    }
 
     private fun wrapForRc(cmd: String): String =
         "sh -c '" + cmd.replace("'", "'\\''") + "'; echo \"" + RC_MARK + "$?\""

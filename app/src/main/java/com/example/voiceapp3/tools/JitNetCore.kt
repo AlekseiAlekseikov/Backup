@@ -135,6 +135,25 @@ object JitRef {
 
     interface JitShell {
         fun exec(command: String, timeoutMs: Int): Pair<Int, String>
+        /**
+         * iter67c §1 — доставка ДЛИННОГО текста тем же путём, что payload (файл + запуск), без
+         * лимита одного ADB-пакета 4096 байт.
+         *
+         * Почему это отдельный метод, а не «просто передать флаг»: 20.11.2026 команда `claim`
+         * выросла до 44 454 байт и транспорт честно ответил `ERR_ADB_TOO_LONG`, а клик был
+         * заблокирован на шаге владения. Размер текста — свойство СБОРКИ команды, а не намерения
+         * владельца, и он обязан вести себя как payload: доставляться файлом.
+         *
+         * `name` — префикс адресации доставки в журнале (`jit_claim_<opId>`).
+         * Возвращает `(rc, stdout+stderr)` так же, как [exec], чтобы разбор не различался.
+         *
+         * Тело по умолчанию оставлено ради тестовых shell'ов, которые моделируют транспорт без
+         * файловой доставки: для них путь остаётся инлайновым и поведение не меняется. Боевой
+         * транспорт ([AndroidShell]) и диагностический ([DiagShell]) переопределяют метод явно.
+         */
+        fun execScript(name: String, text: String, timeoutMs: Int): Pair<Int, String> =
+            exec(text, timeoutMs)
+
 
         /** `w0/bb`: содержимое `/proc/self/maps` процесса или `null`, если прочитать нельзя. */
         fun mapsExcerpt(): String?
@@ -2283,8 +2302,29 @@ object JitOp {
                 identity = JitOwn.ClaimIdentity(opInst, "", "", ""),
                 seq = intentSeq
             )
-            val claimRes = runCatching { shell.exec(JitOwn.claimCmd(opState), 8_000) }
-                .getOrElse { t -> Pair(-1, "ERR_${'$'}{t.javaClass.simpleName}") }
+            // iter67c §1: ВЫБОР ПУТИ ДОСТАВКИ. Текст claim собирается из общих shell-функций
+            // владения и по мере роста защит (iter53…iter67) давно перестал влезать в один
+            // ADB-пакет: 20.11.2026 он весил 44 454 байта, транспорт ответил `ERR_ADB_TOO_LONG`,
+            // и клик был заблокирован на гейте владения. Размер текста — свойство СБОРКИ
+            // команды, а не намерения владельца, поэтому длинный текст доставляется файлом, как
+            // payload. Порог ниже 4096: `wrapForRc`, `shell:` и `\u0000` тоже занимают байты.
+            val claimCmd = JitOwn.claimCmd(opState)
+            val claimTextBytes = claimCmd.toByteArray(Charsets.UTF_8).size
+            // Решение — по ФАКТИЧЕСКОМУ размеру пакета, который посчитает транспорт
+            // (`wrapForRc` + `shell:` + `\u0000`), а не по «на глазок» добавленным 40 байтам.
+            val claimBytes = runCatching { AdbClient.inlinePayloadBytes(claimCmd) }
+                .getOrDefault(claimTextBytes + 48)
+            val claimInline = JitOwn.deliveryPath(claimBytes) == "inline"
+            log(
+                "JIT_CLAIM_DELIVERY op=$opId path=${if (claimInline) "inline" else "script"} " +
+                    "bytes=$claimBytes text_bytes=$claimTextBytes " +
+                    "limit_inline=${JitOwn.INLINE_SAFE_BYTES} " +
+                    "(без этой строки нельзя отличить «не отправлено» от «отправлено другим путём»)"
+            )
+            val claimRes = runCatching {
+                if (claimInline) shell.exec(claimCmd, 12_000)
+                else shell.execScript("jit_claim_$opId", claimCmd, 15_000)
+            }.getOrElse { t -> Pair(-1, "ERR_${'$'}{t.javaClass.simpleName}") }
             val claimWrite = JitOwn.claimResult(claimRes.first, claimRes.second)
             // iter54 §4: ОДНО решающее правило для всех исходов захвата владения. Ни один
             // исход, кроме `Taken`, не разрешает отправку payload.

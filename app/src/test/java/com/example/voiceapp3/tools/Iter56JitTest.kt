@@ -199,7 +199,9 @@ class Iter56JitTest {
         File(JitOwn.lockPath(b)).writeText(live)
         val script = JitOwn.guard(op("Z", 1_700_100_400_000L, seq = 1), b)
         // Запускаем ТОЛЬКО функции из настоящего скрипта (ранние проверки не исполняем).
-        val from = script.indexOf("# ── идентичность этого shell")
+        // iter67c §2: комментарии больше НЕ уходят на устройство (это и был дефект размера),
+        // поэтому границы блока ищутся по исполняемым строкам, а не по заголовку-комментарию.
+        val from = script.indexOf("_me_pid=")
         val to = script.indexOf("_me_line=")
         assertTrue("блок общих функций найден", from >= 0 && to > from)
         val call = script.substring(from, to) +
@@ -229,7 +231,9 @@ class Iter56JitTest {
             "op=PP;ts_ms=$ts;ts_s=1700100600;want=1;inst=$inst;pid=999998;pstart=1;boot=deadboot"
         )
         val script = JitOwn.guard(op("NEWPP", ts + 1_000L, seq = 9), b)
-        val from = script.indexOf("# ── идентичность этого shell")
+        // iter67c §2: комментарии больше НЕ уходят на устройство (это и был дефект размера),
+        // поэтому границы блока ищутся по исполняемым строкам, а не по заголовку-комментарию.
+        val from = script.indexOf("_me_pid=")
         val to = script.indexOf("_me_line=")
         val call = script.substring(from, to) + "\n_me_inst=N2-1\n_me_pid=${'$'}${'$'}\n" +
             "_me_pstart=${'$'}(_me_psof \"${'$'}_me_pid\")\n_me_boot=${'$'}(cat /proc/sys/kernel/random/boot_id)\n" +
@@ -252,7 +256,9 @@ class Iter56JitTest {
                 "ppid=999996;ppstart=1"
         )
         val script = JitOwn.guard(op("NEWK", ts + 1_000L, seq = 10), b)
-        val from = script.indexOf("# ── идентичность этого shell")
+        // iter67c §2: комментарии больше НЕ уходят на устройство (это и был дефект размера),
+        // поэтому границы блока ищутся по исполняемым строкам, а не по заголовку-комментарию.
+        val from = script.indexOf("_me_pid=")
         val to = script.indexOf("_me_line=")
         val call = script.substring(from, to) + "\n_me_inst=N3-1\n_me_pid=${'$'}${'$'}\n" +
             "_me_pstart=${'$'}(_me_psof \"${'$'}_me_pid\")\n_me_boot=${'$'}(cat /proc/sys/kernel/random/boot_id)\n" +

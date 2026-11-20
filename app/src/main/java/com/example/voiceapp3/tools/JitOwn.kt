@@ -38,6 +38,28 @@ internal object JitOwn {
 
     /** Каталог на устройстве (в тестах подменяется на временный). */
     const val BASE = "/data/local/tmp"
+    /**
+     * iter67c §1.5 — предел ИНЛАЙН-доставки: размер ТЕКСТА команды «как есть».
+     *
+     * Не 4096 и не 4000: [AdbClient.execute] добавляет обёртку `wrapForRc` (каждая одинарная
+     * кавычка текста превращается в `'\\''`), префикс `shell:` и завершающий `\u0000`. Поэтому
+     * основное решение принимается по ОДНОЙ формуле — [AdbClient.inlinePayloadBytes], которая
+     * повторяет расчёт `execute` байт в байт; этот порог нужен для журнала и для проверки
+     * «текст не вырос» без обращения к транспорту.
+     *
+     * HIST: 20.11.2026 команда `claim` весила 44 454 байта, транспорт ответил
+     * `ERR_ADB_TOO_LONG`, клик был заблокирован на шаге владения (`claim_unproven`).
+     */
+    const val INLINE_SAFE_BYTES = 4_000
+
+    /**
+     * iter67c §1 — ОДНО решение «инлайн или файлом», общее для claim и для цепочки.
+     *
+     * @param packetBytes размер пакета так, как его посчитает транспорт
+     *   ([AdbClient.inlinePayloadBytes]) — не длина текста.
+     */
+    fun deliveryPath(packetBytes: Int): String =
+        if (packetBytes <= INLINE_SAFE_BYTES) "inline" else "script"
 
     /** Единственная точка сериализации: владелец JIT на устройстве (намерение). */
     const val CLAIM = "$BASE/voiceapp3_jit.claim"
