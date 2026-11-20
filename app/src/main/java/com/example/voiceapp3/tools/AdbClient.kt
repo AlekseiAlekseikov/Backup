@@ -763,7 +763,10 @@ object AdbClient {
                         "state=${state.get()} (payload/hex не печатается: диагностика, личные данные)")
                     LogKit.noteJobRc(out.first)
                 } else {
-                    AppLog.d(TAG, "← execute dt=${dt}ms rc=${out.first} len=${out.second.length} port=${workingPort.get()} state=${state.get()} cmd=${LogKit.redactCmd(job.cmd, 120)}")
+                    // iter67c §6: при rc≠0 — хвост вывода (маскированный, ≤300 байт), иначе причину
+                    // приходилось восстанавливать по соседним строкам. Успешные строки не раздуваем.
+                    AppLog.d(TAG, "← execute dt=${dt}ms rc=${out.first} len=${out.second.length} port=${workingPort.get()} state=${state.get()} cmd=${LogKit.redactCmd(job.cmd, 120)}" +
+                        LogRedact.execTail(out.first, out.second, passive = false))
                     LogKit.noteJobRc(out.first)
                     // iter33h H1.2: итог по пропущенным контрольным суммам — одной строкой на команду.
                     reportChecksumSkip()

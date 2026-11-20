@@ -77,6 +77,29 @@ internal object LogRedact {
         return cmdWithLimit(cmd, limit)
     }
 
+    /**
+     * iter67c §6 — хвост вывода для строки `← execute`: ТОЛЬКО при `rc != 0` и НИКОГДА для
+     * пассивного (диагностического) канала — там `ip addr` с MAC/SSID. Сначала маскирование
+     * целиком (литерал не режется посередине), потом хвост не длиннее [maxBytes] байт UTF-8.
+     * Возвращает `""` или `" out=<хвост>"`.
+     */
+    fun execTail(rc: Int, out: String, passive: Boolean, maxBytes: Int = 300): String {
+        if (rc == 0 || passive) return ""
+        val red = cmdWithLimit(out.replace('\n', ' '), Int.MAX_VALUE)
+        // Идём с конца по кодовым точкам: линейно, и хвост не начинается с половины пары.
+        var start = red.length
+        var bytes = 0
+        while (start > 0) {
+            val cp = Character.codePointBefore(red, start)
+            val n = String(Character.toChars(cp)).toByteArray(Charsets.UTF_8).size
+            if (bytes + n > maxBytes) break
+            bytes += n
+            start -= Character.charCount(cp)
+        }
+        val tail = red.substring(start)
+        return " out=" + (if (start > 0) "…" else "") + tail.ifEmpty { "empty" }
+    }
+
     private fun cmdWithLimit(cmd: String, maxLen: Int): String {
         var s = cmd.replace(Regex("\\s+"), " ").trim()
         s = SINGLE_QUOTED.replace(s) { "'<" + utf8Len(it.value) + "B>'" }
