@@ -1,5 +1,24 @@
 # WORKLOG — iter54 (JIT, доставка, TTL, звук, окна, логи, тумблеры)
 
+## iter67c — claim слишком длинный (1.0.64)
+
+Ветка `fix/v2`, `versionCode=64`/`versionName=1.0.64`, `--force` не применялся, `main` не пушился.
+Полный отчёт — `docs/agent/REPORT_iter67c.md`. Локально: `bash /home/user/runtests67.sh` → `OK (1260 tests)`.
+`SOURCE_SHA=57062652385f433435627ab03756ce8cf61202b0`.
+
+| Шаг | Что сделано | Проверка | Коммит |
+|---|---|---|---|
+| 1 | `JitShell.execScript`, выбор пути по `inlinePayloadBytes`, `JIT_CLAIM_DELIVERY` | `Iter67cClaimDeliveryTest`, `Iter67cClaimPathTest` | `e226202`, `5706265` |
+| 2 | helper'ы без `#`: 37 072 → 10 992 Б | `Iter67cClaimDeliveryTest` | `8a7c9b1` |
+| 2b | тело claim + helper'ы — библиотека `voiceapp3_jitlib.<cksum>.sh` на устройстве; claimCmd 555 Б; `lib_missing` → установка + один повтор (`JIT_CLAIM_LIB`) | `Iter67cClaimSizeTest`, `Iter67cClaimLibTest` | `12ec3d6` |
+| 3 | `ClaimWrite.TooLong` → `claim_cmd_too_long` | `Iter67cClaimDeliveryTest` | `e6839f5` |
+| 1b | цепочка payload файлом, если не влезает | `Iter67cClaimDeliveryTest` | `3ee3cd0` |
+| 4 | админ-секция 100×0.02 с, `JIT_CLAIM_TIMEOUT`; худший случай 10 026 → 2 493 мс | `Iter67cAdminTimeoutTest` | `6ab7aab` |
+| 5 | BLOCKED → «⚠ НЕ ВЫПОЛНЕНО» (WARN), тексты отказов | `Iter67cRefusalTest` | `edc6070` |
+| 6 | `out=` хвост при rc≠0 | `Iter67cExecTailTest` | `9ba6158` |
+| 7 | `PREFS_ABSENT` ≠ `PREFS_UNREADABLE`, без 60-с повтора | `Iter67cPrefsTest` | `2c23c06` |
+| v | версия 1.0.64 / 64 | `BuildMarkerTest` | `347e075` |
+
 ## iter67 — A–K (отметка, яркость, хранилища, цепочка, сеть, UI, аудит команд)
 
 Ветка `fix/v2`, `versionCode=63`/`versionName=1.0.63` без изменений, `--force` не применялся, `main` не пушился.
