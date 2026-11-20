@@ -1807,7 +1807,16 @@ object JitOp {
         CHAIN_UNDEFINED.set(false)
         ABANDONED_OP.set(null)
         scheduledTask = null
+        claimCmdForTest = null
     }
+
+    /**
+     * iter67c §4.3 — ТОЛЬКО для тестов: подмена текста claim, чтобы проверить файловую ветку
+     * доставки (после §2.2 настоящий текст ~555 Б, и ветка `execScript` иначе не достижима).
+     * В бою всегда `null`; сбрасывается в [resetStateForTest].
+     */
+    @Volatile
+    internal var claimCmdForTest: ((JitOwn.Op) -> String)? = null
 
     internal fun generation(): Int = PEDIDO_GEN.get()
 
@@ -2308,7 +2317,7 @@ object JitOp {
             // и клик был заблокирован на гейте владения. Размер текста — свойство СБОРКИ
             // команды, а не намерения владельца, поэтому длинный текст доставляется файлом, как
             // payload. Порог ниже 4096: `wrapForRc`, `shell:` и `\u0000` тоже занимают байты.
-            val claimCmd = JitOwn.claimCmd(opState)
+            val claimCmd = claimCmdForTest?.invoke(opState) ?: JitOwn.claimCmd(opState)
             val claimTextBytes = claimCmd.toByteArray(Charsets.UTF_8).size
             // Решение — по ФАКТИЧЕСКОМУ размеру пакета, который посчитает транспорт
             // (`wrapForRc` + `shell:` + `\u0000`), а не по «на глазок» добавленным 40 байтам.
