@@ -782,7 +782,7 @@ _jit_admin_enter() {
   # 2) Захват: identity подготовлена ЗАРАНЕЕ, имя владельца появляется атомарно вместе с ней.
   _ad_line="inst=${'$'}_ad_inst;pid=${'$'}_ad_pid0;pstart=${'$'}_ad_pst0;boot=${'$'}_ad_boot0"
   _ad_try=0
-  while [ "${'$'}_ad_try" -lt "${'$'}{_ADM_WAIT_ITERS:-400}" ]; do
+  while [ "${'$'}_ad_try" -lt "${'$'}{_ADM_WAIT_ITERS:-100}" ]; do
     _ad_try=${'$'}(( _ad_try + 1 ))
     _adm_barrier_before_claim
     _ad_tmp="${'$'}{_adm_dir}/t.${'$'}{_ad_pid0}.${'$'}_ad_try"
@@ -1083,6 +1083,7 @@ if [ "${'$'}_cl_status" != "busy" ] && [ "${'$'}_cl_status" != "stale" ]; then
   _jit_release
 fi ;;
 esac
+[ "${'$'}_cl_owner" = "admin_busy" ] && echo "CL_ADMIN_REFUSE=${'$'}{_adm_refuse:-unknown} iters=${'$'}{_ad_try:-0} max=${'$'}{_ADM_WAIT_ITERS:-100}"
 echo "CL_STATUS=${'$'}_cl_status"
 [ -n "${'$'}_cl_why" ] && echo "CL_WHY=${'$'}_cl_why"
 [ "${'$'}_cl_status" = "taken" ] && echo "CL_VALUE=${'$'}_rb"

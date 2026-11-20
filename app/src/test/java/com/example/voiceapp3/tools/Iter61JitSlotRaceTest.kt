@@ -129,10 +129,14 @@ class Iter61JitSlotRaceTest {
             fi
         """.trimIndent()
 
-    private fun start(inst: String, scriptBody: String): Runner {
+    private fun start(inst: String, scriptBody: String, waitIters: Int? = null): Runner {
         val f = File(base, "p_$inst.sh").apply { writeText(scriptBody) }
         val pb = ProcessBuilder("/bin/sh", f.absolutePath).redirectErrorStream(true)
         pb.environment()["ROOT"] = b
+        // iter67c §4: production-бюджет ожидания снижен 400 → 100 итераций (~2 с). Тест, который
+        // НАРОЧНО держит секцию секундами, задаёт прежний бюджет явно: он проверяет протокол
+        // (нет двух владельцев, ждущий входит после выхода), а не размер бюджета по умолчанию.
+        if (waitIters != null) pb.environment()["_ADM_WAIT_ITERS"] = waitIters.toString()
         return Runner(pb.start())
     }
 
@@ -194,7 +198,7 @@ class Iter61JitSlotRaceTest {
         assertTrue("A владеет секцией: ${a.text()}", waitFor(File("$barA.scanned")))
 
         // Z стартует и замирает ДО первой попытки занять секцию.
-        val z = start("z", body("z", holdMs = 0, barrier = beforeClaimBarrier(barZ)))
+        val z = start("z", body("z", holdMs = 0, barrier = beforeClaimBarrier(barZ)), waitIters = 400)
         assertTrue("Z замер перед попыткой входа: ${z.text()}", waitFor(File("$barZ.scanned")))
         File("$barA.go").createNewFile()
         assertTrue("A внутри: ${a.text()}", waitFor(File("$base/inside.a")))

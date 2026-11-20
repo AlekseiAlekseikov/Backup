@@ -2321,10 +2321,26 @@ object JitOp {
                     "limit_inline=${JitOwn.INLINE_SAFE_BYTES} " +
                     "(без этой строки нельзя отличить «не отправлено» от «отправлено другим путём»)"
             )
+            val claimT0 = System.currentTimeMillis()
             val claimRes = runCatching {
                 if (claimInline) shell.exec(claimCmd, 12_000)
                 else shell.execScript("jit_claim_$opId", claimCmd, 15_000)
             }.getOrElse { t -> Pair(-1, "ERR_${'$'}{t.javaClass.simpleName}") }
+            // iter67c §4: таймаут ожидания админ-секции (или транспорта) — отдельная строка, чтобы
+            // в журнале он не сливался с «занято живым владельцем» (busy_alive).
+            run {
+                val adm = Regex("CL_ADMIN_REFUSE=busy_timeout iters=(\\d+)").find(claimRes.second)
+                val transportTimeout = claimRes.second.contains("ERR_ADB_TIMEOUT")
+                if (adm != null || transportTimeout) {
+                    log(
+                        "JIT_CLAIM_TIMEOUT op=$opId waited_ms=${System.currentTimeMillis() - claimT0} " +
+                            "iters=${adm?.groupValues?.get(1) ?: "unknown"} " +
+                            "source=${if (adm != null) "admin_section" else "transport"} " +
+                            "timeout_ms=${if (claimInline) 12_000 else 15_000} action=stop " +
+                            "(claim не дождался сериализации — payload НЕ отправлен; повтор кликом)"
+                    )
+                }
+            }
             val claimWrite = JitOwn.claimResult(claimRes.first, claimRes.second)
             // iter54 §4: ОДНО решающее правило для всех исходов захвата владения. Ни один
             // исход, кроме `Taken`, не разрешает отправку payload.
