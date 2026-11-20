@@ -39,11 +39,14 @@ class Iter67cClaimDeliveryTest {
     private class TransportShell : JitRef.JitShell {
         val inline = java.util.Collections.synchronizedList(mutableListOf<String>())
         val scripts = java.util.Collections.synchronizedList(mutableListOf<Pair<String, String>>())
+        /** Команды, которые транспорт ОТБИЛ по размеру (на машине они не исполнились). */
+        val rejected = java.util.Collections.synchronizedList(mutableListOf<String>())
 
         override fun exec(command: String, timeoutMs: Int): Pair<Int, String> {
             inline += command
             val bytes = AdbClient.inlinePayloadBytes(command)
             if (bytes > 4_096) {
+                rejected += command
                 return 1 to "ERR_ADB_TOO_LONG: cmd_len=$bytes > 4096 (use executeScript for long scripts)"
             }
             return JitDev.exec(command) { 0 to "" }
@@ -79,6 +82,23 @@ class Iter67cClaimDeliveryTest {
         assertTrue("не назван порог: $delivery", delivery.contains("limit_inline="))
         assertTrue("в файловом пути не должно быть ERR_ADB_TOO_LONG: $lines",
             lines.none { it.contains("claim_unproven") })
+    }
+
+    @Test
+    fun `цепочка payload доходит до устройства, а не отбивается транспортом`() {
+        // Сквозной: клик под транспортом с НАСТОЯЩИМ лимитом пакета. Строка JIT_CHAIN_SENT
+        // печатается ДО отправки, поэтому сама по себе ничего не доказывает — проверяем, что
+        // текст с `setprop ctl.restart zygote` реально принят транспортом.
+        val shell = TransportShell()
+        JitOp.click(JitFake.Store(), JitFake.Net(wifi = true), shell, want = true, log = ::log)
+        val bounced = shell.rejected.map { AdbClient.inlinePayloadBytes(it) }
+        assertTrue("транспорт отбил по размеру ${bounced.size} команд(ы), байт: $bounced", bounced.isEmpty())
+        val chainViaScript = shell.scripts.any { it.second.contains("setprop ctl.restart zygote") }
+        val chainInline = shell.payloadCmds().any { AdbClient.inlinePayloadBytes(it) <= 4_096 }
+        assertTrue("цепочка не доставлена ни инлайн, ни файлом: $lines", chainViaScript || chainInline)
+        val d = lines.firstOrNull { it.startsWith("JIT_CHAIN_DELIVERY ") }
+        assertTrue("нет строки выбора пути доставки цепочки: $lines", d != null)
+        assertTrue("не назван размер: $d", d!!.contains("bytes="))
     }
 
     @Test

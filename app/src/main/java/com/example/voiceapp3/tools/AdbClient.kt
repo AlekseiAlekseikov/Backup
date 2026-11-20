@@ -2191,10 +2191,9 @@ object AdbClient {
         val payload = ("shell:$wrapped\u0000").toByteArray(StandardCharsets.UTF_8)
         // iter21 §1.3: не валим IllegalArgumentException в общий поток — возвращаем ERR_ADB_TOO_LONG.
         if (payload.size > 4096) {
-            // iter67c §1: раньше здесь был МОЛЧАЛИВЫЙ обход — команда уезжала файлом через
-            // executeScript, и вызывающий не узнавал, что не влезла в один пакет (на этом
-            // 20.11.2026 держался разбор: claim не дошёл, а причина не называлась). Теперь
-            // решение о доставке принимает вызывающий ДО вызова, а здесь отказ громкий.
+            // iter67c §1: обхода здесь НЕТ и не будет — длинное идёт только через executeScript,
+            // и решение принимает вызывающий ДО вызова (JIT_CLAIM_DELIVERY / JIT_CHAIN_DELIVERY).
+            // Лимит 4096 — это A_MAXDATA_LEGACY ветки ROOT_5555, повышать его нельзя.
             return Pair(1, "ERR_ADB_TOO_LONG: cmd_len=${payload.size} > 4096 (use executeScript for long scripts)")
         }
         val deadline = System.currentTimeMillis() + timeoutMs

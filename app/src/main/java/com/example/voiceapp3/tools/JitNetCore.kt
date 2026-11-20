@@ -2431,9 +2431,25 @@ object JitOp {
                     "attempt=${sentMark.attempt} ts_ms=${sentMark.tsMs} " +
                     "restart=not_claimed command=w0/la.run (литерал референса)"
             )
-            val (rc, out) = shell.exec(
-                JitRef.chainScript(want, JitOwn.guard(opState), JitOwn.termPath(opId)),
-                JitRef.CHAIN_TIMEOUT_MS)
+            // iter67c (та же болезнь, что §1): цепочка = литерал референса + гвардия с helper'ами,
+            // и даже после §2 это ~15 КБ при лимите пакета 4 096. Через `exec` она получала бы
+            // ERR_ADB_TOO_LONG сразу после успешного claim. Решение о пути — явное и с той же
+            // строкой в журнале, что у claim; сам текст цепочки не меняется ни на байт.
+            val chainCmd = JitRef.chainScript(want, JitOwn.guard(opState), JitOwn.termPath(opId))
+            val chainBytes = runCatching { AdbClient.inlinePayloadBytes(chainCmd) }
+                .getOrDefault(chainCmd.toByteArray(Charsets.UTF_8).size + 48)
+            val chainInline = JitOwn.deliveryPath(chainBytes) == "inline"
+            log(
+                "JIT_CHAIN_DELIVERY op=$opId path=${if (chainInline) "inline" else "script"} " +
+                    "bytes=$chainBytes limit_inline=${JitOwn.INLINE_SAFE_BYTES}" +
+                    (if (chainInline) "" else
+                        " (цепочка не влезает в один ADB-пакет — доставляется файлом, как payload)")
+            )
+            val (rc, out) = if (chainInline) {
+                shell.exec(chainCmd, JitRef.CHAIN_TIMEOUT_MS)
+            } else {
+                shell.execScript("jit_chain_$opId", chainCmd, JitRef.CHAIN_TIMEOUT_MS)
+            }
             val outcome = JitRef.chainOutcome(rc, out)
             // §7 iter51: ФАЗА по фактам устройства. Ответ транспорта — не доказательство исхода;
             // terminal-файл ЭТОЙ операции — доказательство (START/END/refused). Ошибка чтения
