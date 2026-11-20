@@ -176,11 +176,10 @@ enum class Choice(
                 false -> "off"
                 null -> "unknown"
             })
-            if (tri == null) {
-                unknownPrefs.add(t.key)
-                AppLog.w(TAG, "PREFS_UNKNOWN key=${t.key} pref=${t.pref} " +
-                    "(значение не подтверждено: показываем unknown, а не выдуманный default)")
-            }
+            if (tri == null) unknownPrefs.add(t.key)
+            // iter67c §7: снимок строится раз в 60 с — строка печатается только при СМЕНЕ факта
+            // (нет ключа / не читается / копии расходятся), а не на каждом проходе.
+            Prefs2.noteBoolean(appContext, t.pref, t.default, t.key)
         }
         add("prefsUnknown", unknownPrefs)
         Choice.values().forEach { c ->

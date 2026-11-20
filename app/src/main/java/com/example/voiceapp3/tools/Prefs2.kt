@@ -409,20 +409,105 @@ object Prefs2 {
      * подстановка `default` и была дефектом («тумблер сам выключился»). Всё, что решает
      * применять/не применять, должно использовать [getBooleanOrNull] (или `readBoolean`).
      */
-    fun getBoolean(c: Context, key: String, default: Boolean = false): Boolean =
-        when (val r = readBoolean(c, key)) {
+    fun getBoolean(c: Context, key: String, default: Boolean = false): Boolean {
+        // iter67c §7: журнал — по ФАКТУ чтения (есть / нет / не читается / расходятся) и только
+        // при смене состояния ключа. Возвращаемое значение не меняется.
+        noteBoolean(c, key, default)
+        return when (val r = readBoolean(c, key)) {
             is Toggles45.Resolved.Value -> r.v
             Toggles45.Resolved.Deleted -> false
-            Toggles45.Resolved.Conflict -> {
-                AppLog.w("CENTRAL_Prefs2", "PREFS_UNKNOWN key=$key reason=conflict_same_rev " +
-                    "fallback=$default (порядок записей неизвестен: значение НЕ выдаётся за решение владельца)")
-                default
+            Toggles45.Resolved.Conflict -> default
+            Toggles45.Resolved.Unknown -> default
+        }
+    }
+
+    // ─────────── iter67c §7: «ключа нет» ≠ «прочитать нельзя» ───────────
+
+    /**
+     * Исход чтения ключа. Раньше «ключа нет ни в одной копии» и «копию прочитать нельзя» сводились
+     * к одному `Unknown` и печатались как `reason=unreadable` каждые 60 секунд — по журналу нельзя
+     * было отличить сломанное чтение от тумблера, который владелец просто не трогал.
+     */
+    internal sealed class PrefRead {
+        data class Present(val value: String, val used: String) : PrefRead()
+        data class Absent(val usingDefault: String) : PrefRead()
+        data class Unreadable(val err: String) : PrefRead()
+        data class Conflict(val usingDefault: String) : PrefRead()
+    }
+
+    /** `cps`/`dps` — сырое содержимое копии: значение, `""` (ключа нет) или `"?"` (не прочитано). */
+    internal data class PrefProbe(val key: String, val read: PrefRead, val cps: String, val dps: String)
+
+    private fun rawBoolean(p: SharedPreferences?, name: String, key: String): Pair<String, String?> {
+        if (p == null) return "?" to "${name}_unavailable"
+        return runCatching { if (p.contains(key)) p.getBoolean(key, false).toString() else "" }
+            .fold({ it to null }, { t -> "?" to "$name:${t.javaClass.simpleName}" })
+    }
+
+    /** Ядро (без Android): классификация по двум копиям ТЕМ ЖЕ согласованием, что [readBoolean]. */
+    internal fun probeBooleanCore(
+        key: String, pc: SharedPreferences?, pd: SharedPreferences?, default: Boolean
+    ): PrefProbe {
+        val (cv, ce) = rawBoolean(pc, "cps", key)
+        val (dv, de) = rawBoolean(pd, "dps", key)
+        val resolved = Toggles45.resolveBoolean(
+            cv.toBooleanStrictOrNull(), readRev(pc, key), readDel(pc, key),
+            dv.toBooleanStrictOrNull(), readRev(pd, key), readDel(pd, key)
+        )
+        val read = when (resolved) {
+            is Toggles45.Resolved.Value -> {
+                val v = resolved.v.toString()
+                PrefRead.Present(v, when { cv == v && dv == v -> "both"; cv == v -> "cps"; else -> "dps" })
             }
-            Toggles45.Resolved.Unknown -> {
-                AppLog.w("CENTRAL_Prefs2", "PREFS_UNKNOWN key=$key reason=unreadable fallback=$default")
-                default
+            Toggles45.Resolved.Deleted -> PrefRead.Present("false", "tombstone")
+            Toggles45.Resolved.Conflict -> PrefRead.Conflict(default.toString())
+            Toggles45.Resolved.Unknown -> when {
+                ce != null || de != null -> PrefRead.Unreadable(listOfNotNull(ce, de).joinToString(","))
+                cv.isEmpty() && dv.isEmpty() -> PrefRead.Absent(default.toString())
+                else -> PrefRead.Unreadable("newer_rev_without_value")
             }
         }
+        return PrefProbe(key, read, cv, dv)
+    }
+
+    private val prefNoted = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    internal fun resetPrefNotesForTest() = prefNoted.clear()
+
+    /**
+     * Строки журнала по факту чтения — пары (уровень, строка). Печатаются только при ИЗМЕНЕНИИ
+     * состояния ключа (значения копий и исход), а не по таймеру: `PREFS_ABSENT` — один раз за
+     * сеанс, пока ключ не появится.
+     */
+    internal fun prefNotes(p: PrefProbe, label: String = p.key): List<Pair<String, String>> {
+        val sig = "${p.read}|${p.cps}|${p.dps}"
+        if (prefNoted.put(p.key, sig) == sig) return emptyList()
+        val k = if (label == p.key) "key=${p.key}" else "key=${p.key} toggle=$label"
+        return when (val r = p.read) {
+            is PrefRead.Present ->
+                if (p.cps == p.dps) emptyList()
+                else listOf("INFO" to "PREF_SPLIT $k cps=${p.cps} dps=${p.dps} used=${r.used}")
+            is PrefRead.Absent -> listOf("INFO" to "PREFS_ABSENT $k using_default=${r.usingDefault} " +
+                "(ключа нет ни в cps, ни в dps: тумблер не меняли — это не ошибка чтения)")
+            is PrefRead.Unreadable -> listOf("WARN" to "PREFS_UNREADABLE $k err=${r.err} " +
+                "cps=${p.cps} dps=${p.dps}")
+            is PrefRead.Conflict -> listOf("WARN" to "PREF_SPLIT $k cps=${p.cps} dps=${p.dps} " +
+                "used=default:${r.usingDefault} (равные ревизии, разные значения: порядок записей " +
+                "неизвестен — значение НЕ выдаётся за решение владельца)")
+        }
+    }
+
+    /** Прочитать обе копии так же, как [readBoolean], и напечатать факт (если он изменился). */
+    fun noteBoolean(c: Context, key: String, default: Boolean, label: String = key) {
+        runCatching {
+            val app = c.applicationContext
+            val pc = runCatching { cps(app) }.getOrNull()
+            val pd = runCatching { dps(app) }.getOrNull()
+            prefNotes(probeBooleanCore(key, pc, pd, default), label).forEach { (lvl, line) ->
+                if (lvl == "WARN") AppLog.w("CENTRAL_Prefs2", line) else AppLog.i("CENTRAL_Prefs2", line)
+            }
+        }
+    }
 
     fun getString(c: Context, key: String, default: String? = null): String? {
         val app = c.applicationContext
