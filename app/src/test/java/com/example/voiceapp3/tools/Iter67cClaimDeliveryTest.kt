@@ -118,4 +118,43 @@ class Iter67cClaimDeliveryTest {
         assertEquals("inlinePayloadBytes обязан считать тем же правилом", packet(claim),
             AdbClient.inlinePayloadBytes(claim))
     }
+
+    // ─────────────────────────── §2: сторож размера ───────────────────────────
+
+    @Test
+    fun `текст claim укладывается в сторож размера`() {
+        val bytes = JitOwn.claimCmd(op()).toByteArray(Charsets.UTF_8).size
+        // Красный ДО: 44 134 байта (из них 25 066 — комментарии на русском).
+        assertTrue("claimCmd = $bytes байт, предел ${JitOwn.CLAIM_TEXT_LIMIT}",
+            bytes <= JitOwn.CLAIM_TEXT_LIMIT)
+        // Сторож обязан быть «узким»: комментариев в тексте нет, и он в 2.4 раза меньше прежнего.
+        assertTrue("текст всё ещё слишком велик для файлового пути: $bytes",
+            bytes < 18_500)
+    }
+
+    @Test
+    fun `в отправляемом тексте нет ни одного комментария shell`() {
+        val h = JitOwn.ownHelpersForTest()
+        val bad = h.lines().filter { it.trimStart().startsWith("#") }
+        assertTrue("в отправляемом тексте ${bad.size} комментариев, первый: ${bad.firstOrNull()}",
+            bad.isEmpty())
+        val bytes = h.toByteArray(Charsets.UTF_8).size
+        assertTrue("helper'ы = $bytes байт, предел ${JitOwn.HELPERS_TEXT_LIMIT}",
+            bytes <= JitOwn.HELPERS_TEXT_LIMIT)
+        // Форма, уходящая на устройство, обязана быть и в гвардии payload — иначе формы разойдутся.
+        val guard = JitOwn.guard(op("GUARD-1"))
+        val guardComments = guard.lines().count { it.trimStart().startsWith("#") }
+        assertTrue("в гвардии payload $guardComments комментариев", guardComments == 0)
+        assertTrue("в гвардии нет самого кода helper'ов", guard.contains("_me_psof()"))
+    }
+
+    @Test
+    fun `размер пакета claim измерен той же формулой, что и отправка`() {
+        val text = JitOwn.claimCmd(op())
+        val packet = AdbClient.inlinePayloadBytes(text)
+        // Пакет больше лимита ОДНОГО пакета — именно поэтому путь script, а не «почти влезло».
+        assertTrue("пакет = $packet; ожидалось > 4096 (иначе путь должен быть inline)",
+            packet > 4_096)
+        assertTrue("текст обязан быть заметно меньше пакета", packet > text.length)
+    }
 }
