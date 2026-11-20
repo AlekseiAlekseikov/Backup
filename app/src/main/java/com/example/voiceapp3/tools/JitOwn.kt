@@ -1103,6 +1103,15 @@ echo CL_END
         data class Stale(val newer: String) : ClaimWrite
 
         data class Failed(val why: String) : ClaimWrite
+
+        /**
+         * iter67c §3 — команда НЕ БЫЛА ОТПРАВЛЕНА: превышен лимит одного ADB-пакета.
+         *
+         * Это не «транспорт упал» и не состояние устройства, а наша собственная ошибка сборки
+         * команды. На 1.0.63 такой отказ был сведён к `Failed("transport_rc=1")`: в журнале не
+         * осталось ни слова о длине, а владелец увидел «не удалось подтвердить владение».
+         */
+        data class TooLong(val bytes: Int, val limit: Int) : ClaimWrite
     }
 
     /** Разбор вывода [claimCmd]: те же строгие правила, что и у чтения. */
@@ -1116,6 +1125,11 @@ echo CL_END
     internal fun ownHelpersForTest(base: String = BASE): String = ownHelpers(base)
 
     fun claimResult(rc: Int, out: String): ClaimWrite {
+        // iter67c §3: СНАЧАЛА — наш собственный отказ по размеру, потом всё остальное.
+        // Иначе `rc != 0` съедал причину, и разбор на машине упирался в «transport_rc=1».
+        Regex("ERR_ADB_TOO_LONG: cmd_len=(\\d+) > (\\d+)").find(out)?.let { m ->
+            return ClaimWrite.TooLong(m.groupValues[1].toInt(), m.groupValues[2].toInt())
+        }
         if (rc != 0) return ClaimWrite.Failed("transport_rc=$rc")
         if (out.contains("ERR_")) return ClaimWrite.Failed("transport")
         val lines = out.split('\n').map { it.trim() }
@@ -1359,6 +1373,11 @@ echo CS_END
         is ClaimWrite.Failed -> Gate(
             false, "claim_unproven",
             "запись/чтение claim не подтверждены (${write.why}): fencing нет, payload не отправляется"
+        )
+        is ClaimWrite.TooLong -> Gate(
+            false, "claim_cmd_too_long",
+            "команда claim не отправлена: ${write.bytes} байт > ${write.limit} (лимит одного " +
+                "ADB-пакета). Это ошибка сборки команды, а не состояние устройства"
         )
     }
 

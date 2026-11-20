@@ -2364,6 +2364,18 @@ object JitOp {
                     )
                     return abortIntent(gate.code, gate.why)
                 }
+                is JitOwn.ClaimWrite.TooLong -> {
+                    // iter67c §3: отказ по размеру называется своими словами и своим кодом.
+                    // Молчаливый `claim_unproven` отправлял владельца искать причину в устройстве.
+                    log(
+                        "JIT_CLAIM op=$opId taken=0 too_long=1 bytes=${cw.bytes} limit=${cw.limit} " +
+                            "path=${JitOwn.CLAIM} action=stop pending=1 commands=0 " +
+                            "(команда claim не отправлена: ${cw.bytes} > ${cw.limit}. Это ошибка " +
+                            "сборки команды, а не состояние устройства: ни один байт скрипта не ушёл, " +
+                            "сеть, свойства и zygote НЕ менялись)"
+                    )
+                    return abortIntent("claim_cmd_too_long", gate.why)
+                }
                 is JitOwn.ClaimWrite.Failed -> {
                     // iter54 §4: раньше здесь стояло `action=proceed`, и скрипт всё равно
                     // уходил на устройство. Границы записи намерения нет — значит нет и fencing:

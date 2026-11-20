@@ -157,4 +157,47 @@ class Iter67cClaimDeliveryTest {
             packet > 4_096)
         assertTrue("текст обязан быть заметно меньше пакета", packet > text.length)
     }
+
+    // ─────────────────────────── §3: честный отказ ───────────────────────────
+
+    @Test
+    fun `отказ по длине называется, а не сводится к transport_rc`() {
+        val w = JitOwn.claimResult(
+            1, "ERR_ADB_TOO_LONG: cmd_len=44454 > 4096 (use executeScript for long scripts)"
+        )
+        // Красный ДО: ClaimWrite.Failed("transport_rc=1")
+        assertEquals(JitOwn.ClaimWrite.TooLong(44_454, 4_096), w)
+    }
+
+    @Test
+    fun `отказ по длине не разрешает отправку и имеет свой код`() {
+        val gate = JitOwn.claimGate(JitOwn.ClaimWrite.TooLong(44_454, 4_096))
+        assertFalse("отправка запрещена", gate.send)
+        assertEquals("код причины обязан отличать длину от «не подтверждено»",
+            "claim_cmd_too_long", gate.code)
+        assertTrue("причина обязана называть числа: ${gate.why}",
+            gate.why.contains("44454") && gate.why.contains("4096"))
+    }
+
+    @Test
+    fun `в журнале отказ по длине печатается своей строкой и кодом`() {
+        // Отказ обязан доехать ДО разбора, каким бы путём команда ни шла: моделируем транспорт,
+        // который отказывает по размеру на обоих путях (инлайн и файл).
+        val shell = object : JitRef.JitShell {
+            override fun exec(command: String, timeoutMs: Int): Pair<Int, String> =
+                JitDev.exec(command) { 1 to "ERR_ADB_TOO_LONG: cmd_len=44454 > 4096" }
+            override fun execScript(name: String, text: String, timeoutMs: Int): Pair<Int, String> =
+                Pair(1, "ERR_ADB_TOO_LONG: cmd_len=44454 > 4096 (use executeScript for long scripts)")
+            override fun mapsExcerpt(): String? = null
+        }
+        val res = JitOp.click(JitFake.Store(), JitFake.Net(wifi = true), shell, want = true, log = ::log)
+        assertEquals("код блокировки", "claim_cmd_too_long", res.blocked)
+        assertNotEquals("нельзя выдавать это за «владение не подтверждено»",
+            "claim_unproven", res.blocked)
+        assertTrue("нет строки too_long: $lines", lines.any { it.contains("too_long=1") })
+        val line = lines.first { it.contains("too_long=1") }
+        assertTrue("не названы байты: $line", line.contains("bytes=44454"))
+        assertTrue("не назван лимит: $line", line.contains("limit=4096"))
+        assertTrue("не сказано, что это ошибка сборки: $line", line.contains("сборки команды"))
+    }
 }
