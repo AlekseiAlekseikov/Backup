@@ -212,24 +212,31 @@ object AppLog {
         e(tag, "← $fn ОШИБКА: $reason")
     }
 
+    /** iter67c §5: штатный отказ (`BLOCKED`) — WARN, не ERROR; настоящая ошибка остаётся ERROR. */
+    private fun logByLevel(level: String, msg: String) = when (level) {
+        "INFO" -> i("CENTRAL_Tools", msg)
+        "WARN" -> w("CENTRAL_Tools", msg)
+        else -> e("CENTRAL_Tools", msg)
+    }
+
     /** Toggle-лог (тумблеры в Tools). */
     fun logToggle(c: Context, key: String, en: Boolean, r: ToolsResult) {
-        val sb = StringBuilder("TOGGLE [$key] → ${if(en)"ON"else"OFF"} | ${if(r.ok)"✓ SUCCESS"else"✗ FAILED"} | ${r.summary}")
+        val sb = StringBuilder("TOGGLE [$key] → ${if(en)"ON"else"OFF"} | ${r.verdictMark} | ${r.summary}")
         for (s in r.steps) {
             sb.append("\n    • ${s.step}  [${s.status.wire} exit=${s.exitCode}]")
             if (s.stdout.isNotEmpty()) sb.append("\n        out: ${s.stdout.take(600)}")
             if (s.stderr.isNotEmpty()) sb.append("\n        err: ${s.stderr.take(600)}")
         }
-        if (r.ok) i("CENTRAL_Tools", sb.toString()) else e("CENTRAL_Tools", sb.toString())
+        logByLevel(r.logLevel, sb.toString())
     }
     fun logAction(c: Context, act: String, r: ToolsResult) {
-        val sb = StringBuilder("ACTION [$act] | ${r.title} | ${if(r.ok)"✓ SUCCESS"else"✗ FAILED"} | ${r.summary}")
+        val sb = StringBuilder("ACTION [$act] | ${r.title} | ${r.verdictMark} | ${r.summary}")
         for (s in r.steps) {
             sb.append("\n    • ${s.step}: ${s.status.wire}")
             if (s.stdout.isNotEmpty()) sb.append(" (${s.stdout.take(400)})")
             if (s.stderr.isNotEmpty()) sb.append(" ERROR: ${s.stderr.take(400)}")
         }
-        if (r.ok) i("CENTRAL_Tools", sb.toString()) else e("CENTRAL_Tools", sb.toString())
+        logByLevel(r.logLevel, sb.toString())
     }
 
     // ───────────── internal ─────────────

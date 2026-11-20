@@ -108,6 +108,25 @@ data class ToolsResult(
             else -> ToolsStep.Status.FAILED.wire
         }
 
+    /**
+     * iter67c §5 — отметка итога для строк TOGGLE/ACTION. Осознанный отказ (`BLOCKED`) — это
+     * «не выполнено, причина названа», а не провал: без `FAILED` и без `✗`.
+     */
+    val verdictMark: String
+        get() = when {
+            ok -> "✓ SUCCESS"
+            statusWire == ToolsStep.Status.BLOCKED.wire -> "⚠ НЕ ВЫПОЛНЕНО"
+            else -> "✗ FAILED"
+        }
+
+    /** iter67c §5 — уровень журнала: отказ `WARN`, настоящая ошибка остаётся `ERROR`. */
+    val logLevel: String
+        get() = when {
+            ok -> "INFO"
+            statusWire == ToolsStep.Status.BLOCKED.wire -> "WARN"
+            else -> "ERROR"
+        }
+
     private fun blockedReason(): String = steps
         .firstOrNull { it.status == ToolsStep.Status.BLOCKED }
         ?.let { it.stderr.ifEmpty { it.stdout }.ifEmpty { "зависимость недоступна" } }

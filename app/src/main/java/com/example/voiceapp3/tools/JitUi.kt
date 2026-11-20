@@ -51,6 +51,17 @@ object JitUi {
         JitUiState.UNKNOWN -> "неизвестно"
     }
 
+    /**
+     * iter67c §5 — короткий русский текст ШТАТНОГО отказа отправки (без жаргона, без «провала»).
+     * `null` — для кода нет отдельного текста (вызывающий оставляет свой).
+     */
+    fun refusalText(blocked: String?): String? = when (blocked) {
+        "claim_cmd_too_long" -> "не отправлено: внутренняя ошибка размера команды (сообщите разработчику)"
+        "claim_unproven" -> "не отправлено: не удалось подтвердить владение, повторите"
+        "op_in_flight" -> "не отправлено: уже выполняется другая операция JIT"
+        else -> null
+    }
+
     /** Машинное имя состояния — для свойства `perfJitState` (UI не парсит русский текст). */
     fun wire(state: JitUiState): String = when (state) {
         JitUiState.ON -> "on"

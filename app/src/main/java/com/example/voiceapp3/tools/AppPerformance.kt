@@ -1090,6 +1090,7 @@ object AppPerformance {
                     blocked == "snapshot_not_readable" ->
                         "скрипт не отправлен: снимок не читается тем порядком, которым его читает " +
                             "продолжение (CPS→DPS). Сеть и свойства не менялись"
+                    JitUi.refusalText(blocked) != null -> JitUi.refusalText(blocked)!!
                     blocked != null ->
                         "скрипт не отправлен: $blocked"
                     shellReply ->
