@@ -94,10 +94,10 @@ class Iter54JitConcurrencyTest {
         // перезаписан, обязан отказаться сам — до первого опасного действия.
         val gate = File(base, "gate1")
         val (pa, _) = startAtGate(
-            JitOwn.claimCmd(a, b) + "\n" + payload(a, "A"), "A.sh", gate
+            JitOwn.claimScriptForTest(a, b) + "\n" + payload(a, "A"), "A.sh", gate
         )
         val (pb, _) = startAtGate(
-            JitOwn.claimCmd(bOp, b) + "\n" + payload(bOp, "B"), "B.sh", gate
+            JitOwn.claimScriptForTest(bOp, b) + "\n" + payload(bOp, "B"), "B.sh", gate
         )
         Thread.sleep(150)
         gate.writeText("go")
@@ -124,13 +124,13 @@ class Iter54JitConcurrencyTest {
         val older = op("OLD", 1_700_000_000_000L)
         val newer = op("NEW", 1_700_000_009_000L)
 
-        val (rcNew, outNew) = sh(JitOwn.claimCmd(newer, b), "new.sh")
+        val (rcNew, outNew) = sh(JitOwn.claimScriptForTest(newer, b), "new.sh")
         assertEquals("новое намерение записано: $outNew", 0, rcNew)
         assertTrue("taken: $outNew", outNew.contains("CL_STATUS=taken"))
         val afterNew = claimText()
 
         // «Догоняющий» устаревший claim приходит ПОЗЖЕ.
-        val (rcOld, outOld) = sh(JitOwn.claimCmd(older, b), "old.sh")
+        val (rcOld, outOld) = sh(JitOwn.claimScriptForTest(older, b), "old.sh")
         assertEquals(0, rcOld)
         assertTrue("устаревшее намерение уступает, а не перезаписывает: $outOld",
             outOld.contains("CL_STATUS=stale") && outOld.contains("verdict=older_intent"))
@@ -142,7 +142,7 @@ class Iter54JitConcurrencyTest {
     @Test
     fun finishedNewerIntentDoesNotMakeOlderIntentCurrent() {
         val newer = op("NEW", 1_700_000_009_000L)
-        sh(JitOwn.claimCmd(newer, b), "new.sh")
+        sh(JitOwn.claimScriptForTest(newer, b), "new.sh")
         // Новый владелец реально выполнился и написал END (доказанное завершение).
         val (_, outRun) = sh(payload(newer, "NEW", holdMs = 10), "new_payload.sh")
         assertTrue("новый payload выполнился: $outRun", !outRun.contains("JIT_REFUSED"))
@@ -153,7 +153,7 @@ class Iter54JitConcurrencyTest {
         // Устаревшее намерение приходит ПОСЛЕ завершения нового. Владелец уже выбрал другое:
         // завершение чужой операции не возвращает старое решение в силу.
         val older = op("OLD", 1_700_000_000_000L)
-        val (_, outOld) = sh(JitOwn.claimCmd(older, b), "old.sh")
+        val (_, outOld) = sh(JitOwn.claimScriptForTest(older, b), "old.sh")
         assertTrue("устаревшее намерение уступает даже после завершения нового: $outOld",
             outOld.contains("CL_STATUS=stale"))
         assertFalse("ветка newer_finished удалена: $outOld", outOld.contains("newer_finished"))
@@ -167,7 +167,7 @@ class Iter54JitConcurrencyTest {
         val ts = 1_700_000_000_000L
         val i1 = op("SAME", ts, inst = JitOwn.newInstance("SAME", ts, nonce = 1))
         val i2 = op("SAME", ts, inst = JitOwn.newInstance("SAME", ts, nonce = 2))
-        sh(JitOwn.claimCmd(i1, b), "claim1.sh")
+        sh(JitOwn.claimScriptForTest(i1, b), "claim1.sh")
 
         val gate = File(base, "gate4")
         val (p1, _) = startAtGate(payload(i1, "I1", holdMs = 800), "i1.sh", gate)
@@ -218,7 +218,7 @@ class Iter54JitConcurrencyTest {
         // не появляется, потому что мы вообще не отправляем payload.
         val bad = "/proc/definitely-not-writable/voiceapp3"
         val o = op("NOPE", 1_700_000_000_000L)
-        val (rc, out) = runCatching { sh(JitOwn.claimCmd(o, bad), "bad.sh") }
+        val (rc, out) = runCatching { sh(JitOwn.claimScriptForTest(o, bad), "bad.sh") }
             .getOrElse { 0 to "" }
         val w = JitOwn.claimResult(rc, out)
         assertFalse("недоступный каталог не выдаётся за владение (${w})",

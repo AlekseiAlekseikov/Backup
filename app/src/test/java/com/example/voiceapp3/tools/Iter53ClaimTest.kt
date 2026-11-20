@@ -66,7 +66,7 @@ class Iter53ClaimTest {
     @Test
     fun realClaimWrittenByClaimCommandIsReadAsPresent() {
         val op = JitOwn.Op("a1b2", 1_700_000_000_000L, want = true, state = JitOwn.State.CLAIMED)
-        val (wrc, wout) = dev.sh(JitOwn.claimCmd(op, base))
+        val (wrc, wout) = dev.sh(JitOwn.claimScriptForTest(op, base))
         assertEquals("запись claim через реальный shell", 0, wrc)
         assertTrue("claimCmd подтверждает запись чтением", wout.contains("op=a1b2"))
         val r = reply("a1b2")
@@ -181,7 +181,7 @@ class Iter53ClaimTest {
     @Test
     fun endToEndOwnClaimAllowsRestoreForeignDoesNot() {
         val op = JitOwn.Op("own", 1_700_000_000_000L, true, JitOwn.State.CLAIMED)
-        dev.sh(JitOwn.claimCmd(op, base))
+        dev.sh(JitOwn.claimScriptForTest(op, base))
         val (rc, out) = read("own")
         assertTrue("claim нашей операции разрешает возврат",
             JitOwn.restoreDecision("own", JitOwn.parseClaimReply(rc, out)).first)

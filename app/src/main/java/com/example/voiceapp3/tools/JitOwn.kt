@@ -41,7 +41,8 @@ internal object JitOwn {
     /**
      * iter67c §1.5 — предел ИНЛАЙН-доставки: размер ТЕКСТА команды «как есть».
      *
-     * Не 4096 и не 4000: [AdbClient.execute] добавляет обёртку `wrapForRc` (каждая одинарная
+     * 3 500 — как `ScriptDelivery.DIRECT_LIMIT` (§1.5 задания). Не 4096 и не 4000: на такой
+     * границе лимит и выстрелил. [AdbClient.execute] добавляет обёртку `wrapForRc` (каждая одинарная
      * кавычка текста превращается в `'\\''`), префикс `shell:` и завершающий `\u0000`. Поэтому
      * основное решение принимается по ОДНОЙ формуле — [AdbClient.inlinePayloadBytes], которая
      * повторяет расчёт `execute` байт в байт; этот порог нужен для журнала и для проверки
@@ -50,7 +51,7 @@ internal object JitOwn {
      * HIST: 20.11.2026 команда `claim` весила 44 454 байта, транспорт ответил
      * `ERR_ADB_TOO_LONG`, клик был заблокирован на шаге владения (`claim_unproven`).
      */
-    const val INLINE_SAFE_BYTES = 4_000
+    const val INLINE_SAFE_BYTES = 3_500
 
     /**
      * iter67c §1 — ОДНО решение «инлайн или файлом», общее для claim и для цепочки.
@@ -68,14 +69,10 @@ internal object JitOwn {
      * работает: значит текст снова начал расти незамеченным. Именно это случилось между 1.0.62 и
      * 1.0.63 — никто не мерил.
      *
-     * Почему 18 500, а не 3500: после чистки комментариев текст = 18 054, из них тело `claim`
-     * (порядок намерений, lock, takeover, атомарная запись с readback) — 4 217 байт кода, и оно
-     * само по себе больше 3 500. Опустить текст до 3 500 можно только убрав часть доказательства
-     * владения либо вынеся тело на устройство отдельным файлом-хелпером (это разрешено §2.2
-     * задания, но требует отдельной итерации: см. отчёт, «Возражения» п.2). Пока сторож держит
-     * фактический размер: он и ловит рост.
+     * После §2.2 тело `claim` и helper'ы живут в библиотеке на устройстве ([libPath]); по ADB
+     * уходит только обвязка, и её предел совпадает с инлайн-порогом: 3 500 байт.
      */
-    const val CLAIM_TEXT_LIMIT = 18_500
+    const val CLAIM_TEXT_LIMIT = INLINE_SAFE_BYTES
 
     /** Сторож размера ТЕКСТА общих helper'ов (правка 2 задания). */
     const val HELPERS_TEXT_LIMIT = 13_500
@@ -971,19 +968,60 @@ _lock_self_mark() {
      *
      * Вывод (разбирается [claimResult]): `CL_BEGIN … CL_STATUS=taken|busy|failed … CL_END`.
      */
-    fun claimCmd(op: Op, base: String = BASE): String {
+    fun claimCmd(op: Op, base: String = BASE): String = claimText(op, base, inlineLib = false)
+
+    /**
+     * iter67c §2.2 — ТОТ ЖЕ claim, но самодостаточный: вместо подключения файла-хелпера в текст
+     * вставлена сама библиотека (байт в байт [libText]). Нужен тестам, которые исполняют claim
+     * настоящим `/bin/sh` во временном каталоге без установки библиотеки; на устройство не уходит.
+     */
+    internal fun claimScriptForTest(op: Op, base: String = BASE): String = claimText(op, base, inlineLib = true)
+
+    /**
+     * iter67c §2.2 — команда claim = короткая «обвязка» (≤ [INLINE_SAFE_BYTES]) + библиотека на
+     * устройстве ([libPath]). Обвязка: маркеры протокола, `_me_inst`, строка намерения и вызов
+     * `_jit_claim_main`. Библиотека подключается ТОЛЬКО при точном совпадении размера, а её имя
+     * содержит POSIX `cksum` содержимого: другая версия текста — другое имя, старая не исполнится.
+     * Нет библиотеки → `CL_STATUS=failed` + `CL_WHY=lib_missing`, ядро ставит её и повторяет
+     * claim один раз (см. `JIT_CLAIM_LIB`).
+     */
+    private fun claimText(op: Op, base: String, inlineLib: Boolean): String {
         val claim = claimPath(base)
+        val inst = op.identity?.inst ?: "${op.id}-${op.tsMs}-${'$'}${'$'}"
+        val me = "_me_line=\"op=${op.id};ts_ms=${op.tsMs};ts_s=${op.tsS};want=${if (op.want) 1 else 0};" +
+            "seq=${op.seq};inst=${'$'}_me_inst;pid=${'$'}_me_pid;pstart=${'$'}{_me_pstart:-?};boot=${'$'}{_me_boot:-?}\""
+        val call = "_jit_claim_main $claim ${op.id} ${op.seq} ${op.tsMs}"
+        if (inlineLib) {
+            return "set +e\necho CL_BEGIN\n_me_inst=$inst\n${libText(base)}$me\n$call\necho CL_END\n"
+        }
+        val want = libBytes(base)
+        return "set +e\n" +
+            "echo CL_BEGIN\n" +
+            "_me_inst=$inst\n" +
+            "_jl=${libPath(base)}\n" +
+            "_jl_n=${'$'}(wc -c < \"${'$'}_jl\" 2>/dev/null | tr -d ' ')\n" +
+            "if [ \"${'$'}_jl_n\" = \"$want\" ]; then\n" +
+            ". \"${'$'}_jl\"\n" +
+            "$me\n" +
+            "$call\n" +
+            "else\n" +
+            "echo \"CL_LIB_MISSING size=${'$'}{_jl_n:-none} want=$want\"\n" +
+            "echo CL_STATUS=failed\n" +
+            "echo CL_WHY=lib_missing\n" +
+            "fi\n" +
+            "echo CL_END\n"
+    }
+
+    /**
+     * iter67c §2.2 — тело claim как shell-ФУНКЦИЯ библиотеки. Логика та же, что была в тексте
+     * команды (порядок намерений, lock, takeover, атомарная запись с readback) — изменены только
+     * источники значений: `$1` файл claim, `$2` id операции, `$3` seq, `$4` ts_ms.
+     */
+    private fun claimMainRaw(base: String): String {
         val lock = lockPath(base)
-        val inst = op.identity?.inst ?: "${op.id}-${op.tsMs}-\$\$"
-        // Префикс terminal-файлов: нужен, чтобы уступить владение только ЗАВЕРШИВШЕМУСЯ
-        // более новому намерению (см. ниже), не собирая путь в shell из ненадёжной склейки.
-        val termPrefix = "$base/voiceapp3_jit_"
         return """
-set +e
-echo CL_BEGIN
-_me_inst=${inst}
-${ownHelpers(base)}
-_me_line="op=${op.id};ts_ms=${op.tsMs};ts_s=${op.tsS};want=${if (op.want) 1 else 0};seq=${op.seq};inst=${'$'}_me_inst;pid=${'$'}_me_pid;pstart=${'$'}{_me_pstart:-?};boot=${'$'}{_me_boot:-?}"
+_jit_claim_main() {
+_cm_file=${'$'}1; _cm_id=${'$'}2; _cm_myseq=${'$'}3; _cm_myts=${'$'}4
 _cl_status=failed; _cl_owner=""; _cl_why=""
 # ── порядок НАМЕРЕНИЙ: поздний claim не отменяет более новое намерение ────────
 # `ts_ms` — время клика владельца, а не время выполнения команды. Если в claim уже лежит
@@ -992,19 +1030,19 @@ _cl_status=failed; _cl_owner=""; _cl_why=""
 # Перезапись чужого claim допускается только если новее МЫ (по поколению) или владелец
 # намерения доказанно завершился (его собственный END/смерть) — тогда его намерение уже не
 # «последнее», а счётчики относятся к разным поколениям установки.
-_cm_seen=$(cat ${claim} 2>/dev/null)
+_cm_seen=$(cat "${'$'}_cm_file" 2>/dev/null)
 _cm_ts=$(printf '%s' "${'$'}_cm_seen" | sed -n 's/.*ts_ms=\([0-9][0-9]*\).*/\1/p')
 _cm_seq=$(printf '%s' "${'$'}_cm_seen" | sed -n 's/.*seq=\([0-9][0-9]*\).*/\1/p')
 _cm_op=$(printf '%s' "${'$'}_cm_seen" | sed -n 's/^op=\([A-Za-z0-9_.-]*\).*/\1/p')
 _cm_verdict=free; _cm_rule=none
-if [ -n "${'$'}_cm_op" ] && [ "${'$'}_cm_op" != "${op.id}" ]; then
-  _jit_intent_order "${'$'}_cm_seen" ${op.seq} ${op.tsMs} ${op.id}
+if [ -n "${'$'}_cm_op" ] && [ "${'$'}_cm_op" != "${'$'}_cm_id" ]; then
+  _jit_intent_order "${'$'}_cm_seen" ${'$'}_cm_myseq ${'$'}_cm_myts ${'$'}_cm_id
   _cm_verdict=${'$'}_ord_verdict; _cm_rule=${'$'}_ord_rule
 fi
 # iter55 §4.3: НИКАКОГО `newer_finished`. То, что более новое намерение завершилось,
 # не делает старое намерение актуальным: владелец уже выбрал другое. Устаревшая операция
 # уступает навсегда, иначе «догоняющий» старый payload снимал бы последнее решение.
-echo "CL_ORDER seen_op=${'$'}{_cm_op:-none} seen_seq=${'$'}{_cm_seq:-none} seen_ts_ms=${'$'}{_cm_ts:-none} me_seq=${op.seq} rule=${'$'}_cm_rule verdict=${'$'}_cm_verdict"
+echo "CL_ORDER seen_op=${'$'}{_cm_op:-none} seen_seq=${'$'}{_cm_seq:-none} seen_ts_ms=${'$'}{_cm_ts:-none} me_seq=${'$'}_cm_myseq rule=${'$'}_cm_rule verdict=${'$'}_cm_verdict"
 case "${'$'}_cm_verdict" in
   older_intent|ts_tie|seq_tie)
     _cl_status=stale; _cl_owner="${'$'}_cm_seen"
@@ -1044,22 +1082,22 @@ fi
 # перечитывается уже под lock'ом, и если конкурент успел записать БОЛЕЕ НОВОЕ намерение,
 # наш claim не перезаписывает его. Решение и запись происходят в одной критической секции.
 if [ "${'$'}_cl_status" != "busy" ]; then
-  _v2=${'$'}(cat ${claim} 2>/dev/null)
+  _v2=${'$'}(cat "${'$'}_cm_file" 2>/dev/null)
   _v2_op=${'$'}(printf '%s' "${'$'}_v2" | sed -n 's/^op=\([A-Za-z0-9_.-]*\).*/\1/p')
   _v2_ts=${'$'}(printf '%s' "${'$'}_v2" | sed -n 's/.*ts_ms=\([0-9][0-9]*\).*/\1/p')
   _v2_seq=${'$'}(printf '%s' "${'$'}_v2" | sed -n 's/.*seq=\([0-9][0-9]*\).*/\1/p')
   _v2_verdict=free; _v2_rule=none
   # Под lock порядок пересчитывается ТЕМ ЖЕ правилом, что и до него (ноль расхождений
   # между ранней и авторитетной проверкой). «Не новее» здесь означает уступку.
-  if [ -n "${'$'}_v2_op" ] && [ "${'$'}_v2_op" != "${op.id}" ]; then
-    _jit_intent_order "${'$'}_v2" ${op.seq} ${op.tsMs} ${op.id}
+  if [ -n "${'$'}_v2_op" ] && [ "${'$'}_v2_op" != "${'$'}_cm_id" ]; then
+    _jit_intent_order "${'$'}_v2" ${'$'}_cm_myseq ${'$'}_cm_myts ${'$'}_cm_id
     _v2_rule=${'$'}_ord_rule
     case "${'$'}_ord_verdict" in
       older_intent|seq_tie|ts_tie) _v2_verdict=newer_intent ;;
       *) _v2_verdict=free ;;
     esac
   fi
-  echo "CL_ORDER_UNDER_LOCK seen_op=${'$'}{_v2_op:-none} seen_seq=${'$'}{_v2_seq:-none} seen_ts_ms=${'$'}{_v2_ts:-none} me_seq=${op.seq} rule=${'$'}_v2_rule verdict=${'$'}_v2_verdict"
+  echo "CL_ORDER_UNDER_LOCK seen_op=${'$'}{_v2_op:-none} seen_seq=${'$'}{_v2_seq:-none} seen_ts_ms=${'$'}{_v2_ts:-none} me_seq=${'$'}_cm_myseq rule=${'$'}_v2_rule verdict=${'$'}_v2_verdict"
   if [ "${'$'}_v2_verdict" = "newer_intent" ]; then
     _jit_release
     _cl_status=stale; _cl_owner="${'$'}_v2"; _cl_why="newer_intent_under_lock"
@@ -1067,15 +1105,15 @@ if [ "${'$'}_cl_status" != "busy" ]; then
 fi
 # ── ПОД lock: замена claim АТОМАРНА (tmp + mv), а не «exists + запись по месту» ──
 if [ "${'$'}_cl_status" != "busy" ] && [ "${'$'}_cl_status" != "stale" ]; then
-  _tmp="${claim}.tmp.${'$'}${'$'}"
+  _tmp="${'$'}_cm_file.tmp.${'$'}${'$'}"
   printf '%s\n' "${'$'}_me_line" > "${'$'}_tmp" 2>/dev/null
   _wr=${'$'}?
-  if [ "${'$'}_wr" = "0" ] && mv "${'$'}_tmp" ${claim} 2>/dev/null; then
+  if [ "${'$'}_wr" = "0" ] && mv "${'$'}_tmp" "${'$'}_cm_file" 2>/dev/null; then
     _cl_status=written
   else
     rm -f "${'$'}_tmp" 2>/dev/null; _cl_status=failed
   fi
-  _rb=${'$'}(cat ${claim} 2>/dev/null)
+  _rb=${'$'}(cat "${'$'}_cm_file" 2>/dev/null)
   # «записано» и «подтверждено чтением» — разные факты: taken ставится ТОЛЬКО после readback.
   if [ "${'$'}_cl_status" = "written" ]; then
     if [ "${'$'}_rb" = "${'$'}_me_line" ]; then _cl_status=taken; else _cl_status=failed; fi
@@ -1088,8 +1126,50 @@ echo "CL_STATUS=${'$'}_cl_status"
 [ -n "${'$'}_cl_why" ] && echo "CL_WHY=${'$'}_cl_why"
 [ "${'$'}_cl_status" = "taken" ] && echo "CL_VALUE=${'$'}_rb"
 [ -n "${'$'}_cl_owner" ] && echo "CL_OWNER=${'$'}_cl_owner"
-echo CL_END
-""".trimIndent()
+}
+"""
+    }
+
+    /** iter67c §2.2 — текст библиотеки на устройстве: helper'ы + тело claim, компактная форма. */
+    internal fun libText(base: String = BASE): String =
+        compact(ownHelpersRaw(base) + "\n" + claimMainRaw(base)) + "\n"
+
+    internal fun libBytes(base: String = BASE): Int = libText(base).toByteArray(Charsets.UTF_8).size
+
+    /** Имя содержит POSIX `cksum` текста: версия определяется содержимым, а не номером сборки. */
+    fun libPath(base: String = BASE): String =
+        "$base/voiceapp3_jitlib." +
+            java.lang.Long.toHexString(ScriptDelivery.cksum(libText(base).toByteArray(Charsets.UTF_8))) + ".sh"
+
+    /** Вывод claim говорит «библиотеки нет/не та» — ядро ставит её и повторяет claim один раз. */
+    fun libMissing(out: String): Boolean = out.lineSequence().any { it.trim() == "CL_WHY=lib_missing" }
+
+    /**
+     * iter67c §2.2 — установщик библиотеки. Доставляется файлом ([JitRef.JitShell.execScript]:
+     * запись + сверка `cksum` самого установщика), поэтому текст библиотеки внутри heredoc
+     * приходит байт в байт. Запись — во временный файл и `mv` (атомарно), затем сверка размера.
+     * Прежние версии библиотеки (другой `cksum` в имени) удаляются.
+     */
+    fun libInstallScript(base: String = BASE): String {
+        val path = libPath(base)
+        val want = libBytes(base)
+        val text = libText(base)
+        var eof = "JITLIB_EOF"
+        while (text.lineSequence().any { it == eof }) eof += "_X"
+        return "set +e\n" +
+            "_li=$path\n" +
+            "_lt=${'$'}_li.tmp.${'$'}${'$'}\n" +
+            "cat > \"${'$'}_lt\" <<'$eof'\n" +
+            text +
+            "$eof\n" +
+            "_ln=${'$'}(wc -c < \"${'$'}_lt\" 2>/dev/null | tr -d ' ')\n" +
+            "if [ \"${'$'}_ln\" = \"$want\" ] && mv -f \"${'$'}_lt\" \"${'$'}_li\"; then\n" +
+            "for _lo in $base/voiceapp3_jitlib.*.sh; do [ \"${'$'}_lo\" = \"${'$'}_li\" ] || rm -f \"${'$'}_lo\" 2>/dev/null; done\n" +
+            "echo \"JITLIB_OK bytes=${'$'}_ln\"\n" +
+            "else\n" +
+            "rm -f \"${'$'}_lt\" 2>/dev/null\n" +
+            "echo \"JITLIB_FAIL bytes=${'$'}{_ln:-none} want=$want\"\n" +
+            "fi\n"
     }
 
     /** Результат записи claim: «занято» отделено от «записано» и от «неизвестно». */

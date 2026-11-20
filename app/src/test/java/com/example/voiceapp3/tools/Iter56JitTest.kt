@@ -87,7 +87,7 @@ class Iter56JitTest {
         val ts = 1_700_100_000_000L
         val instA = JitOwn.newInstance("OPA", ts, nonce = 1)
         val a = op("OPA", ts, seq = 10, inst = instA)
-        assertTrue("claim A записан", sh(JitOwn.claimCmd(a, b), "claimA.sh").second
+        assertTrue("claim A записан", sh(JitOwn.claimScriptForTest(a, b), "claimA.sh").second
             .contains("CL_STATUS=taken"))
 
         // A: настоящий shell, держит lock и ещё работает (fake side effect уже сделал).
@@ -109,7 +109,7 @@ class Iter56JitTest {
         // 2) Пока A жив, новое намерение D вызывает ИМЕННО claimCmd (аудит: прежний тест
         //    запускал payload без claim и потому не проверял решение о смерти владельца).
         val d = op("OPD", ts + 3_000L, seq = 11, inst = JitOwn.newInstance("OPD", ts + 3_000L, nonce = 2))
-        val (_, outD) = sh(JitOwn.claimCmd(d, b), "claimD.sh")
+        val (_, outD) = sh(JitOwn.claimScriptForTest(d, b), "claimD.sh")
         assertTrue("claim нового намерения УСТУПИЛ живому владельцу: $outD",
             outD.contains("CL_STATUS=busy"))
         assertFalse("ложной смерти A не приписано: $outD",
@@ -125,7 +125,7 @@ class Iter56JitTest {
             Regex("^END rc=0 op=OPA inst=$instA pid=\\d+ pstart=", RegexOption.MULTILINE)
                 .containsMatchIn(term("OPA")))
         assertFalse("lock освобождён A", File(JitOwn.lockPath(b)).exists())
-        val (_, outD2) = sh(JitOwn.claimCmd(d, b), "claimD2.sh")
+        val (_, outD2) = sh(JitOwn.claimScriptForTest(d, b), "claimD2.sh")
         assertTrue("после конца A новое намерение принимается: $outD2",
             outD2.contains("CL_STATUS=taken"))
     }
@@ -150,7 +150,7 @@ class Iter56JitTest {
                 "END rc=0 op=LIV inst=liv-1 pid=999998 pstart=1 boot=$boot\n"
         )
         val d = op("NEWL", ts, seq = 6, inst = JitOwn.newInstance("NEWL", ts, nonce = 3))
-        val (_, out) = sh(JitOwn.claimCmd(d, b), "claim_newl.sh")
+        val (_, out) = sh(JitOwn.claimScriptForTest(d, b), "claim_newl.sh")
         assertTrue("живой владелец не объявлен мёртвым чужим END: $out",
             out.contains("CL_STATUS=busy"))
         assertTrue("lock владельца на месте", lockText().contains("inst=liv-1"))
@@ -166,7 +166,7 @@ class Iter56JitTest {
                 "pid=999999;pstart=1;boot=deadboot"
         )
         val n = op("N2", 1_700_100_300_000L, seq = 2, inst = JitOwn.newInstance("N2", 1_700_100_300_000L, nonce = 4))
-        val (_, out) = sh(JitOwn.claimCmd(n, b), "claim_n2.sh")
+        val (_, out) = sh(JitOwn.claimScriptForTest(n, b), "claim_n2.sh")
         assertTrue("перехват доказанно мёртвого lock разрешён: $out", out.contains("CL_STATUS=taken"))
         assertTrue("перехват назван по identity: $out", out.contains("proof=owner_dead_exact_inst"))
         // Ни одного «dead»/«pin» файла не осталось: временные объекты убираются за собой.
@@ -275,10 +275,10 @@ class Iter56JitTest {
         val t = 1_700_100_500_000L
         // Прежнее намерение записано с БОЛЬШИМ временем (часы «вперёд»).
         val first = op("K1", t + 60_000L, seq = 20, inst = JitOwn.newInstance("K1", t + 60_000L, nonce = 5))
-        assertTrue(sh(JitOwn.claimCmd(first, b), "k1.sh").second.contains("CL_STATUS=taken"))
+        assertTrue(sh(JitOwn.claimScriptForTest(first, b), "k1.sh").second.contains("CL_STATUS=taken"))
         // Новый клик после перевода часов НАЗАД: время меньше, поколение больше.
         val second = op("K2", t - 120_000L, seq = 21, inst = JitOwn.newInstance("K2", t - 120_000L, nonce = 6))
-        val (_, outSecond) = sh(JitOwn.claimCmd(second, b), "k2.sh")
+        val (_, outSecond) = sh(JitOwn.claimScriptForTest(second, b), "k2.sh")
         assertTrue("новое поколение принято несмотря на часы назад: $outSecond",
             outSecond.contains("CL_STATUS=taken"))
         assertTrue("порядок решён по seq и это названо: $outSecond",
@@ -290,10 +290,10 @@ class Iter56JitTest {
     fun olderIntentArrivingLateYieldsEvenWithLaterClockReading() {
         val t = 1_700_100_600_000L
         val newer = op("M2", t, seq = 40, inst = JitOwn.newInstance("M2", t, nonce = 7))
-        assertTrue(sh(JitOwn.claimCmd(newer, b), "m2.sh").second.contains("CL_STATUS=taken"))
+        assertTrue(sh(JitOwn.claimScriptForTest(newer, b), "m2.sh").second.contains("CL_STATUS=taken"))
         // Устаревший клик доставлен поздно: часы у него ПОЗЖЕ, поколение МЕНЬШЕ.
         val older = op("M1", t + 30_000L, seq = 39, inst = JitOwn.newInstance("M1", t + 30_000L, nonce = 8))
-        val (_, outOld) = sh(JitOwn.claimCmd(older, b), "m1.sh")
+        val (_, outOld) = sh(JitOwn.claimScriptForTest(older, b), "m1.sh")
         assertTrue("устаревшее намерение уступило: $outOld", outOld.contains("CL_STATUS=stale"))
         assertTrue("причина по seq: $outOld",
             outOld.contains("rule=seq") && outOld.contains("verdict=older_intent"))
@@ -303,11 +303,11 @@ class Iter56JitTest {
     @Test
     fun equalGenerationsAreATieAndDoNotOverwriteByChance() {
         val t = 1_700_100_700_000L
-        assertTrue(sh(JitOwn.claimCmd(op("P1", t, seq = 50, inst = JitOwn.newInstance("P1", t, nonce = 9)), b),
+        assertTrue(sh(JitOwn.claimScriptForTest(op("P1", t, seq = 50, inst = JitOwn.newInstance("P1", t, nonce = 9)), b),
             "p1.sh").second.contains("CL_STATUS=taken"))
         // Второй клик с тем же поколением (два процесса выдали одно значение): угадывать нельзя.
         val (_, outTie) = sh(
-            JitOwn.claimCmd(op("P2", t + 1, seq = 50, inst = JitOwn.newInstance("P2", t + 1, nonce = 10)), b),
+            JitOwn.claimScriptForTest(op("P2", t + 1, seq = 50, inst = JitOwn.newInstance("P2", t + 1, nonce = 10)), b),
             "p2.sh"
         )
         assertTrue("равные поколения — уступка, а не победа по случайности: $outTie",
@@ -315,7 +315,7 @@ class Iter56JitTest {
         assertTrue("прежнее намерение не перезаписано", claimText().startsWith("op=P1;"))
         // Следующий клик получит бо́льшее поколение и пройдёт — «вечного pending» нет.
         val (_, outNext) = sh(
-            JitOwn.claimCmd(op("P3", t + 2, seq = 51, inst = JitOwn.newInstance("P3", t + 2, nonce = 11)), b),
+            JitOwn.claimScriptForTest(op("P3", t + 2, seq = 51, inst = JitOwn.newInstance("P3", t + 2, nonce = 11)), b),
             "p3.sh"
         )
         assertTrue("следующее поколение проходит: $outNext", outNext.contains("CL_STATUS=taken"))
@@ -328,7 +328,7 @@ class Iter56JitTest {
         File(JitOwn.claimPath(b)).writeText(
             "op=OLDL;ts_ms=${t - 5_000};ts_s=1700100800;want=0;inst=oldl-1;pid=1;pstart=1;boot=x"
         )
-        val (_, out) = sh(JitOwn.claimCmd(op("NEWQ", t, seq = 3, inst = JitOwn.newInstance("NEWQ", t, nonce = 12)), b),
+        val (_, out) = sh(JitOwn.claimScriptForTest(op("NEWQ", t, seq = 3, inst = JitOwn.newInstance("NEWQ", t, nonce = 12)), b),
             "newq.sh")
         assertTrue("легаси-запись: порядок по времени с явным правилом: $out",
             out.contains("rule=ts_legacy") && out.contains("CL_STATUS=taken"))
@@ -339,7 +339,7 @@ class Iter56JitTest {
     @Test
     fun claimLineCarriesGenerationAndIdentity() {
         val o = op("Q1", 1_700_100_900_000L, seq = 77, inst = JitOwn.newInstance("Q1", 1_700_100_900_000L, nonce = 13))
-        val (_, out) = sh(JitOwn.claimCmd(o, b), "q1.sh")
+        val (_, out) = sh(JitOwn.claimScriptForTest(o, b), "q1.sh")
         assertTrue("claim записан: $out", out.contains("CL_STATUS=taken"))
         val line = claimText()
         assertNotNull(line)

@@ -88,7 +88,7 @@ class Iter55JitTest {
         val ts = 1_700_000_100_000L
         val instA = JitOwn.newInstance("OP", ts, nonce = 1)
         val a = op("OP", ts, inst = instA)
-        val outClaimA = sh(JitOwn.claimCmd(a, b), "claimA.sh").second
+        val outClaimA = sh(JitOwn.claimScriptForTest(a, b), "claimA.sh").second
         assertTrue("claim записан: $outClaimA", outClaimA.contains("CL_STATUS=taken"))
 
         // A: настоящий shell, держит lock и «работает» (безопасный fake side effect).
@@ -131,7 +131,7 @@ class Iter55JitTest {
 
         // После завершения A путь к работе открыт: новое намерение проходит и выполняется.
         val d2 = op("OP3", ts + 9_000L, inst = JitOwn.newInstance("OP3", ts + 9_000L, nonce = 4))
-        val (_, outClaimD2) = sh(JitOwn.claimCmd(d2, b), "claimD2.sh")
+        val (_, outClaimD2) = sh(JitOwn.claimScriptForTest(d2, b), "claimD2.sh")
         assertTrue("claim нового намерения принят: $outClaimD2", outClaimD2.contains("CL_STATUS=taken"))
         val (_, outRunD2) = sh(payload(d2, "D2", holdMs = 10), "D2.sh")
         assertFalse("новый владелец работает: $outRunD2", outRunD2.contains("JIT_REFUSED"))
@@ -156,9 +156,9 @@ class Iter55JitTest {
                 "while [ ! -f '${gate.absolutePath}' ]; do sleep 0.02; done\n" + script, name
             )
         }
-        val p1 = ProcessBuilder("/bin/sh", wrap(JitOwn.claimCmd(one, b), "one.sh"))
+        val p1 = ProcessBuilder("/bin/sh", wrap(JitOwn.claimScriptForTest(one, b), "one.sh"))
             .redirectErrorStream(true).start()
-        val p2 = ProcessBuilder("/bin/sh", wrap(JitOwn.claimCmd(two, b), "two.sh"))
+        val p2 = ProcessBuilder("/bin/sh", wrap(JitOwn.claimScriptForTest(two, b), "two.sh"))
             .redirectErrorStream(true).start()
         Thread.sleep(120)
         gate.writeText("go")
@@ -198,14 +198,14 @@ class Iter55JitTest {
 
         // Детерминированный барьер ровно между решением «free» и захватом lock: копия
         // production-скрипта с ОДНОЙ вставленной паузой (в production её нет).
-        val script = JitOwn.claimCmd(oldOp, b).replace(
+        val script = JitOwn.claimScriptForTest(oldOp, b).replace(
             "echo \"CL_ORDER seen_op=",
             "sleep 0.5\necho \"CL_ORDER seen_op="
         )
         assertTrue("барьер вставлен в копию скрипта", script.contains("sleep 0.5"))
         val p = start(script, "old_delayed.sh")
         Thread.sleep(150) // старый уже прочитал состояние, но ещё не взял lock
-        val (_, outNew) = sh(JitOwn.claimCmd(newOp, b), "new.sh")
+        val (_, outNew) = sh(JitOwn.claimScriptForTest(newOp, b), "new.sh")
         assertTrue("новое намерение записано: $outNew", outNew.contains("CL_STATUS=taken"))
         val afterNew = claimText()
         val outOld = collect(p)
@@ -229,7 +229,7 @@ class Iter55JitTest {
         // (а) пустой/мусорный lock: ни pid, ни inst — доказать смерть нечем.
         File(JitOwn.lockPath(b)).writeText("garbage-without-identity")
         val a = op("A5", ts, inst = JitOwn.newInstance("A5", ts, nonce = 31))
-        sh(JitOwn.claimCmd(a, b), "claim_a5.sh")
+        sh(JitOwn.claimScriptForTest(a, b), "claim_a5.sh")
         val (_, outGarbage) = sh(payload(a, "GARBAGE", holdMs = 10), "garbage.sh")
         assertTrue("мусорный lock не перехвачен: $outGarbage", outGarbage.contains("JIT_REFUSED"))
         assertTrue("lock не тронут", lockText().startsWith("garbage-without-identity"))
@@ -245,7 +245,7 @@ class Iter55JitTest {
                 "pstart=$stalePstart;boot=${File("/proc/sys/kernel/random/boot_id").readText().trim()}"
         )
         val b5 = op("B5", ts + 1_000, inst = JitOwn.newInstance("B5", ts + 1_000, nonce = 32))
-        val (_, outClaim) = sh(JitOwn.claimCmd(b5, b), "claim_b5.sh")
+        val (_, outClaim) = sh(JitOwn.claimScriptForTest(b5, b), "claim_b5.sh")
         assertTrue("перехват по PID reuse разрешён: $outClaim",
             outClaim.contains("CL_STATUS=taken") || outClaim.contains("proof=owner_dead_exact_inst"))
     }
@@ -270,7 +270,7 @@ class Iter55JitTest {
         )
         File(JitOwn.termPath("A6", b)).writeText("END rc=0 op=A6 inst=a6-1\n")
         val c = op("C6", ts, inst = JitOwn.newInstance("C6", ts, nonce = 33))
-        sh(JitOwn.claimCmd(c, b), "claim_c6.sh")
+        sh(JitOwn.claimScriptForTest(c, b), "claim_c6.sh")
         val (_, out) = sh(payload(c, "C6", holdMs = 10), "c6.sh")
         assertTrue("живой владелец не перехвачен чужим END: $out", out.contains("JIT_REFUSED"))
         assertTrue("lock владельца не тронут", lockText().contains("inst=b6-owner"))

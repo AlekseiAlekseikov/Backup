@@ -249,7 +249,7 @@ class Iter58JitLockTest {
         val op = JitOwn.Op("OPNEW", ts, true, JitOwn.State.CLAIMED,
             identity = JitOwn.ClaimIdentity(JitOwn.newInstance("OPNEW", ts, nonce = 7), "", "", ""),
             seq = 2L)
-        val (_, out) = sh(JitOwn.claimCmd(op, b), "claim_after_crash.sh")
+        val (_, out) = sh(JitOwn.claimScriptForTest(op, b), "claim_after_crash.sh")
 
         assertTrue("claim после crash принят: $out", out.contains("CL_STATUS=taken"))
         assertTrue("перехват назван причиной: $out",
@@ -297,10 +297,10 @@ class Iter58JitLockTest {
             identity = JitOwn.ClaimIdentity(JitOwn.newInstance(id, ts, nonce = id.hashCode()), "", "", ""),
             seq = 5L)
         val p1 = ProcessBuilder("/bin/sh", File(base, "c1.sh").apply {
-            writeText(JitOwn.claimCmd(op("OPA"), b))
+            writeText(JitOwn.claimScriptForTest(op("OPA"), b))
         }.absolutePath).redirectErrorStream(true).start()
         val p2 = ProcessBuilder("/bin/sh", File(base, "c2.sh").apply {
-            writeText(JitOwn.claimCmd(op("OPC"), b))
+            writeText(JitOwn.claimScriptForTest(op("OPC"), b))
         }.absolutePath).redirectErrorStream(true).start()
         val r1 = p1.inputStream.bufferedReader().readText()
         val r2 = p2.inputStream.bufferedReader().readText()

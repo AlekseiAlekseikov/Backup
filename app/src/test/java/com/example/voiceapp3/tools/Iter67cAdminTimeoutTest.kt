@@ -61,6 +61,12 @@ class Iter67cAdminTimeoutTest {
     @Test
     fun `claim при живом владельце админ-секции укладывается в 6 секунд`() {
         liveAdminOwner()
+        // Библиотека claim стоит на «устройстве» (как после первого клика 1.0.64): проверяем
+        // ровно тот текст, что уходит по ADB, плюс тот, что лежит в файле-хелпере.
+        val inst = File(base, "lib.sh").apply { writeText(JitOwn.libInstallScript(b)) }
+        val ip = ProcessBuilder("/bin/sh", inst.absolutePath).redirectErrorStream(true).start()
+        val iout = ip.inputStream.bufferedReader().readText(); ip.waitFor(30, TimeUnit.SECONDS)
+        assertTrue("библиотека не установилась: $iout", iout.contains("JITLIB_OK"))
         val f = File(base, "claim.sh")
         f.writeText(JitOwn.claimCmd(op(), b))
         val t0 = System.nanoTime()
@@ -83,7 +89,7 @@ class Iter67cAdminTimeoutTest {
             "CL_STATUS=busy\nCL_OWNER=admin_busy\nCL_END\n"
         val shell = object : JitRef.JitShell {
             override fun exec(command: String, timeoutMs: Int): Pair<Int, String> =
-                JitDev.exec(command) { 0 to reply }
+                if (command.contains("CL_BEGIN")) 0 to reply else JitDev.exec(command) { 0 to "" }
             override fun execScript(name: String, text: String, timeoutMs: Int): Pair<Int, String> =
                 0 to reply
             override fun mapsExcerpt(): String? = null
@@ -101,7 +107,7 @@ class Iter67cAdminTimeoutTest {
         val reply = "CL_BEGIN\nCL_STATUS=busy\nCL_OWNER=op=X;ts_ms=1;want=1;inst=Y;pid=1;pstart=1;boot=b\nCL_END\n"
         val shell = object : JitRef.JitShell {
             override fun exec(command: String, timeoutMs: Int): Pair<Int, String> =
-                JitDev.exec(command) { 0 to reply }
+                if (command.contains("CL_BEGIN")) 0 to reply else JitDev.exec(command) { 0 to "" }
             override fun execScript(name: String, text: String, timeoutMs: Int): Pair<Int, String> =
                 0 to reply
             override fun mapsExcerpt(): String? = null

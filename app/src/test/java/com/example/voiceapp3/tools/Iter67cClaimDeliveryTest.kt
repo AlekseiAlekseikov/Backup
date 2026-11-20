@@ -68,20 +68,24 @@ class Iter67cClaimDeliveryTest {
     // ─────────────────────────── §1: доставка ───────────────────────────
 
     @Test
-    fun `длинная команда claim уходит файлом, и это видно строкой`() {
+    fun `команда claim доходит до устройства, и путь доставки виден строкой`() {
         val shell = TransportShell()
         JitOp.click(JitFake.Store(), JitFake.Net(wifi = true), shell, want = true, log = ::log)
-        // fail-before: claim шёл через exec и получал ERR_ADB_TOO_LONG (44 454 > 4096),
-        // клик останавливался на владении; ни одной доставки скриптом не было.
-        val claimScripts = shell.scripts.filter { it.first.startsWith("jit_claim_") }
-        assertEquals("claim должен уйти доставкой скриптом: $lines", 1, claimScripts.size)
+        // fail-before (1.0.63): claim шёл через exec и получал ERR_ADB_TOO_LONG (44 454 > 4096),
+        // клик останавливался на владении. После §2.2 по ADB уходит только обвязка (≤ 3500):
+        // путь — inline, и транспорт её принимает.
         val delivery = lines.firstOrNull { it.startsWith("JIT_CLAIM_DELIVERY ") }
         assertTrue("нет строки выбора пути доставки: $lines", delivery != null)
-        assertTrue("не назван путь: $delivery", delivery!!.contains("path=script"))
+        assertTrue("не назван путь: $delivery", delivery!!.contains("path=inline"))
         assertTrue("не назван размер: $delivery", delivery.contains("bytes="))
-        assertTrue("не назван порог: $delivery", delivery.contains("limit_inline="))
-        assertTrue("в файловом пути не должно быть ERR_ADB_TOO_LONG: $lines",
+        assertTrue("не назван порог: $delivery", delivery.contains("limit_inline=3500"))
+        val claimSent = shell.inline.filter { it.contains("CL_BEGIN") && it.contains(JitOwn.CLAIM) }
+        assertEquals("claim отправлен ровно один раз: $lines", 1, claimSent.size)
+        assertTrue("транспорт не должен был отбить claim: ${shell.rejected.size}",
+            shell.rejected.none { it.contains("CL_BEGIN") })
+        assertTrue("владение не должно остаться неподтверждённым: $lines",
             lines.none { it.contains("claim_unproven") })
+        assertTrue("цепочка отправлена: $lines", lines.any { it.startsWith("JIT_CHAIN_SENT ") })
     }
 
     @Test
@@ -106,9 +110,9 @@ class Iter67cClaimDeliveryTest {
         // Решение — функция от РАЗМЕРА ПАКЕТА, и проверяются обе стороны порога.
         assertEquals("inline", JitOwn.deliveryPath(JitOwn.INLINE_SAFE_BYTES))
         assertEquals("script", JitOwn.deliveryPath(JitOwn.INLINE_SAFE_BYTES + 1))
-        // Текущий текст claim в один пакет не влезает — значит решение обязано быть script.
+        // После §2.2 обвязка claim влезает в один пакет — решение обязано быть inline.
         val packet = AdbClient.inlinePayloadBytes(JitOwn.claimCmd(op()))
-        assertEquals("script", JitOwn.deliveryPath(packet))
+        assertEquals("пакет claim = $packet", "inline", JitOwn.deliveryPath(packet))
     }
 
     @Test
@@ -144,12 +148,10 @@ class Iter67cClaimDeliveryTest {
     @Test
     fun `текст claim укладывается в сторож размера`() {
         val bytes = JitOwn.claimCmd(op()).toByteArray(Charsets.UTF_8).size
-        // Красный ДО: 44 134 байта (из них 25 066 — комментарии на русском).
+        // Красный ДО: 44 134 байта (из них 25 066 — комментарии на русском), 18 184 после §2.
         assertTrue("claimCmd = $bytes байт, предел ${JitOwn.CLAIM_TEXT_LIMIT}",
             bytes <= JitOwn.CLAIM_TEXT_LIMIT)
-        // Сторож обязан быть «узким»: комментариев в тексте нет, и он в 2.4 раза меньше прежнего.
-        assertTrue("текст всё ещё слишком велик для файлового пути: $bytes",
-            bytes < 18_500)
+        assertEquals("сторож claim = инлайн-порог", JitOwn.INLINE_SAFE_BYTES, JitOwn.CLAIM_TEXT_LIMIT)
     }
 
     @Test
@@ -172,9 +174,9 @@ class Iter67cClaimDeliveryTest {
     fun `размер пакета claim измерен той же формулой, что и отправка`() {
         val text = JitOwn.claimCmd(op())
         val packet = AdbClient.inlinePayloadBytes(text)
-        // Пакет больше лимита ОДНОГО пакета — именно поэтому путь script, а не «почти влезло».
-        assertTrue("пакет = $packet; ожидалось > 4096 (иначе путь должен быть inline)",
-            packet > 4_096)
+        // Пакет обвязки ≤ порога инлайн-пути — запас до 4096 остаётся.
+        assertTrue("пакет = $packet; ожидалось ≤ ${JitOwn.INLINE_SAFE_BYTES}",
+            packet <= JitOwn.INLINE_SAFE_BYTES)
         assertTrue("текст обязан быть заметно меньше пакета", packet > text.length)
     }
 
@@ -205,7 +207,8 @@ class Iter67cClaimDeliveryTest {
         // который отказывает по размеру на обоих путях (инлайн и файл).
         val shell = object : JitRef.JitShell {
             override fun exec(command: String, timeoutMs: Int): Pair<Int, String> =
-                JitDev.exec(command) { 1 to "ERR_ADB_TOO_LONG: cmd_len=44454 > 4096" }
+                if (command.contains("CL_BEGIN")) 1 to "ERR_ADB_TOO_LONG: cmd_len=44454 > 4096"
+                else JitDev.exec(command) { 0 to "" }
             override fun execScript(name: String, text: String, timeoutMs: Int): Pair<Int, String> =
                 Pair(1, "ERR_ADB_TOO_LONG: cmd_len=44454 > 4096 (use executeScript for long scripts)")
             override fun mapsExcerpt(): String? = null

@@ -2322,10 +2322,32 @@ object JitOp {
                     "(без этой строки нельзя отличить «не отправлено» от «отправлено другим путём»)"
             )
             val claimT0 = System.currentTimeMillis()
-            val claimRes = runCatching {
-                if (claimInline) shell.exec(claimCmd, 12_000)
-                else shell.execScript("jit_claim_$opId", claimCmd, 15_000)
-            }.getOrElse { t -> Pair(-1, "ERR_${'$'}{t.javaClass.simpleName}") }
+            val sendClaim = {
+                runCatching {
+                    if (claimInline) shell.exec(claimCmd, 12_000)
+                    else shell.execScript("jit_claim_$opId", claimCmd, 15_000)
+                }.getOrElse { t -> Pair(-1, "ERR_${'$'}{t.javaClass.simpleName}") }
+            }
+            var claimRes = sendClaim()
+            // iter67c §2.2: тело claim живёт в библиотеке на устройстве. Нет её (первый клик после
+            // установки 1.0.64, другая версия текста, кто-то вычистил /data/local/tmp) — claim
+            // НИЧЕГО не записал и честно ответил `lib_missing`. Ставим библиотеку файловой
+            // доставкой и повторяем claim РОВНО один раз; любой иной исход разбирается как обычно.
+            if (JitOwn.libMissing(claimRes.second)) {
+                val lib = runCatching {
+                    shell.execScript("jit_lib", JitOwn.libInstallScript(), 15_000)
+                }.getOrElse { t -> Pair(-1, "ERR_${t.javaClass.simpleName}") }
+                val ok = lib.first == 0 && lib.second.contains("JITLIB_OK")
+                log(
+                    "JIT_CLAIM_LIB op=$opId action=install result=${if (ok) "ok" else "fail"} " +
+                        "rc=${lib.first} bytes=${JitOwn.libBytes()} " +
+                        "file=${JitOwn.libPath().substringAfterLast('/')} " +
+                        "out=«${lib.second.lineSequence().lastOrNull { it.startsWith("JITLIB_") } ?: lib.second.takeLast(120).trim()}» " +
+                        "(библиотеки claim на устройстве не было: claim ничего не записал; " +
+                        "${if (ok) "повтор claim один раз" else "повтора нет"})"
+                )
+                if (ok) claimRes = sendClaim()
+            }
             // iter67c §4: таймаут ожидания админ-секции (или транспорта) — отдельная строка, чтобы
             // в журнале он не сливался с «занято живым владельцем» (busy_alive).
             run {
