@@ -278,6 +278,8 @@ class VoiceAssistantService : Service() {
                 com.example.voiceapp3.tools.NetInfoAndroid(applicationContext)
             )
         }
+        // iter65: возврат Wi-Fi после рестарта zygote — отдельный сервис (как у референса).
+        runCatching { JitWatchdogService.start(this, "service.onCreate") }
         // iter33e A2: сверка «JIT после перезапуска zygote». Вызывается на КАЖДОМ старте.
         runCatching { AppPerformance.checkPendingZygoteVerify(this, "onCreate") }
         registerKeyReceiver()

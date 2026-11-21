@@ -24,6 +24,11 @@ class BootReceiver : BroadcastReceiver() {
             val serviceIntent = Intent(app, VoiceAssistantService::class.java)
                 .putExtra(VoiceAssistantService.EXTRA_BOOT_RESTORE, true)
             app.startForegroundService(serviceIntent)
+            // iter65: возврат Wi-Fi после рестарта zygote (JIT) — как `CentralWatchdogService.onCreate`.
+            // Только BOOT_COMPLETED: до разблокировки обычное хранилище префов недоступно.
+            if (action == Intent.ACTION_BOOT_COMPLETED) {
+                runCatching { JitWatchdogService.start(app, "boot") }
+            }
 
             // iter16: ПЕРВЫМ ДЕЛОМ на фоне замеряем текущий screen_off_timeout
             // (ДО любых наших записей) — чтобы понять, сбрасывает ли его прошивка.

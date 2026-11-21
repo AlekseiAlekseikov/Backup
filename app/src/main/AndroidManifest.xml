@@ -197,6 +197,12 @@
             </intent-filter>
         </service>
 
+        <!-- iter65: аналог CentralWatchdogService референса — возврат Wi-Fi после рестарта zygote (JIT). -->
+        <service
+            android:name=".JitWatchdogService"
+            android:enabled="true"
+            android:exported="false" />
+
         <receiver
             android:name=".BootReceiver"
             android:exported="true"

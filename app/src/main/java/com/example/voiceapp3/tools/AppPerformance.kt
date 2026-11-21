@@ -812,32 +812,15 @@ object AppPerformance {
     }
 
     /**
-     * Продолжение операции на старте процесса — `CentralWatchdogService.onCreate`:
-     * снимок `jit_restaurar` разобран → снят → через 15 с `w0/e2` **только клиентский Wi-Fi**
-     * (AP не поднимается: решение владельца, iter36 §2.1).
-     *
-     * Своих условий здесь нет: ни метки загрузки, ни проверки «а выполнялся ли скрипт», ни
-     * блокировок. Так делает референс — и это описано в отчёте как его поведение, включая риск:
-     * снимок применяется на ЛЮБОМ старте процесса, пока строка не снята, а снимается она до
-     * выполнения, поэтому смерть процесса в эти 15 с отменяет возврат сети навсегда.
+     * Сверка на старте процесса. iter65: возврат Wi-Fi отсюда УБРАН — его делает
+     * [com.example.voiceapp3.JitWatchdogService] (`CentralWatchdogService.onCreate` референса).
+     * Здесь — только сверка, если есть `jit_pedido`.
      */
     fun jitPendingVerify(context: Context, source: String = "process"): Boolean {
         val app = context.applicationContext
-        val out = runCatching { JitNet.onProcessStart(app, source) }
-            .onFailure { AppLog.i(TAG, "JIT_START_RESULT exception=${it.javaClass.simpleName} (сеть не тронута)") }
-            .getOrNull()
-        if (out == null) return false
-        // Ни `restarted=`, ни `net_restore_done`: наличие снимка НЕ доказывает ни рестарт zygote,
-        // ни успешный возврат сети. Пишем только то, что известно: что снято, что запланировано.
-        AppLog.i(TAG, "JIT_START_RESULT source=$source snapshot=${out.snapshot?.wire() ?: "none"} " +
-            "format=${out.format ?: "none"} reason=${out.reason} op=${out.mark?.op ?: "none"} " +
-            "mark_state=${out.mark?.state ?: "none"} restore_removed=after_restore " +
-            "restore_scheduled=${out.scheduled} delay_ms=${JitRef.RESTORE_DELAY_MS} " +
-            "restart=not_claimed internet=not_checked " +
-            "(iter38: снимок НЕ удаляется до фактического возврата — смерть процесса в эти 15 с " +
-            "больше не теряет продолжение; неопознанный снимок (legacy_or_unknown) не выполняется и " +
-            "не удаляется; AP не поднимается — решение владельца)")
-        return out.scheduled
+        return runCatching { verifyJitOnly(app) }
+            .onFailure { AppLog.i(TAG, "JIT_START_RESULT source=$source exception=${it.javaClass.simpleName}") }
+            .getOrDefault(false)
     }
 
     /**
