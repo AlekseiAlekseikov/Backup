@@ -92,9 +92,9 @@ class JitUiStateTest {
     fun verificationIsReachableAndNotPerTick() {
         val app = code("src/main/java/com/example/voiceapp3/tools/AppPerformance.kt")
         assertTrue("сверка проверяет наличие намерения до shell",
-            app.contains("JitNet.hasPendingPedido(app)"))
+            app.contains("JitMechAndroid.hasPedido(app)"))   // iter65: проверка намерения — JitMechAndroid
         assertTrue("и честно пишет, что снимает ключ",
-            app.contains("write=remove_if_confirmed"))
+            app.contains("pedido_removed="))                // iter65: поле лога JitMech.verify
         val svc = code("src/main/java/com/example/voiceapp3/VoiceAssistantService.kt")
         assertTrue("watchdog зовёт сверку только внутри ветки тяжёлых тиков",
             svc.contains("AppPerformance.verifyJitOnly(app)"))

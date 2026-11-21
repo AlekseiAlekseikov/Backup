@@ -216,6 +216,16 @@ object JitMech {
     )
 
     /**
+     * Текст `master_perf_jit_not_applied` для существующей строки состояния (тоста/новых элементов
+     * UI нет). Только при [Verify.notApplied]; иначе `null`.
+     */
+    fun notAppliedHint(v: Verify): String? = when {
+        !v.notApplied -> null
+        v.getprop != v.pedido -> "JIT не применился: dalvik.vm.usejit=${v.getprop}, запрошено ${v.pedido}"
+        else -> "JIT не применился: свойство true, исполняемого JIT-кэша в карте процесса нет"
+    }
+
+    /**
      * `w0/bb` + `w0/r7`. Тумблер рисуется по [Verify.getprop]. `jit_pedido` снимается после сверки.
      * Отличия от референса (обоснованы в сравнении): сверка не идёт, пока в этом процессе клик в
      * полёте, и откладывается, если `getprop` не прочитан.

@@ -828,8 +828,11 @@ object AppPerformance {
      * Результат кэшируется в [LAST_JIT_FACT] для UI: панель не должна ходить в shell из main.
      */
     fun jitRuntimeFact(context: Context): JitRef.PropFact {
-        val fact = runCatching { JitNet.usejitFact(context.applicationContext) }
-            .getOrDefault(JitRef.PropFact(JitRef.Prop.UNKNOWN, "", 1, "exception"))
+        // iter65: `H1(8000, "getprop dalvik.vm.usejit")` референса — одна команда, без ожиданий.
+        val fact = runCatching {
+            val (rc, out) = JitMechAndroid.AndroidShell.exec(JitMech.GETPROP_CMD, JitMech.GETPROP_TIMEOUT_MS)
+            JitRef.parseProp(rc, out)
+        }.getOrDefault(JitRef.PropFact(JitRef.Prop.UNKNOWN, "", 1, "exception"))
         LAST_JIT_FACT = fact
         return fact
     }
@@ -860,7 +863,7 @@ object AppPerformance {
      * файловую систему с main-потока. `null` — прочитать/разобрать не удалось (это НЕ «кэша нет»).
      */
     fun jitCodeCacheExecutable(): Boolean? = runCatching {
-        JitRef.cacheExecutableFromMaps(java.io.File("/proc/self/maps").readText())
+        JitMech.cacheExecutable(JitMechAndroid.selfMaps())
     }.getOrNull()
 
     /**
@@ -1004,30 +1007,31 @@ object AppPerformance {
      *
      * Вызывается: (а) при открытии панели инструментов — как настройки в референсе (`S0` → `bb`);
      * (б) в watchdog раз в 5 тиков, и только если в префах есть `jit_pedido`
-     * ([JitNet.hasPendingPedido], локальная проверка без shell). Пока наш клик в полёте, сверка
+     * ([JitMechAndroid.hasPedido], локальная проверка без shell). Пока наш клик в полёте, сверка
      * ядром пропускается (`click_in_flight`) — иначе она удалила бы только что записанное намерение.
      *
      * @return `true`, если сверка действительно выполнялась (было что сверять).
      */
     fun verifyJitOnly(context: Context): Boolean {
         val app = context.applicationContext
-        if (!runCatching { JitNet.hasPendingPedido(app) }.getOrDefault(false)) {
+        if (!runCatching { JitMechAndroid.hasPedido(app) }.getOrDefault(false)) {
             AppLog.i(TAG, "JIT_PROBE skipped reason=no_pedido write=none commands=0 " +
                 "(сверять нечего: намерения нет; getprop-запрос не отправлялся)")
             return false
         }
-        val out = runCatching { JitNet.verifyApplied(app) }.getOrNull() ?: return false
-        if (out.skipped != null) {
-            AppLog.i(TAG, "JIT_PROBE skipped reason=${out.skipped} write=none")
-            return false
+        val v = runCatching { JitMechAndroid.verify(app) }.getOrNull() ?: return false
+        // Прочитанный факт сразу идёт в кэш тумблера (`setActive(getprop)` в `w0/r7`).
+        v.getprop?.let { on ->
+            LAST_JIT_FACT = JitRef.PropFact(if (on) JitRef.Prop.TRUE else JitRef.Prop.FALSE, on.toString(), 0, "ok")
+            lastJitFactAt = System.currentTimeMillis()
         }
+        if (v.skipped != null) return false
         val gen = jitGeneration.get()
-        val hint = JitRef.verifyHint(out.verdict, out.prop, out.cache)
+        val hint = JitMech.notAppliedHint(v)
         LAST_JIT_HINT.set(Hint(hint, gen))
-        AppLog.i(TAG, "JIT_PROBE result=${JitRef.verifyLabel(out.verdict)} pedido=${out.pedido} " +
-            "write=remove_if_confirmed removed=${out.removed?.allOk ?: false} " +
-            "still_present=${out.stillPresent} generation=$gen ui_hint=${hint ?: "none"} " +
-            "restart=not_claimed")
+        AppLog.i(TAG, "JIT_PROBE ok=${v.ok} not_applied=${v.notApplied} pedido=${v.pedido} " +
+            "getprop=${v.getprop} maps=${v.maps} pedido_removed=${v.pedidoRemoved} " +
+            "generation=$gen ui_hint=${hint ?: "none"}")
         return true
     }
 
