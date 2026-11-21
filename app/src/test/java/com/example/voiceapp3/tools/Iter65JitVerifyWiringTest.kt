@@ -42,4 +42,16 @@ class Iter65JitVerifyWiringTest {
         assertTrue(ap.contains("JitMech.cacheExecutable(JitMechAndroid.selfMaps())"))
         for (old in listOf("JitNet.", "JitOp.", "JitUi.")) assertFalse(old, ap.contains(old))
     }
+
+    /** Описание тумблера ссылается на строку лога, которую реально пишет сверка (JIT_APPLIED удалён вместе с JitOp). */
+    @Test
+    fun toggleDescriptionNamesTheRealVerifyLogLine() {
+        val dir = listOf(File("src/main/java"), File("app/src/main/java")).first { it.isDirectory }
+        val catalog = File(dir, "com/example/voiceapp3/ui/ToolsCatalog.kt").readText()
+        val desc = catalog.lineSequence().first { it.contains("\"desc.perfJit\"") }
+        assertTrue(desc, desc.contains("JIT_VERIFY"))
+        assertFalse(desc, desc.contains("JIT_APPLIED"))
+        val mech = File(dir, "com/example/voiceapp3/tools/JitMech.kt").readText()
+        assertTrue(mech.contains("log(\"JIT_VERIFY ok="))
+    }
 }
