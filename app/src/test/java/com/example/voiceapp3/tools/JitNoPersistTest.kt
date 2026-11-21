@@ -42,8 +42,9 @@ class JitNoPersistTest {
     @Test
     fun legacyValuesAreReadOnly() {
         val ap = code("src/main/java/com/example/voiceapp3/tools/AppPerformance.kt")
-        assertTrue(ap.contains("getprop \$PROP_PERSIST_USEJIT_INIT"))
-        assertTrue(ap.contains("JIT_BOOT_LEGACY"))
+        // iter65: persist-свойства JIT больше даже не читаются (референс их не знает).
+        assertFalse(ap.contains("persist.dalvik.vm.usejit") || ap.contains("persist.sys.dalvik.vm.usejit"))
+        assertFalse(ap.contains("JIT_BOOT_LEGACY"))
         assertFalse("нет автоочистки старых значений", ap.contains("clearLegacy") || ap.contains("remove(\"persist"))
     }
 }

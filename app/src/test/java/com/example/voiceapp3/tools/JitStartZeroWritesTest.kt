@@ -96,12 +96,11 @@ class JitStartZeroWritesTest {
         val src = File("src/main/java/com/example/voiceapp3/tools/AppPerformance.kt")
             .let { if (it.isFile) it else File("app/src/main/java/com/example/voiceapp3/tools/AppPerformance.kt") }
             .readText()
-        val probe = src.substring(
-            src.indexOf("fun jitBootProbe"),
-            src.indexOf("fun jitBootProbe") + 4_000
-        )
-        assertTrue("проба только читает свойства", probe.contains("getprop"))
+        // iter65: граница — до следующей функции (проба стала короче, 4000 символов захватывали чужой код).
+        val start = src.indexOf("fun jitBootProbe")
+        val probe = src.substring(start, src.indexOf("\n    private fun ", start))
+        assertTrue("проба только читает свойство", probe.contains("jitRuntimeFact(context)"))   // iter65
         assertFalse("проба не пишет свойства", probe.contains("setprop"))
-        assertTrue("остатки старых версий фиксируются отдельно", src.contains("JIT_BOOT_LEGACY"))
+        assertFalse("iter65: persist-остатки не читаются", src.contains("JIT_BOOT_LEGACY"))
     }
 }

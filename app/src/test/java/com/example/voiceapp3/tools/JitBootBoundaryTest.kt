@@ -61,8 +61,8 @@ class JitBootBoundaryTest {
     @Test
     fun legacyPersistIsOnlyRead() {
         val ap = code("src/main/java/com/example/voiceapp3/tools/AppPerformance.kt")
-        assertTrue("остатки читаются", ap.contains("getprop \$PROP_PERSIST_USEJIT_INIT"))
-        assertTrue("и помечены как решение владельца", ap.contains("need=owner_decision"))
-        assertTrue("и явно read-only", ap.contains("write=none"))
+        // iter65: persist-свойства JIT больше не читаются (проба — только dalvik.vm.usejit).
+        assertFalse("остатки не читаются", ap.contains("PROP_PERSIST_USEJIT"))
+        assertTrue("проба явно read-only", ap.contains("write=none (только чтение: JIT на старте не применяется)"))
     }
 }

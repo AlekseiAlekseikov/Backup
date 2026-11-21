@@ -688,20 +688,6 @@ object AppPerformance {
     // ═══════════════ iter33b A2б: JIT после перезагрузки ═══════════════
 
     private const val PROP_USEJIT = "dalvik.vm.usejit"
-    private const val PROP_USEJIT_PROFILES = "dalvik.vm.usejitprofiles"
-    /**
-     * iter33l §3.5 — init поднимает `persist.X` в `X`, поэтому ОСНОВНОЙ ключ —
-     * `persist.dalvik.vm.usejit` (из него при загрузке станет `dalvik.vm.usejit`).
-     * `persist.sys.dalvik.vm.usejit` остаётся МАРКЕРОМ (совместимость и лог миграции).
-     */
-    private const val PROP_PERSIST_USEJIT = "persist.sys.dalvik.vm.usejit"
-    private const val PROP_PERSIST_USEJIT_INIT = "persist.dalvik.vm.usejit"
-    /**
-     * iter33g C2: `claim none` печатаем один раз за процесс — при обычном открытии приложения
-     * `onCreate` + `onStartCommand` давали две одинаковые строки шума.
-     */
-    private val saidNoClaim = java.util.concurrent.atomic.AtomicBoolean(false)
-
 
     /**
      * Тег текущей загрузки ГУ. Реализация одна на приложение (`HvacDigitalPlugin.currentBootTag`:
@@ -714,44 +700,19 @@ object AppPerformance {
     private val videoBootAttempted = java.util.concurrent.atomic.AtomicBoolean(false)
 
     /**
-     * iter33n §3 — проба JIT на КАЖДОМ старте, БЕЗ условий (ни преф, ни runtime не влияют).
+     * Проба JIT на КАЖДОМ старте процесса — одна строка, только чтение.
      *
-     * Лог 08.11 (после ребута ГУ): `JIT_VERIFY: skipped reason=zygote_restart_removed` и больше
-     * ничего — состояние JIT после перезагрузки по логу не восстановить. Теперь одна строка всегда:
-     *
-     *   `JIT_BOOT runtime=… persist=… profiles=… init=… expect_runtime_true_after_reboot=… key=…`
-     *
-     * и, если `persist=true`, а `runtime` не `true`, — вторая строка с причиной
-     * `reason=init_did_not_carry` (§3.2). Ничего не пишем: только чтение.
+     * iter65: читается ТОЛЬКО `dalvik.vm.usejit` (механизм референса не знает persist-свойств JIT
+     * и `usejitprofiles`); строка `JIT_BOOT runtime=… pref=… write=none`. JIT на старте не
+     * применяется — только по явному клику тумблера.
      */
     fun jitBootProbe(context: Context) {
         if (!jitProbeDone.compareAndSet(false, true)) return
-        val cmd = "echo RT=\$(getprop $PROP_USEJIT); " +
-            "echo PS=\$(getprop $PROP_PERSIST_USEJIT_INIT); " +
-            "echo MK=\$(getprop $PROP_PERSIST_USEJIT); " +
-            "echo PR=\$(getprop $PROP_USEJIT_PROFILES)"
-        val out = runCatching { AdbClient.execute(cmd, 6000, expectRoot = false).second }.getOrDefault("")
-        fun read(tag: String): String =
-            Regex("$tag=([^\\n]*)").find(out)?.groupValues?.get(1)?.trim().orEmpty()
-        val runtime = read("RT").ifEmpty { "empty" }
-        val persist = read("PS").ifEmpty { "empty" }        // persist.dalvik.vm.usejit (init-ключ)
-        val marker = read("MK").ifEmpty { "empty" }         // persist.sys.dalvik.vm.usejit (маркер старых версий)
-        val profiles = read("PR").ifEmpty { "empty" }
-        val init = persist                                   // init = тот же ключ
-        val expect = init == "true" || marker == "true"
+        val fact = jitRuntimeFact(context)
         val pref = if (isAutoOptimizeEnabled(context)) "on" else "off"
-        AppLog.i(TAG, "JIT_BOOT runtime=$runtime persist=$persist profiles=$profiles init=$init " +
-            "expect_runtime_true_after_reboot=$expect marker=$marker key=$PROP_PERSIST_USEJIT_INIT pref=$pref " +
+        AppLog.i(TAG, "JIT_BOOT runtime=${fact.raw.ifEmpty { "empty" }} rc=${fact.rc} pref=$pref " +
             "write=none (только чтение: JIT на старте не применяется)")
-        // iter33p (1.0.61): остатки прежних версий только ЧИТАЕМ и не трогаем — очистка persist-флагов
-        // это запись в систему, на которую нужно решение владельца (см. §2.1 отчёта).
-        if (persist == "true" || marker == "true") {
-            AppLog.i(TAG, "JIT_BOOT_LEGACY persist=${persist} marker=$marker action=none " +
-                "reason=leftover_from_previous_versions need=owner_decision " +
-                "(read-only способ проверки: getprop $PROP_PERSIST_USEJIT_INIT / getprop $PROP_PERSIST_USEJIT)")
-        }
-        // Сверка результата операции (getprop + кэш) и продолжение операции — оба ТОЛЬКО читают,
-        // если снимка этой загрузки нет (см. [jitPendingVerify]).
+        // Сверка (getprop + кэш), если есть `jit_pedido` (см. [jitPendingVerify]).
         runCatching { jitPendingVerify(context) }
         // AVAS: прежняя JIT-привязка удалена (§2 мандата: mute/sound type — самостоятельные функции
         // референса, `w0/la.run`/`w0/e2.run` их не трогают). Остаточный снимок AVAS старых версий
@@ -808,7 +769,6 @@ object AppPerformance {
         BgWorker.post("AppPerformance.jitPendingVerify") {
             runCatching { jitPendingVerify(app, source) }
         }
-        saidNoClaim.compareAndSet(false, true)
     }
 
     /**

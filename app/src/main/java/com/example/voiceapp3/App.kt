@@ -46,7 +46,7 @@ class App : Application() {
         BgWorker.post("HvacFlagsApply.startupDiagnostics") {
             runCatching { com.example.voiceapp3.tools.HvacFlagsApply.startupDiagnostics() }
         }
-        // iter33n §3: строка `JIT_BOOT runtime/persist/profiles/init` — ВСЕГДА, на каждом старте,
+        // iter33n §3 / iter65: строка `JIT_BOOT runtime=…` (только dalvik.vm.usejit) — на каждом старте,
         // независимо от тумблера (после ребута иначе состояние JIT по логу неизвестно).
         BgWorker.post("AppPerformance.jitBootProbe") {
             runCatching { com.example.voiceapp3.tools.AppPerformance.jitBootProbe(this) }
