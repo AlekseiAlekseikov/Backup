@@ -40,6 +40,26 @@ class Iter65JitClickWiringTest {
         assertFalse("нет persist-свойств", b.contains("persist."))
     }
 
+    /** Критерии §6: нет persist usejit, нет авто-применения на старте, нет jit_boot_restore_done и claim-библиотеки. */
+    @Test
+    fun noAutoApplyNoPersistNoClaimAnywhere() {
+        val dir = listOf(File("src/main/java"), File("app/src/main/java")).first { it.isDirectory }
+        val files = dir.walkTopDown().filter { it.isFile && it.extension == "kt" }.toList()
+        fun live(f: File) = f.readLines().filterNot { val t = it.trim(); t.startsWith("*") || t.startsWith("//") || t.startsWith("/*") }
+        val bad = mutableListOf<String>()
+        for (f in files) for (l in live(f)) {
+            if (f.name != "JitMech.kt" && l.contains("setprop dalvik.vm.usejit")) bad += "${f.name}: usejit вне JitMech"
+            if (Regex("setprop\\s+persist\\.[a-z.]*usejit").containsMatchIn(l)) bad += "${f.name}: persist usejit"
+            if (l.contains("usejitprofiles")) bad += "${f.name}: usejitprofiles"
+            if (l.contains("jit_boot_restore_done")) bad += "${f.name}: jit_boot_restore_done"
+            if (l.contains("JIT_CLAIM")) bad += "${f.name}: JIT_CLAIM"
+        }
+        assertEquals(emptyList<String>(), bad)
+        val names = files.map { it.name }.toSet()
+        for (gone in listOf("JitOwn.kt", "JitPair.kt", "JitUnblock.kt", "JitBootMark.kt", "JitNetDecision.kt", "JitUi.kt"))
+            assertFalse(gone, gone in names)
+    }
+
     @Test
     fun nothingElseSendsTheChain() {
         val dir = listOf(File("src/main/java"), File("app/src/main/java")).first { it.isDirectory }
