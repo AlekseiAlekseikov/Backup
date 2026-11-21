@@ -63,8 +63,7 @@ class Iter67cRefusalTest {
         assertFalse("любой не-ok больше не пишется через e()", toggle.contains("else e(\"CENTRAL_Tools\""))
         assertEquals("обе строки (TOGGLE и ACTION) пишутся по уровню результата", 2,
             Regex("logByLevel\\(r\\.logLevel").findAll(toggle).count())
-        val perf = File(m + "AppPerformance.kt").readText()
-        assertTrue("панель JIT берёт текст отказа из JitUi.refusalText",
-            perf.contains("JitUi.refusalText(blocked)"))
+        // iter65: проверка `JitUi.refusalText(blocked)` в AppPerformance снята — отказы claim/lock
+        // удалены вместе со старым кликом; у клика референса единственный отказ — `busy`.
     }
 }

@@ -193,12 +193,12 @@ object AppPerformance {
         val steps = mutableListOf<ToolsStep>()
         val now = System.currentTimeMillis()
         try {
-            // preference пишет клик — как `w0/j9.onClick`: `perf_auto_otimizar` входит в тот же
-            // `commit()`, что `jit_pedido` и `jit_restaurar` (`JitNet.click` → `JitOp.click`).
+            // preference пишет клик — как `w0/j9.onClick`: `perf_auto_otimizar` пишется вместе с
+            // `jit_pedido` и `jit_restaurar` (`JitMechAndroid.click` → `JitMech.click`).
             steps.add(
                 ToolsStep(
                     step = "perf_pref",
-                    command = "prefs.putBoolean(perf_auto_otimizar, $enabled) — пишет JitOp после снимка",
+                    command = "prefs.putBoolean(perf_auto_otimizar, $enabled) — пишет JitMech.click",
                     startedAtMs = now,
                     finishedAtMs = System.currentTimeMillis(),
                     exitCode = 0,
@@ -946,13 +946,15 @@ object AppPerformance {
      */
 
     /**
-     * Применение JIT по клику тумблера — один вызов ядра [JitOp.click] (референс `w0/j9.onClick`
-     * → `w0/la.run`). Своей логики здесь нет: только строка статуса.
+     * iter65 — клик тумблера JIT = `w0.j9.onClick` + `w0/la.run` референса ([JitMech.click]):
+     * три ключа префов (`jit_pedido`, `perf_auto_otimizar`, `jit_restaurar=wifi=X`), строка
+     * `dalvik.vm.usejit -> X; reiniciando o framework` и ОДНА команда — литерал цепочки
+     * (`svc wifi disable` → ожидание правил `oif wlan0` → `umount -l` монтирований `/data/app/` →
+     * `setprop dalvik.vm.usejit` → `setprop ctl.restart zygote`).
      *
-     * Статус честный: `PARTIAL` — «скрипт отправлен, итог дочитается на следующем старте»: и
-     * `getprop`, и `maps` из процесса, который умрёт от рестарта zygote, прочитать нельзя.
-     * `BLOCKED` — скрипт НЕ отправлялся, и в тексте написано, почему (Wi-Fi неизвестен/снимок не
-     * подтверждён).
+     * При успехе процесс погибает внутри вызова (рестарт фреймворка), и до `return` дело не
+     * доходит. Если вернулись — рестарта не было (или транспорт ответил ошибкой): статус `PARTIAL`,
+     * итог покажет сверка ([verifyJitOnly]). Wi-Fi вернёт [com.example.voiceapp3.JitWatchdogService].
      */
     fun jitApplyWithZygote(context: Context, enabled: Boolean): List<ToolsStep> {
         BgWorker.assertNotMain("AppPerformance.jitApplyWithZygote")
@@ -961,134 +963,28 @@ object AppPerformance {
         // Поколение уже поднято событием клика в UI (markJitClick); вызов здесь — страховка для
         // путей, которые приходят не из панели. Устаревшие ответы это только отсекает.
         bumpJitGeneration()
-        AppLog.i(TAG, "JIT_APPLIED_REQUEST want=$enabled ${JitRef.mountStepNote()} " +
-            "warning=\"фреймворк перезапустится: экран гаснет на 10–20 с, приложения закрываются\"")
-        val click = runCatching { JitNet.click(app, enabled) }
-            .onFailure { AppLog.i(TAG, "JIT_CLICK exception=${it.javaClass.simpleName}") }
+        val click = runCatching { JitMechAndroid.click(app, enabled) }
+            .onFailure { AppLog.w(TAG, "JIT_CLICK exception=${it.javaClass.simpleName}") }
             .getOrNull()
-        val fact = runCatching { JitNet.usejitFact(app) }
-            .getOrDefault(JitRef.PropFact(JitRef.Prop.UNKNOWN, "", 1, "exception"))
         val sent = click?.sent == true
-        val blocked = click?.blocked
-        AppLog.i(TAG, "JIT_APPLIED_RESULT sent=$sent blocked=${blocked ?: "none"} " +
-            "attempted=${click?.write?.attempted ?: 0} committed=${click?.write?.committed ?: 0} " +
-            "confirmed=${click?.confirmed ?: 0} first_readable=${click?.write?.firstReadable ?: false} " +
-            "read=${click?.read?.value ?: "none"} " +
-            "conflicts=${click?.read?.conflicts?.size ?: 0} previous_undefined=${click?.previousUndefined ?: false} " +
-            "${fact.log} want=$enabled restart=not_claimed rc=${click?.exitCode ?: -1} " +
-            "outcome=${click?.let { JitRef.chainOutcomeLabel(it.outcome) } ?: "none"}")
-        val shellReply = click != null && click.sent &&
-            click.outcome == JitRef.ChainOutcome.REPLY_RECEIVED
-        val restoreShown = click?.snap?.wire() ?: "none"
-        val actual = when {
-            blocked == "busy" ->
-                "предыдущий клик ещё выполняется → вторая цепочка НЕ запущена, снимок Wi-Fi не " +
-                    "перезаписан; дождитесь завершения первой операции"
-            blocked == "chain_undefined" ->
-                "у прошлой команды не было ответа транспорта: она могла остаться в очереди и " +
-                    "выполниться позже. Исход НЕ известен → вторая цепочка НЕ отправлена, снимок " +
-                    "не перезаписан. Включённый Wi-Fi, IP и новый запуск доказательством не " +
-                    "считаются: действие станет возможным только когда появится подтверждение " +
-                    "завершения именно той команды (или по решению владельца — см. отчёт), ⛔"
-            blocked == "previous_unfinished" ->
-                "сохранённая операция не завершена: возврат клиентского Wi-Fi не подтверждён или " +
-                    "очистка не прошла → новый клик отклонён, чтобы не потерять исходный снимок. " +
-                    "Повторная попытка возврата — при следующем обычном запуске приложения"
-            blocked == "previous_ambiguous" ->
-                "сохранённые данные операции неполные или копии CPS/DPS расходятся → какое " +
-                    "состояние верно, достоверно неизвестно; ничего не записано и не отправлено"
-            blocked == "previous_broken" ->
-                "сохранённый снимок Wi-Fi не нашего формата: выполнить его нельзя, а затереть " +
-                    "новым значением — потерять данные владельца → скрипт НЕ отправлен"
-            blocked == "prev_unknown" ->
-                "прежние значения ключей операции прочитать не удалось («данных нет» утверждать " +
-                    "нельзя) → запись и скрипт не выполнялись, сеть не тронута"
-            blocked == "restore_pending" ->
-                "возврат клиентского Wi-Fi по прошлому снимку уже запланирован и ещё не выполнен → " +
-                    "новый клик отклонён, чтобы не перезаписать снимок и не поставить вторую " +
-                    "цепочку поверх отложенного возврата"
-            blocked == "wifi_unknown" ->
-                "состояние клиентского Wi-Fi прочитать не удалось → скрипт НЕ отправлен, сеть не тронута"
-            blocked == "snapshot_not_saved" ->
-                "снимок Wi-Fi не сохранён надёжно (committed=${click?.write?.committed ?: 0}, " +
-                    "confirmed=${click?.confirmed ?: 0}, первое по порядку чтения хранилище " +
-                    "подтвердило=${click?.write?.firstReadable ?: false}) → скрипт НЕ отправлен, " +
-                    "сеть и свойства не тронуты"
-            blocked == "snapshot_conflict" ->
-                "CPS и DPS расходятся, будущий снимок неоднозначен → скрипт НЕ отправлен"
-            blocked == "snapshot_not_readable" ->
-                "снимок не читается тем порядком, которым его прочтёт продолжение → скрипт НЕ отправлен"
-            blocked != null -> "блокировано ($blocked) → скрипт НЕ отправлен"
-            else ->
-                "restore=$restoreShown committed=${click?.write?.committed ?: 0} " +
-                    "confirmed=${click?.confirmed ?: 0} rc=${click?.exitCode ?: -1} " +
-                    "outcome=${click?.let { JitRef.chainOutcomeLabel(it.outcome) } ?: "none"} " +
-                    "getprop=${fact.raw.ifEmpty { "unknown" }} restart=not_claimed internet=not_checked"
-        }
-        val note = if (click?.previousUndefined == true)
-            " · у предыдущей команды не было ответа: она могла остаться в очереди — исход прошлого " +
-                "действия не подтверждён"
-        else ""
+        val usejit = "setprop $PROP_USEJIT ${if (enabled) "true" else "false"}"
         return listOf(
             ToolsStep(
                 step = "perf_zygote",
-                command = if (sent)
-                    "setprop $PROP_USEJIT=${if (enabled) "true" else "false"} + " +
-                        "setprop ctl.restart zygote (скрипт референса w0/la.run; " +
-                        "${JitRef.mountStepNote()})"
-                else "нет: клик не дошёл до отправки скрипта (см. лог)",
+                command = if (sent) "$usejit + setprop ctl.restart zygote (цепочка референса w0/la.run)"
+                else "нет: ${click?.refused ?: "exception"}",
                 startedAtMs = t0, finishedAtMs = System.currentTimeMillis(),
-                exitCode = if (sent) (click!!.exitCode) else 1,
-                expected = "JIT pedido=… getprop=… result=ok на следующем старте (w0/bb + w0/r7)",
-                actual = actual + note,
-                stdout = when {
-                    blocked == "busy" ->
-                        "скрипт не отправлен: предыдущий клик JIT ещё выполняется. Второй " +
-                            "конфликтующей цепочки нет — исходный снимок Wi-Fi не перезаписывается " +
-                            "состоянием, снятым уже после отключения Wi-Fi"
-                    blocked == "chain_undefined" ->
-                        "скрипт не отправлен: у прошлой команды не было ответа, она могла остаться " +
-                            "в очереди. Пока исход не установлен, вторая цепочка не запускается и " +
-                            "снимок не перезаписывается; таймаут, getprop, boot id, новый процесс и " +
-                            "включённый Wi-Fi доказательством не считаются"
-                    blocked == "previous_unfinished" || blocked == "previous_ambiguous" ||
-                        blocked == "previous_broken" || blocked == "prev_unknown" ->
-                        "скрипт не отправлен: сохранённое состояние операции не позволяет безопасно " +
-                            "начать новую (причина: $blocked). Сеть и системные свойства не менялись"
-                    blocked == "restore_pending" ->
-                        "скрипт не отправлен: возврат Wi-Fi по прошлому снимку ещё не выполнен " +
-                            "(запланирован). Новый клик сейчас перезаписал бы снимок"
-                    blocked == "wifi_unknown" ->
-                        "скрипт не отправлен: Wi-Fi ГУ сейчас не прочитать, а без достоверного " +
-                            "снимка после рестарта фреймворка сеть нечем вернуть. Выключение " +
-                            "клиентского Wi-Fi в этом клике не выполнялось"
-                    blocked == "snapshot_not_saved" ->
-                        "скрипт не отправлен: снимок Wi-Fi не подтверждён (нужен успешный commit и " +
-                            "чтение ВСЕХ трёх ключей, причём в том хранилище, которое продолжение " +
-                            "прочитает первым — иначе после перезапуска вернулось бы прежнее " +
-                            "значение). Сеть и системные свойства не менялись"
-                    blocked == "snapshot_conflict" ->
-                        "скрипт не отправлен: в CPS и DPS разные значения снимка, продолжение " +
-                            "прочитало бы не то. Сеть и свойства не менялись"
-                    blocked == "snapshot_not_readable" ->
-                        "скрипт не отправлен: снимок не читается тем порядком, которым его читает " +
-                            "продолжение (CPS→DPS). Сеть и свойства не менялись"
-                    JitUi.refusalText(blocked) != null -> JitUi.refusalText(blocked)!!
-                    blocked != null ->
-                        "скрипт не отправлен: $blocked"
-                    shellReply ->
-                        "экран гаснет на 10–20 с · транспорт ответил целиком. Возврат клиентского " +
-                            "Wi-Fi запрошен через 15 с после следующего запуска приложения " +
-                            "(restore=$restoreShown); интернет при этом НЕ проверяется. " +
-                            "Если приложение после рестарта фреймворка не запустится, Wi-Fi " +
-                            "останется выключенным: это ограничение референса, см. отчёт"
-                    sent ->
-                        "команда отправлена, ответа транспорта нет (rc=${click?.exitCode ?: -1}): " +
-                            "рестарт фреймворка мог не произойти, а команда могла остаться в очереди. " +
-                            "Намерение сохранено; итог покажет только сверка после определённого " +
-                            "исхода"
-                    else -> "клик не отправлен"
+                exitCode = if (sent) (click?.rc ?: -1) else 1,
+                expected = "рестарт фреймворка; после него JIT pedido=… getprop=… (w0/bb + w0/r7)",
+                actual = when {
+                    click == null -> "клик не выполнен (исключение, см. лог)"
+                    !sent -> "предыдущий клик ещё выполняется → вторая цепочка не запущена"
+                    else -> "цепочка вернулась rc=${click.rc}: рестарт фреймворка не произошёл " +
+                        "(или ещё не дошёл); restaurar=${click.restaurar} prefs=${if (click.prefsOk) "ok" else "partial"}"
                 },
+                stdout = if (sent) "экран гаснет на 10–20 с · Wi-Fi вернётся через 15 с после запуска " +
+                    "приложения (JitWatchdogService); итог JIT — по getprop после рестарта"
+                else "скрипт не отправлен: ${click?.refused ?: "exception"}",
                 status = if (sent) ToolsStep.Status.PARTIAL else ToolsStep.Status.BLOCKED
             )
         )
