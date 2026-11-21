@@ -47,7 +47,7 @@ class AvasIndependenceTest {
     @Test
     fun chainHasNoAvasOrAudioCommands() {
         val stand = JitIsoStand(rules = 0)
-        stand.exec(JitRef.chainScript(true))
+        stand.exec(JitMech.chainScript(true))   // iter65: цепочка референса — JitMech
         val text = stand.callsText()
         for (bad in listOf("audio", "avas", "am ", "cmd car", "service call")) {
             assertFalse("в цепочке нет «$bad»", text.contains(bad))

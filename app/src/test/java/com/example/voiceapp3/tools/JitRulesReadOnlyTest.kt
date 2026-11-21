@@ -18,17 +18,17 @@ class JitRulesReadOnlyTest {
 
     @Test
     fun codeOnlyCountsRules() {
-        val c = code("src/main/java/com/example/voiceapp3/tools/JitNetCore.kt")
+        val c = code("src/main/java/com/example/voiceapp3/tools/JitMech.kt")   // iter65: литерал — в JitMech
         assertTrue("правило только считается", c.contains("grep -c 'oif wlan0'"))
         for (bad in listOf("ip rule del", "ip rule flush", "ndc ", "settings put", "setenforce", "route add")) {
-            assertFalse("JitNetCore не содержит «$bad»", c.contains(bad))
+            assertFalse("JitMech не содержит «$bad»", c.contains(bad))
         }
     }
 
     @Test
     fun scriptOnlyCountsRules() {
         val stand = JitIsoStand(rules = 3)
-        stand.exec(JitRef.chainScript(true))
+        stand.exec(JitMech.chainScript(true))   // iter65: цепочка референса — JitMech
         assertEquals("правила считаются до нуля", 4, stand.calls().count { it == "ip rule show" })
         assertFalse(stand.calls().any { it.contains("del") || it.contains("flush") })
         assertEquals("setprop ctl.restart zygote", stand.calls().last())

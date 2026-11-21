@@ -33,7 +33,7 @@ class JitNoPersistTest {
 
     @Test
     fun chainHasSinglePropertyWrite() {
-        val script = JitRef.chainScript(true)
+        val script = JitMech.chainScript(true)   // iter65: литерал референса
         assertTrue(script.contains("setprop dalvik.vm.usejit true"))
         assertFalse(script.contains("persist."))
         assertFalse(script.contains("usejitprofiles"))

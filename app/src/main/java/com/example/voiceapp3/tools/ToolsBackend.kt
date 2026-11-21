@@ -212,20 +212,8 @@ enum class Choice(
         addProperty("lockSoundName", LockSound.getDisplayName(appContext))
         addProperty("lockSoundVol", LockSound.getVolume(appContext))
         addProperty("lockSoundDelay", LockSound.getDelayMs(appContext).toString())
-        /* iter67 §I.4: если сеть снял наш клик, а автоматический возврат не выполнен — владелец
-           видит это отдельным свойством (без красного), а не только строкой журнала. */
-        run {
-            val weCut = runCatching {
-                Prefs2.cps(appContext).getBoolean(JitNetDecision.KEY_NET_CUT_BY_US, false)
-            }.getOrDefault(false)
-            val enabled = runCatching {
-                (appContext.getSystemService(android.content.Context.WIFI_SERVICE)
-                    as? android.net.wifi.WifiManager)?.isWifiEnabled
-            }.getOrNull()
-            val notice = JitNetDecision.ownerNotice(weCut, enabled, snapWifi = true)
-            addProperty("wifiRestoreState", notice?.first ?: "none")
-            addProperty("wifiRestoreNotice", notice?.second ?: "")
-        }
+        /* iter65: свойства `wifiRestoreState`/`wifiRestoreNotice` удалены вместе с флагом «сеть сняли
+           мы» (JitNetDecision): Wi-Fi после рестарта возвращает JitWatchdogService, как у референса. */
         addProperty("unlockSound", LockSound.isUnlockSoundEnabled(appContext))
         addProperty("unlockSoundPath", LockSound.getUnlockSelectedPath(appContext))
         addProperty("unlockSoundName", LockSound.getUnlockDisplayName(appContext))
@@ -257,25 +245,8 @@ enum class Choice(
         addProperty("perfJitRuntimeRaw", jitFact?.raw ?: "")
         addProperty("perfJitRuntimeReason", jitFact?.reason ?: "not_read_yet")
         addProperty("perfJitConfirmed", AppPerformance.jitConfirmedState(appContext))
-        /* iter67 §D: ЯВНАЯ модель состояния. Намерение (`perfJit`) отвечает только за выбранное
-           владельцем; рядом обязательные свойства: машинное состояние, факт, сырой факт и причина.
-           «Включено, не применено» и «включено, ждёт перезапуска» видны отдельно и без красного. */
-        run {
-            val st = JitUi.jitUiState(
-                intent = AppPerformance.isAutoOptimizeEnabled(appContext),
-                propValue = jitFact?.value,
-                cache = AppPerformance.jitCodeCacheExecutable()
-            )
-            addProperty("perfJitState", JitUi.wire(st))
-            addProperty("perfJitRuntime", when (jitFact?.value) {
-                JitRef.Prop.TRUE -> "true"
-                JitRef.Prop.FALSE -> "false"
-                else -> "unknown"
-            })
-            addProperty("perfJitRuntimeRaw", jitFact?.raw ?: "")
-            addProperty("perfJitWhy", JitUi.why(st))
-            addProperty("perfJitText", JitUi.text(st))
-        }
+        /* iter65: `perfJitState`/`perfJitWhy`/`perfJitText` (модель JitUi) удалены — потребителей в UI
+           не было; тумблер рисуется по факту getprop (`perfJitRuntime`/`perfJitConfirmed`). */
         addProperty("unlockSound", LockSound.isUnlockSoundEnabled(appContext))
         addProperty("unlockSoundPath", LockSound.getUnlockSelectedPath(appContext))
         add("keepAliveApps", AppPerformance.getKeepAliveAppsJson(appContext))

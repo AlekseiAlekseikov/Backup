@@ -37,7 +37,7 @@ class JitBootBoundaryTest {
     fun restartOnlyFromClickPath() {
         val ap = code("src/main/java/com/example/voiceapp3/tools/AppPerformance.kt")
         val svc = code("src/main/java/com/example/voiceapp3/VoiceAssistantService.kt")
-        val jit = code("src/main/java/com/example/voiceapp3/tools/JitNetCore.kt")
+        val jit = code("src/main/java/com/example/voiceapp3/tools/JitMech.kt")   // iter65: литерал — в JitMech
         val jitNet = code("src/main/java/com/example/voiceapp3/tools/JitNet.kt")
         assertFalse("сервис не рестартует фреймворк", svc.contains("ctl.restart zygote"))
         assertFalse("адаптер не собирает команд", jitNet.contains("ctl.restart zygote"))
@@ -48,13 +48,13 @@ class JitBootBoundaryTest {
 
     @Test
     fun startPathIsReadOnly() {
-        val jit = code("src/main/java/com/example/voiceapp3/tools/JitNetCore.kt")
+        val jit = code("src/main/java/com/example/voiceapp3/tools/JitMech.kt")   // iter65: ядро — JitMech
         // Ядро не выдаёт устройству ни одной команды само: `setprop`/`svc` есть только как ТЕКСТ
         // скрипта референса, который уходит транспорту из click(); сеть меняется через адаптер.
         assertFalse("ядро не зовёт shell", jit.contains("shell.exec(\"setprop") || jit.contains("shell.exec(\"svc"))
         assertFalse("ядро не пишет свойства напрямую", jit.contains("Runtime.getRuntime"))
         assertTrue("сеть меняется только через адаптер",
-            jit.contains("netState.setWifi") && jit.contains("netState.wifiOn"))
+            jit.contains("wifi.setEnabled(true)") && jit.contains("wifi.isEnabled()"))   // iter65: адаптер JitMech.Wifi
         assertFalse("точек доступа в JIT нет", jit.contains("startAp"))
     }
 

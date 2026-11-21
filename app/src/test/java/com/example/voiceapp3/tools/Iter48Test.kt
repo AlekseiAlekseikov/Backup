@@ -453,47 +453,7 @@ class Iter48Test {
     }
     // ─────────────── §Д: время старта zygote читается и доказывает только факт ───────────────
 
-    @Test
-    fun zygoteStartIsParsedFromProcFields() {
-        // /proc/<pid>/stat: имя в скобках может содержать пробелы, starttime — 22-е поле.
-        val stat = "1234 (zygote) S 1 1234 1234 0 -1 4194560 100 0 0 0 5 3 0 0 20 0 1 0 98765 1234 56"
-        assertEquals(98765L, ZygoteStart.parseStarttimeTicks(stat))
-        assertEquals(1234.5, ZygoteStart.parseUptimeSec("1234.50 5000.10")!!, 0.001)
-        assertTrue(ZygoteStart.isZygoteCmdline("zygote64"))
-        assertTrue(ZygoteStart.isZygoteCmdline("/system/bin/zygote"))
-        assertFalse(ZygoteStart.isZygoteCmdline("zygote_helper"))
-        assertFalse(ZygoteStart.isZygoteCmdline(""))
-        // btime = now - uptime; старт = btime + ticks/hz
-        val now = 1_800_000_000_000L
-        val started = ZygoteStart.startMsFrom(1000L, 100.0, now, hz = 100L)
-        assertEquals(now - 100_000L + 10_000L, started)
-        assertNull("без uptime не догадываемся", ZygoteStart.startMsFrom(1000L, null, now))
-        assertNull("без ticks не догадываемся", ZygoteStart.startMsFrom(null, 100.0, now))
-    }
 
-    @Test
-    fun zygoteEvidenceRequiresStrictlyLaterStartWithoutTolerance() {
-        val now = 1_800_000_000_000L
-        val mark = JitRef.OpMark.of("op", true, JitRef.OpMark.UNDEFINED, now - 120_000L)
-        // iter47 засчитывал старт «за 60 с ДО отметки» как доказательство — это и убрано.
-        assertFalse(
-            "старт zygote ДО отметки не доказывает нашу команду (перенос/очередь/pid reuse)",
-            JitOp.zygoteRestartEvidence(mark, now - 180_000L, now)
-        )
-        assertFalse(
-            "равенство времени тоже не доказательство",
-            JitOp.zygoteRestartEvidence(mark, mark.tsMs, now)
-        )
-        assertTrue(
-            "строго позже — признак есть (но только для снятия блокировки нового клика)",
-            JitOp.zygoteRestartEvidence(mark, now - 60_000L, now)
-        )
-        val old = JitRef.OpMark.of("op2", true, JitRef.OpMark.UNDEFINED, now - 60 * 60_000L)
-        assertFalse(
-            "отметка старше окна: поздний старт zygote мог быть чем угодно",
-            JitOp.zygoteRestartEvidence(old, now - 1_000L, now)
-        )
-    }
 
     // ─────────────── §Е: ротация лога не теряет .1 и не теряет строку ───────────────
 

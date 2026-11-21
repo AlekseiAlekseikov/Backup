@@ -78,7 +78,7 @@ object HvacDigitalPlugin {
         val id = runCatching { java.io.File("/proc/sys/kernel/random/boot_id").readText().trim() }
             .getOrDefault("")
         val tag = if (id.isNotEmpty()) id
-                  else JitBootMark.epochTag(System.currentTimeMillis() - android.os.SystemClock.elapsedRealtime())
+                  else "epoch" + ((System.currentTimeMillis() - android.os.SystemClock.elapsedRealtime()) / 1000L)  // формат прежнего JitBootMark.epochTag
         bootTagCache = tag
         return tag
     }

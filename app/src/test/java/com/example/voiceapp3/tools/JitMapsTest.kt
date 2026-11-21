@@ -20,7 +20,7 @@ class JitMapsTest {
     private fun read(path: File): String? = runCatching { path.readText() }.getOrNull()
 
     private fun parsed(path: File): Boolean? =
-        JitRef.cacheExecutableFromMaps(read(path))
+        JitMech.cacheExecutable(read(path))   // iter65: копия j5.d + фильтр sa — JitMech
 
     private fun tmp(content: String): File =
         File.createTempFile("maps", ".txt").apply { writeText(content); deleteOnExit() }

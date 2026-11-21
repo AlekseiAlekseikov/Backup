@@ -20,15 +20,6 @@ class Iter67cRefusalTest {
         listOf(ToolsStep("perf_zygote", "нет", 0, 0, 1, stdout = stdout, status = status))
     )
 
-    @Test
-    fun `штатный отказ без FAILED и без крестика, уровень WARN`() {
-        val r = result(ToolsStep.Status.BLOCKED, JitUi.refusalText("claim_unproven")!!)
-        val line = "TOGGLE [perfJit] → ON | ${r.verdictMark} | ${r.summary}"
-        assertFalse("в строке отказа FAILED: $line", line.contains("FAILED"))
-        assertFalse("в строке отказа ✗: $line", line.contains("✗"))
-        assertEquals("уровень журнала отказа", "WARN", r.logLevel)
-        assertEquals("OP_SUMMARY обязан остаться BLOCKED", "BLOCKED", r.statusWire.uppercase())
-    }
 
     @Test
     fun `настоящая ошибка остаётся ошибкой`() {
@@ -39,19 +30,6 @@ class Iter67cRefusalTest {
         assertEquals("INFO", result(ToolsStep.Status.PARTIAL).logLevel)
     }
 
-    @Test
-    fun `тексты отказов по-русски, дословно по заданию`() {
-        assertEquals("не отправлено: внутренняя ошибка размера команды (сообщите разработчику)",
-            JitUi.refusalText("claim_cmd_too_long"))
-        assertEquals("не отправлено: не удалось подтвердить владение, повторите",
-            JitUi.refusalText("claim_unproven"))
-        assertEquals("не отправлено: уже выполняется другая операция JIT",
-            JitUi.refusalText("op_in_flight"))
-        assertEquals(null, JitUi.refusalText("wifi_unknown"))
-        val summary = result(ToolsStep.Status.BLOCKED, JitUi.refusalText("claim_cmd_too_long")!!).summary
-        assertTrue("сводка панели обязана показать русский текст: $summary",
-            summary.startsWith("не отправлено: внутренняя ошибка размера команды"))
-    }
 
     @Test
     fun `журнал и панель проведены через новое правило`() {

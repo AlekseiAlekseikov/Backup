@@ -102,12 +102,4 @@ class Iter67WriteVerdictTest {
             adb.contains("ExecExpect.logLine(rc, out, expect, command)"))
     }
 
-    @Test
-    fun `getprop читается только через сравнение с ожиданием`() {
-        val core = java.io.File("app/src/main/java/com/example/voiceapp3/tools/JitNetCore.kt").readText()
-        // fail-before: `return JitRef.parseProp(rc, out)` — сравнения с ожидаемым не было.
-        assertTrue("readProp не считает expectOk",
-            core.contains("val expectOk = expected != null && ExecExpect.evaluate(rc, out, expected)"))
-        assertTrue("PropFact не несёт expectOk", core.contains("val expectOk: Boolean = false"))
-    }
 }

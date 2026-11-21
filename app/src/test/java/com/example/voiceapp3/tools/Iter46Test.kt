@@ -180,23 +180,6 @@ class Iter46Test {
 
     // ───────────────────────── §7.2: поздний старт не включает Wi-Fi ─────────────────────────
 
-    @Test
-    fun lateStartNeverEnablesWifiFromSavedSnapshot() {
-        val now = 1_800_000_000_000L
-        val fresh = JitRef.OpMark.of("op1", true, tsMs = now - 20_000)
-        assertEquals("свежая отметка = продолжение клика", true,
-            JitOp.restoreMayEnableWifi(fresh, now).first)
-
-        val late = JitRef.OpMark.of("op1", true, tsMs = now - 40 * 60_000L)
-        val (allowed, why) = JitOp.restoreMayEnableWifi(late, now)
-        assertFalse("поздний независимый старт не включает Wi-Fi", allowed)
-        assertTrue(why.startsWith("late_start"))
-
-        // Коррекция часов назад/вперёд не должна выдаваться за свежесть.
-        assertFalse(JitOp.restoreMayEnableWifi(JitRef.OpMark.of("op", true, tsMs = now + 60_000), now).first)
-        assertFalse("нет отметки — нет права включать", JitOp.restoreMayEnableWifi(null, now).first)
-        assertFalse(JitOp.restoreMayEnableWifi(JitRef.OpMark.of("op", true, tsMs = 0), now).first)
-    }
 
     // ───────────────────────── §8.3: жертвы выбираются по возрасту, активная защищена ─────────
 

@@ -30,14 +30,14 @@ class Iter67CommandAuditTest {
 
     @Test
     fun `многострочная цепочка с переводами строк — не склейка`() {
-        val multiline = JitRef.chainScriptForTest(want = true, guard = "")
+        val multiline = JitMech.chainScript(true)   // iter65: литерал референса
         assertTrue("ложное срабатывание на многострочной цепочке",
             CommandAudit.missingSeparators(multiline).isEmpty())
     }
 
     @Test
     fun `истинный литерал скрипта цепочки проходит проверку`() {
-        val script = JitRef.chainScriptForTest(want = true, guard = "")
+        val script = JitMech.chainScript(true)   // iter65: литерал референса
         assertTrue("срабатывание на боевом скрипте: ${CommandAudit.missingSeparators(script)}",
             CommandAudit.missingSeparators(script).isEmpty())
     }

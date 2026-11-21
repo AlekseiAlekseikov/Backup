@@ -4,7 +4,7 @@ package com.example.voiceapp3.tools
  * iter45 §4/§5/§6/§7/§10 — чистые правила, на которых держатся исправления.
  *
  * Здесь нет ни Android-API, ни shell: всё это покрыто JVM-тестами (`Toggles45Test`), а
- * production-код ([NetworkTtl], [LockSound], [JitOp], ToolsPanel, [AppFileLogger]) вызывает
+ * production-код ([NetworkTtl], [LockSound], ToolsPanel, [AppFileLogger]) вызывает
  * ИМЕННО эти функции. Так «модель» и боевой путь не расходятся.
  */
 object Toggles45 {
@@ -216,38 +216,6 @@ object Toggles45 {
         if (!cpsWins && dpsDeleted) return Resolved.Deleted
         val v = if (cpsWins) cpsValue else dpsValue
         return if (v == null) Resolved.Unknown else Resolved.Value(v)
-    }
-
-    /**
-     * §7.2: истекло ли окно жизни незавершённой операции.
-     *
-     * @param markTs время отметки операции (wall clock, мс); `<= 0` — время неизвестно.
-     * @param now текущее время.
-     * @param limitMs граница (см. `JitOp.STALE_MARK_MS`).
-     * Возвращает `true` только при ДОКАЗАННО известной и достаточно старой отметке: неизвестное
-     * время окно не открывает.
-     */
-    fun isStale(markTs: Long?, now: Long, limitMs: Long): Boolean = staleness(markTs, now, limitMs).first
-
-    /**
-     * iter67 §H.3 — `isStale` ВМЕСТЕ С КЛАССОМ отметки.
-     *
-     * Дефект (живая ГУ): `ts=-196980728` давал `isStale == false`, окно не истекало никогда, и
-     * блокировка держалась 6 суток. Причина — `isStale` отвечал только «истекло/нет» и не называл,
-     * что со временем отметки что-то не так.
-     *
-     * Теперь вызывающий ОБЯЗАН видеть класс ([MarkVerdict]) и логировать его: `mark_invalid_*` —
-     * это доказанный разрыв цепочки, а не «ещё не истекло». Правило истёкшести не меняется
-     * (ради совместимости с прежними вызовами): `true` — только при доказанно известной и
-     * достаточно старой отметке.
-     */
-    fun staleness(markTs: Long?, now: Long, limitMs: Long): Pair<Boolean, MarkVerdict> {
-        val ts = markTs ?: return false to MarkVerdict.UNREADABLE
-        val verdict = JitUnblock.classifyMark(ts, now)
-        if (verdict != MarkVerdict.OK) return false to verdict
-        if (limitMs <= 0L) return false to verdict
-        val age = now - ts
-        return (age >= limitMs) to verdict
     }
 
     /**

@@ -42,32 +42,8 @@ class Toggles45Test {
 
     // ───────────────────────── §7.2: окно жизни операции ─────────────────────────
 
-    @Test
-    fun freshMarkIsNotStale() {
-        val now = 1_000_000L
-        assertFalse(Toggles45.isStale(now - 60_000L, now, 15 * 60_000L))
-    }
 
-    @Test
-    fun oldMarkIsStaleOnlyAfterLimit() {
-        val now = 10_000_000L
-        val limit = 15 * 60_000L
-        assertFalse("ровно за миг до границы — ещё блокирует",
-            Toggles45.isStale(now - limit + 1, now, limit))
-        assertTrue("граница достигнута — окно истекло",
-            Toggles45.isStale(now - limit, now, limit))
-    }
 
-    @Test
-    fun unknownMarkTimeNeverOpensTheWindow() {
-        val now = 10_000_000L
-        assertFalse("нет отметки", Toggles45.isStale(null, now, 900_000L))
-        assertFalse("time<=0 — время неизвестно, окно не открываем",
-            Toggles45.isStale(0L, now, 900_000L))
-        assertFalse("будущее время (часы назад) не считается истёкшим",
-            Toggles45.isStale(now + 5_000L, now, 900_000L))
-        assertFalse("нулевая граница не открывает окно", Toggles45.isStale(1L, now, 0L))
-    }
 
     // ───────────────────────── §4: значения тумблеров ─────────────────────────
 

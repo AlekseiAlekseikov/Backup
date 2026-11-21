@@ -509,20 +509,6 @@ class Iter47Test {
         assertFalse("набор изменился — нe трогаем", canDrop(listOf(7), listOf(7, 42)))
     }
 
-    @Test
-    fun zygoteRestartIsEvidenceAndClockShiftIsNot() {
-        val now = 1_800_000_000_000L
-        val mark = JitRef.OpMark.of("op1", true, JitRef.OpMark.UNDEFINED, now - 20_000)
-        assertTrue("zygote стартовал после отметки — команда доставлена",
-            JitOp.zygoteRestartEvidence(mark, now - 5_000, now))
-        assertFalse("zygote стартовал ДО отметки — не доказательство",
-            JitOp.zygoteRestartEvidence(mark, now - 120_000, now))
-        assertFalse("zygote не читается", JitOp.zygoteRestartEvidence(mark, null, now))
-        assertFalse("нет отметки", JitOp.zygoteRestartEvidence(null, now, now))
-        // Коррекция часов: отметка «из будущего» — не доказательство.
-        val future = JitRef.OpMark.of("op2", true, JitRef.OpMark.UNDEFINED, now + 600_000)
-        assertFalse(JitOp.zygoteRestartEvidence(future, now + 10_000, now))
-    }
 
     private fun tmpDir(): File =
         File.createTempFile("iter47", "").let { it.delete(); it.mkdirs(); it }
