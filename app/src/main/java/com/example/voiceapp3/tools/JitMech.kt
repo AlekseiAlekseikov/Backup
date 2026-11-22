@@ -48,6 +48,15 @@ object JitMech {
 
     interface Shell {
         fun exec(command: String, timeoutMs: Int): Pair<Int, String>
+
+        /**
+         * 1.0.66: как [exec], но [onSent] вызывается, как только транспорт ДОКАЗАЛ доставку —
+         * adbd ответил `OKAY` на `OPEN shell:<цепочка>`, т.е. shell с цепочкой на устройстве запущен.
+         * Ответа (`CLSE`) после этого может не быть вовсе: процесс погибает вместе с фреймворком.
+         * По умолчанию доказать доставку нечем — [onSent] не вызывается.
+         */
+        fun execNotify(command: String, timeoutMs: Int, onSent: () -> Unit): Pair<Int, String> =
+            exec(command, timeoutMs)
     }
 
     interface Scheduler {
@@ -107,7 +116,9 @@ object JitMech {
         val restaurar: String?,
         val prefsOk: Boolean,
         val rc: Int?,
-        val out: String?
+        val out: String?,
+        /** 1.0.66: транспорт подтвердил доставку цепочки (строка `JIT_CHAIN_SENT`). */
+        val delivered: Boolean = false
     )
 
     /**
@@ -130,13 +141,23 @@ object JitMech {
             log("JIT_CLICK want=$want $KEY_PEDIDO=$want $KEY_AUTO=$want $KEY_RESTAURAR=$restaurar " +
                 "prefs=${if (prefsOk) "ok" else "partial pedido=$okPedido auto=$okAuto restaurar=$okRest"}")
             log("dalvik.vm.usejit -> $want; reiniciando o framework")
-            val (rc, out) = runCatching { shell.exec(chainScript(want), CHAIN_TIMEOUT_MS) }
-                .getOrElse { t -> -1 to "ERR_${t.javaClass.simpleName}" }
+            val delivered = java.util.concurrent.atomic.AtomicBoolean(false)
+            val (rc, out) = runCatching {
+                shell.execNotify(chainScript(want), CHAIN_TIMEOUT_MS) {
+                    // Одна строка на клик: shell с цепочкой запущен на устройстве. Дальше `svc wifi
+                    // disable` → … → `ctl.restart zygote`, и процесс приложения погибнет раньше ответа.
+                    if (delivered.compareAndSet(false, true)) {
+                        log("JIT_CHAIN_SENT want=$want transport=open_okay " +
+                            "(цепочка доставлена: shell на устройстве запущен; ответа не ждём как успеха — " +
+                            "процесс погибнет вместе с фреймворком)")
+                    }
+                }
+            }.getOrElse { t -> -1 to "ERR_${t.javaClass.simpleName}" }
             // Сюда доходим, только если процесс пережил цепочку: zygote не перезапущен
             // (или транспорт ответил ошибкой). Это не «успех» и не «провал» — факт покажет сверка.
-            log("JIT_CHAIN_RETURNED want=$want rc=$rc out=«${out.trim().takeLast(200)}» " +
+            log("JIT_CHAIN_RETURNED want=$want rc=$rc delivered=${delivered.get()} out=«${out.trim().takeLast(200)}» " +
                 "(процесс жив после цепочки: рестарт zygote не произошёл или ещё не дошёл)")
-            return Click(true, null, restaurar, prefsOk, rc, out)
+            return Click(true, null, restaurar, prefsOk, rc, out, delivered.get())
         } finally {
             busy.set(false)
         }

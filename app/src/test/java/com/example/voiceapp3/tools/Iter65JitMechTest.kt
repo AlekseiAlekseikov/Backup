@@ -238,6 +238,41 @@ class Iter65JitMechTest {
         assertTrue(lines.contains("dalvik.vm.usejit -> false; reiniciando o framework"))
     }
 
+    /** 1.0.66: транспорт, который умеет доказать доставку (adbd ответил OKAY на OPEN). */
+    private class SentShell(val opened: Boolean, val rc: Int = 0) : JitMech.Shell {
+        val calls = mutableListOf<String>()
+        override fun exec(command: String, timeoutMs: Int): Pair<Int, String> { calls += command; return rc to "" }
+        override fun execNotify(command: String, timeoutMs: Int, onSent: () -> Unit): Pair<Int, String> {
+            calls += command
+            if (opened) onSent()
+            return rc to (if (opened) "" else "ERR_ADB_IO")
+        }
+    }
+
+    @Test
+    fun chainSentIsLoggedWhenTransportConfirmsDeliveryBeforeAnyReply() {
+        val shell = SentShell(opened = true)
+        val r = JitMech.click(MemPrefs(), FakeWifi(true), shell, want = true, log = ::log)
+        assertEquals("одна команда — литерал", listOf(JitMech.chainScript(true)), shell.calls)
+        val sent = lines.filter { it.startsWith("JIT_CHAIN_SENT ") }
+        assertEquals(1, sent.size)
+        assertTrue(sent[0], sent[0].startsWith("JIT_CHAIN_SENT want=true "))
+        val iFramework = lines.indexOf("dalvik.vm.usejit -> true; reiniciando o framework")
+        val iSent = lines.indexOf(sent[0])
+        val iRet = lines.indexOfFirst { it.startsWith("JIT_CHAIN_RETURNED ") }
+        assertTrue("порядок: reiniciando → SENT → RETURNED", iFramework in 0 until iSent && iSent < iRet)
+        assertTrue(r.delivered)
+        assertTrue(lines[iRet], lines[iRet].contains("delivered=true"))
+    }
+
+    @Test
+    fun noChainSentWhenTransportNeverOpenedTheShell() {
+        val r = JitMech.click(MemPrefs(), FakeWifi(true), SentShell(opened = false, rc = 1), want = false, log = ::log)
+        assertTrue(lines.none { it.startsWith("JIT_CHAIN_SENT") })
+        assertFalse(r.delivered)
+        assertTrue(lines.single { it.startsWith("JIT_CHAIN_RETURNED ") }.contains("delivered=false"))
+    }
+
     @Test
     fun secondClickWhileFirstInFlightIsRefused() {
         val entered = CountDownLatch(1); val release = CountDownLatch(1)
