@@ -228,6 +228,34 @@ object JitMech {
 
     private val EXEC_RX = Regex("\\br[-w]x[ps]\\b")
 
+    /** iter66: паузы повторного чтения неизвестного факта getprop (после загрузки канал ADB ещё поднимается). */
+    val FACT_RETRY_DELAYS_MS: List<Long> = listOf(5_000L, 15_000L, 30_000L, 60_000L)
+
+    /**
+     * iter66 — повтор ЧТЕНИЯ `getprop dalvik.vm.usejit`, пока факт неизвестен: не больше
+     * [FACT_RETRY_DELAYS_MS] попыток, без циклов и без записи. На первом известном значении —
+     * [onKnown] и стоп. У референса этого нет (`r7` читает при открытии настроек); здесь нужно,
+     * потому что тумблер не должен часами висеть в «состояние неизвестно» из-за одного таймаута.
+     */
+    fun retryFact(
+        scheduler: Scheduler,
+        read: () -> Boolean?,
+        onKnown: (Boolean) -> Unit,
+        log: (String) -> Unit,
+        attempt: Int = 0
+    ) {
+        val total = FACT_RETRY_DELAYS_MS.size
+        if (attempt >= total) {
+            log("JIT_FACT_RETRY gave_up attempts=$attempt (факт остаётся неизвестным до открытия панели)")
+            return
+        }
+        scheduler.postDelayed(FACT_RETRY_DELAYS_MS[attempt]) {
+            val v = runCatching { read() }.getOrNull()
+            log("JIT_FACT_RETRY attempt=${attempt + 1}/$total getprop=${v ?: "unknown"}")
+            if (v != null) onKnown(v) else retryFact(scheduler, read, onKnown, log, attempt + 1)
+        }
+    }
+
     /** `w0/r7`: `ok = (pedido == getprop) && (!pedido || maps != FALSE)`. */
     fun verdictOk(pedido: Boolean, getprop: Boolean, maps: Boolean?): Boolean =
         pedido == getprop && (!pedido || maps != false)

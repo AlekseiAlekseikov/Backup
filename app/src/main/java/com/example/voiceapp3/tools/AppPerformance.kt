@@ -712,12 +712,33 @@ object AppPerformance {
         val pref = if (isAutoOptimizeEnabled(context)) "on" else "off"
         AppLog.i(TAG, "JIT_BOOT runtime=${fact.raw.ifEmpty { "empty" }} rc=${fact.rc} pref=$pref " +
             "write=none (только чтение: JIT на старте не применяется)")
+        // iter66: одно неудачное чтение (таймаут канала ADB при загрузке/после рестарта фреймворка)
+        // больше не оставляет тумблер в «состояние неизвестно» до следующего открытия панели.
+        if (fact.value == JitRef.Prop.UNKNOWN) scheduleJitFactRetry(context.applicationContext)
         // Сверка (getprop + кэш), если есть `jit_pedido` (см. [jitPendingVerify]).
         runCatching { jitPendingVerify(context) }
         // AVAS: прежняя JIT-привязка удалена (§2 мандата: mute/sound type — самостоятельные функции
         // референса, `w0/la.run`/`w0/e2.run` их не трогают). Остаточный снимок AVAS старых версий
         // только ФИКСИРУЕТСЯ строкой: не применяем, не удаляем, значений на устройстве не меняем.
         runCatching { reportLegacyAvasSnapshot(context.applicationContext) }
+    }
+
+    /**
+     * iter66 — повторное ЧТЕНИЕ факта `getprop` ([JitMech.retryFact]: 5/15/30/60 с, затем стоп).
+     * Если факт уже известен (панель успела прочитать) — shell не вызывается. На известном значении
+     * — обычная сверка (она что-то делает, только если есть `jit_pedido`).
+     */
+    private fun scheduleJitFactRetry(app: Context) {
+        JitMech.retryFact(
+            JitMechAndroid.AndroidScheduler,
+            read = {
+                val cached = LAST_JIT_FACT?.value
+                val v = if (cached != null && cached != JitRef.Prop.UNKNOWN) cached else jitRuntimeFact(app).value
+                when (v) { JitRef.Prop.TRUE -> true; JitRef.Prop.FALSE -> false; else -> null }
+            },
+            onKnown = { runCatching { jitPendingVerify(app, "fact_retry") } },
+            log = { line -> AppLog.i(TAG, line) }
+        )
     }
 
     /**
