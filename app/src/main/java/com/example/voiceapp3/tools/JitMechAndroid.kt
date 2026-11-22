@@ -107,12 +107,44 @@ object JitMechAndroid {
     // ─────────────────────────── входы ───────────────────────────
 
     /** Клик тумблера (`w0.j9.onClick` + `w0/la.run`). Только из фонового потока. */
-    fun click(app: Context, want: Boolean): JitMech.Click =
-        JitMech.click(DualPrefs(app), AndroidWifi(app), AndroidShell, want, log)
+    fun click(app: Context, want: Boolean): JitMech.Click {
+        val prefs = DualPrefs(app)
+        // iter66: pid zygote ДО клика — чтобы после рестарта доказать, что zygote сменился.
+        // Пишется только если клик не будет отклонён `busy` (иначе он перетёр бы pid идущего клика).
+        if (!JitMech.busy()) {
+            val pid = zygotePid()
+            if (pid != null) prefs.putString(JitMech.KEY_ZYGOTE_ANTES, pid.toString())
+            log("JIT_ZYGOTE before pid=${pid ?: "unknown"} want=$want " +
+                "(родитель процесса приложения = zygote64; его перезапускает ctl.restart zygote)")
+        }
+        return JitMech.click(prefs, AndroidWifi(app), AndroidShell, want, log)
+    }
 
     /** `CentralWatchdogService.onCreate` → 15 с → `w0/e2`. Возвращается сразу. */
-    fun watchdogStart(app: Context, alive: () -> Boolean): JitMech.Restaurar? =
-        JitMech.watchdogStart(DualPrefs(app), AndroidWifi(app), AndroidScheduler, alive, log)
+    fun watchdogStart(app: Context, alive: () -> Boolean): JitMech.Restaurar? {
+        val prefs = DualPrefs(app)
+        val r = JitMech.watchdogStart(prefs, AndroidWifi(app), AndroidScheduler, alive, log)
+        if (r != null) {
+            // iter66: доказательство рестарта (zygote_pid сменился) — без shell, по getppid.
+            val antes = prefs.getString(JitMech.KEY_ZYGOTE_ANTES)
+            prefs.remove(JitMech.KEY_ZYGOTE_ANTES)
+            val now = zygotePid()
+            log("JIT_ZYGOTE after pid=${now ?: "unknown"} before=${antes ?: "unknown"} " +
+                "restarted=${JitMech.zygoteRestarted(antes, now) ?: "unknown"}")
+            // Строка `wifi agora=` пишется сразу после setWifiEnabled(true), когда Wi-Fi ещё
+            // включается (как в референсе) — поэтому отдельное подтверждение через 10 с, только чтение.
+            if (r.wifi) {
+                AndroidScheduler.postDelayed(JitMech.RESTORE_DELAY_MS + 10_000L) {
+                    log("JIT_WIFI_CONFIRM wifi_now=${AndroidWifi(app).isEnabled()} " +
+                        "(через 10 с после возврата; только чтение)")
+                }
+            }
+        }
+        return r
+    }
+
+    /** iter66: pid zygote, из которого запущен этот процесс (`getppid`, без shell). */
+    fun zygotePid(): Int? = runCatching { android.system.Os.getppid() }.getOrNull()?.takeIf { it > 1 }
 
     /** Сверка `w0/bb` + `w0/r7`. Только из фонового потока (getprop до 8 с). */
     fun verify(app: Context): JitMech.Verify =

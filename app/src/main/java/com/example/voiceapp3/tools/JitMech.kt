@@ -19,6 +19,11 @@ object JitMech {
     const val KEY_PEDIDO = "jit_pedido"
     const val KEY_AUTO = "perf_auto_otimizar"
     const val KEY_RESTAURAR = "jit_restaurar"
+    /**
+     * iter66 — pid zygote ДО клика (one-shot, только для доказательства рестарта; цепочка и
+     * сверка его не читают). Это ключ префов приложения, не системное свойство.
+     */
+    const val KEY_ZYGOTE_ANTES = "jit_zygote_antes"
 
     /** `mainActivity.H1(40000, …)` в `w0/la`. */
     const val CHAIN_TIMEOUT_MS = 40_000
@@ -191,6 +196,16 @@ object JitMech {
             else log("JIT_WATCHDOG restore=skipped reason=service_destroyed (как `T2=false` в референсе)")
         }
         return r
+    }
+
+    /**
+     * iter66 — сменился ли zygote: pid до клика ([KEY_ZYGOTE_ANTES]) против pid родителя нового
+     * процесса. `null` — сравнивать нечего (ключа нет, мусор, pid не прочитан).
+     */
+    fun zygoteRestarted(antes: String?, now: Int?): Boolean? {
+        val a = antes?.trim()?.toIntOrNull()?.takeIf { it > 1 } ?: return null
+        val n = now?.takeIf { it > 1 } ?: return null
+        return a != n
     }
 
     /** `w0/e2` case 1 (без AP — решение владельца). */
