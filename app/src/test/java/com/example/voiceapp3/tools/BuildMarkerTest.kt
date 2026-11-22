@@ -18,9 +18,9 @@ class BuildMarkerTest {
 
     @Test
     fun versionIs61() {
-        // iter65: версию 64 → 65 поднимает агент (механизм JIT по референсу 3.3.9).
-        assertEquals("versionCode", 65, BuildConfig.VERSION_CODE)
-        assertEquals("versionName", "1.0.65", BuildConfig.VERSION_NAME)
+        // iter66: версию 65 → 66 поднимает агент (доставка цепочки JIT, доказательства, факт после загрузки).
+        assertEquals("versionCode", 66, BuildConfig.VERSION_CODE)
+        assertEquals("versionName", "1.0.66", BuildConfig.VERSION_NAME)
     }
 
     @Test
