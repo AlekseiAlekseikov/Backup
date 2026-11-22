@@ -87,6 +87,11 @@ object JitMechAndroid {
         override fun exec(command: String, timeoutMs: Int): Pair<Int, String> = runCatching {
             AdbClient.execute(command, timeoutMs)
         }.getOrElse { t -> Pair(1, "ERR_EXCEPTION:${t.javaClass.simpleName}") }
+
+        /** iter66: тот же вызов, плюс [onSent] по `OKAY` adbd на `OPEN` (цепочка запущена на ГУ). */
+        override fun execNotify(command: String, timeoutMs: Int, onSent: () -> Unit): Pair<Int, String> = runCatching {
+            AdbClient.executeNotifyOpened(command, timeoutMs, onSent)
+        }.getOrElse { t -> Pair(1, "ERR_EXCEPTION:${t.javaClass.simpleName}") }
     }
 
     /** Отложенная задача в фоновом пуле (у референса — `postDelayed` handler-а + `Thread`). */

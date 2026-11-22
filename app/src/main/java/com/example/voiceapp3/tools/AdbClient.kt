@@ -169,8 +169,16 @@ object AdbClient {
          * bootstrap, переподключение, replay и `ctl.restart adbd` ни на одной ветке обработки.
          */
         val passive: Boolean = false,
+        /**
+         * iter66: вызывается один раз, когда adbd ответил `OKAY` на `OPEN shell:<cmd>` — команда
+         * запущена на устройстве ([executeNotifyOpened], доставка цепочки JIT).
+         */
+        val onOpened: (() -> Unit)? = null,
         val onResult: (Pair<Int, String>) -> Unit
     )
+
+    /** iter66: обработчик `OKAY` на `OPEN` текущей задачи (рабочий поток один — задача одна). */
+    private val openHook = AdbOpenHook()
 
     private val queue = LinkedBlockingQueue<Job>()
     private val workingPort = AtomicInteger(0)
@@ -465,6 +473,27 @@ object AdbClient {
     }
 
     /**
+     * iter66 — как [execute], но [onOpened] вызывается (на рабочем потоке транспорта) в момент, когда
+     * adbd ответил `OKAY` на `OPEN shell:<command>`: команда запущена на устройстве. Нужен цепочке JIT
+     * (`ctl.restart zygote` убивает процесс раньше ответа). Ожидание и таймаут — как у [execute].
+     */
+    @JvmStatic
+    fun executeNotifyOpened(command: String, timeoutMs: Int, onOpened: () -> Unit): Pair<Int, String> {
+        start()
+        if (Looper.myLooper() == Looper.getMainLooper()) return execute(command, timeoutMs)
+        val latch = CountDownLatch(1)
+        var res: Pair<Int, String> = Pair(1, "pending")
+        queue.offer(Job(command, timeoutMs, expectRoot = true, onOpened = onOpened) { r -> res = r; latch.countDown() })
+        val ok = latch.await((timeoutMs + 5000).toLong(), TimeUnit.MILLISECONDS)
+        if (!ok) {
+            channelLost("timeout:${timeoutMs}ms")
+            scheduleReconnectOnce("timeout")
+            return Pair(137, "ERR_ADB_TIMEOUT after ${timeoutMs}ms")
+        }
+        return res
+    }
+
+    /**
      * iter67 §A — «команда отработала» ≠ «получилось то, что хотели».
      *
      * Дефект (измерено на ГУ): `getprop dalvik.vm.usejit` при `rc=0` и значении `false` печатался
@@ -743,11 +772,14 @@ object AdbClient {
             LogKit.beginJobTrace()
             // iter33h H1.2: счётчик checksum_skipped живёт в границах команды.
             resetChecksumSkip()
+            openHook.arm(job.cmd, job.onOpened)
             val out = try {
                 runCommand(job.cmd, job.timeoutMs, job.expectRoot, passive = job.passive)
             } catch (t: Throwable) {
                 Log.e(TAG, "runCommand error", t)
                 Pair(1, "ERR_EXEC: ${t.javaClass.simpleName}: ${t.message}")
+            } finally {
+                openHook.disarm()
             }
             val dt = SystemClock.uptimeMillis() - t0
             LogKit.countExec()
@@ -1846,7 +1878,7 @@ object AdbClient {
                 sock.soTimeout = left
                 val m = readMsg(dis)
                 when (m.cmd) {
-                    OKAY -> localId = m.arg0
+                    OKAY -> { localId = m.arg0; openHook.opened(command) }
                     WRTE -> { out.write(m.payload); writeMsg(os, OKAY, 1, m.arg0, ByteArray(0)) }
                     CLSE -> {
                         writeMsg(os, CLSE, 1, localId, ByteArray(0))
@@ -2227,7 +2259,7 @@ object AdbClient {
                 s.soTimeout = left.toInt().coerceIn(1, Int.MAX_VALUE)
                 val msg = readMsg(dis)
                 when (msg.cmd) {
-                    OKAY -> { localId = msg.arg0 }
+                    OKAY -> { localId = msg.arg0; openHook.opened(command) }
                     WRTE -> {
                         out.write(msg.payload)
                         writeMsg(os, OKAY, 1, msg.arg0, ByteArray(0))
